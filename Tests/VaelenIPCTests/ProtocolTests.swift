@@ -2,6 +2,29 @@ import XCTest
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
+    func testUnknownProtocolVersionSurvivesEnvelopeDecoding() throws {
+        let request = IPCRequest(rawMethod: "core.status", protocolVersion: 2)
+        let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+
+        XCTAssertEqual(decoded.protocolVersion, 2)
+        XCTAssertEqual(decoded.knownMethod, .status)
+    }
+
+    func testUnknownMethodSurvivesEnvelopeDecoding() throws {
+        let request = IPCRequest(rawMethod: "project.future", protocolVersion: 1)
+        let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+
+        XCTAssertNil(decoded.knownMethod)
+        XCTAssertEqual(decoded.method, "project.future")
+    }
+
+    func testResponseRequiresExactlyOneResultOrError() throws {
+        let id = UUID()
+        let invalid = "{\"id\":\"\(id.uuidString)\",\"protocolVersion\":1}"
+
+        XCTAssertThrowsError(try IPCCodec.decode(IPCResponse.self, from: Data(invalid.utf8)))
+    }
+
     func testRequestRoundTripsThroughJSON() throws {
         let request = IPCRequest(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
@@ -20,7 +43,7 @@ final class ProtocolTests: XCTestCase {
             id: UUID(),
             result: .status(CoreStatusResponse(
                 core: .init(state: .running, version: "0.0.1-dev", pid: 42),
-                protocolVersion: .v1
+                protocolVersion: 1
             ))
         )
 

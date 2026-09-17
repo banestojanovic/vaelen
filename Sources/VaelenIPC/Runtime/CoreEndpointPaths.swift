@@ -1,4 +1,5 @@
 import Foundation
+import VaelenCore
 
 public struct CoreEndpointPaths: Sendable {
     public let root: URL
@@ -11,6 +12,15 @@ public struct CoreEndpointPaths: Sendable {
         let base = root ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Vaelen", isDirectory: true)
             .appendingPathComponent("runtime", isDirectory: true)
+        self.root = base
+        self.sockets = base.appendingPathComponent("sockets", isDirectory: true)
+        self.locks = base.appendingPathComponent("locks", isDirectory: true)
+        self.socket = self.sockets.appendingPathComponent("core.sock", isDirectory: false)
+        self.lock = self.locks.appendingPathComponent("vaelend.lock", isDirectory: false)
+    }
+
+    public init(layout: VaelenFilesystemLayout) {
+        let base = layout.rootURL.appendingPathComponent("runtime", isDirectory: true)
         self.root = base
         self.sockets = base.appendingPathComponent("sockets", isDirectory: true)
         self.locks = base.appendingPathComponent("locks", isDirectory: true)

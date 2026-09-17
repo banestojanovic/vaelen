@@ -7,15 +7,17 @@ let package = Package(
     products: [
         .library(name: "VaelenCore", targets: ["VaelenCore"]),
         .library(name: "VaelenIPC", targets: ["VaelenIPC"]),
+        .library(name: "VaelenDaemonSupport", targets: ["VaelenDaemonSupport"]),
         .executable(name: "vaelend", targets: ["VaelenDaemon"]),
         .executable(name: "val", targets: ["VaelenCLI"])
     ],
     targets: [
-        .target(name: "VaelenCore"),
+        .target(name: "VaelenCore", linkerSettings: [.linkedLibrary("sqlite3")]),
         .target(name: "VaelenIPC", dependencies: ["VaelenCore"]),
-        .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenCore", "VaelenIPC"]),
+        .target(name: "VaelenDaemonSupport", dependencies: ["VaelenCore", "VaelenIPC"]),
+        .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenDaemonSupport"]),
         .executableTarget(name: "VaelenCLI", dependencies: ["VaelenIPC"]),
         .testTarget(name: "VaelenCoreTests", dependencies: ["VaelenCore"]),
-        .testTarget(name: "VaelenIPCTests", dependencies: ["VaelenCore", "VaelenIPC"])
+        .testTarget(name: "VaelenIPCTests", dependencies: ["VaelenCore", "VaelenIPC", "VaelenDaemonSupport"])
     ]
 )

@@ -1,8 +1,8 @@
 # Vaelen
 
-Vaelen is a native macOS developer control center. Milestone 0 contains the
-authoritative per-user `vaelend` Core daemon, the `val` CLI, structured JSON
-UNIX-socket IPC, and the initial SwiftUI menu-bar app.
+Vaelen is a native macOS developer control center. Milestone 1 contains the
+authoritative per-user `vaelend` Core daemon, structured UNIX-socket IPC,
+project registration, and shallow parked-directory discovery.
 
 ## Requirements
 
@@ -34,6 +34,12 @@ Then, in another terminal:
 ```bash
 swift run val status
 swift run val status --json
+swift run val link
+swift run val links
+swift run val links --json
+swift run val park
+swift run val paths
+swift run val paths --json
 ```
 
 The daemon owns the socket at:
@@ -41,6 +47,20 @@ The daemon owns the socket at:
 ```text
 ~/Library/Application Support/Vaelen/runtime/sockets/core.sock
 ```
+
+Project metadata is stored in:
+
+```text
+~/Library/Application Support/Vaelen/state/vaelen.sqlite
+```
+
+`val link` and `val park` store canonical absolute paths. Parked roots expose
+only immediate child directories; hidden entries, files, symlink children, and
+grandchildren are ignored. Explicit links override discovered entries at the
+same path. Missing registrations remain visible as unavailable metadata.
+
+Vaelen never owns or modifies project source directories. Link, unlink, park,
+and unpark change only Vaelen's registry metadata.
 
 Milestone 0 uses manual daemon startup. LaunchAgent installation and
 socket-activation are intentionally deferred.
@@ -53,6 +73,5 @@ directly.
 
 ## Scope
 
-PHP, Caddy, routing, DNS/TLS, project management, modules, reconciliation,
-privileged helpers, Docker, Electron, and Homebrew-managed infrastructure are
-not part of Milestone 0.
+PHP, Caddy, routing, DNS/TLS, modules, reconciliation, privileged helpers,
+Docker, Electron, and Homebrew-managed infrastructure remain deferred.

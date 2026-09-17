@@ -16,11 +16,14 @@ final class ClientTests: XCTestCase {
                 for frame in try decoder.append(data) {
                     let request = try IPCCodec.decode(IPCRequest.self, from: frame)
                     let response: IPCResponse
-                    switch request.method {
+                    switch request.knownMethod! {
                     case .handshake:
-                        response = IPCResponse(id: request.id, result: .handshake(.init(protocolVersion: .v1, coreVersion: "0.0.1-dev")))
+                        response = IPCResponse(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: "0.0.1-dev")))
                     case .status:
-                        response = IPCResponse(id: request.id, result: .status(.init(core: .init(state: .running, version: "0.0.1-dev", pid: 99), protocolVersion: .v1)))
+                        response = IPCResponse(id: request.id, result: .status(.init(core: .init(state: .running, version: "0.0.1-dev", pid: 99), protocolVersion: 1)))
+                    default:
+                        XCTFail("Unexpected test method")
+                        return
                     }
                     try await pair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
                 }
