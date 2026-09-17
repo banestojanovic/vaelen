@@ -73,5 +73,8 @@ directly.
 
 ## Scope
 
-PHP, Caddy, routing, DNS/TLS, modules, reconciliation, privileged helpers,
-Docker, Electron, and Homebrew-managed infrastructure remain deferred.
+PHP runtime management, Caddy, routing, DNS/TLS, modules, reconciliation,
+privileged helpers, Docker, Electron, and Homebrew-managed infrastructure remain
+deferred. The controlled PHP distribution build inputs and CI workflow live
+under `Distribution/PHP` and `.github/workflows/build-php.yml`; no PHP binaries
+are stored in the repository.

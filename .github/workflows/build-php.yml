@@ -1,0 +1,117 @@
+name: Build Vaelen PHP
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'php-v*'
+
+permissions:
+  contents: write
+
+env:
+  PHP_BUILD_CONFIG: Distribution/PHP/php-8.4.23.json
+  STATIC_PHP_CLI_COMMIT: 4318ef8fa32a02460ec1554746674a7bc42b49fa
+
+jobs:
+  build:
+    name: Build PHP 8.4.23 arm64
+    runs-on: macos-14
+    timeout-minutes: 240
+    steps:
+      - name: Checkout Vaelen
+        uses: actions/checkout@v4
+
+      - name: Read build configuration
+        id: config
+        run: |
+          echo "php-version=$(jq -r '.phpVersion' "$PHP_BUILD_CONFIG")" >> "$GITHUB_OUTPUT"
+          echo "extensions=$(jq -r '.buildExtensions | join(",")' "$PHP_BUILD_CONFIG")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned static-php-cli
+        uses: actions/checkout@v4
+        with:
+          repository: crazywhalecc/static-php-cli
+          ref: ${{ env.STATIC_PHP_CLI_COMMIT }}
+          path: .build/static-php-cli
+
+      - name: Set up build PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: composer:v2
+          extensions: curl,mbstring,openssl
+          ini-values: memory_limit=-1
+          coverage: none
+
+      - name: Build pinned static-php-cli tool
+        working-directory: .build/static-php-cli
+        run: |
+          composer install --no-interaction --prefer-dist
+          composer build:phar
+          chmod +x bin/spc
+
+      - name: Download pinned PHP sources and libraries
+        working-directory: .build/static-php-cli
+        run: |
+          ./bin/spc doctor --auto-fix
+          ./bin/spc download \
+            --with-php=${{ steps.config.outputs.php-version }} \
+            --for-extensions=${{ steps.config.outputs.extensions }} \
+            --ignore-cache-sources=php-src \
+            --prefer-pre-built
+
+      - name: Build CLI and FPM
+        working-directory: .build/static-php-cli
+        run: |
+          ./bin/spc build \
+            --build-cli \
+            --build-fpm \
+            ${{ steps.config.outputs.extensions }}
+
+      - name: Validate generated binaries
+        run: |
+          mkdir -p .build/validated
+          cp .build/static-php-cli/buildroot/bin/php .build/validated/php
+          cp .build/static-php-cli/buildroot/bin/php-fpm .build/validated/php-fpm
+          chmod +x .build/validated/php .build/validated/php-fpm
+          Scripts/validate-php-artifacts.sh .build/validated "$PHP_BUILD_CONFIG"
+
+      - name: Preserve third-party license notices
+        run: |
+          test -d .build/static-php-cli/buildroot/license
+          cp -R .build/static-php-cli/buildroot/license .build/validated/license
+
+      - name: Create deterministic release archives
+        run: |
+          mkdir -p .build/release
+          tar -cf - -C .build/validated php license | gzip -n > ".build/release/$(jq -r '.artifactNames.cli' "$PHP_BUILD_CONFIG")"
+          tar -cf - -C .build/validated php-fpm license | gzip -n > ".build/release/$(jq -r '.artifactNames.fpm' "$PHP_BUILD_CONFIG")"
+
+      - name: Generate Vaelen release manifest
+        run: |
+          release_tag="${GITHUB_REF_NAME:-php-v${{ steps.config.outputs.php-version }}}"
+          release_base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}"
+          VAELEN_RELEASE_BASE_URL="$release_base_url" \
+            Scripts/create-php-manifest.sh \
+            .build/release \
+            "$PHP_BUILD_CONFIG" \
+            .build/release/vaelen-php-manifest.json \
+            "$release_tag"
+          jq . .build/release/vaelen-php-manifest.json
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaelen-php-${{ steps.config.outputs.php-version }}-arm64
+          path: .build/release/*
+
+      - name: Publish trusted Vaelen release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Vaelen PHP ${{ steps.config.outputs.php-version }}" \
+            --notes "Vaelen-controlled PHP arm64 distribution built from pinned static-php-cli sources. SHA-256 values are integrity checks against the attached Vaelen manifest; authenticity derives from the trusted Vaelen release and workflow." \
+            .build/release/*
