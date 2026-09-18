@@ -323,7 +323,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         let derived = ProjectDerivedEnvironment(framework: framework, phpResolution: phpResolution(desired: desiredResult.state.php, resolved: resolved), dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication, routeDocumentRootMatches: route.documentRoot == nil ? nil : routeRootMatch, configCache: cache)
         let observed = ProjectObservedEnvironment(php: observedPHP, mysql: mysql, mailpit: mailpit, route: route, dns: dns, tls: tls, standardPorts: standardPorts)
         let secrets = ProjectSecretEnvironment(databasePassword: env.databasePassword, mailPassword: env.mailPassword, notes: ["Secret values are never returned by inspection."])
-        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, mailAuthentication: mailAuthentication))
+        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication))
     }
 
     private struct DesiredRead { let state: ProjectDesiredEnvironment; let error: String? }
@@ -442,13 +442,15 @@ public struct ProjectEnvironmentInspector: Sendable {
         return .init(requirement: .notRequired, evidence: ["Configured SMTP endpoint matches healthy Vaelen-managed Mailpit.", "Vaelen Mailpit is configured without SMTP authentication."])
     }
 
-    private func diagnostics(project: Project, desired: ProjectDesiredEnvironment, desiredError: String?, framework: ProjectFrameworkInspection, env: EnvRead, cache: ProjectConfigCacheObservation, route: ProjectObservedRoute, resolvedPHP: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, routeRootMatch: Bool?, mailAuthentication: ProjectMailAuthentication) -> [ProjectDiagnostic] {
+    private func diagnostics(project: Project, desired: ProjectDesiredEnvironment, desiredError: String?, framework: ProjectFrameworkInspection, env: EnvRead, cache: ProjectConfigCacheObservation, route: ProjectObservedRoute, resolvedPHP: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, routeRootMatch: Bool?, dbEndpoint: ProjectEndpointObservation, mailEndpoint: ProjectEndpointObservation, mailAuthentication: ProjectMailAuthentication) -> [ProjectDiagnostic] {
         var result = [ProjectDiagnostic]()
         if project.registrationKind == .discovered { result.append(.init(code: "PROJECT_DISCOVERED_EPHEMERAL", severity: .info, message: "This project is discovered and can be inspected read-only; durable environment ownership requires linking it.", suggestion: "Link the project before assigning durable Vaelen environment state.")) }
         if let desiredError { result.append(.init(code: "VAELEN_CONFIG_INVALID", severity: .error, message: "vaelen.yml is invalid: \(desiredError)", suggestion: "Correct vaelen.yml version, fields, and types.")) }
         if desired.php != nil && resolvedPHP == nil { result.append(.init(code: "PHP_FAMILY_UNAVAILABLE", severity: .warning, message: "The desired PHP family is not installed in Vaelen.", suggestion: "Install a compatible Vaelen PHP package explicitly.")) }
         if desired.mysql == true, mysql?.state != .running { result.append(.init(code: "MYSQL_NOT_HEALTHY", severity: .warning, message: "The project requests MySQL, but the Vaelen MySQL service is not running healthy.", suggestion: "Start or inspect MySQL explicitly.")) }
         if desired.mailpit == true, mailpit?.state != .running { result.append(.init(code: "MAILPIT_NOT_HEALTHY", severity: .warning, message: "The project requests Mailpit, but the Vaelen Mailpit service is not running healthy.", suggestion: "Start or inspect Mailpit explicitly.")) }
+        if desired.mysql == true, dbEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "DB_ENDPOINT_MISMATCH", service: "database", endpoint: dbEndpoint)) }
+        if desired.mailpit == true, mailEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "MAIL_ENDPOINT_MISMATCH", service: "SMTP mail", endpoint: mailEndpoint)) }
         if env.configured.dbHost != nil, env.configured.dbPort != nil, env.configured.dbConnection == "mysql", env.configured.database != nil, env.configured.password != .unknown { }
         if env.configured.dbHost != nil, env.configured.dbPort != nil, env.configured.password == .missing { result.append(.init(code: "DB_PASSWORD_MISSING", severity: .warning, message: "A database password is not configured.", suggestion: "Review application configuration explicitly.")) }
         if let diagnostic = Self.mailPasswordDiagnostic(authentication: mailAuthentication.requirement, password: env.configured.mailPassword) { result.append(diagnostic) }
@@ -460,6 +462,12 @@ public struct ProjectEnvironmentInspector: Sendable {
         if standardPorts.state.rawValue != "healthy" && desired.secureWeb == true { result.append(.init(code: "STANDARD_PORTS_UNHEALTHY", severity: .warning, message: "Secure web intent exists but standard local ports are not healthy.", suggestion: "Inspect standard port capability state.")) }
         if project.availability != .available { result.append(.init(code: "PROJECT_UNAVAILABLE", severity: .error, message: "The registered project path is unavailable.", suggestion: "Restore the project path before inspecting runtime integration.")) }
         return result
+    }
+
+    private func endpointMismatchDiagnostic(code: String, service: String, endpoint: ProjectEndpointObservation) -> ProjectDiagnostic {
+        let configured = "\(endpoint.configuredHost ?? "unknown"):\(endpoint.configuredPort ?? "unknown")"
+        let observed = "\(endpoint.expectedHost ?? "unknown"):\(endpoint.expectedPort.map(String.init) ?? "unknown")"
+        return .init(code: code, severity: .warning, message: "The configured application \(service) endpoint (\(configured)) does not match the observed Vaelen endpoint (\(observed)). Effective application connectivity was not tested.", suggestion: "Review the application configuration explicitly; Vaelen did not modify it.")
     }
 
     static func mailPasswordDiagnostic(authentication: ProjectMailAuthenticationRequirement, password: ProjectSecretAvailability) -> ProjectDiagnostic? {

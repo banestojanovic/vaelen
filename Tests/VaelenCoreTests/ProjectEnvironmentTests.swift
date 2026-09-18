@@ -107,6 +107,36 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertTrue(codes.contains("MAILPIT_NOT_HEALTHY"))
     }
 
+    func testEndpointMismatchDiagnosticsRespectTriStateAndRequestedState() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("version: 1\nservices:\n  mysql: true\n  mailpit: true\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        try Data("DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\nMAIL_MAILER=smtp\nMAIL_HOST=127.0.0.1\nMAIL_PORT=1025\nMAIL_PASSWORD=null\n".utf8).write(to: root.appendingPathComponent(".env"))
+
+        let matching = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertFalse(matching.diagnostics.contains { $0.code == "DB_ENDPOINT_MISMATCH" })
+        XCTAssertFalse(matching.diagnostics.contains { $0.code == "MAIL_ENDPOINT_MISMATCH" })
+
+        try Data("DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=13306\nMAIL_MAILER=smtp\nMAIL_HOST=127.0.0.1\nMAIL_PORT=11026\nMAIL_PASSWORD=null\n".utf8).write(to: root.appendingPathComponent(".env"))
+        let mismatched = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertTrue(mismatched.diagnostics.contains { $0.code == "DB_ENDPOINT_MISMATCH" })
+        XCTAssertTrue(mismatched.diagnostics.contains { $0.code == "MAIL_ENDPOINT_MISMATCH" })
+        XCTAssertEqual(mismatched.derived.mailAuthentication.requirement, .unknown)
+        XCTAssertFalse(mismatched.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
+        XCTAssertTrue(mismatched.diagnostics.allSatisfy { !$0.message.contains("null") })
+
+        try Data("version: 1\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let unrequested = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertFalse(unrequested.diagnostics.contains { $0.code == "DB_ENDPOINT_MISMATCH" })
+        XCTAssertFalse(unrequested.diagnostics.contains { $0.code == "MAIL_ENDPOINT_MISMATCH" })
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".env"))
+        try Data("version: 1\nservices:\n  mysql: true\n  mailpit: true\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let unknown = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertFalse(unknown.diagnostics.contains { $0.code == "DB_ENDPOINT_MISMATCH" })
+        XCTAssertFalse(unknown.diagnostics.contains { $0.code == "MAIL_ENDPOINT_MISMATCH" })
+    }
+
     func testVaelenMailpitDoesNotRequireAnSMTPPassword() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
