@@ -7,7 +7,7 @@ public enum ProtocolVersion: Int, Codable, Sendable {
 
 public enum IPCCompatibility {
     // Increment when an existing client/Core pair can no longer share command models or semantics.
-    public static let schemaVersion = 2
+    public static let schemaVersion = 3
 }
 
 public struct ClientIdentity: Codable, Equatable, Sendable {
@@ -81,6 +81,7 @@ public enum CoreMethod: String, Sendable {
     case routeList = "route.list"
     case routeAdd = "route.add"
     case routeRemove = "route.remove"
+    case routeProjectAssociationAttach = "route.project-association.attach"
     case dnsStatus = "dns.status"
     case dnsInstall = "dns.install"
     case dnsRemove = "dns.remove"
@@ -104,6 +105,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case phpExec(PHPExecRequest)
     case route(RouteIntent)
     case routeRemove(RouteRemoveRequest)
+    case routeAssociation(RouteProjectAssociationRequest)
     case dnsInstall(DNSInstallRequest)
     case empty
     case raw(JSONValue)
@@ -121,6 +123,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .phpExec(let value): try value.encode(to: encoder)
         case .route(let value): try value.encode(to: encoder)
         case .routeRemove(let value): try value.encode(to: encoder)
+        case .routeAssociation(let value): try value.encode(to: encoder)
         case .dnsInstall(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
@@ -134,6 +137,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
                 self = .handshake(params); return
             }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
+            if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
         }
         self = .raw(value)
     }
@@ -296,6 +300,9 @@ public struct MailpitStatusResult: Codable, Equatable, Sendable { public let mai
 public struct PHPExecResult: Codable, Equatable, Sendable { public let exitStatus: Int32; public let output: String; public init(exitStatus: Int32, output: String) { self.exitStatus = exitStatus; self.output = output } }
 public struct RouterStatusResult: Codable, Equatable, Sendable { public let router: RouterStatus; public init(router: RouterStatus) { self.router = router } }
 public struct RouteRemoveRequest: Codable, Equatable, Sendable { public let id: RouteID; public init(id: RouteID) { self.id = id } }
+public struct RouteProjectAssociationRequest: Codable, Equatable, Sendable { public let routeID: RouteID; public let projectID: ProjectID; public init(routeID: RouteID, projectID: ProjectID) { self.routeID = routeID; self.projectID = projectID } }
+public enum RouteAssociationMutationState: String, Codable, Equatable, Sendable { case associated, satisfied }
+public struct RouteProjectAssociationResult: Codable, Equatable, Sendable { public let route: RouteIntent; public let state: RouteAssociationMutationState; public init(route: RouteIntent, state: RouteAssociationMutationState) { self.route = route; self.state = state } }
 public struct RouteListResult: Codable, Equatable, Sendable { public let routes: [RouteIntent]; public init(routes: [RouteIntent]) { self.routes = routes } }
 public struct DNSInstallRequest: Codable, Equatable, Sendable { public let takeover: Bool; public init(takeover: Bool = false) { self.takeover = takeover } }
 public struct DNSStatusResult: Codable, Equatable, Sendable { public let dns: DNSStatus; public init(dns: DNSStatus) { self.dns = dns } }
@@ -322,6 +329,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case routingStatus(RouterStatusResult)
     case routeList(RouteListResult)
     case routeMutation(RouteIntent)
+    case routeAssociation(RouteProjectAssociationResult)
     case dnsStatus(DNSStatusResult)
     case tlsStatus(TLSStatusResult)
     case portsStatus(PortsStatusResult)
@@ -348,6 +356,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .routingStatus(let value): try value.encode(to: encoder)
         case .routeList(let value): try value.encode(to: encoder)
         case .routeMutation(let value): try value.encode(to: encoder)
+        case .routeAssociation(let value): try value.encode(to: encoder)
         case .dnsStatus(let value): try value.encode(to: encoder)
         case .tlsStatus(let value): try value.encode(to: encoder)
         case .portsStatus(let value): try value.encode(to: encoder)
@@ -377,6 +386,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["exitStatus"] != nil, let result = try? IPCCodec.decode(PHPExecResult.self, from: data) { self = .phpExec(result) }
         else if fields["router"] != nil, let result = try? IPCCodec.decode(RouterStatusResult.self, from: data) { self = .routingStatus(result) }
         else if fields["routes"] != nil, let result = try? IPCCodec.decode(RouteListResult.self, from: data) { self = .routeList(result) }
+        else if fields["route"] != nil, fields["state"] != nil, let result = try? IPCCodec.decode(RouteProjectAssociationResult.self, from: data) { self = .routeAssociation(result) }
         else if fields["route"] != nil, let result = try? IPCCodec.decode(RouteIntent.self, from: data) { self = .routeMutation(result) }
         else if fields["dns"] != nil, let result = try? IPCCodec.decode(DNSStatusResult.self, from: data) { self = .dnsStatus(result) }
         else if fields["tls"] != nil, let result = try? IPCCodec.decode(TLSStatusResult.self, from: data) { self = .tlsStatus(result) }

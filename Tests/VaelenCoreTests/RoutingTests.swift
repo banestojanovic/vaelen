@@ -68,4 +68,79 @@ final class RoutingTests: XCTestCase {
             XCTFail("unexpected error: \(error)")
         }
     }
+
+    func testMalformedRouteJSONFailsClosed() throws {
+        let (store, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rowID = UUID()
+        try store.execute("INSERT INTO route_intents (id,route_json) VALUES ('\(rowID.uuidString)', X'7B6E6F7420726F7574657D')")
+
+        XCTAssertThrowsError(try repository.all()) { error in
+            XCTAssertEqual(error as? SQLiteStateError, .invalidRecord)
+        }
+    }
+
+    func testInvalidRouteModelFailsClosed() throws {
+        let (store, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let route = Route(hostname: "not valid", target: .staticFiles(documentRoot: "/tmp/root"), tls: .disabled)
+        try insertRouteJSON(route, rowID: route.id.rawValue, into: store)
+
+        XCTAssertThrowsError(try repository.all()) { error in
+            XCTAssertEqual(error as? SQLiteStateError, .invalidRecord)
+        }
+    }
+
+    func testDatabaseRowIDMustMatchEmbeddedRouteID() throws {
+        let (store, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let route = Route(hostname: "mismatch.test", target: .staticFiles(documentRoot: "/tmp/root"), tls: .disabled)
+        try insertRouteJSON(route, rowID: UUID(), into: store)
+
+        XCTAssertThrowsError(try repository.all()) { error in
+            XCTAssertEqual(error as? SQLiteStateError, .invalidRecord)
+        }
+    }
+
+    func testInvalidNonNullProjectUUIDFailsClosed() throws {
+        let (store, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let route = Route(hostname: "invalid-project.test", target: .staticFiles(documentRoot: "/tmp/root"), tls: .disabled)
+        try insertRouteJSON(route, rowID: route.id.rawValue, projectID: "not-a-uuid", into: store)
+
+        XCTAssertThrowsError(try repository.all()) { error in
+            XCTAssertEqual(error as? SQLiteStateError, .invalidRecord)
+        }
+    }
+
+    func testDuplicateEmbeddedRouteIDsFailClosedWithoutDictionaryTrap() throws {
+        let (store, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let route = Route(hostname: "duplicate-a.test", target: .staticFiles(documentRoot: "/tmp/a"), tls: .disabled)
+        try insertRouteJSON(route, rowID: route.id.rawValue, into: store)
+        try insertRouteJSON(route, rowID: UUID(), into: store)
+
+        XCTAssertThrowsError(try repository.all()) { error in
+            XCTAssertEqual(error as? SQLiteStateError, .invalidRecord)
+        }
+    }
+
+    private func repositoryFixture() throws -> (SQLiteStateStore, RouteIntentRepository, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        return (store, RouteIntentRepository(store: store), root)
+    }
+
+    private func insertRouteJSON(_ route: Route, rowID: UUID, projectID: String? = nil, into store: SQLiteStateStore) throws {
+        let data = try JSONEncoder().encode(route)
+        let hex = data.map { String(format: "%02x", $0) }.joined()
+        let sql: String
+        if let projectID {
+            sql = "INSERT INTO route_intents (id,route_json,project_id) VALUES ('\(rowID.uuidString)', X'\(hex)', '\(projectID)')"
+        } else {
+            sql = "INSERT INTO route_intents (id,route_json) VALUES ('\(rowID.uuidString)', X'\(hex)')"
+        }
+        try store.execute(sql)
+    }
 }

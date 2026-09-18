@@ -98,4 +98,16 @@ final class ProtocolTests: XCTestCase {
         let response = IPCResponse(id: UUID(), result: .projectPlan(.init(plan: plan)))
         XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
     }
+
+    func testRouteAssociationRequestAndResponseRoundTripThroughJSON() throws {
+        let routeID = RouteID()
+        let projectID = ProjectID()
+        let request = IPCRequest(method: .routeProjectAssociationAttach, params: .routeAssociation(.init(routeID: routeID, projectID: projectID)))
+        let decodedRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(decodedRequest, request)
+
+        let route = RouteIntent(route: Route(id: routeID, hostname: "project.test", target: .staticFiles(documentRoot: "/tmp/project"), tls: .disabled), projectID: projectID.rawValue, projectPath: "/tmp/project")
+        let response = IPCResponse(id: UUID(), result: .routeAssociation(.init(route: route, state: .associated)))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
+    }
 }

@@ -17,9 +17,10 @@ public actor CoreRequestDispatcher {
     private var routeIntents: [RouteID: RouteIntent]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) {
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) throws {
         self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
-        self.routeIntents = Dictionary(uniqueKeysWithValues: (try? routeRepository?.all() ?? [])?.map { ($0.route.id, $0) } ?? [])
+        let persistedRoutes = try routeRepository?.all() ?? []
+        self.routeIntents = Dictionary(uniqueKeysWithValues: persistedRoutes.map { ($0.route.id, $0) })
     }
 
     public func dispatch(_ request: IPCRequest, handshaken: Bool) async -> (response: IPCResponse, handshaken: Bool) {
@@ -153,6 +154,27 @@ public actor CoreRequestDispatcher {
                 try repository.remove(id: params.id); routeIntents.removeValue(forKey: params.id)
                 if (await router.status()).state == .running { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
                 return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
+            case .routeProjectAssociationAttach:
+                guard let repository = routeRepository else { throw IPCErrorPayload(code: .internalError, message: "Route persistence is unavailable.") }
+                let params = try request.params?.decode(RouteProjectAssociationRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route association parameters are required.") }()
+                guard let intent = routeIntents[params.routeID] else { throw IPCErrorPayload(code: .invalidRequest, message: "The requested route does not exist.") }
+                guard let project = try await registry.linkedProject(id: params.projectID) else { throw IPCErrorPayload(code: .invalidRequest, message: "Route association requires a registered linked project.") }
+                if intent.projectID == params.projectID.rawValue {
+                    return (.init(id: request.id, result: .routeAssociation(.init(route: intent, state: .satisfied))), true)
+                }
+                guard intent.projectID == nil else { throw IPCErrorPayload(code: .invalidRequest, message: "The route is already associated with another project.") }
+                let report = try await projectEnvironmentReport(for: project)
+                guard report.observed.route.associationState == .safelyAssociable else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: report.observed.route.mutationAuthorityReason)
+                }
+                guard report.observed.route.hostname == intent.route.hostname || report.observed.route.hostname == nil else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "The requested route is not the route identified by the current project evidence.")
+                }
+                let path = project.rootPath.string
+                try repository.associateMetadata(id: params.routeID, projectID: params.projectID.rawValue, projectPath: path)
+                let associated = RouteIntent(route: intent.route, projectID: params.projectID.rawValue, projectPath: path)
+                routeIntents[params.routeID] = associated
+                return (.init(id: request.id, result: .routeAssociation(.init(route: associated, state: .associated))), true)
             case .dnsStatus:
                 return (.init(id: request.id, result: .dnsStatus(.init(dns: await dns.status()))), true)
             case .dnsInstall:
@@ -252,7 +274,8 @@ public actor CoreRequestDispatcher {
             dns: await dns.status(),
             tls: await tls.status(),
             standardPorts: await ports.status(),
-            invalidPHPVersions: invalidPHPVersions
+            invalidPHPVersions: invalidPHPVersions,
+            registeredProjects: try await registry.linkedProjects()
         )
         return report
     }

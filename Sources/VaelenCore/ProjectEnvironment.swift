@@ -218,8 +218,12 @@ public struct ProjectObservedRoute: Codable, Equatable, Sendable {
     public let tls: TLSMode?
     public let routerState: RouterState
     public let routerHealth: RouterHealth
+    public let associationState: RouteAssociationState
+    public let associationEvidence: RouteAssociationEvidence
+    public let mutationAuthority: RouteMutationAuthority
+    public let mutationAuthorityReason: String
 
-    public init(intentExists: Bool, hostname: String? = nil, documentRoot: String? = nil, target: String? = nil, tls: TLSMode? = nil, routerState: RouterState, routerHealth: RouterHealth) {
+    public init(intentExists: Bool, hostname: String? = nil, documentRoot: String? = nil, target: String? = nil, tls: TLSMode? = nil, routerState: RouterState, routerHealth: RouterHealth, associationState: RouteAssociationState = .none, associationEvidence: RouteAssociationEvidence = .init(), mutationAuthority: RouteMutationAuthority = .blocked, mutationAuthorityReason: String = "No route association evidence was found.") {
         self.intentExists = intentExists
         self.hostname = hostname
         self.documentRoot = documentRoot
@@ -227,6 +231,10 @@ public struct ProjectObservedRoute: Codable, Equatable, Sendable {
         self.tls = tls
         self.routerState = routerState
         self.routerHealth = routerHealth
+        self.associationState = associationState
+        self.associationEvidence = associationEvidence
+        self.mutationAuthority = mutationAuthority
+        self.mutationAuthorityReason = mutationAuthorityReason
     }
 }
 
@@ -323,13 +331,13 @@ public enum ProjectEnvironmentInspectionError: Error, Equatable, Sendable {
 public struct ProjectEnvironmentInspector: Sendable {
     public init() {}
 
-    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = []) -> ProjectEnvironmentReport {
+    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = [], registeredProjects: [Project] = []) -> ProjectEnvironmentReport {
         let root = URL(fileURLWithPath: project.rootPath.string, isDirectory: true)
         let framework = inspectFramework(root: root)
         let desiredResult = readDesiredState(root: root)
         let env = readDotenv(root: root)
         let cache = inspectConfigCache(root: root, envPath: root.appendingPathComponent(".env"))
-        let route = routeObservation(project: project, framework: framework, routes: routes, router: router)
+        let route = routeObservation(project: project, framework: framework, routes: routes, router: router, registeredProjects: registeredProjects)
         let installed = phpPackages.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
         let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
         let resolved = resolvePHP(family: desiredResult.state.php, packages: phpPackages)
@@ -431,14 +439,11 @@ public struct ProjectEnvironmentInspector: Sendable {
         return .init(framework: "Generic/Unknown", confidence: .low, evidence: evidence, composerPHPRequirement: composerPHP)
     }
 
-    private func routeObservation(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], router: RouterStatus) -> ProjectObservedRoute {
-        let inferredDocumentRoot = framework.suggestedDocumentRoot.map { URL(fileURLWithPath: project.rootPath.string).appendingPathComponent($0).path }
-        let intent = routes.first {
-            ($0.projectID == project.id?.rawValue) ||
-            ($0.projectPath == project.rootPath.string) ||
-            routeDocumentRoot($0.route) == inferredDocumentRoot
-        }
-        guard let route = intent?.route else { return .init(intentExists: false, routerState: router.state, routerHealth: router.health) }
+    private func routeObservation(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], router: RouterStatus, registeredProjects: [Project]) -> ProjectObservedRoute {
+        let association = RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects)
+        let intent = association.selectedRouteID.flatMap { id in routes.first { $0.route.id == id } }
+        let intentExists = !association.routeIDs.isEmpty
+        guard let route = intent?.route else { return .init(intentExists: intentExists, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason) }
         let documentRoot: String?
         let target: String
         switch route.target {
@@ -446,14 +451,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         case .staticFiles(let root): documentRoot = root; target = "static"
         case .http(let host, let port): documentRoot = nil; target = "http \(host):\(port)"
         }
-        return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health)
-    }
-
-    private func routeDocumentRoot(_ route: Route) -> String? {
-        switch route.target {
-        case .fastCGI(_, let root), .staticFiles(let root): return root
-        case .http: return nil
-        }
+        return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason)
     }
 
     private func resolvePHP(family: String?, packages: [PHPPackage]) -> String? {
@@ -492,6 +490,16 @@ public struct ProjectEnvironmentInspector: Sendable {
         if let diagnostic = Self.mailPasswordDiagnostic(authentication: mailAuthentication.requirement, password: env.configured.mailPassword) { result.append(diagnostic) }
         if cache.state == "present, .env is newer" { result.append(.init(code: "LARAVEL_CONFIG_CACHE_STALE_POSSIBLE", severity: .warning, message: "Laravel config cache exists and .env is newer; effective Laravel configuration is unknown.", suggestion: "Clear the cache explicitly if the application owner intends to do so.")) }
         if !route.intentExists { result.append(.init(code: "ROUTE_INTENT_MISSING", severity: .warning, message: "No Vaelen route intent is associated with this project.", suggestion: "Inspect existing routing before making an explicit route change.")) }
+        switch route.associationState {
+        case .safelyAssociable: result.append(.init(code: "ROUTE_ASSOCIATION_INFERRED", severity: .info, message: "A unique legacy route has corroborated project evidence but is not durably associated.", suggestion: "Use explicit route association before allowing route mutation."))
+        case .inferred: result.append(.init(code: "ROUTE_ASSOCIATION_INFERRED", severity: .info, message: "The route is observable through legacy evidence but is not durably associated.", suggestion: "Review the route before making an explicit route change."))
+        case .ambiguous: result.append(.init(code: "ROUTE_ASSOCIATION_AMBIGUOUS", severity: .error, message: "Multiple routes match this project's association evidence.", suggestion: "Specify and review one exact route before association."))
+        case .orphaned: result.append(.init(code: "ROUTE_ASSOCIATION_ORPHANED", severity: .warning, message: "The route references a project that is no longer registered.", suggestion: "Restore the original project registration before changing the route."))
+        case .conflicted:
+            let hostnameConflict = route.mutationAuthorityReason.localizedCaseInsensitiveContains("hostname")
+            result.append(.init(code: hostnameConflict ? "ROUTE_HOSTNAME_CONFLICT" : "ROUTE_PROJECT_CONFLICT", severity: .error, message: route.mutationAuthorityReason, suggestion: "Review route ownership before changing the route."))
+        case .durable, .none: break
+        }
         if routeRootMatch == false { result.append(.init(code: "ROUTE_DOCUMENT_ROOT_MISMATCH", severity: .warning, message: "The route document root differs from the framework-derived document root.", suggestion: "Review the route manually; no route was changed.")) }
         if desired.secureWeb == true && tls.trustObserved == false { result.append(.init(code: "TLS_NOT_TRUSTED", severity: .warning, message: "Secure web access is desired but Vaelen TLS is not observed as trusted.", suggestion: "Inspect TLS capability state.")) }
         if dns.health != "healthy" { result.append(.init(code: "DNS_UNHEALTHY", severity: .warning, message: "Vaelen DNS capability is not healthy.", suggestion: "Inspect DNS capability state.")) }

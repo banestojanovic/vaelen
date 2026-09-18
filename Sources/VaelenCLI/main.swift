@@ -42,6 +42,7 @@ private enum CLICommand {
     case routeList(json: Bool)
     case routeAdd(hostname: String, documentRoot: String, socketPath: String?, projectID: UUID?, tls: Bool)
     case routeRemove(RouteID)
+    case routeAssociate(RouteID, ProjectID)
     case dnsStatus(json: Bool)
     case dnsInstall(takeover: Bool)
     case dnsRemove
@@ -181,6 +182,9 @@ struct VaelenCLIMain {
             case "remove":
                 guard args.count == 3, let uuid = UUID(uuidString: args[2]) else { throw CLIError.usage }
                 return .routeRemove(RouteID(rawValue: uuid))
+            case "associate":
+                guard args.count == 4, let routeUUID = UUID(uuidString: args[2]), let projectUUID = UUID(uuidString: args[3]) else { throw CLIError.usage }
+                return .routeAssociate(RouteID(rawValue: routeUUID), ProjectID(rawValue: projectUUID))
              default: throw CLIError.usage
              }
         case "mailpit":
@@ -324,6 +328,14 @@ struct VaelenCLIMain {
             print("Added route \(result.route.id)\t\(result.route.hostname)\t\(targetDescription(result.route.target))")
         case .routeRemove(let id):
             _ = try await client.routeRemove(id); print("Removed route \(id)")
+        case .routeAssociate(let routeID, let projectID):
+            let routes = try await client.routeList()
+            guard let route = routes.first(where: { $0.route.id == routeID }) else { throw CLIError.message("Route \(routeID) was not found.") }
+            let projects = try await client.linkedProjects()
+            guard let project = projects.first(where: { $0.id == projectID.rawValue }) else { throw CLIError.message("Linked project \(projectID) was not found.") }
+            print("Route association review\nRoute       \(route.route.id)\nHostname    \(route.route.hostname)\nProject     \(project.name)\nProject ID  \(projectID)\nPath        \(displayPath(project.path))\nMetadata    project_id and project_path only")
+            let result = try await client.routeAssociate(routeID: routeID, projectID: projectID)
+            print(result.state == .satisfied ? "Already associated" : "Associated route \(routeID) with project \(projectID)")
         case .dnsStatus(let json):
             let result = try await client.dnsStatus()
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
@@ -424,5 +436,5 @@ struct VaelenCLIMain {
 private enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status | val project status|inspect|doctor|plan|activate [project] [--json] | val routing status|start|stop | val route list|add|remove | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return "Usage: val status | val project status|inspect|doctor|plan|activate [project] [--json] | val routing status|start|stop | val route list|add|remove|associate | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
 }

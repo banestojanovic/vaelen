@@ -10,7 +10,7 @@ final class DispatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
-        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry)
 
         let old = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "old", version: "0.0.10-dev")))), handshaken: false)
         XCTAssertEqual(old.response.error?.code, .coreIncompatible)
@@ -28,7 +28,7 @@ final class DispatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
-        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry)
 
         let result = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: false)
 
@@ -41,7 +41,7 @@ final class DispatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
-        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry)
 
         let result = await dispatcher.dispatch(IPCRequest(rawMethod: "project.future"), handshaken: true)
 
@@ -57,13 +57,13 @@ final class DispatcherTests: XCTestCase {
         let repository = RouteIntentRepository(store: store)
         let route = Route(hostname: "persisted.test", target: .staticFiles(documentRoot: "/tmp/persisted"), tls: .disabled)
         let intent = RouteIntent(route: route)
-        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, routeRepository: repository)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, routeRepository: repository)
 
         let added = await dispatcher.dispatch(IPCRequest(method: .routeAdd, params: .route(intent)), handshaken: true)
         guard case .routeMutation(let addedIntent) = added.response.result else { return XCTFail("route add did not return the route") }
         XCTAssertEqual(addedIntent, intent)
 
-        let recreated = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 2), registry: registry, routeRepository: repository)
+        let recreated = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 2), registry: registry, routeRepository: repository)
         let listed = await recreated.dispatch(IPCRequest(method: .routeList), handshaken: true)
         guard case .routeList(let result) = listed.response.result else { return XCTFail("route list did not return routes") }
         XCTAssertEqual(result.routes, [intent])
@@ -73,6 +73,101 @@ final class DispatcherTests: XCTestCase {
         XCTAssertTrue(afterRemoval.routes.isEmpty)
     }
 
+    func testExplicitRouteAssociationChangesOnlyMetadataAndIsIdempotent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let projectRoot = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: projectRoot.appendingPathComponent("public"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: projectRoot.appendingPathComponent("bootstrap"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: projectRoot.appendingPathComponent("config"), withIntermediateDirectories: true)
+        try Data("<?php".utf8).write(to: projectRoot.appendingPathComponent("artisan"))
+        try Data("<?php".utf8).write(to: projectRoot.appendingPathComponent("public/index.php"))
+        try Data("{\"require\":{\"laravel/framework\":\"^11.0\",\"php\":\"^8.3\"}}".utf8).write(to: projectRoot.appendingPathComponent("composer.json"))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let project = try await registry.link(path: projectRoot)
+        guard let projectID = project.id else { return XCTFail("linked project did not receive an ID") }
+        let repository = RouteIntentRepository(store: store)
+        let route = Route(hostname: "project.test", target: .fastCGI(socketPath: "/tmp/php.sock", documentRoot: projectRoot.appendingPathComponent("public").path), tls: .local)
+        let intent = RouteIntent(route: route)
+        try repository.upsert(intent)
+        let router = InMemoryRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry, router: router, routeRepository: repository)
+
+        let request = IPCRequest(method: .routeProjectAssociationAttach, params: .routeAssociation(.init(routeID: route.id, projectID: projectID)))
+        let response = await dispatcher.dispatch(request, handshaken: true)
+        guard case .routeAssociation(let association) = response.response.result else { return XCTFail("association did not return typed result") }
+        XCTAssertEqual(association.state, .associated)
+        XCTAssertEqual(association.route.route, route)
+        XCTAssertEqual(try repository.all().first?.projectID, projectID.rawValue)
+        XCTAssertEqual(try repository.all().first?.projectPath, projectRoot.path)
+        let routerStatus = await router.status()
+        XCTAssertEqual(routerStatus.routeCount, 0)
+
+        let second = await dispatcher.dispatch(request, handshaken: true)
+        guard case .routeAssociation(let repeated) = second.response.result else { return XCTFail("repeated association did not return typed result") }
+        XCTAssertEqual(repeated.state, .satisfied)
+        XCTAssertEqual(try repository.all().first?.route, route)
+    }
+
+    func testRouteAssociationRejectsExistingDifferentProject() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let firstRoot = root.appendingPathComponent("first")
+        let secondRoot = root.appendingPathComponent("second")
+        try FileManager.default.createDirectory(at: firstRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+        let first = try await registry.link(path: firstRoot)
+        let second = try await registry.link(path: secondRoot)
+        let repository = RouteIntentRepository(store: store)
+        let route = Route(hostname: "owned.test", target: .staticFiles(documentRoot: firstRoot.path), tls: .disabled)
+        try repository.upsert(RouteIntent(route: route, projectID: first.id?.rawValue, projectPath: firstRoot.path))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry, routeRepository: repository)
+
+        let response = await dispatcher.dispatch(IPCRequest(method: .routeProjectAssociationAttach, params: .routeAssociation(.init(routeID: route.id, projectID: second.id!))), handshaken: true)
+        XCTAssertEqual(response.response.error?.code, .invalidRequest)
+        XCTAssertEqual(try repository.all().first?.projectID, first.id?.rawValue)
+    }
+
+    func testUnlinkPreservesDurableRouteAssociationAsOrphanedState() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let projectRoot = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        let project = try await registry.link(path: projectRoot)
+        let repository = RouteIntentRepository(store: store)
+        let route = Route(hostname: "orphan.test", target: .staticFiles(documentRoot: projectRoot.path), tls: .disabled)
+        try repository.upsert(RouteIntent(route: route, projectID: project.id?.rawValue, projectPath: projectRoot.path))
+
+        try await registry.unlink(path: projectRoot)
+
+        let persisted = try repository.all().first
+        XCTAssertEqual(persisted?.projectID, project.id?.rawValue)
+        XCTAssertEqual(persisted?.projectPath, projectRoot.path)
+    }
+
+    func testDispatcherDoesNotConvertRepositoryFailureIntoEmptyRoutes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        try store.execute("DROP TABLE route_intents")
+        let registry = ProjectRegistry(store: store)
+        let repository = RouteIntentRepository(store: store)
+
+        XCTAssertThrowsError(try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, routeRepository: repository)) { error in
+            XCTAssertNotNil(error as? SQLiteStateError)
+        }
+    }
+
     func testProjectReconciliationRejectsDiscoveredProjects() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let projectRoot = root.appendingPathComponent("discovered")
@@ -80,7 +175,7 @@ final class DispatcherTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
         _ = try await registry.park(path: root)
-        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry)
 
         let result = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: "discovered", workingDirectory: root.path))), handshaken: true)
 
@@ -110,7 +205,7 @@ final class DispatcherTests: XCTestCase {
         FileManager.default.createFile(atPath: mailpit.instanceDatabasePath(), contents: Data())
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: layout.databaseURL))
         _ = try await registry.link(path: projectRoot)
-        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, mailpit: mailpit, router: InMemoryRouter(), routeRepository: RouteIntentRepository(store: try SQLiteStateStore(databaseURL: layout.databaseURL.appendingPathExtension("routes"))))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, mailpit: mailpit, router: InMemoryRouter(), routeRepository: RouteIntentRepository(store: try SQLiteStateStore(databaseURL: layout.databaseURL.appendingPathExtension("routes"))))
 
         let planResponse = await dispatcher.dispatch(IPCRequest(method: .projectPlan, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
         guard case .projectPlan(let planResult) = planResponse.response.result else { return XCTFail("project plan did not return a plan") }

@@ -58,6 +58,7 @@ public enum ProjectReconciliationAction: String, Codable, Equatable, Sendable {
     case reconcile
     case review
     case authorize
+    case associate
 }
 
 public enum ProjectReconciliationOwnership: String, Codable, Equatable, Sendable {
@@ -236,6 +237,9 @@ public struct ProjectReconciliationPlanner: Sendable {
 
     private func appendWeb(report: ProjectEnvironmentReport, to operations: inout [ProjectReconciliationOperation]) {
         guard report.desired.secureWeb == true else { return }
+        if report.observed.route.associationState == .safelyAssociable {
+            operations.append(.init(id: "route.project-association.attach", resource: .route, action: .associate, currentState: .mismatch, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .actionable, reason: "A unique legacy route has corroborated project evidence; explicit route association is required before route mutation."))
+        }
         if !report.observed.route.intentExists {
             operations.append(.init(id: "route.reconcile", resource: .route, action: .reconcile, currentState: .missing, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .deferred, reason: "Route creation is deferred; M8 Slice 1 does not invent a hostname or mutate route_intents."))
         } else if report.derived.routeDocumentRootMatches == false {

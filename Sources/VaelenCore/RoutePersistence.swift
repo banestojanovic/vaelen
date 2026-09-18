@@ -34,13 +34,35 @@ public final class RouteIntentRepository: @unchecked Sendable {
 
     public func all() throws -> [RouteIntent] {
         var intents = [RouteIntent]()
-        try store.query("SELECT route_json,project_id,project_path FROM route_intents ORDER BY id") { statement in
-            guard let bytes = sqlite3_column_blob(statement, 0) else { throw SQLiteStateError.invalidRecord }
-            let length = Int(sqlite3_column_bytes(statement, 0))
-            let route = try JSONDecoder().decode(Route.self, from: Data(bytes: bytes, count: length))
-            let projectID = store.columnString(statement, 1).flatMap(UUID.init(uuidString:))
-            intents.append(RouteIntent(route: route, projectID: projectID, projectPath: store.columnString(statement, 2)))
+        var routeIDs = Set<RouteID>()
+        try store.query("SELECT id,route_json,project_id,project_path FROM route_intents ORDER BY id") { statement in
+            guard let rowID = UUID(uuidString: store.columnString(statement, 0) ?? ""), let bytes = sqlite3_column_blob(statement, 1) else { throw SQLiteStateError.invalidRecord }
+            let length = Int(sqlite3_column_bytes(statement, 1))
+            let route: Route
+            do {
+                route = try JSONDecoder().decode(Route.self, from: Data(bytes: bytes, count: length))
+            } catch {
+                throw SQLiteStateError.invalidRecord
+            }
+            guard route.id.rawValue == rowID, (try? route.validated()) == route, routeIDs.insert(route.id).inserted else { throw SQLiteStateError.invalidRecord }
+            let rawProjectID = store.columnString(statement, 2)
+            let projectID: UUID?
+            if let rawProjectID {
+                guard let decoded = UUID(uuidString: rawProjectID) else { throw SQLiteStateError.invalidRecord }
+                projectID = decoded
+            } else {
+                projectID = nil
+            }
+            intents.append(RouteIntent(route: route, projectID: projectID, projectPath: store.columnString(statement, 3)))
         }
         return intents
+    }
+
+    public func associateMetadata(id: RouteID, projectID: UUID, projectPath: String) throws {
+        try store.query("UPDATE route_intents SET project_id = ?, project_path = ? WHERE id = ?", bind: { statement in
+            store.bind(projectID.uuidString, to: statement, index: 1)
+            store.bind(projectPath, to: statement, index: 2)
+            store.bind(id.description, to: statement, index: 3)
+        }) { _ in }
     }
 }
