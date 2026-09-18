@@ -25,7 +25,7 @@ final class AppModel {
         case connecting
         case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?, DNSStatus?, TLSStatus?, StandardPortsStatus?, MySQLStatus?, MailpitStatus?)
         case unavailable
-        case incompatible(Int, Int)
+        case incompatible(String)
     }
 
     private(set) var state: State = .connecting
@@ -41,7 +41,7 @@ final class AppModel {
         let paths = CoreEndpointPaths()
         let client = VaelenCoreClient(
             transport: UnixSocketTransport(path: paths.socketPath),
-            identity: ClientIdentity(name: "Vaelen.app", version: VaelenBuildInfo.version)
+            identity: ClientIdentity(name: "Vaelen.app", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)
         )
         self.client = client
         state = .connecting
@@ -74,7 +74,8 @@ final class AppModel {
             await client.disconnect()
             switch error {
             case .coreUnavailable: state = .unavailable
-            case .protocolIncompatible(let client, let core): state = .incompatible(client, core)
+            case .protocolIncompatible(let client, let core): state = .incompatible("Protocol mismatch: client \(client), Core \(core). Restart Vaelen Core and try again.")
+            case .coreIncompatible(let reason): state = .incompatible("\(reason) Restart Vaelen Core and try again.")
             default: state = .unavailable
             }
         } catch {
@@ -145,9 +146,9 @@ struct StatusView: View {
                 Label("Core Connecting", systemImage: "circle.dotted")
             case .unavailable:
                 Label("Core Unavailable", systemImage: "circle")
-            case .incompatible(let client, let core):
-                Label("Protocol Incompatible", systemImage: "exclamationmark.circle")
-                Text("Client \(client), Core \(core)").font(.caption)
+            case .incompatible(let reason):
+                Label("Core Incompatible", systemImage: "exclamationmark.circle")
+                Text(reason).font(.caption)
             case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit):
                 Label("Core Running", systemImage: "circle.fill").foregroundStyle(.green)
                 Text("Version  \(status.core.version)")

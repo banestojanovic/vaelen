@@ -80,6 +80,7 @@ struct VaelenCLIMain {
         } catch let error as CoreClientError {
             if case .coreUnavailable = error { fail("Vaelen Core is not running.", code: 3) }
             if case .protocolIncompatible(let client, let core) = error { fail("Vaelen Core uses an incompatible protocol version.\n\nClient: \(client)\nCore:   \(core)", code: 4) }
+            if case .coreIncompatible = error { fail("The running Vaelen Core is incompatible with this client.\nRestart Vaelen Core and try again.", code: 4) }
             if case .remote(let payload) = error { fail(payload.message, code: 1) }
             fail("Vaelen Core returned an invalid response.", code: 1)
         } catch {

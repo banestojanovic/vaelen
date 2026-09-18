@@ -5,10 +5,19 @@ public enum ProtocolVersion: Int, Codable, Sendable {
     case v1 = 1
 }
 
+public enum IPCCompatibility {
+    // Increment when an existing client/Core pair can no longer share command models or semantics.
+    public static let schemaVersion = 2
+}
+
 public struct ClientIdentity: Codable, Equatable, Sendable {
     public let name: String
     public let version: String
-    public init(name: String, version: String) { self.name = name; self.version = version }
+    public let schemaCompatibilityVersion: Int?
+    public let buildIdentity: String?
+    public init(name: String, version: String, schemaCompatibilityVersion: Int? = nil, buildIdentity: String? = nil) {
+        self.name = name; self.version = version; self.schemaCompatibilityVersion = schemaCompatibilityVersion; self.buildIdentity = buildIdentity
+    }
 }
 
 public struct HandshakeParams: Codable, Equatable, Sendable {
@@ -19,7 +28,11 @@ public struct HandshakeParams: Codable, Equatable, Sendable {
 public struct HandshakeResult: Codable, Equatable, Sendable {
     public let protocolVersion: Int
     public let coreVersion: String
-    public init(protocolVersion: Int, coreVersion: String) { self.protocolVersion = protocolVersion; self.coreVersion = coreVersion }
+    public let schemaCompatibilityVersion: Int?
+    public let buildIdentity: String?
+    public init(protocolVersion: Int, coreVersion: String, schemaCompatibilityVersion: Int? = nil, buildIdentity: String? = nil) {
+        self.protocolVersion = protocolVersion; self.coreVersion = coreVersion; self.schemaCompatibilityVersion = schemaCompatibilityVersion; self.buildIdentity = buildIdentity
+    }
 }
 
 public struct CoreStatusResponse: Codable, Equatable, Sendable {
@@ -149,6 +162,7 @@ public struct IPCRequest: Codable, Equatable, Sendable {
 
 public enum IPCErrorCode: String, Codable, Sendable {
     case protocolIncompatible = "PROTOCOL_INCOMPATIBLE"
+    case coreIncompatible = "CORE_INCOMPATIBLE"
     case invalidRequest = "INVALID_REQUEST"
     case internalError = "INTERNAL_ERROR"
     case projectNotFound = "PROJECT_NOT_FOUND"

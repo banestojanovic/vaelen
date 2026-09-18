@@ -1861,3 +1861,17 @@ The CLI is a client.
 Future MCP and IDE integrations are clients.
 
 Only Core owns the developer environment.
+
+# M10 compatibility clarification
+
+The transport protocol version and semantic command-schema compatibility are
+separate identities. The transport version describes the framed IPC envelope;
+the schema compatibility version describes the request, response, handshake,
+and command semantics shared by `val`, `Vaelen.app`, and `vaelend`.
+
+Clients must complete the compatibility handshake before sending normal
+commands. A missing or mismatched schema compatibility identity is an
+incompatible Core condition, not a command decoding failure. Clients fail
+closed with restart guidance and do not automatically replace or restart the
+daemon. Product and build identities are diagnostic metadata and are not a
+substitute for the schema compatibility gate.

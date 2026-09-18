@@ -30,10 +30,13 @@ public actor CoreRequestDispatcher {
             return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Unknown Core method: \(request.method).")), handshaken)
         }
         if method == .handshake {
-            guard let params = request.params, (try? params.decode(HandshakeParams.self)) != nil else {
-                return (.init(id: request.id, error: .init(code: .invalidRequest, message: "A valid handshake payload is required.")), false)
+            guard let params = request.params, let handshake = try? params.decode(HandshakeParams.self), let schema = handshake.client.schemaCompatibilityVersion else {
+                return (.init(id: request.id, error: .init(code: .coreIncompatible, message: "The client does not provide the required Core compatibility identity.")), false)
             }
-            return (.init(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: runtime.status.version))), true)
+            guard schema == VaelenBuildInfo.schemaCompatibilityVersion else {
+                return (.init(id: request.id, error: .init(code: .coreIncompatible, message: "The client uses an incompatible command schema.", details: ["clientSchemaCompatibilityVersion": "\(schema)", "coreSchemaCompatibilityVersion": "\(VaelenBuildInfo.schemaCompatibilityVersion)"])), false)
+            }
+            return (.init(id: request.id, result: .handshake(.init(protocolVersion: VaelenBuildInfo.protocolVersion.rawValue, coreVersion: runtime.status.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))), true)
         }
         guard handshaken else {
             return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Handshake is required before other requests.")), false)

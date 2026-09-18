@@ -4,6 +4,7 @@ import VaelenCore
 public enum CoreClientError: Error, Equatable, Sendable {
     case coreUnavailable
     case protocolIncompatible(client: Int, core: Int)
+    case coreIncompatible(reason: String)
     case invalidResponse
     case remote(IPCErrorPayload)
 }
@@ -23,11 +24,28 @@ public actor VaelenCoreClient {
         do {
             try await transport.connect()
             connected = true
-            let request = IPCRequest(method: .handshake, params: .handshake(HandshakeParams(client: identity)))
+            let request = IPCRequest(method: .handshake, params: .handshake(HandshakeParams(client: ClientIdentity(name: identity.name, version: identity.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))))
             let response = try await send(request)
-            guard case .handshake(let result) = try result(from: response) else { throw CoreClientError.invalidResponse }
-            guard result.protocolVersion == ProtocolVersion.v1.rawValue else {
-                throw CoreClientError.protocolIncompatible(client: ProtocolVersion.v1.rawValue, core: result.protocolVersion)
+            do {
+                guard case .handshake(let result) = try result(from: response) else { throw CoreClientError.coreIncompatible(reason: "The running Vaelen Core returned an incompatible handshake.") }
+                guard result.protocolVersion == ProtocolVersion.v1.rawValue else {
+                    throw CoreClientError.protocolIncompatible(client: ProtocolVersion.v1.rawValue, core: result.protocolVersion)
+                }
+                guard result.schemaCompatibilityVersion == VaelenBuildInfo.schemaCompatibilityVersion else {
+                    throw CoreClientError.coreIncompatible(reason: "The running Vaelen Core uses an incompatible command schema.")
+                }
+            } catch let error as CoreClientError {
+                switch error {
+                case .remote(let payload):
+                    if payload.code == .invalidRequest || payload.code == .coreIncompatible {
+                        throw CoreClientError.coreIncompatible(reason: "The running Vaelen Core rejected the compatibility handshake.")
+                    }
+                    throw error
+                case .invalidResponse:
+                    throw CoreClientError.coreIncompatible(reason: "The running Vaelen Core returned an incompatible handshake.")
+                default:
+                    throw error
+                }
             }
         } catch let error as CoreTransportError {
             await transport.disconnect()
@@ -182,6 +200,10 @@ public actor VaelenCoreClient {
             await transport.disconnect()
             if case .unavailable = error { throw CoreClientError.coreUnavailable }
             throw error
+        } catch is DecodingError {
+            throw CoreClientError.invalidResponse
+        } catch is IPCModelError {
+            throw CoreClientError.invalidResponse
         }
     }
 
@@ -198,6 +220,7 @@ public actor VaelenCoreClient {
            let core = Int(details["coreProtocolVersion"] ?? "") {
             return .protocolIncompatible(client: client, core: core)
         }
+        if error.code == .coreIncompatible { return .coreIncompatible(reason: error.message) }
         return .remote(error)
     }
 }

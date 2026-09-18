@@ -5,6 +5,37 @@ import Darwin
 @testable import VaelenDaemonSupport
 
 final class DispatcherTests: XCTestCase {
+    func testDispatcherHandshakeRequiresMatchingSchemaBeforeNormalDispatch() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry)
+
+        let old = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "old", version: "0.0.10-dev")))), handshaken: false)
+        XCTAssertEqual(old.response.error?.code, .coreIncompatible)
+        XCTAssertFalse(old.handshaken)
+
+        let current = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "current", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))), handshaken: false)
+        XCTAssertTrue(current.handshaken)
+        guard case .handshake(let result) = current.response.result else { return XCTFail("handshake did not return compatibility identity") }
+        XCTAssertEqual(result.schemaCompatibilityVersion, VaelenBuildInfo.schemaCompatibilityVersion)
+        XCTAssertEqual(result.buildIdentity, VaelenBuildInfo.buildIdentity)
+    }
+
+    func testDispatcherRejectsNormalCommandBeforeHandshake() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry)
+
+        let result = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: false)
+
+        XCTAssertEqual(result.response.error?.code, .invalidRequest)
+        XCTAssertEqual(result.response.error?.message, "Handshake is required before other requests.")
+    }
+
     func testDispatcherRejectsUnknownMethodStructurally() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
