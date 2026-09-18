@@ -8,6 +8,7 @@ public actor CoreRequestDispatcher {
     private let registry: ProjectRegistry
     private let php: PHPModule?
     private let mysql: MySQLModule?
+    private let mailpit: MailpitModule?
     private let router: any Router
     private let routeRepository: RouteIntentRepository?
     private let dns: DNSCapability
@@ -16,8 +17,8 @@ public actor CoreRequestDispatcher {
     private var routeIntents: [RouteID: RouteIntent]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
         self.routeIntents = Dictionary(uniqueKeysWithValues: (try? routeRepository?.all() ?? [])?.map { ($0.route.id, $0) } ?? [])
     }
 
@@ -97,6 +98,16 @@ public actor CoreRequestDispatcher {
                 let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.stop()))), true)
             case .mysqlStatus:
                 let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: module.status()))), true)
+            case .mailpitVersions:
+                let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: module.installedVersions().map(MailpitPackageWire.init))))), true)
+            case .mailpitInstall:
+                let module = try mailpitModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Mailpit version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: module.installedVersions().map(MailpitPackageWire.init))))), true)
+            case .mailpitStart:
+                let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.start()))), true)
+            case .mailpitStop:
+                let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.stop()))), true)
+            case .mailpitStatus:
+                let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: module.status()))), true)
             case .routingStatus:
                 return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routingStart:
@@ -154,6 +165,8 @@ public actor CoreRequestDispatcher {
             }
         } catch let error as MySQLModuleError {
             return (.init(id: request.id, error: map(error)), true)
+        } catch let error as MailpitModuleError {
+            return (.init(id: request.id, error: map(error)), true)
         } catch let error as ProjectRegistryError {
             return (.init(id: request.id, error: map(error)), true)
         } catch let error as IPCErrorPayload {
@@ -180,6 +193,7 @@ public actor CoreRequestDispatcher {
 
     private func phpModule() throws -> PHPModule { guard let php else { throw IPCErrorPayload(code: .internalError, message: "PHP distribution manifest is not configured.") }; return php }
     private func mysqlModule() throws -> MySQLModule { guard let mysql else { throw IPCErrorPayload(code: .internalError, message: "MySQL module is not configured.") }; return mysql }
+    private func mailpitModule() throws -> MailpitModule { guard let mailpit else { throw IPCErrorPayload(code: .internalError, message: "Mailpit module is not configured.") }; return mailpit }
 
     private func map(_ error: MySQLModuleError) -> IPCErrorPayload {
         switch error {
@@ -188,6 +202,16 @@ public actor CoreRequestDispatcher {
         case .portConflict(let port): return .init(code: .invalidRequest, message: "MySQL port conflict on 127.0.0.1:\(port); external processes were not modified.")
         case .processIdentityMismatch: return .init(code: .invalidRequest, message: "MySQL process identity could not be verified; no process was signaled.")
         default: return .init(code: .internalError, message: "MySQL operation failed: \(error)")
+        }
+    }
+
+    private func map(_ error: MailpitModuleError) -> IPCErrorPayload {
+        switch error {
+        case .unsupportedVersion, .packageMissing: return .init(code: .invalidRequest, message: "Mailpit operation rejected: \(error)")
+        case .portConflict(let port): return .init(code: .invalidRequest, message: "Mailpit port conflict on 127.0.0.1:\(port); external processes were not modified.")
+        case .processIdentityMismatch: return .init(code: .invalidRequest, message: "Mailpit process identity could not be verified; no process was signaled.")
+        case .unhealthy(let detail): return .init(code: .invalidRequest, message: "Mailpit is unhealthy: \(detail)")
+        default: return .init(code: .internalError, message: "Mailpit operation failed: \(error)")
         }
     }
 

@@ -23,7 +23,7 @@ struct VaelenApp: App {
 final class AppModel {
     enum State {
         case connecting
-        case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?, DNSStatus?, TLSStatus?, StandardPortsStatus?, MySQLStatus?)
+        case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?, DNSStatus?, TLSStatus?, StandardPortsStatus?, MySQLStatus?, MailpitStatus?)
         case unavailable
         case incompatible(Int, Int)
     }
@@ -54,8 +54,9 @@ final class AppModel {
             let tls = try? await client.tlsStatus()
             let ports = try? await client.portsStatus()
             let mysql = try? await client.mysqlStatus()
+            let mailpit = try? await client.mailpitStatus()
             guard generation == refreshGeneration else { await client.disconnect(); return }
-            state = .running(status, projects, php, routing, dns, tls, ports, mysql)
+            state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
@@ -73,13 +74,13 @@ final class AppModel {
 
     func trustLocalCA() async {
         trustError = nil
-        guard case .running(_, _, _, _, _, let tls, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+        guard case .running(_, _, _, _, _, let tls, _, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
         do { try LocalCATrustService().trust(certificateData: data); await refresh() } catch { trustError = error.localizedDescription }
     }
 
     func removeLocalCATrust() async {
         trustError = nil
-        guard case .running(_, _, _, _, _, let tls, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+        guard case .running(_, _, _, _, _, let tls, _, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
         do { try LocalCATrustService().removeTrust(certificateData: data); await refresh() } catch { trustError = error.localizedDescription }
     }
 
@@ -108,6 +109,10 @@ final class AppModel {
     func installMySQL() async { trustError = nil; guard let client else { return }; do { _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion); await refresh() } catch { trustError = error.localizedDescription } }
     func startMySQL() async { trustError = nil; guard let client else { return }; do { let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart(); await refresh() } catch { trustError = error.localizedDescription } }
     func stopMySQL() async { trustError = nil; guard let client else { return }; do { _ = try await client.mysqlStop(); await refresh() } catch { trustError = error.localizedDescription } }
+    func installMailpit() async { trustError = nil; guard let client else { return }; do { _ = try await client.mailpitInstall(MailpitModule.defaultVersion); await refresh() } catch { trustError = error.localizedDescription } }
+    func startMailpit() async { trustError = nil; guard let client else { return }; do { _ = try await client.mailpitStart(); await refresh() } catch { trustError = error.localizedDescription } }
+    func stopMailpit() async { trustError = nil; guard let client else { return }; do { _ = try await client.mailpitStop(); await refresh() } catch { trustError = error.localizedDescription } }
+    func openMailpit() async { trustError = nil; guard let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); } catch { trustError = error.localizedDescription } }
 
     func monitor() async {
         while !Task.isCancelled {
@@ -131,7 +136,7 @@ struct StatusView: View {
             case .incompatible(let client, let core):
                 Label("Protocol Incompatible", systemImage: "exclamationmark.circle")
                 Text("Client \(client), Core \(core)").font(.caption)
-            case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let mysql):
+            case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit):
                 Label("Core Running", systemImage: "circle.fill").foregroundStyle(.green)
                 Text("Version  \(status.core.version)")
                 Text("PID       \(status.core.pid)")
@@ -160,6 +165,15 @@ struct StatusView: View {
                     if mysql.state == .notInstalled { Button("Install MySQL") { Task { await model.installMySQL() } } }
                     else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy { Button(mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL") { Task { await model.startMySQL() } } }
                     if mysql.state == .running { Button("Stop MySQL") { Task { await model.stopMySQL() } } }
+                }
+                if let mailpit {
+                    Text("Mailpit    \(mailpit.state.rawValue)")
+                    Text("Version    \(mailpit.installedVersion ?? "none")")
+                    Text("SMTP       \(mailpit.smtpPort)")
+                    Text("UI         \(mailpit.httpPort)")
+                    if mailpit.state == .notInstalled { Button("Install Mailpit") { Task { await model.installMailpit() } } }
+                    else if mailpit.state == .installed || mailpit.state == .stopped || mailpit.state == .unhealthy || mailpit.state == .conflict { Button("Start Mailpit") { Task { await model.startMailpit() } } }
+                    if mailpit.state == .running { Button("Stop Mailpit") { Task { await model.stopMailpit() } }; Button("Open Mailpit") { Task { await model.openMailpit() } } }
                 }
                 ForEach(projects.prefix(5), id: \.path) { project in
                     Text("\(project.name) (\(project.registration))")

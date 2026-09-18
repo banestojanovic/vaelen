@@ -25,6 +25,12 @@ private enum CLICommand {
     case mysqlStart
     case mysqlStop
     case mysqlStatus(json: Bool)
+    case mailpitVersions(json: Bool)
+    case mailpitInstall(String)
+    case mailpitStart
+    case mailpitStop
+    case mailpitStatus(json: Bool)
+    case mailpitOpen
     case routingStatus
     case routingStart
     case routingStop
@@ -160,6 +166,17 @@ struct VaelenCLIMain {
                 return .routeRemove(RouteID(rawValue: uuid))
              default: throw CLIError.usage
              }
+        case "mailpit":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "versions": return .mailpitVersions(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "install": guard args.count == 3 else { throw CLIError.usage }; return .mailpitInstall(args[2])
+            case "start": guard args.count == 2 else { throw CLIError.usage }; return .mailpitStart
+            case "stop": guard args.count == 2 else { throw CLIError.usage }; return .mailpitStop
+            case "status": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .mailpitStatus(json: args.count == 3 && args[2] == "--json")
+            case "open": guard args.count == 2 else { throw CLIError.usage }; return .mailpitOpen
+            default: throw CLIError.usage
+            }
         case "dns":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
@@ -240,7 +257,14 @@ struct VaelenCLIMain {
         case .mysqlInitialize: let result = try await client.mysqlInitialize(); print("MySQL \(result.state.rawValue) \(result.health)")
         case .mysqlStart: let result = try await client.mysqlStart(); print("MySQL \(result.state.rawValue) \(result.health)")
         case .mysqlStop: let result = try await client.mysqlStop(); print("MySQL \(result.state.rawValue)")
-        case .mysqlStatus(let json): let result = try await client.mysqlStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nState      \(result.state.rawValue)\nInstalled  \(result.installedVersion ?? "none")\nSelected   \(result.selectedVersion ?? "none")\nPID        \(result.pid.map(String.init) ?? "none")\nPort       127.0.0.1:\(result.port)\nSocket     \(displayPath(result.socket))\nData       \(displayPath(result.datadir))\nHealth     \(result.health)") }
+         case .mysqlStatus(let json): let result = try await client.mysqlStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nState      \(result.state.rawValue)\nInstalled  \(result.installedVersion ?? "none")\nSelected   \(result.selectedVersion ?? "none")\nPID        \(result.pid.map(String.init) ?? "none")\nPort       127.0.0.1:\(result.port)\nSocket     \(displayPath(result.socket))\nData       \(displayPath(result.datadir))\nHealth     \(result.health)") }
+         case .mailpitVersions(let json): let result = try await client.mailpitVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Mailpit\nAvailable  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))") }
+         case .mailpitInstall(let version): let result = try await client.mailpitInstall(version); print("Installed Mailpit \(result.version)")
+         case .mailpitStart: let result = try await client.mailpitStart(); print("Mailpit \(result.state.rawValue) \(result.health)\nSMTP       127.0.0.1:\(result.smtpPort)\nUI         \(result.uiEndpoint)")
+         case .mailpitStop: let result = try await client.mailpitStop(); print("Mailpit \(result.state.rawValue)")
+         case .mailpitStatus(let json): let result = try await client.mailpitStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Mailpit\nState      \(result.state.rawValue)\nVersion    \(result.installedVersion ?? "none")\nPID        \(result.pid.map(String.init) ?? "none")\nSMTP       127.0.0.1:\(result.smtpPort)\nUI         \(result.uiEndpoint)\nDatabase   \(displayPath(result.database))\nHealth     \(result.health)") }
+         case .mailpitOpen:
+             let result = try await client.mailpitStatus(); guard result.state == .running else { throw CLIError.message("Mailpit is not healthy; start it before opening \(result.uiEndpoint).") }; let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/open"); process.arguments = [result.uiEndpoint]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw CLIError.message("Unable to open \(result.uiEndpoint).") }
         case .routingStatus:
             let result = try await client.routingStatus(); print("Routing\nProvider   \(result.provider)\nVersion    \(result.providerVersion ?? "unknown")\nState      \(result.state.rawValue)\nHealth     \(result.health.rawValue)\nRoutes     \(result.routeCount)")
         case .routingStart:
@@ -315,5 +339,5 @@ struct VaelenCLIMain {
 private enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status | val routing status|start|stop | val route list|add|remove | val php versions|install|use|exec|start|stop|status ... | val mysql versions|install|use|initialize|start|stop|status"; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return "Usage: val status | val routing status|start|stop | val route list|add|remove | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
 }

@@ -14,4 +14,8 @@ public enum VaelenNetworkPorts {
     public static let standardHTTP = 80
     /// Standard HTTPS port, served via PF forwarding only.
     public static let standardHTTPS = 443
+    /// Vaelen-owned Mailpit SMTP listener.
+    public static let mailpitSMTP = 11025
+    /// Vaelen-owned Mailpit HTTP/UI listener.
+    public static let mailpitHTTP = 18025
 }
