@@ -11,6 +11,21 @@ public struct VaelenFilesystemLayout: Sendable {
 
     public var stateDirectoryURL: URL { rootURL.appendingPathComponent("state", isDirectory: true) }
     public var databaseURL: URL { stateDirectoryURL.appendingPathComponent("vaelen.sqlite") }
+    public var packagesDirectoryURL: URL { rootURL.appendingPathComponent("packages", isDirectory: true) }
+    public var phpPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("php", isDirectory: true) }
+    public var caddyPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
+    public var instancesDirectoryURL: URL { rootURL.appendingPathComponent("instances", isDirectory: true) }
+    public var phpInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("php", isDirectory: true) }
+    public var caddyInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
+    public var configurationDirectoryURL: URL { rootURL.appendingPathComponent("config", isDirectory: true) }
+    public var routingConfigurationDirectoryURL: URL { configurationDirectoryURL.appendingPathComponent("routing", isDirectory: true) }
+    public var routingRuntimeDirectoryURL: URL { rootURL.appendingPathComponent("runtime/routing", isDirectory: true) }
+    public var cacheDirectoryURL: URL { FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Vaelen", isDirectory: true) }
+    public var downloadsDirectoryURL: URL { cacheDirectoryURL.appendingPathComponent("downloads", isDirectory: true) }
+    public var stagingDirectoryURL: URL { cacheDirectoryURL.appendingPathComponent("staging", isDirectory: true) }
+    public var logsDirectoryURL: URL { FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true) }
+    public var phpLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/php", isDirectory: true) }
+    public var caddyLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
 }
 
 public enum PathAvailability: String, Codable, Sendable { case available, missing, unreadable, notDirectory }

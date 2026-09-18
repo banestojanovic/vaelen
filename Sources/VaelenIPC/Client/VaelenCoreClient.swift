@@ -1,4 +1,5 @@
 import Foundation
+import VaelenCore
 
 public enum CoreClientError: Error, Equatable, Sendable {
     case coreUnavailable
@@ -86,6 +87,28 @@ public actor VaelenCoreClient {
         guard case .parkedPathList(let result) = try result(from: await send(request)) else { throw CoreClientError.invalidResponse }
         return result.paths
     }
+
+    public func phpVersions() async throws -> PHPVersionsResult {
+        guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpVersions))) else { throw CoreClientError.invalidResponse }; return result
+    }
+    public func phpInstall(_ version: String) async throws -> PHPPackageWire {
+        guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpInstall, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version }) ?? result.installed.last else { throw CoreClientError.invalidResponse }; return package
+    }
+    public func phpUse(_ version: String) async throws -> PHPPackageWire {
+        guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpUse, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version || $0.version.split(separator: ".").prefix(2).joined(separator: ".") == version }) else { throw CoreClientError.invalidResponse }; return package
+    }
+    public func phpExec(version: String? = nil, workingDirectory: String, arguments: [String]) async throws -> PHPExecResult {
+        guard case .phpExec(let result) = try result(from: await send(IPCRequest(method: .phpExec, params: .phpExec(.init(version: version, workingDirectory: workingDirectory, arguments: arguments))))) else { throw CoreClientError.invalidResponse }; return result
+    }
+    public func phpStart(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStart, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
+    public func phpStop(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStop, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
+    public func phpStatus(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStatus, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
+    public func routingStatus() async throws -> RouterStatus { guard case .routingStatus(let result) = try result(from: await send(IPCRequest(method: .routingStatus))) else { throw CoreClientError.invalidResponse }; return result.router }
+    public func routingStart() async throws -> RouterStatus { guard case .routingStatus(let result) = try result(from: await send(IPCRequest(method: .routingStart))) else { throw CoreClientError.invalidResponse }; return result.router }
+    public func routingStop() async throws -> RouterStatus { guard case .routingStatus(let result) = try result(from: await send(IPCRequest(method: .routingStop))) else { throw CoreClientError.invalidResponse }; return result.router }
+    public func routeList() async throws -> [RouteIntent] { guard case .routeList(let result) = try result(from: await send(IPCRequest(method: .routeList))) else { throw CoreClientError.invalidResponse }; return result.routes }
+    public func routeAdd(_ intent: RouteIntent) async throws -> RouteIntent { guard case .routeMutation(let result) = try result(from: await send(IPCRequest(method: .routeAdd, params: .route(intent)))) else { throw CoreClientError.invalidResponse }; return result }
+    public func routeRemove(_ id: RouteID) async throws -> [RouteIntent] { guard case .routeList(let result) = try result(from: await send(IPCRequest(method: .routeRemove, params: .routeRemove(.init(id: id))))) else { throw CoreClientError.invalidResponse }; return result.routes }
 
     public func disconnect() async {
         connected = false

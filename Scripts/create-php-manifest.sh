@@ -6,6 +6,7 @@ config=${2:?build config is required}
 output=${3:?manifest output is required}
 release_tag=${4:?release tag is required}
 release_base_url=${VAELEN_RELEASE_BASE_URL:?VAELEN_RELEASE_BASE_URL is required}
+manifest_trust=${VAELEN_MANIFEST_TRUST:-trusted-vaelen-release-manifest}
 
 version=$(jq -r '.phpVersion' "$config")
 architecture=$(jq -r '.architecture' "$config")
@@ -25,6 +26,7 @@ fpm_hash=$(shasum -a 256 "$artifact_dir/$fpm_name" | cut -d ' ' -f 1)
 jq -n \
   --arg releaseTag "$release_tag" \
   --arg releaseURL "$release_base_url" \
+  --arg manifestTrust "$manifest_trust" \
   --arg module "php" \
   --arg version "$version" \
   --arg architecture "$architecture" \
@@ -57,7 +59,7 @@ jq -n \
     },
     verification: {
       algorithm: "sha256",
-      authenticity: "trusted-vaelen-release-manifest"
+      authenticity: $manifestTrust
     },
     artifacts: {
       cli: { file: $cliName, url: ($releaseURL + "/" + $cliName), sha256: $cliHash },

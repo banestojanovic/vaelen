@@ -6,11 +6,15 @@ import VaelenIPC
 public actor CoreRequestDispatcher {
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
+    private let php: PHPModule?
+    private let router: any Router
+    private let routeRepository: RouteIntentRepository?
+    private var routeIntents: [RouteID: RouteIntent]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry) {
-        self.runtime = runtime
-        self.registry = registry
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil) {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.router = router; self.routeRepository = routeRepository
+        self.routeIntents = Dictionary(uniqueKeysWithValues: (try? routeRepository?.all() ?? [])?.map { ($0.route.id, $0) } ?? [])
     }
 
     public func dispatch(_ request: IPCRequest, handshaken: Bool) async -> (response: IPCResponse, handshaken: Bool) {
@@ -61,8 +65,55 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .parkedPathMutation(.init(path: nil, created: false))), true)
             case .pathList:
                 return (.init(id: request.id, result: .parkedPathList(.init(paths: try await registry.parkedPaths().map(ParkedPathWire.init)))), true)
+            case .phpVersions:
+                let module = try phpModule(); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+            case .phpInstall:
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+            case .phpUse:
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.setDefault(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+            case .phpExec:
+                let module = try phpModule(); let params = try request.params?.decode(PHPExecRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP execution parameters are required.") }(); let result = try module.exec(requestedVersion: params.version, workingDirectory: params.workingDirectory, arguments: params.arguments); return (.init(id: request.id, result: .phpExec(.init(exitStatus: result.status, output: result.output))), true)
+            case .phpStart:
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.start(requestedVersion: params.version)))), true)
+            case .phpStop:
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.stop(requestedVersion: params.version)))), true)
+            case .phpStatus:
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.status(requestedVersion: params.version)))), true)
+            case .routingStatus:
+                return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
+            case .routingStart:
+                try await router.start(); try await router.reconcile(routes: routeIntents.values.map(\.route)); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
+            case .routingStop:
+                try await router.stop(); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
+            case .routeList:
+                return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
+            case .routeAdd:
+                guard let repository = routeRepository else { throw IPCErrorPayload(code: .internalError, message: "Route persistence is unavailable.") }
+                let intent = try request.params?.decode(RouteIntent.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route parameters are required.") }()
+                let validated = try intent.route.validated()
+                var projectPath = intent.projectPath
+                if let projectID = intent.projectID {
+                    guard let project = try await registry.linkedProject(id: ProjectID(rawValue: projectID)) else { throw IPCErrorPayload(code: .invalidRequest, message: "Route project identity is not a registered M1 project.") }
+                    projectPath = projectPath ?? project.rootPath.string
+                }
+                let normalized = RouteIntent(route: validated, projectID: intent.projectID, projectPath: projectPath)
+                try repository.upsert(normalized); routeIntents[validated.id] = normalized
+                if (await router.status()).state == .running { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
+                return (.init(id: request.id, result: .routeMutation(normalized)), true)
+            case .routeRemove:
+                guard let repository = routeRepository else { throw IPCErrorPayload(code: .internalError, message: "Route persistence is unavailable.") }
+                let params = try request.params?.decode(RouteRemoveRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route ID is required.") }()
+                guard routeIntents[params.id] != nil else { throw RouterError.routeNotFound(params.id) }
+                try repository.remove(id: params.id); routeIntents.removeValue(forKey: params.id)
+                if (await router.status()).state == .running { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
+                return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
             case .handshake:
                 fatalError("handled above")
+            }
+        } catch let error as PHPModuleError {
+            switch error {
+            case .invalidWorkingDirectory(let path): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "PHP working directory is unavailable: \(path)")), true)
+            default: return (.init(id: request.id, error: .init(code: .internalError, message: "PHP operation failed: \(error)")), true)
             }
         } catch let error as ProjectRegistryError {
             return (.init(id: request.id, error: map(error)), true)
@@ -70,9 +121,16 @@ public actor CoreRequestDispatcher {
             return (.init(id: request.id, error: error), true)
         } catch {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
-            return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed.")), true)
+            return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
         }
     }
+
+    public func reconcilePersistedRoutesOnStartup() async throws {
+        guard (await router.status()).state == .running else { return }
+        try await router.reconcile(routes: routeIntents.values.map(\.route))
+    }
+
+    private func phpModule() throws -> PHPModule { guard let php else { throw IPCErrorPayload(code: .internalError, message: "PHP distribution manifest is not configured.") }; return php }
 
     private func map(_ error: ProjectRegistryError) -> IPCErrorPayload {
         switch error {

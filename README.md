@@ -42,6 +42,29 @@ swift run val paths
 swift run val paths --json
 ```
 
+## Development CLI
+
+For local dogfooding, install a user-owned symlink to the built CLI:
+
+```bash
+Scripts/install-dev-cli.sh
+export PATH="$HOME/.local/bin:$PATH"
+val status
+```
+
+The installer builds `val` first and refuses to replace an unrelated existing
+`val` executable or symlink. For zsh, it adds one marked, idempotent PATH block
+to `~/.zshrc`; it does not modify unrelated shell configuration. Remove only
+the symlink owned by this checkout and any PATH block added by this installer
+with:
+
+```bash
+Scripts/uninstall-dev-cli.sh
+```
+
+This is a development convenience, not the final Vaelen installation or
+distribution mechanism.
+
 The daemon owns the socket at:
 
 ```text

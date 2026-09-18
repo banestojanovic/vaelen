@@ -21,7 +21,7 @@ struct VaelenApp: App {
 final class AppModel {
     enum State {
         case connecting
-        case running(CoreStatusResponse, [ProjectWire])
+        case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?)
         case unavailable
         case incompatible(Int, Int)
     }
@@ -45,8 +45,10 @@ final class AppModel {
             try await client.connect()
             let status = try await client.status()
             let projects = try await client.projectList()
+            let php = try? await client.phpVersions()
+            let routing = try? await client.routingStatus()
             guard generation == refreshGeneration else { await client.disconnect(); return }
-            state = .running(status, projects)
+            state = .running(status, projects, php, routing)
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
@@ -84,12 +86,14 @@ struct StatusView: View {
             case .incompatible(let client, let core):
                 Label("Protocol Incompatible", systemImage: "exclamationmark.circle")
                 Text("Client \(client), Core \(core)").font(.caption)
-            case .running(let status, let projects):
+            case .running(let status, let projects, let php, let routing):
                 Label("Core Running", systemImage: "circle.fill").foregroundStyle(.green)
                 Text("Version  \(status.core.version)")
                 Text("PID       \(status.core.pid)")
                 Text("Protocol  \(status.protocolVersion)")
                 Text("Projects  \(projects.count)")
+                if let php { Text("PHP       \(php.installed.map(\.version).joined(separator: ", "))") }
+                if let routing { Text("Routing   \(routing.state.rawValue) (\(routing.routeCount))") }
                 ForEach(projects.prefix(5), id: \.path) { project in
                     Text("\(project.name) (\(project.registration))")
                         .font(.caption)

@@ -38,6 +38,19 @@ public enum CoreMethod: String, Sendable {
     case pathPark = "path.park"
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
+    case phpVersions = "php.versions"
+    case phpInstall = "php.install"
+    case phpUse = "php.use"
+    case phpExec = "php.exec"
+    case phpStart = "php.start"
+    case phpStop = "php.stop"
+    case phpStatus = "php.status"
+    case routingStatus = "routing.status"
+    case routingStart = "routing.start"
+    case routingStop = "routing.stop"
+    case routeList = "route.list"
+    case routeAdd = "route.add"
+    case routeRemove = "route.remove"
 }
 
 public enum RequestParams: Codable, Equatable, Sendable {
@@ -47,6 +60,10 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case listProjects(ListProjectsRequest)
     case park(ParkPathRequest)
     case unpark(UnparkPathRequest)
+    case phpVersion(PHPVersionRequest)
+    case phpExec(PHPExecRequest)
+    case route(RouteIntent)
+    case routeRemove(RouteRemoveRequest)
     case empty
     case raw(JSONValue)
 
@@ -58,6 +75,10 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .listProjects(let value): try value.encode(to: encoder)
         case .park(let value): try value.encode(to: encoder)
         case .unpark(let value): try value.encode(to: encoder)
+        case .phpVersion(let value): try value.encode(to: encoder)
+        case .phpExec(let value): try value.encode(to: encoder)
+        case .route(let value): try value.encode(to: encoder)
+        case .routeRemove(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
@@ -199,6 +220,16 @@ public struct ParkedPathListResult: Codable, Equatable, Sendable {
     public init(paths: [ParkedPathWire]) { self.paths = paths }
 }
 
+public struct PHPVersionRequest: Codable, Equatable, Sendable { public let version: String; public init(version: String) { self.version = version } }
+public struct PHPExecRequest: Codable, Equatable, Sendable { public let version: String?; public let workingDirectory: String; public let arguments: [String]; public init(version: String? = nil, workingDirectory: String, arguments: [String]) { self.version = version; self.workingDirectory = workingDirectory; self.arguments = arguments } }
+public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
+public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
+public struct PHPStatusResult: Codable, Equatable, Sendable { public let status: PHPStatus; public init(status: PHPStatus) { self.status = status } }
+public struct PHPExecResult: Codable, Equatable, Sendable { public let exitStatus: Int32; public let output: String; public init(exitStatus: Int32, output: String) { self.exitStatus = exitStatus; self.output = output } }
+public struct RouterStatusResult: Codable, Equatable, Sendable { public let router: RouterStatus; public init(router: RouterStatus) { self.router = router } }
+public struct RouteRemoveRequest: Codable, Equatable, Sendable { public let id: RouteID; public init(id: RouteID) { self.id = id } }
+public struct RouteListResult: Codable, Equatable, Sendable { public let routes: [RouteIntent]; public init(routes: [RouteIntent]) { self.routes = routes } }
+
 public enum ResponseResult: Codable, Equatable, Sendable {
     case handshake(HandshakeResult)
     case status(CoreStatusResponse)
@@ -206,6 +237,12 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectList(ProjectListResult)
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
+    case phpVersions(PHPVersionsResult)
+    case phpStatus(PHPStatusResult)
+    case phpExec(PHPExecResult)
+    case routingStatus(RouterStatusResult)
+    case routeList(RouteListResult)
+    case routeMutation(RouteIntent)
     case raw(JSONValue)
 
     public func encode(to encoder: Encoder) throws {
@@ -216,6 +253,12 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectList(let value): try value.encode(to: encoder)
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
+        case .phpVersions(let value): try value.encode(to: encoder)
+        case .phpStatus(let value): try value.encode(to: encoder)
+        case .phpExec(let value): try value.encode(to: encoder)
+        case .routingStatus(let value): try value.encode(to: encoder)
+        case .routeList(let value): try value.encode(to: encoder)
+        case .routeMutation(let value): try value.encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
     }
@@ -230,6 +273,12 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["project"] != nil, let result = try? IPCCodec.decode(ProjectMutationResult.self, from: data) { self = .projectMutation(result) }
         else if fields["paths"] != nil, let result = try? IPCCodec.decode(ParkedPathListResult.self, from: data) { self = .parkedPathList(result) }
         else if fields["path"] != nil, let result = try? IPCCodec.decode(ParkedPathMutationResult.self, from: data) { self = .parkedPathMutation(result) }
+        else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }
+        else if fields["status"] != nil, let result = try? IPCCodec.decode(PHPStatusResult.self, from: data) { self = .phpStatus(result) }
+        else if fields["exitStatus"] != nil, let result = try? IPCCodec.decode(PHPExecResult.self, from: data) { self = .phpExec(result) }
+        else if fields["router"] != nil, let result = try? IPCCodec.decode(RouterStatusResult.self, from: data) { self = .routingStatus(result) }
+        else if fields["routes"] != nil, let result = try? IPCCodec.decode(RouteListResult.self, from: data) { self = .routeList(result) }
+        else if fields["route"] != nil, let result = try? IPCCodec.decode(RouteIntent.self, from: data) { self = .routeMutation(result) }
         else { self = .raw(value) }
     }
 }

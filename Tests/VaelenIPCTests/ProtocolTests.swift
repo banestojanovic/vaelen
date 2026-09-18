@@ -38,6 +38,18 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(decoded, request)
     }
 
+    func testPHPExecRequestCarriesWorkingDirectoryAndArguments() throws {
+        let request = IPCRequest(
+            method: .phpExec,
+            params: .phpExec(PHPExecRequest(version: nil, workingDirectory: "/tmp/fixture with spaces", arguments: ["test.php", "--flag", "value with spaces"]))
+        )
+
+        let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        let params = try decoded.params?.decode(PHPExecRequest.self)
+        XCTAssertEqual(params?.workingDirectory, "/tmp/fixture with spaces")
+        XCTAssertEqual(params?.arguments, ["test.php", "--flag", "value with spaces"])
+    }
+
     func testStatusResponseRoundTripsThroughJSON() throws {
         let response = IPCResponse(
             id: UUID(),

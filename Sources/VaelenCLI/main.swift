@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import VaelenCore
 import VaelenIPC
 
 private enum CLICommand {
@@ -10,10 +11,24 @@ private enum CLICommand {
     case park(path: String?)
     case unpark(path: String?)
     case paths(json: Bool)
+    case phpVersions(json: Bool)
+    case phpInstall(String)
+    case phpUse(String)
+    case phpExec(version: String?, arguments: [String])
+    case phpStart(String)
+    case phpStop(String)
+    case phpStatus(String, json: Bool)
+    case routingStatus
+    case routingStart
+    case routingStop
+    case routeList(json: Bool)
+    case routeAdd(hostname: String, documentRoot: String, socketPath: String?, projectID: UUID?)
+    case routeRemove(RouteID)
 }
 
 private struct ProjectListEnvelope: Encodable { let projects: [ProjectWire] }
 private struct ParkedPathListEnvelope: Encodable { let paths: [ParkedPathWire] }
+private struct RouteListEnvelope: Encodable { let routes: [RouteIntent] }
 private struct StatusEnvelope: Encodable {
     let core: StatusPayload
 }
@@ -72,6 +87,49 @@ struct VaelenCLIMain {
             return .unlink(path: path, name: name)
         case "park": return .park(path: try optionalPath(args, command: "park"))
         case "unpark": return .unpark(path: try optionalPath(args, command: "unpark"))
+        case "php":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "versions": return .phpVersions(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "install": guard args.count == 3 else { throw CLIError.usage }; return .phpInstall(args[2])
+            case "use": guard args.count == 3 else { throw CLIError.usage }; return .phpUse(args[2])
+            case "start": guard args.count == 3 else { throw CLIError.usage }; return .phpStart(args[2])
+            case "stop": guard args.count == 3 else { throw CLIError.usage }; return .phpStop(args[2])
+            case "status": guard args.count == 3 || args.count == 4 else { throw CLIError.usage }; return .phpStatus(args[2], json: args.count == 4 && args[3] == "--json")
+            case "exec":
+                let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }; return .phpExec(version: nil, arguments: Array(rest.dropFirst(marker + 1)))
+             default: throw CLIError.usage
+             }
+        case "routing":
+            guard args.count == 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "status": return .routingStatus
+            case "start": return .routingStart
+            case "stop": return .routingStop
+            default: throw CLIError.usage
+            }
+        case "route":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "list": return .routeList(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "add":
+                guard args.count >= 4 else { throw CLIError.usage }
+                var socket: String?
+                var projectID: UUID?
+                var index = 4
+                while index < args.count {
+                    guard index + 1 < args.count else { throw CLIError.usage }
+                    if args[index] == "--php-socket" { socket = args[index + 1] }
+                    else if args[index] == "--project-id" { guard let value = UUID(uuidString: args[index + 1]) else { throw CLIError.usage }; projectID = value }
+                    else { throw CLIError.usage }
+                    index += 2
+                }
+                return .routeAdd(hostname: args[2], documentRoot: args[3], socketPath: socket, projectID: projectID)
+            case "remove":
+                guard args.count == 3, let uuid = UUID(uuidString: args[2]) else { throw CLIError.usage }
+                return .routeRemove(RouteID(rawValue: uuid))
+            default: throw CLIError.usage
+            }
         default: throw CLIError.usage
         }
     }
@@ -114,12 +172,44 @@ struct VaelenCLIMain {
             let paths = try await client.parkedPaths()
             if json { print(String(decoding: try IPCCodec.encode(ParkedPathListEnvelope(paths: paths)), as: UTF8.self)) }
             else { paths.forEach { print("\(displayPath($0.path))\t\($0.availability)") } }
+        case .phpVersions(let json):
+            let result = try await client.phpVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Available  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))\nDefault    \(result.default ?? "none")") }
+        case .phpInstall(let version): let result = try await client.phpInstall(version); print("Installed PHP \(result.version)")
+        case .phpUse(let version): let result = try await client.phpUse(version); print("Using PHP \(result.version) for CLI")
+        case .phpExec(let version, let arguments): let result = try await client.phpExec(version: version, workingDirectory: FileManager.default.currentDirectoryPath, arguments: arguments); print(result.output, terminator: ""); if result.exitStatus != 0 { exit(result.exitStatus) }
+        case .phpStart(let version): let result = try await client.phpStart(version); print("PHP \(result.version) FPM \(result.state.rawValue) \(result.health)")
+        case .phpStop(let version): let result = try await client.phpStop(version); print("PHP \(result.version) FPM \(result.state.rawValue)")
+        case .phpStatus(let version, let json): let result = try await client.phpStatus(version); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("PHP \(result.version)\nPackage    \(result.package == nil ? "Missing" : "Installed")\nFPM        \(result.state.rawValue)\nPID        \(result.pid.map(String.init) ?? "none")\nSocket     \(displayPath(result.socket))\nHealth     \(result.health)") }
+        case .routingStatus:
+            let result = try await client.routingStatus(); print("Routing\nProvider   \(result.provider)\nVersion    \(result.providerVersion ?? "unknown")\nState      \(result.state.rawValue)\nHealth     \(result.health.rawValue)\nRoutes     \(result.routeCount)")
+        case .routingStart:
+            let result = try await client.routingStart(); print("Routing \(result.state.rawValue) \(result.health.rawValue)")
+        case .routingStop:
+            let result = try await client.routingStop(); print("Routing \(result.state.rawValue)")
+        case .routeList(let json):
+            let routes = try await client.routeList()
+            if json { print(String(decoding: try IPCCodec.encode(RouteListEnvelope(routes: routes)), as: UTF8.self)) }
+            else { routes.forEach { intent in print("\(intent.route.id)\t\(intent.route.hostname)\t\(targetDescription(intent.route.target))\tDesired") } }
+        case .routeAdd(let hostname, let documentRoot, let socketPath, let projectID):
+            let target: RouteTarget = socketPath.map { .fastCGI(socketPath: $0, documentRoot: documentRoot) } ?? .staticFiles(documentRoot: documentRoot)
+            let result = try await client.routeAdd(.init(route: .init(hostname: hostname, target: target, tls: .disabled), projectID: projectID))
+            print("Added route \(result.route.id)\t\(result.route.hostname)\t\(targetDescription(result.route.target))")
+        case .routeRemove(let id):
+            _ = try await client.routeRemove(id); print("Removed route \(id)")
         }
     }
 
     private static func displayPath(_ path: String) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
+    }
+
+    private static func targetDescription(_ target: RouteTarget) -> String {
+        switch target {
+        case .staticFiles(let root): return "static \(root)"
+        case .fastCGI(let socket, let root): return "fastcgi \(socket) root=\(root)"
+        case .http(let host, let port): return "http \(host):\(port)"
+        }
     }
 
     private static func message(for error: Error) -> String {
@@ -133,5 +223,5 @@ struct VaelenCLIMain {
 private enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status [--json] | val link [path] [--name name] | val unlink [--path path|--name name] | val links [--json] | val park [path] | val unpark [path] | val paths [--json]"; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return "Usage: val status | val routing status|start|stop | val route list|add|remove | val php versions|install|use|exec|start|stop|status ..."; case .message(let text): return text } }
 }
