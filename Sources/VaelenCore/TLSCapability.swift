@@ -142,6 +142,14 @@ public actor TLSCapability {
     }
     public func issueLeaf(hostname: String) throws -> TLSLeafMaterial {
         let hostname = try LocalTLSNamespace.validate(hostname)
+        let base = layout.tlsLeafDirectoryURL.appendingPathComponent(hostname.replacingOccurrences(of: ".", with: "_"))
+        let certURL = base.appendingPathExtension("crt")
+        let keyURL = base.appendingPathExtension("key")
+        if let certificateData = try? Data(contentsOf: certURL),
+           SecCertificateCreateWithData(nil, Self.derCertificateData(certificateData) as CFData) != nil,
+           let privateKeyData = try? Data(contentsOf: keyURL), !privateKeyData.isEmpty {
+            return TLSLeafMaterial(certificateURL: certURL, keyURL: keyURL)
+        }
         let caPath = layout.tlsCertificatesDirectoryURL.appendingPathComponent("ca.der")
         guard let caData = try? Data(contentsOf: caPath), SecCertificateCreateWithData(nil, caData as CFData) != nil else { throw TLSError.unavailable }
         let caKey = try keychain.caKey(); var error: Unmanaged<CFError>?
@@ -150,11 +158,16 @@ public actor TLSCapability {
         let certificate = try LocalCertificateBuilder.leaf(hostname: hostname, key: leafKey, issuer: "Vaelen Local CA", issuerKey: caKey)
         guard let privateData = SecKeyCopyExternalRepresentation(leafKey, nil) as Data? else { throw TLSError.certificate("leaf key export failed") }
         try FileManager.default.createDirectory(at: layout.tlsLeafDirectoryURL, withIntermediateDirectories: true)
-        let base = layout.tlsLeafDirectoryURL.appendingPathComponent(hostname.replacingOccurrences(of: ".", with: "_"))
-        let certURL = base.appendingPathExtension("crt"); let keyURL = base.appendingPathExtension("key")
         try Data(pem: certificate, label: "CERTIFICATE").write(to: certURL, options: .atomic); try Data(pem: privateData, label: "RSA PRIVATE KEY").write(to: keyURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path); try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: certURL.path)
         return TLSLeafMaterial(certificateURL: certURL, keyURL: keyURL)
+    }
+
+    private static func derCertificateData(_ data: Data) -> Data {
+        guard SecCertificateCreateWithData(nil, data as CFData) == nil,
+              let text = String(data: data, encoding: .utf8) else { return data }
+        let lines = text.components(separatedBy: .newlines).filter { !$0.contains("BEGIN") && !$0.contains("END") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return Data(base64Encoded: lines.joined()) ?? data
     }
 }
 

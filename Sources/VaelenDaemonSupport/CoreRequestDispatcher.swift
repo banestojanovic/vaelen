@@ -63,6 +63,15 @@ public actor CoreRequestDispatcher {
                 let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
                 let report = try await projectEnvironmentReport(for: project)
                 return (.init(id: request.id, result: .projectEnvironment(.init(report: report))), true)
+            case .projectPlan, .projectActivate:
+                let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project reconciliation parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard project.registrationKind == .linked, project.id != nil else { throw IPCErrorPayload(code: .invalidRequest, message: "Project reconciliation requires a registered linked project.") }
+                if method == .projectPlan {
+                    let report = try await projectEnvironmentReport(for: project)
+                    return (.init(id: request.id, result: .projectPlan(.init(plan: ProjectReconciliationPlanner().plan(report: report)))), true)
+                }
+                return (.init(id: request.id, result: .projectActivation(.init(execution: try await activate(project: project)))), true)
             case .pathPark:
                 let params = try request.params?.decode(ParkPathRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Park parameters are required.") }()
                 let path = try await registry.parkWithCreation(path: params.path, workingDirectory: params.workingDirectory)
@@ -240,6 +249,57 @@ public actor CoreRequestDispatcher {
             standardPorts: await ports.status()
         )
         return report
+    }
+
+    private func activate(project: Project) async throws -> ProjectReconciliationExecutionResult {
+        let planner = ProjectReconciliationPlanner()
+        let initialPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        let freshPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        var results = [ProjectReconciliationOperationResult]()
+        var startedMailpit = false
+
+        for operation in initialPlan.operations {
+            guard operation.disposition != .satisfied else {
+                results.append(.init(operationID: operation.id, state: .satisfied, message: "Already satisfied; no mutation performed.", verified: true))
+                continue
+            }
+            guard operation.disposition == .actionable else {
+                results.append(.init(operationID: operation.id, state: .blocked, message: operation.reason ?? "Operation is not executable in M8 Slice 1.", verified: false))
+                continue
+            }
+            guard operation.id == "mailpit.start", let current = freshPlan.operations.first(where: { $0.id == operation.id }), current.disposition == .actionable else {
+                results.append(.init(operationID: operation.id, state: .skipped, message: "The plan became stale before execution; no mutation performed.", verified: false))
+                continue
+            }
+            guard let mailpit else {
+                results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit module is unavailable.", verified: false))
+                continue
+            }
+            do {
+                _ = try mailpit.start()
+                startedMailpit = true
+                results.append(.init(operationID: operation.id, state: .succeeded, message: "Mailpit start requested; final health verification follows.", verified: false))
+            } catch {
+                results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit start failed; actual state was re-observed.", verified: false))
+            }
+        }
+
+        let finalPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        if startedMailpit, let resultIndex = results.firstIndex(where: { $0.operationID == "mailpit.start" }) {
+            let healthy = finalPlan.operations.first(where: { $0.id == "mailpit.start" })?.disposition == .satisfied
+            results[resultIndex] = .init(operationID: "mailpit.start", state: healthy ? .succeeded : .failed, message: healthy ? "Mailpit is healthy after activation." : "Mailpit did not verify healthy after activation.", verified: healthy)
+        }
+        let state: ProjectReconciliationExecutionState
+        if finalPlan.state == .satisfied && results.allSatisfy({ $0.state == .satisfied || $0.state == .succeeded }) {
+            state = .succeeded
+        } else if results.contains(where: { $0.state == .succeeded }) {
+            state = .partial
+        } else if results.contains(where: { $0.state == .failed }) {
+            state = .failed
+        } else {
+            state = .blocked
+        }
+        return .init(initialPlan: initialPlan, operations: results, finalPlan: finalPlan, state: state)
     }
 
     private func map(_ error: MySQLModuleError) -> IPCErrorPayload {

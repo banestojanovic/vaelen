@@ -14,6 +14,8 @@ private enum CLICommand {
     case projectStatus(selector: String?, json: Bool)
     case projectInspect(selector: String?, json: Bool)
     case projectDoctor(selector: String?, json: Bool)
+    case projectPlan(selector: String?, json: Bool)
+    case projectActivate(selector: String?, json: Bool)
     case phpVersions(json: Bool)
     case phpInstall(String)
     case phpUse(String)
@@ -98,6 +100,8 @@ struct VaelenCLIMain {
             case "status": return .projectStatus(selector: parsed.selector, json: parsed.json)
             case "inspect": return .projectInspect(selector: parsed.selector, json: parsed.json)
             case "doctor": return .projectDoctor(selector: parsed.selector, json: parsed.json)
+            case "plan": return .projectPlan(selector: parsed.selector, json: parsed.json)
+            case "activate": return .projectActivate(selector: parsed.selector, json: parsed.json)
             default: throw CLIError.usage
             }
         case "link":
@@ -275,6 +279,12 @@ struct VaelenCLIMain {
         case .projectDoctor(let selector, let json):
             let report = try await client.projectDoctor(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectDoctor(report)) }
+        case .projectPlan(let selector, let json):
+            let plan = try await client.projectPlan(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(plan), as: UTF8.self)) } else { print(projectPlan(plan)) }
+        case .projectActivate(let selector, let json):
+            let execution = try await client.projectActivate(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(execution), as: UTF8.self)) } else { print(projectActivation(execution)) }
         case .phpVersions(let json):
             let result = try await client.phpVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Available  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))\nDefault    \(result.default ?? "none")") }
         case .phpInstall(let version): let result = try await client.phpInstall(version); print("Installed PHP \(result.version)")
@@ -380,6 +390,28 @@ struct VaelenCLIMain {
         return report.diagnostics.map { "\($0.severity.rawValue.uppercased()) \($0.code)\n  \($0.message)\($0.suggestion.map { "\n  Suggested: \($0)" } ?? "")" }.joined(separator: "\n")
     }
 
+    private static func projectPlan(_ plan: ProjectReconciliationPlan) -> String {
+        let groups = [
+            ("Satisfied", plan.operations.filter { $0.disposition == .satisfied }),
+            ("Actionable", plan.operations.filter { $0.disposition == .actionable }),
+            ("Blocked or deferred", plan.operations.filter { $0.disposition != .satisfied && $0.disposition != .actionable })
+        ]
+        let sections = groups.compactMap { title, operations -> String? in
+            guard !operations.isEmpty else { return nil }
+            let lines = operations.map { operation in
+                let reason = operation.reason.map { "\n  \($0)" } ?? ""
+                return "  \(operation.id) [\(operation.disposition.rawValue)]\(reason)"
+            }.joined(separator: "\n")
+            return "\(title)\n\(lines)"
+        }.joined(separator: "\n\n")
+        return "Project \(plan.identity.name)\nOverall    \(plan.state.rawValue)\n\n\(sections.isEmpty ? "No operations required." : sections)"
+    }
+
+    private static func projectActivation(_ execution: ProjectReconciliationExecutionResult) -> String {
+        let operations = execution.operations.map { "\($0.operationID) [\($0.state.rawValue)] \($0.message)" }.joined(separator: "\n")
+        return "Project \(execution.finalPlan.identity.name)\nResult     \(execution.state.rawValue)\n\(operations.isEmpty ? "No operations required." : operations)\nFinal plan \(execution.finalPlan.state.rawValue)"
+    }
+
     private static func message(for error: Error) -> String {
         if let error = error as? CLIError { return error.description }
         return "val failed: \(error)"
@@ -391,5 +423,5 @@ struct VaelenCLIMain {
 private enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status | val project status|inspect|doctor [project] [--json] | val routing status|start|stop | val route list|add|remove | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return "Usage: val status | val project status|inspect|doctor|plan|activate [project] [--json] | val routing status|start|stop | val route list|add|remove | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
 }

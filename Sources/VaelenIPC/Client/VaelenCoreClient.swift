@@ -83,6 +83,16 @@ public actor VaelenCoreClient {
         try await projectEnvironment(method: .projectDoctor, selector: selector, workingDirectory: workingDirectory)
     }
 
+    public func projectPlan(selector: String?, workingDirectory: String) async throws -> ProjectReconciliationPlan {
+        guard case .projectPlan(let result) = try result(from: await send(IPCRequest(method: .projectPlan, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
+        return result.plan
+    }
+
+    public func projectActivate(selector: String?, workingDirectory: String) async throws -> ProjectReconciliationExecutionResult {
+        guard case .projectActivation(let result) = try result(from: await send(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
+        return result.execution
+    }
+
     private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
         guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
         return result.report

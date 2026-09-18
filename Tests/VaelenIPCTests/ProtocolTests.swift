@@ -86,4 +86,16 @@ final class ProtocolTests: XCTestCase {
 
         XCTAssertEqual(decoded, response)
     }
+
+    func testProjectReconciliationMethodsAndResponsesRoundTripThroughJSON() throws {
+        for method in [CoreMethod.projectPlan, .projectActivate] {
+            let request = IPCRequest(method: method, params: .projectEnvironment(.init(selector: "syncproof", workingDirectory: "/tmp")))
+            XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)).knownMethod, method)
+        }
+        let identity = ProjectEnvironmentIdentity(project: Project(id: ProjectID(), name: "syncproof", rootPath: CanonicalPath(url: URL(fileURLWithPath: "/tmp/syncproof")), registrationKind: .linked, availability: .available))
+        let desired = ProjectDesiredEnvironment(file: .valid, php: "8.4", secureWeb: true, mysql: true, mailpit: true)
+        let plan = ProjectReconciliationPlan(identity: identity, desired: desired, observedAt: Date(timeIntervalSince1970: 1), operations: [], state: .satisfied)
+        let response = IPCResponse(id: UUID(), result: .projectPlan(.init(plan: plan)))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
+    }
 }

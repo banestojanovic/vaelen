@@ -1,5 +1,6 @@
 import XCTest
-import VaelenCore
+import Darwin
+@testable import VaelenCore
 @testable import VaelenIPC
 @testable import VaelenDaemonSupport
 
@@ -39,5 +40,80 @@ final class DispatcherTests: XCTestCase {
         let removed = await recreated.dispatch(IPCRequest(method: .routeRemove, params: .routeRemove(.init(id: route.id))), handshaken: true)
         guard case .routeList(let afterRemoval) = removed.response.result else { return XCTFail("route remove did not return routes") }
         XCTAssertTrue(afterRemoval.routes.isEmpty)
+    }
+
+    func testProjectReconciliationRejectsDiscoveredProjects() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let projectRoot = root.appendingPathComponent("discovered")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        _ = try await registry.park(path: root)
+        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry)
+
+        let result = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: "discovered", workingDirectory: root.path))), handshaken: true)
+
+        XCTAssertEqual(result.response.error?.code, .invalidRequest)
+        XCTAssertEqual(result.response.error?.message, "Project reconciliation requires a registered linked project.")
+    }
+
+    func testProjectActivationStartsAndThenReusesAnIsolatedMailpit() async throws {
+        guard let package = MailpitModule().installedVersions().first else { throw XCTSkip("Mailpit package prerequisite unavailable") }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let projectRoot = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { removeTestRoot(root) }
+        let configuration = MailpitRuntimeConfiguration(smtpPort: try availablePort(), httpPort: try availablePort())
+        try Data("version: 1\nservices:\n  mailpit: true\n".utf8).write(to: projectRoot.appendingPathComponent("vaelen.yml"))
+        try Data("MAIL_MAILER=smtp\nMAIL_HOST=127.0.0.1\nMAIL_PORT=\(configuration.smtpPort)\nMAIL_PASSWORD=null\n".utf8).write(to: projectRoot.appendingPathComponent(".env"))
+
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("vaelen"))
+        let finalPackage = layout.mailpitPackagesDirectoryURL.appendingPathComponent(package.version, isDirectory: true)
+        try FileManager.default.createDirectory(at: layout.mailpitPackagesDirectoryURL, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: package.packagePath), to: finalPackage)
+        let chmod = Process(); chmod.executableURL = URL(fileURLWithPath: "/bin/chmod"); chmod.arguments = ["-R", "u+w", finalPackage.path]; try chmod.run(); chmod.waitUntilExit()
+        let copiedPackage = MailpitPackage(version: package.version, architecture: package.architecture, packagePath: finalPackage.path, executablePath: finalPackage.appendingPathComponent("mailpit").path, source: package.source, artifactSHA256: package.artifactSHA256, license: package.license, installedAt: package.installedAt)
+        try JSONEncoder().encode(copiedPackage).write(to: finalPackage.appendingPathComponent(".vaelen-package.json"), options: .atomic)
+        let mailpit = MailpitModule(layout: layout, configuration: configuration)
+        try FileManager.default.createDirectory(at: URL(fileURLWithPath: mailpit.instanceDatabasePath()).deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: mailpit.instanceDatabasePath(), contents: Data())
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: layout.databaseURL))
+        _ = try await registry.link(path: projectRoot)
+        let dispatcher = CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, mailpit: mailpit, router: InMemoryRouter(), routeRepository: RouteIntentRepository(store: try SQLiteStateStore(databaseURL: layout.databaseURL.appendingPathExtension("routes"))))
+
+        let planResponse = await dispatcher.dispatch(IPCRequest(method: .projectPlan, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectPlan(let planResult) = planResponse.response.result else { return XCTFail("project plan did not return a plan") }
+        XCTAssertEqual(planResult.plan.state, .actionable)
+        XCTAssertEqual(planResult.plan.operations.first?.id, "mailpit.start")
+
+        let activationResponse = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectActivation(let activationResult) = activationResponse.response.result else { return XCTFail("project activation did not return an execution result") }
+        XCTAssertEqual(activationResult.execution.state, .succeeded)
+        let firstPID = mailpit.status().pid
+        XCTAssertEqual(mailpit.status().state, .running)
+
+        let secondResponse = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectActivation(let secondResult) = secondResponse.response.result else { return XCTFail("second activation did not return an execution result") }
+        XCTAssertEqual(secondResult.execution.state, .succeeded)
+        XCTAssertEqual(mailpit.status().pid, firstPID)
+        _ = try mailpit.stop()
+    }
+
+    private func removeTestRoot(_ root: URL) {
+        guard FileManager.default.fileExists(atPath: root.path) else { return }
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/chmod"); process.arguments = ["-R", "u+w", root.path]; try? process.run(); process.waitUntilExit(); try? FileManager.default.removeItem(at: root)
+    }
+
+    private func availablePort() throws -> Int {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw MailpitModuleError.processFailed("socket") }
+        defer { close(descriptor) }
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = 0; address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard bound == 0 else { throw MailpitModuleError.processFailed("bind") }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let result = withUnsafeMutablePointer(to: &address) { pointer in pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) } }
+        guard result == 0 else { throw MailpitModuleError.processFailed("getsockname") }
+        return Int(UInt16(bigEndian: address.sin_port))
     }
 }
