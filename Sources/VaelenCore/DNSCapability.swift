@@ -125,7 +125,12 @@ public actor DNSResponderSupervisor: DNSResponderControlling {
         guard kill(candidate, 0) == 0 else { return false }
         var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         let length = proc_pidpath(candidate, &buffer, UInt32(buffer.count))
-        return length > 0 && String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) == executablePath
+        guard length > 0 else { return false }
+        let candidatePath = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        guard Self.acceptsExecutablePath(candidatePath, expected: executablePath) else { return false }
+        let commandLine = processCommandLine(candidate)
+        let user = (try? command("/bin/ps", ["-p", "\(candidate)", "-o", "user="]))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return user == NSUserName() && commandLine.contains("--port \(port)")
     }
 
     private func discoverOwnedProcess() -> Int32? {
@@ -136,6 +141,22 @@ public actor DNSResponderSupervisor: DNSResponderControlling {
             if isOwnedProcess(candidate) { return candidate }
         }
         return nil
+    }
+
+    static func acceptsExecutablePath(_ candidate: String, expected: String) -> Bool {
+        if candidate == expected { return true }
+        let expectedComponents = URL(fileURLWithPath: expected).standardizedFileURL.pathComponents
+        let candidateComponents = URL(fileURLWithPath: candidate).standardizedFileURL.pathComponents
+        guard URL(fileURLWithPath: candidate).lastPathComponent == URL(fileURLWithPath: expected).lastPathComponent,
+              let expectedBuild = expectedComponents.firstIndex(of: ".build"),
+              let candidateBuild = candidateComponents.firstIndex(of: ".build") else { return false }
+        return expectedComponents.prefix(expectedBuild + 1).elementsEqual(candidateComponents.prefix(candidateBuild + 1))
+    }
+
+    private func processCommandLine(_ pid: Int32) -> String { (try? command("/bin/ps", ["-p", "\(pid)", "-o", "command="])) ?? "" }
+
+    private func command(_ executable: String, _ arguments: [String]) throws -> String {
+        let process = Process(); let output = Pipe(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments; process.standardOutput = output; try process.run(); let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit(); return String(data: data, encoding: .utf8) ?? ""
     }
 }
 

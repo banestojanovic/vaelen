@@ -94,6 +94,7 @@ final class CaddyRouterTests: XCTestCase {
         let root = URL(fileURLWithPath: "/tmp/vaelen-fastcgi-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("<?php echo 'php response';".utf8).write(to: root.appendingPathComponent("index.php"))
+        try Data("asset response".utf8).write(to: root.appendingPathComponent("asset.txt"))
 
         let layout = VaelenFilesystemLayout(rootURL: root)
         let supervisor = CaddyProcessSupervisor(layout: layout)
@@ -112,6 +113,12 @@ final class CaddyRouterTests: XCTestCase {
         let route = Route(hostname: "php.test", target: .fastCGI(socketPath: socket, documentRoot: root.path), tls: .disabled)
         try await router.reconcile(routes: [route])
         XCTAssertEqual(try runCurl(host: "php.test", path: "/index.php"), "php response")
+        let phpPath = try runHTTP(host: "php.test", path: "/index.php")
+        XCTAssertEqual(phpPath.status, 200, phpPath.body)
+        XCTAssertFalse(phpPath.body.contains("<?php"), phpPath.body)
+        let asset = try runHTTP(host: "php.test", path: "/asset.txt")
+        XCTAssertEqual(asset.status, 200, asset.body)
+        XCTAssertEqual(asset.body, "asset response")
     }
 
     func testOfficialCaddyReachesSyncproofLaravelFrontController() async throws {

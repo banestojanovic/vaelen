@@ -18,6 +18,13 @@ private enum CLICommand {
     case phpStart(String)
     case phpStop(String)
     case phpStatus(String, json: Bool)
+    case mysqlVersions(json: Bool)
+    case mysqlInstall(String)
+    case mysqlUse(String)
+    case mysqlInitialize
+    case mysqlStart
+    case mysqlStop
+    case mysqlStatus(json: Bool)
     case routingStatus
     case routingStart
     case routingStop
@@ -108,7 +115,19 @@ struct VaelenCLIMain {
             case "exec":
                 let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }; return .phpExec(version: nil, arguments: Array(rest.dropFirst(marker + 1)))
              default: throw CLIError.usage
-             }
+              }
+        case "mysql":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "versions": return .mysqlVersions(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "install": guard args.count == 3 else { throw CLIError.usage }; return .mysqlInstall(args[2])
+            case "use": guard args.count == 3 else { throw CLIError.usage }; return .mysqlUse(args[2])
+            case "initialize": guard args.count == 2 else { throw CLIError.usage }; return .mysqlInitialize
+            case "start": guard args.count == 2 else { throw CLIError.usage }; return .mysqlStart
+            case "stop": guard args.count == 2 else { throw CLIError.usage }; return .mysqlStop
+            case "status": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .mysqlStatus(json: args.count == 3 && args[2] == "--json")
+            default: throw CLIError.usage
+            }
         case "routing":
             guard args.count == 2 else { throw CLIError.usage }
             switch args[1] {
@@ -215,6 +234,13 @@ struct VaelenCLIMain {
         case .phpStart(let version): let result = try await client.phpStart(version); print("PHP \(result.version) FPM \(result.state.rawValue) \(result.health)")
         case .phpStop(let version): let result = try await client.phpStop(version); print("PHP \(result.version) FPM \(result.state.rawValue)")
         case .phpStatus(let version, let json): let result = try await client.phpStatus(version); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("PHP \(result.version)\nPackage    \(result.package == nil ? "Missing" : "Installed")\nFPM        \(result.state.rawValue)\nPID        \(result.pid.map(String.init) ?? "none")\nSocket     \(displayPath(result.socket))\nHealth     \(result.health)") }
+        case .mysqlVersions(let json): let result = try await client.mysqlVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nAvailable  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))\nSelected   \(result.default ?? "none")") }
+        case .mysqlInstall(let version): let result = try await client.mysqlInstall(version); print("Installed MySQL \(result.installed.first(where: { $0.version == version })?.version ?? version)")
+        case .mysqlUse(let version): let result = try await client.mysqlUse(version); print("Using MySQL \(result.default ?? version)")
+        case .mysqlInitialize: let result = try await client.mysqlInitialize(); print("MySQL \(result.state.rawValue) \(result.health)")
+        case .mysqlStart: let result = try await client.mysqlStart(); print("MySQL \(result.state.rawValue) \(result.health)")
+        case .mysqlStop: let result = try await client.mysqlStop(); print("MySQL \(result.state.rawValue)")
+        case .mysqlStatus(let json): let result = try await client.mysqlStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nState      \(result.state.rawValue)\nInstalled  \(result.installedVersion ?? "none")\nSelected   \(result.selectedVersion ?? "none")\nPID        \(result.pid.map(String.init) ?? "none")\nPort       127.0.0.1:\(result.port)\nSocket     \(displayPath(result.socket))\nData       \(displayPath(result.datadir))\nHealth     \(result.health)") }
         case .routingStatus:
             let result = try await client.routingStatus(); print("Routing\nProvider   \(result.provider)\nVersion    \(result.providerVersion ?? "unknown")\nState      \(result.state.rawValue)\nHealth     \(result.health.rawValue)\nRoutes     \(result.routeCount)")
         case .routingStart:
@@ -289,5 +315,5 @@ struct VaelenCLIMain {
 private enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status | val routing status|start|stop | val route list|add|remove | val php versions|install|use|exec|start|stop|status ..."; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return "Usage: val status | val routing status|start|stop | val route list|add|remove | val php versions|install|use|exec|start|stop|status ... | val mysql versions|install|use|initialize|start|stop|status"; case .message(let text): return text } }
 }

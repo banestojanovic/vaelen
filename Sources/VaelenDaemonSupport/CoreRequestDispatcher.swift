@@ -7,6 +7,7 @@ public actor CoreRequestDispatcher {
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
     private let php: PHPModule?
+    private let mysql: MySQLModule?
     private let router: any Router
     private let routeRepository: RouteIntentRepository?
     private let dns: DNSCapability
@@ -15,8 +16,8 @@ public actor CoreRequestDispatcher {
     private var routeIntents: [RouteID: RouteIntent]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
         self.routeIntents = Dictionary(uniqueKeysWithValues: (try? routeRepository?.all() ?? [])?.map { ($0.route.id, $0) } ?? [])
     }
 
@@ -82,6 +83,20 @@ public actor CoreRequestDispatcher {
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.stop(requestedVersion: params.version)))), true)
             case .phpStatus:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.status(requestedVersion: params.version)))), true)
+            case .mysqlVersions:
+                let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
+            case .mysqlInstall:
+                let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
+            case .mysqlUse:
+                let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }(); _ = try module.use(params.version); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
+            case .mysqlInitialize:
+                let module = try mysqlModule(); try module.initialize(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: module.status()))), true)
+            case .mysqlStart:
+                let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.start()))), true)
+            case .mysqlStop:
+                let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.stop()))), true)
+            case .mysqlStatus:
+                let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: module.status()))), true)
             case .routingStatus:
                 return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routingStart:
@@ -137,6 +152,8 @@ public actor CoreRequestDispatcher {
             case .invalidWorkingDirectory(let path): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "PHP working directory is unavailable: \(path)")), true)
             default: return (.init(id: request.id, error: .init(code: .internalError, message: "PHP operation failed: \(error)")), true)
             }
+        } catch let error as MySQLModuleError {
+            return (.init(id: request.id, error: map(error)), true)
         } catch let error as ProjectRegistryError {
             return (.init(id: request.id, error: map(error)), true)
         } catch let error as IPCErrorPayload {
@@ -162,6 +179,17 @@ public actor CoreRequestDispatcher {
     }
 
     private func phpModule() throws -> PHPModule { guard let php else { throw IPCErrorPayload(code: .internalError, message: "PHP distribution manifest is not configured.") }; return php }
+    private func mysqlModule() throws -> MySQLModule { guard let mysql else { throw IPCErrorPayload(code: .internalError, message: "MySQL module is not configured.") }; return mysql }
+
+    private func map(_ error: MySQLModuleError) -> IPCErrorPayload {
+        switch error {
+        case .unsupportedVersion, .unsupportedArchitecture, .packageMissing, .notInitialized, .alreadyInitialized, .partialInitialization, .instanceVersionMismatch, .credentialsUnavailable:
+            return .init(code: .invalidRequest, message: "MySQL operation rejected: \(error)")
+        case .portConflict(let port): return .init(code: .invalidRequest, message: "MySQL port conflict on 127.0.0.1:\(port); external processes were not modified.")
+        case .processIdentityMismatch: return .init(code: .invalidRequest, message: "MySQL process identity could not be verified; no process was signaled.")
+        default: return .init(code: .internalError, message: "MySQL operation failed: \(error)")
+        }
+    }
 
     private func map(_ error: ProjectRegistryError) -> IPCErrorPayload {
         switch error {

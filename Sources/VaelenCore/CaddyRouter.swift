@@ -72,7 +72,7 @@ public actor CaddyRouter: Router {
         let runtimeConfiguration = supervisor.configuration
         let httpListen = "127.0.0.1:\(process.httpPort)"
         let httpsListen = "127.0.0.1:\(runtimeConfiguration.httpsPort)"
-        let documents = routes.map { route in
+        let documentEntries: [(String, CaddyRoute)] = routes.flatMap { route in
             let handlers: [CaddyHandler]
             switch route.target {
             case .staticFiles(let documentRoot):
@@ -80,10 +80,14 @@ public actor CaddyRouter: Router {
             case .http(let host, let port):
                 handlers = [.reverseProxy(upstream: "\(host):\(port)")]
             case .fastCGI(let socketPath, let documentRoot):
-                handlers = [.variables(root: documentRoot), .rewrite(uri: "/index.php"), .fastCGI(socketPath: socketPath)]
+                let staticMatcher = CaddyHostMatcher(host: [route.hostname], file: CaddyFileMatcher(root: documentRoot, tryFiles: ["{http.request.uri.path}"]), not: [CaddyPathMatcher(path: ["/*.php"])])
+                let staticRoute = CaddyRoute(match: [staticMatcher], handle: [.fileServer(root: documentRoot)], terminal: true)
+                let fastCGIRoute = CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname])], handle: [.variables(root: documentRoot), .rewrite(uri: "/index.php"), .fastCGI(socketPath: socketPath)], terminal: true)
+                return [(route.hostname, staticRoute), (route.hostname, fastCGIRoute)]
             }
-            return CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname])], handle: handlers, terminal: true)
+            return [(route.hostname, CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname])], handle: handlers, terminal: true))]
         }
+        let documents = documentEntries.map(\.1)
         var leaves = [CaddyCertificateFile]()
         var tlsHostnames = [String]()
         for route in routes where route.tls == .local {
@@ -99,7 +103,7 @@ public actor CaddyRouter: Router {
         let httpServer = CaddyHTTPServer(listen: [httpListen], automaticHTTPS: CaddyAutoHTTPS(disable: true), protocols: ["h1", "h2"], tlsConnectionPolicies: nil, routes: redirects + documents)
         var servers = ["vaelen-http": httpServer]
         if !leaves.isEmpty {
-            let httpsDocuments = documents.enumerated().filter { tlsHostnames.contains(routes[$0.offset].hostname) }.map(\.element)
+            let httpsDocuments = documentEntries.filter { tlsHostnames.contains($0.0) }.map(\.1)
             servers["vaelen-https"] = CaddyHTTPServer(listen: [httpsListen], automaticHTTPS: CaddyAutoHTTPS(disable: true), protocols: ["h1", "h2"], tlsConnectionPolicies: [CaddyTLSConnectionPolicy()], routes: httpsDocuments)
         }
         let tlsApp = leaves.isEmpty ? nil : CaddyTLSApp(certificates: CaddyTLSCertificates(loadFiles: leaves))
@@ -125,7 +129,9 @@ private struct CaddyHTTPApp: Encodable { let servers: [String: CaddyHTTPServer] 
 private struct CaddyHTTPServer: Encodable { let listen: [String]; let automaticHTTPS: CaddyAutoHTTPS; let protocols: [String]; let tlsConnectionPolicies: [CaddyTLSConnectionPolicy]?; let routes: [CaddyRoute]; private enum CodingKeys: String, CodingKey { case listen, automaticHTTPS = "automatic_https", protocols, tlsConnectionPolicies = "tls_connection_policies", routes } }
 private struct CaddyTLSConnectionPolicy: Encodable {}
 private struct CaddyRoute: Encodable { let match: [CaddyHostMatcher]; let handle: [CaddyHandler]; let terminal: Bool }
-private struct CaddyHostMatcher: Encodable { let host: [String] }
+private struct CaddyHostMatcher: Encodable { let host: [String]; let file: CaddyFileMatcher?; let not: [CaddyPathMatcher]?; init(host: [String], file: CaddyFileMatcher? = nil, not: [CaddyPathMatcher]? = nil) { self.host = host; self.file = file; self.not = not } }
+private struct CaddyFileMatcher: Encodable { let root: String; let tryFiles: [String]; private enum CodingKeys: String, CodingKey { case root; case tryFiles = "try_files" } }
+private struct CaddyPathMatcher: Encodable { let path: [String] }
 private struct CaddyUpstream: Encodable { let dial: String }
 private struct CaddyTransport: Encodable { let protocolName: String; let splitPath: [String]; private enum CodingKeys: String, CodingKey { case protocolName = "protocol"; case splitPath = "split_path" } }
 

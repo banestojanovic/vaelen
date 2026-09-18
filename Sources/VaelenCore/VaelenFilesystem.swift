@@ -14,9 +14,11 @@ public struct VaelenFilesystemLayout: Sendable {
     public var packagesDirectoryURL: URL { rootURL.appendingPathComponent("packages", isDirectory: true) }
     public var phpPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("php", isDirectory: true) }
     public var caddyPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
+    public var mysqlPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("mysql", isDirectory: true) }
     public var instancesDirectoryURL: URL { rootURL.appendingPathComponent("instances", isDirectory: true) }
     public var phpInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("php", isDirectory: true) }
     public var caddyInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
+    public var mysqlInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("mysql", isDirectory: true) }
     public var configurationDirectoryURL: URL { rootURL.appendingPathComponent("config", isDirectory: true) }
     public var routingConfigurationDirectoryURL: URL { configurationDirectoryURL.appendingPathComponent("routing", isDirectory: true) }
     public var routingRuntimeDirectoryURL: URL { rootURL.appendingPathComponent("runtime/routing", isDirectory: true) }
@@ -26,6 +28,7 @@ public struct VaelenFilesystemLayout: Sendable {
     public var logsDirectoryURL: URL { FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true) }
     public var phpLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/php", isDirectory: true) }
     public var caddyLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
+    public var mysqlLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/mysql", isDirectory: true) }
     public var dnsInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("dns", isDirectory: true) }
     public var dnsLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("dns", isDirectory: true) }
     public var tlsDirectoryURL: URL { rootURL.appendingPathComponent("tls", isDirectory: true) }

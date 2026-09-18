@@ -45,6 +45,13 @@ public enum CoreMethod: String, Sendable {
     case phpStart = "php.start"
     case phpStop = "php.stop"
     case phpStatus = "php.status"
+    case mysqlVersions = "mysql.versions"
+    case mysqlInstall = "mysql.install"
+    case mysqlUse = "mysql.use"
+    case mysqlInitialize = "mysql.initialize"
+    case mysqlStart = "mysql.start"
+    case mysqlStop = "mysql.stop"
+    case mysqlStatus = "mysql.status"
     case routingStatus = "routing.status"
     case routingStart = "routing.start"
     case routingStop = "routing.stop"
@@ -237,6 +244,10 @@ public struct PHPExecRequest: Codable, Equatable, Sendable { public let version:
 public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
 public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
 public struct PHPStatusResult: Codable, Equatable, Sendable { public let status: PHPStatus; public init(status: PHPStatus) { self.status = status } }
+public struct MySQLPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: MySQLPackage) { version = package.version; architecture = package.architecture } }
+public struct MySQLVersionsPayload: Codable, Equatable, Sendable { public let available: [String]; public let installed: [MySQLPackageWire]; public let `default`: String?; public init(available: [String], installed: [MySQLPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
+public struct MySQLVersionsResult: Codable, Equatable, Sendable { public let mysql: MySQLVersionsPayload; public init(mysql: MySQLVersionsPayload) { self.mysql = mysql } }
+public struct MySQLStatusResult: Codable, Equatable, Sendable { public let mysql: MySQLStatus; public init(mysql: MySQLStatus) { self.mysql = mysql } }
 public struct PHPExecResult: Codable, Equatable, Sendable { public let exitStatus: Int32; public let output: String; public init(exitStatus: Int32, output: String) { self.exitStatus = exitStatus; self.output = output } }
 public struct RouterStatusResult: Codable, Equatable, Sendable { public let router: RouterStatus; public init(router: RouterStatus) { self.router = router } }
 public struct RouteRemoveRequest: Codable, Equatable, Sendable { public let id: RouteID; public init(id: RouteID) { self.id = id } }
@@ -255,6 +266,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
     case phpStatus(PHPStatusResult)
+    case mysqlVersions(MySQLVersionsResult)
+    case mysqlStatus(MySQLStatusResult)
     case phpExec(PHPExecResult)
     case routingStatus(RouterStatusResult)
     case routeList(RouteListResult)
@@ -274,6 +287,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
         case .phpStatus(let value): try value.encode(to: encoder)
+        case .mysqlVersions(let value): try value.encode(to: encoder)
+        case .mysqlStatus(let value): try value.encode(to: encoder)
         case .phpExec(let value): try value.encode(to: encoder)
         case .routingStatus(let value): try value.encode(to: encoder)
         case .routeList(let value): try value.encode(to: encoder)
@@ -295,6 +310,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["project"] != nil, let result = try? IPCCodec.decode(ProjectMutationResult.self, from: data) { self = .projectMutation(result) }
         else if fields["paths"] != nil, let result = try? IPCCodec.decode(ParkedPathListResult.self, from: data) { self = .parkedPathList(result) }
         else if fields["path"] != nil, let result = try? IPCCodec.decode(ParkedPathMutationResult.self, from: data) { self = .parkedPathMutation(result) }
+        else if fields["mysql"] != nil, let result = try? IPCCodec.decode(MySQLVersionsResult.self, from: data) { self = .mysqlVersions(result) }
+        else if fields["mysql"] != nil, let result = try? IPCCodec.decode(MySQLStatusResult.self, from: data) { self = .mysqlStatus(result) }
         else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }
         else if fields["status"] != nil, let result = try? IPCCodec.decode(PHPStatusResult.self, from: data) { self = .phpStatus(result) }
         else if fields["exitStatus"] != nil, let result = try? IPCCodec.decode(PHPExecResult.self, from: data) { self = .phpExec(result) }

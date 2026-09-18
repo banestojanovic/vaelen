@@ -2,6 +2,13 @@ import XCTest
 @testable import VaelenCore
 
 final class DNSCapabilityTests: XCTestCase {
+    func testResponderDiscoveryAcceptsVaelenBuildPathDriftButNotUnrelatedExecutable() {
+        let expected = "/Users/banes/Code/apps/vaelen/.build/debug/vaelendns"
+        XCTAssertTrue(DNSResponderSupervisor.acceptsExecutablePath("/Users/banes/Code/apps/vaelen/.build/out/Products/Debug/vaelendns", expected: expected))
+        XCTAssertFalse(DNSResponderSupervisor.acceptsExecutablePath("/tmp/vaelendns", expected: expected))
+        XCTAssertFalse(DNSResponderSupervisor.acceptsExecutablePath("/Users/banes/Code/apps/vaelen/.build/out/Products/Debug/other", expected: expected))
+    }
+
     func testExternalResolverConflictsWithoutMutation() async throws {
         let helper = FixtureDNSHelper(content: "external resolver A\n")
         let capability = makeCapability(helper: helper)

@@ -62,6 +62,16 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(decoded, response)
     }
 
+    func testMySQLMethodsAndStatusResponseRoundTripThroughJSON() throws {
+        for method in [CoreMethod.mysqlVersions, .mysqlInstall, .mysqlUse, .mysqlInitialize, .mysqlStart, .mysqlStop, .mysqlStatus] {
+            let request = IPCRequest(method: method)
+            XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)).knownMethod, method)
+        }
+        let status = MySQLStatus(state: .stopped, health: "stopped", installedVersion: "8.4.11", selectedVersion: "8.4.11", pid: nil, port: 13306, socket: "/tmp/mysql.sock", datadir: "/tmp/mysql-data", executablePath: "/tmp/mysqld")
+        let response = IPCResponse(id: UUID(), result: .mysqlStatus(MySQLStatusResult(mysql: status)))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
+    }
+
     func testStatusResponseRoundTripsThroughJSON() throws {
         let response = IPCResponse(
             id: UUID(),

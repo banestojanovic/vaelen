@@ -23,7 +23,7 @@ struct VaelenApp: App {
 final class AppModel {
     enum State {
         case connecting
-        case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?, DNSStatus?, TLSStatus?, StandardPortsStatus?)
+        case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?, DNSStatus?, TLSStatus?, StandardPortsStatus?, MySQLStatus?)
         case unavailable
         case incompatible(Int, Int)
     }
@@ -53,8 +53,9 @@ final class AppModel {
             let dns = try? await client.dnsStatus()
             let tls = try? await client.tlsStatus()
             let ports = try? await client.portsStatus()
+            let mysql = try? await client.mysqlStatus()
             guard generation == refreshGeneration else { await client.disconnect(); return }
-            state = .running(status, projects, php, routing, dns, tls, ports)
+            state = .running(status, projects, php, routing, dns, tls, ports, mysql)
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
@@ -72,13 +73,13 @@ final class AppModel {
 
     func trustLocalCA() async {
         trustError = nil
-        guard case .running(_, _, _, _, _, let tls, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+        guard case .running(_, _, _, _, _, let tls, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
         do { try LocalCATrustService().trust(certificateData: data); await refresh() } catch { trustError = error.localizedDescription }
     }
 
     func removeLocalCATrust() async {
         trustError = nil
-        guard case .running(_, _, _, _, _, let tls, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+        guard case .running(_, _, _, _, _, let tls, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
         do { try LocalCATrustService().removeTrust(certificateData: data); await refresh() } catch { trustError = error.localizedDescription }
     }
 
@@ -104,6 +105,10 @@ final class AppModel {
         do { _ = try await client.portsRemove(); await refresh() } catch { trustError = error.localizedDescription }
     }
 
+    func installMySQL() async { trustError = nil; guard let client else { return }; do { _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion); await refresh() } catch { trustError = error.localizedDescription } }
+    func startMySQL() async { trustError = nil; guard let client else { return }; do { let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart(); await refresh() } catch { trustError = error.localizedDescription } }
+    func stopMySQL() async { trustError = nil; guard let client else { return }; do { _ = try await client.mysqlStop(); await refresh() } catch { trustError = error.localizedDescription } }
+
     func monitor() async {
         while !Task.isCancelled {
             await refresh()
@@ -126,7 +131,7 @@ struct StatusView: View {
             case .incompatible(let client, let core):
                 Label("Protocol Incompatible", systemImage: "exclamationmark.circle")
                 Text("Client \(client), Core \(core)").font(.caption)
-            case .running(let status, let projects, let php, let routing, let dns, let tls, let ports):
+            case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let mysql):
                 Label("Core Running", systemImage: "circle.fill").foregroundStyle(.green)
                 Text("Version  \(status.core.version)")
                 Text("PID       \(status.core.pid)")
@@ -146,6 +151,15 @@ struct StatusView: View {
                     Text("Std Ports \(ports.state.rawValue)")
                     if ports.state == .absent || ports.state == .unhealthy { Button("Enable Standard Ports") { Task { await model.installStandardPorts() } } }
                     if ports.state == .healthy || ports.state == .installed { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
+                }
+                if let mysql {
+                    Text("MySQL     \(mysql.state.rawValue)")
+                    Text("Version   \(mysql.selectedVersion ?? "none")")
+                    Text("Port      \(mysql.port)")
+                    if let pid = mysql.pid { Text("PID       \(pid)") }
+                    if mysql.state == .notInstalled { Button("Install MySQL") { Task { await model.installMySQL() } } }
+                    else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy { Button(mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL") { Task { await model.startMySQL() } } }
+                    if mysql.state == .running { Button("Stop MySQL") { Task { await model.stopMySQL() } } }
                 }
                 ForEach(projects.prefix(5), id: \.path) { project in
                     Text("\(project.name) (\(project.registration))")
