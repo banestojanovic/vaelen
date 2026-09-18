@@ -1,4 +1,5 @@
 import XCTest
+@testable import VaelenCore
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
@@ -48,6 +49,17 @@ final class ProtocolTests: XCTestCase {
         let params = try decoded.params?.decode(PHPExecRequest.self)
         XCTAssertEqual(params?.workingDirectory, "/tmp/fixture with spaces")
         XCTAssertEqual(params?.arguments, ["test.php", "--flag", "value with spaces"])
+    }
+
+    func testPortsMethodsAndResponseRoundTripThroughJSON() throws {
+        for method in [CoreMethod.portsStatus, .portsInstall, .portsRemove] {
+            let request = IPCRequest(method: method)
+            let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+            XCTAssertEqual(decoded.knownMethod, method)
+        }
+        let response = IPCResponse(id: UUID(), result: .portsStatus(PortsStatusResult(ports: StandardPortsStatus(state: .healthy))))
+        let decoded = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        XCTAssertEqual(decoded, response)
     }
 
     func testStatusResponseRoundTripsThroughJSON() throws {

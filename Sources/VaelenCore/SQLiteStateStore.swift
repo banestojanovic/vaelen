@@ -9,7 +9,7 @@ public enum SQLiteStateError: Error, Equatable, Sendable {
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public final class SQLiteStateStore: @unchecked Sendable {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 4
     private var database: OpaquePointer?
 
     public init(databaseURL: URL) throws {
@@ -68,6 +68,14 @@ public final class SQLiteStateStore: @unchecked Sendable {
             if version <= 1 {
                 try execute("CREATE TABLE IF NOT EXISTS route_intents (id TEXT PRIMARY KEY NOT NULL, route_json BLOB NOT NULL, project_id TEXT NULL, project_path TEXT NULL)")
                 try execute("PRAGMA user_version = 2")
+            }
+            if version <= 2 {
+                try execute("CREATE TABLE IF NOT EXISTS system_modifications (capability TEXT PRIMARY KEY NOT NULL, installed_content TEXT NOT NULL, previous_content TEXT NULL, active INTEGER NOT NULL)")
+                try execute("PRAGMA user_version = 3")
+            }
+            if version <= 3 {
+                try execute("CREATE TABLE IF NOT EXISTS tls_capability (id INTEGER PRIMARY KEY CHECK (id = 1), ca_fingerprint TEXT NOT NULL, ca_certificate_path TEXT NOT NULL, active INTEGER NOT NULL)")
+                try execute("PRAGMA user_version = 4")
             }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

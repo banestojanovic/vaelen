@@ -3,8 +3,9 @@ import Darwin
 
 public struct CaddyRuntimeConfiguration: Codable, Equatable, Sendable {
     public let httpPort: Int
+    public let httpsPort: Int
 
-    public init(httpPort: Int = 8787) { self.httpPort = httpPort }
+    public init(httpPort: Int = VaelenNetworkPorts.httpBackend, httpsPort: Int = VaelenNetworkPorts.httpsBackend) { self.httpPort = httpPort; self.httpsPort = httpsPort }
 }
 
 public enum CaddyProcessState: String, Codable, Sendable { case stopped, starting, running, degraded, stopping }
@@ -39,7 +40,27 @@ private struct CaddyProcessRecord: Codable, Sendable {
     let configPath: String
     let adminEndpoint: String
     let httpPort: Int
+    let httpsPort: Int
     let startedAt: String
+
+    private enum CodingKeys: String, CodingKey { case pid, version, executablePath, arguments, configPath, adminEndpoint, httpPort, httpsPort, startedAt }
+
+    init(pid: Int32, version: String, executablePath: String, arguments: [String], configPath: String, adminEndpoint: String, httpPort: Int, httpsPort: Int, startedAt: String) {
+        self.pid = pid; self.version = version; self.executablePath = executablePath; self.arguments = arguments; self.configPath = configPath; self.adminEndpoint = adminEndpoint; self.httpPort = httpPort; self.httpsPort = httpsPort; self.startedAt = startedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pid = try container.decode(Int32.self, forKey: .pid)
+        version = try container.decode(String.self, forKey: .version)
+        executablePath = try container.decode(String.self, forKey: .executablePath)
+        arguments = try container.decode([String].self, forKey: .arguments)
+        configPath = try container.decode(String.self, forKey: .configPath)
+        adminEndpoint = try container.decode(String.self, forKey: .adminEndpoint)
+        httpPort = try container.decode(Int.self, forKey: .httpPort)
+        httpsPort = try container.decodeIfPresent(Int.self, forKey: .httpsPort) ?? VaelenNetworkPorts.httpsBackend
+        startedAt = try container.decode(String.self, forKey: .startedAt)
+    }
 }
 
 public actor CaddyProcessSupervisor {
@@ -77,6 +98,7 @@ public actor CaddyProcessSupervisor {
         if current.state == .running, current.health == .healthy { return current }
         if current.state == .degraded { throw CaddyRuntimeError.processIdentityMismatch }
         guard isPortAvailable(configuration.httpPort) else { throw CaddyRuntimeError.portConflict(configuration.httpPort) }
+        guard isPortAvailable(configuration.httpsPort) else { throw CaddyRuntimeError.portConflict(configuration.httpsPort) }
 
         let configURL = layout.routingConfigurationDirectoryURL.appendingPathComponent("caddy.json")
         let admin = adminEndpoint()
@@ -96,7 +118,7 @@ public actor CaddyProcessSupervisor {
         let log = try FileHandle(forWritingTo: logURL)
         process.standardOutput = log; process.standardError = log
         try process.run()
-        let record = CaddyProcessRecord(pid: process.processIdentifier, version: package.version, executablePath: package.executablePath, arguments: arguments, configPath: configURL.path, adminEndpoint: admin, httpPort: configuration.httpPort, startedAt: processStartIdentity(process.processIdentifier))
+        let record = CaddyProcessRecord(pid: process.processIdentifier, version: package.version, executablePath: package.executablePath, arguments: arguments, configPath: configURL.path, adminEndpoint: admin, httpPort: configuration.httpPort, httpsPort: configuration.httpsPort, startedAt: processStartIdentity(process.processIdentifier))
         try atomicWrite(record, to: processRecordURL())
 
         for _ in 0..<60 {
@@ -143,7 +165,7 @@ public actor CaddyProcessSupervisor {
     private func makeDirectories(_ urls: [URL]) throws { for url in urls { try manager.createDirectory(at: url, withIntermediateDirectories: true); try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path) } }
     private func atomicWrite<T: Encodable>(_ value: T, to url: URL) throws { let temporary = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp"); try JSONEncoder().encode(value).write(to: temporary, options: .atomic); if manager.fileExists(atPath: url.path) { _ = try manager.replaceItemAt(url, withItemAt: temporary) } else { try manager.moveItem(at: temporary, to: url) } }
     private func writeInitialConfiguration(to url: URL, admin: String, dataDirectory: URL) throws {
-        let config: [String: Any] = ["admin": ["listen": admin], "storage": ["module": "file_system", "root": dataDirectory.path], "apps": ["http": ["servers": ["vaelen": ["listen": ["127.0.0.1:\(configuration.httpPort)"], "automatic_https": ["disable": true], "routes": []]]]]]
+        let config: [String: Any] = ["admin": ["listen": admin], "storage": ["module": "file_system", "root": dataDirectory.path], "apps": ["http": ["servers": ["vaelen-http": ["listen": ["127.0.0.1:\(configuration.httpPort)"], "automatic_https": ["disable": true], "protocols": ["h1", "h2"], "routes": []]]]]]
         let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .prettyPrinted]); try data.write(to: url, options: .atomic)
     }
     private func isPortAvailable(_ port: Int) -> Bool {

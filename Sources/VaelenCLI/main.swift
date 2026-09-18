@@ -22,8 +22,17 @@ private enum CLICommand {
     case routingStart
     case routingStop
     case routeList(json: Bool)
-    case routeAdd(hostname: String, documentRoot: String, socketPath: String?, projectID: UUID?)
+    case routeAdd(hostname: String, documentRoot: String, socketPath: String?, projectID: UUID?, tls: Bool)
     case routeRemove(RouteID)
+    case dnsStatus(json: Bool)
+    case dnsInstall(takeover: Bool)
+    case dnsRemove
+    case tlsStatus(json: Bool)
+    case tlsInstall
+    case tlsRemove
+    case portsStatus(json: Bool)
+    case portsInstall
+    case portsRemove
 }
 
 private struct ProjectListEnvelope: Encodable { let projects: [ProjectWire] }
@@ -116,18 +125,44 @@ struct VaelenCLIMain {
                 guard args.count >= 4 else { throw CLIError.usage }
                 var socket: String?
                 var projectID: UUID?
+                var tls = false
                 var index = 4
                 while index < args.count {
+                    if args[index] == "--tls" { tls = true; index += 1; continue }
                     guard index + 1 < args.count else { throw CLIError.usage }
                     if args[index] == "--php-socket" { socket = args[index + 1] }
                     else if args[index] == "--project-id" { guard let value = UUID(uuidString: args[index + 1]) else { throw CLIError.usage }; projectID = value }
                     else { throw CLIError.usage }
                     index += 2
                 }
-                return .routeAdd(hostname: args[2], documentRoot: args[3], socketPath: socket, projectID: projectID)
+                return .routeAdd(hostname: args[2], documentRoot: args[3], socketPath: socket, projectID: projectID, tls: tls)
             case "remove":
                 guard args.count == 3, let uuid = UUID(uuidString: args[2]) else { throw CLIError.usage }
                 return .routeRemove(RouteID(rawValue: uuid))
+             default: throw CLIError.usage
+             }
+        case "dns":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "status": return .dnsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "install": return .dnsInstall(takeover: args.dropFirst(2).elementsEqual(["--takeover"]))
+            case "remove": guard args.count == 2 else { throw CLIError.usage }; return .dnsRemove
+            default: throw CLIError.usage
+            }
+        case "tls":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "status": return .tlsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "install": guard args.count == 2 else { throw CLIError.usage }; return .tlsInstall
+            case "remove": guard args.count == 2 else { throw CLIError.usage }; return .tlsRemove
+            default: throw CLIError.usage
+            }
+        case "ports":
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "status": return .portsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "install": guard args.count == 2 else { throw CLIError.usage }; return .portsInstall
+            case "remove": guard args.count == 2 else { throw CLIError.usage }; return .portsRemove
             default: throw CLIError.usage
             }
         default: throw CLIError.usage
@@ -190,12 +225,43 @@ struct VaelenCLIMain {
             let routes = try await client.routeList()
             if json { print(String(decoding: try IPCCodec.encode(RouteListEnvelope(routes: routes)), as: UTF8.self)) }
             else { routes.forEach { intent in print("\(intent.route.id)\t\(intent.route.hostname)\t\(targetDescription(intent.route.target))\tDesired") } }
-        case .routeAdd(let hostname, let documentRoot, let socketPath, let projectID):
+        case .routeAdd(let hostname, let documentRoot, let socketPath, let projectID, let tls):
             let target: RouteTarget = socketPath.map { .fastCGI(socketPath: $0, documentRoot: documentRoot) } ?? .staticFiles(documentRoot: documentRoot)
-            let result = try await client.routeAdd(.init(route: .init(hostname: hostname, target: target, tls: .disabled), projectID: projectID))
+            let result = try await client.routeAdd(.init(route: .init(hostname: hostname, target: target, tls: tls ? .local : .disabled), projectID: projectID))
             print("Added route \(result.route.id)\t\(result.route.hostname)\t\(targetDescription(result.route.target))")
         case .routeRemove(let id):
             _ = try await client.routeRemove(id); print("Removed route \(id)")
+        case .dnsStatus(let json):
+            let result = try await client.dnsStatus()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else {
+                let conflict = result.conflict.map { "\nConflict   \($0)" } ?? ""
+                print("DNS\nState      \(result.state.rawValue)\nOwnership  \(result.ownership.rawValue)\nResolver   \(result.resolverPath)\nAddress    \(result.address):\(result.port)\nPID        \(result.pid.map(String.init) ?? "none")\nHealth     \(result.health)\(conflict)")
+            }
+        case .dnsInstall(let takeover):
+            let result = try await client.dnsInstall(takeover: takeover); print("DNS \(result.state.rawValue) \(result.health)")
+        case .dnsRemove:
+            let result = try await client.dnsRemove(); print("DNS \(result.state.rawValue)")
+        case .tlsStatus(let json):
+            let result = try await client.tlsStatus()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print("Local TLS\nState      \(result.state.rawValue)\nTrust      \(result.trustObserved ? "Trusted" : "Not Trusted")\nPort       \(result.tlsPort)\(result.detail.map { "\\nDetail     \($0)" } ?? "")") }
+        case .tlsInstall:
+            let result = try await client.tlsInstall(); print("Local CA \(result.state.rawValue). Trust requires approval in Vaelen.app.")
+        case .tlsRemove:
+            let result = try await client.tlsRemove(); print("Local TLS \(result.state.rawValue)")
+        case .portsStatus(let json):
+            let result = try await client.portsStatus()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else {
+                let conflict = result.conflict.map { "\nConflict   \($0)" } ?? ""
+                let detail = result.detail.map { "\nDetail     \($0)" } ?? ""
+                print("Standard Local Ports\nState      \(result.state.rawValue)\nHTTP       127.0.0.1:\(result.httpPort) → 127.0.0.1:\(result.backendHTTPPort)\nHTTPS      127.0.0.1:\(result.httpsPort) → 127.0.0.1:\(result.backendHTTPSPort)\(conflict)\(detail)")
+            }
+        case .portsInstall:
+            let result = try await client.portsInstall(); print("Standard Local Ports \(result.state.rawValue).")
+        case .portsRemove:
+            let result = try await client.portsRemove(); print("Standard Local Ports \(result.state.rawValue)")
         }
     }
 

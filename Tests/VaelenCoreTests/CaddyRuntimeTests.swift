@@ -39,7 +39,7 @@ final class CaddyRuntimeTests: XCTestCase {
             _ = try await collisionSupervisor.start()
             XCTFail("expected port collision")
         } catch let error as CaddyRuntimeError {
-            XCTAssertEqual(error, .portConflict(8787))
+            XCTAssertEqual(error, .portConflict(VaelenNetworkPorts.httpBackend))
         }
         close(collisionSocket)
 
@@ -59,7 +59,7 @@ final class CaddyRuntimeTests: XCTestCase {
     private func listenOnConfiguredPort() throws -> Int32 {
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw CaddyRuntimeError.processFailed("socket") }
-        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(8787).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(VaelenNetworkPorts.httpBackend).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
         let result = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         guard result == 0, Darwin.listen(descriptor, 1) == 0 else { close(descriptor); throw CaddyRuntimeError.processFailed("bind") }
         return descriptor

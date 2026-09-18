@@ -26,6 +26,11 @@ public struct VaelenFilesystemLayout: Sendable {
     public var logsDirectoryURL: URL { FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true) }
     public var phpLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/php", isDirectory: true) }
     public var caddyLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
+    public var dnsInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("dns", isDirectory: true) }
+    public var dnsLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("dns", isDirectory: true) }
+    public var tlsDirectoryURL: URL { rootURL.appendingPathComponent("tls", isDirectory: true) }
+    public var tlsCertificatesDirectoryURL: URL { tlsDirectoryURL.appendingPathComponent("certificates", isDirectory: true) }
+    public var tlsLeafDirectoryURL: URL { tlsCertificatesDirectoryURL.appendingPathComponent("leaf", isDirectory: true) }
 }
 
 public enum PathAvailability: String, Codable, Sendable { case available, missing, unreadable, notDirectory }

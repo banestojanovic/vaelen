@@ -51,6 +51,15 @@ public enum CoreMethod: String, Sendable {
     case routeList = "route.list"
     case routeAdd = "route.add"
     case routeRemove = "route.remove"
+    case dnsStatus = "dns.status"
+    case dnsInstall = "dns.install"
+    case dnsRemove = "dns.remove"
+    case tlsStatus = "tls.status"
+    case tlsInstall = "tls.install"
+    case tlsRemove = "tls.remove"
+    case portsStatus = "ports.status"
+    case portsInstall = "ports.install"
+    case portsRemove = "ports.remove"
 }
 
 public enum RequestParams: Codable, Equatable, Sendable {
@@ -64,6 +73,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case phpExec(PHPExecRequest)
     case route(RouteIntent)
     case routeRemove(RouteRemoveRequest)
+    case dnsInstall(DNSInstallRequest)
     case empty
     case raw(JSONValue)
 
@@ -79,6 +89,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .phpExec(let value): try value.encode(to: encoder)
         case .route(let value): try value.encode(to: encoder)
         case .routeRemove(let value): try value.encode(to: encoder)
+        case .dnsInstall(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
@@ -90,6 +101,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
             if fields["client"] != nil, let params = try? IPCCodec.decode(HandshakeParams.self, from: IPCCodec.encode(value)) {
                 self = .handshake(params); return
             }
+            if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
         }
         self = .raw(value)
     }
@@ -229,6 +241,10 @@ public struct PHPExecResult: Codable, Equatable, Sendable { public let exitStatu
 public struct RouterStatusResult: Codable, Equatable, Sendable { public let router: RouterStatus; public init(router: RouterStatus) { self.router = router } }
 public struct RouteRemoveRequest: Codable, Equatable, Sendable { public let id: RouteID; public init(id: RouteID) { self.id = id } }
 public struct RouteListResult: Codable, Equatable, Sendable { public let routes: [RouteIntent]; public init(routes: [RouteIntent]) { self.routes = routes } }
+public struct DNSInstallRequest: Codable, Equatable, Sendable { public let takeover: Bool; public init(takeover: Bool = false) { self.takeover = takeover } }
+public struct DNSStatusResult: Codable, Equatable, Sendable { public let dns: DNSStatus; public init(dns: DNSStatus) { self.dns = dns } }
+public struct TLSStatusResult: Codable, Equatable, Sendable { public let tls: TLSStatus; public init(tls: TLSStatus) { self.tls = tls } }
+public struct PortsStatusResult: Codable, Equatable, Sendable { public let ports: StandardPortsStatus; public init(ports: StandardPortsStatus) { self.ports = ports } }
 
 public enum ResponseResult: Codable, Equatable, Sendable {
     case handshake(HandshakeResult)
@@ -243,6 +259,9 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case routingStatus(RouterStatusResult)
     case routeList(RouteListResult)
     case routeMutation(RouteIntent)
+    case dnsStatus(DNSStatusResult)
+    case tlsStatus(TLSStatusResult)
+    case portsStatus(PortsStatusResult)
     case raw(JSONValue)
 
     public func encode(to encoder: Encoder) throws {
@@ -259,6 +278,9 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .routingStatus(let value): try value.encode(to: encoder)
         case .routeList(let value): try value.encode(to: encoder)
         case .routeMutation(let value): try value.encode(to: encoder)
+        case .dnsStatus(let value): try value.encode(to: encoder)
+        case .tlsStatus(let value): try value.encode(to: encoder)
+        case .portsStatus(let value): try value.encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
     }
@@ -279,6 +301,9 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["router"] != nil, let result = try? IPCCodec.decode(RouterStatusResult.self, from: data) { self = .routingStatus(result) }
         else if fields["routes"] != nil, let result = try? IPCCodec.decode(RouteListResult.self, from: data) { self = .routeList(result) }
         else if fields["route"] != nil, let result = try? IPCCodec.decode(RouteIntent.self, from: data) { self = .routeMutation(result) }
+        else if fields["dns"] != nil, let result = try? IPCCodec.decode(DNSStatusResult.self, from: data) { self = .dnsStatus(result) }
+        else if fields["tls"] != nil, let result = try? IPCCodec.decode(TLSStatusResult.self, from: data) { self = .tlsStatus(result) }
+        else if fields["ports"] != nil, let result = try? IPCCodec.decode(PortsStatusResult.self, from: data) { self = .portsStatus(result) }
         else { self = .raw(value) }
     }
 }

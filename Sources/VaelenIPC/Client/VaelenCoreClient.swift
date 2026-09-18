@@ -109,6 +109,15 @@ public actor VaelenCoreClient {
     public func routeList() async throws -> [RouteIntent] { guard case .routeList(let result) = try result(from: await send(IPCRequest(method: .routeList))) else { throw CoreClientError.invalidResponse }; return result.routes }
     public func routeAdd(_ intent: RouteIntent) async throws -> RouteIntent { guard case .routeMutation(let result) = try result(from: await send(IPCRequest(method: .routeAdd, params: .route(intent)))) else { throw CoreClientError.invalidResponse }; return result }
     public func routeRemove(_ id: RouteID) async throws -> [RouteIntent] { guard case .routeList(let result) = try result(from: await send(IPCRequest(method: .routeRemove, params: .routeRemove(.init(id: id))))) else { throw CoreClientError.invalidResponse }; return result.routes }
+    public func dnsStatus() async throws -> DNSStatus { guard case .dnsStatus(let result) = try result(from: await send(IPCRequest(method: .dnsStatus))) else { throw CoreClientError.invalidResponse }; return result.dns }
+    public func dnsInstall(takeover: Bool = false) async throws -> DNSStatus { guard case .dnsStatus(let result) = try result(from: await send(IPCRequest(method: .dnsInstall, params: .dnsInstall(.init(takeover: takeover))))) else { throw CoreClientError.invalidResponse }; return result.dns }
+    public func dnsRemove() async throws -> DNSStatus { guard case .dnsStatus(let result) = try result(from: await send(IPCRequest(method: .dnsRemove))) else { throw CoreClientError.invalidResponse }; return result.dns }
+    public func tlsStatus() async throws -> TLSStatus { guard case .tlsStatus(let result) = try result(from: await send(IPCRequest(method: .tlsStatus))) else { throw CoreClientError.invalidResponse }; return result.tls }
+    public func tlsInstall() async throws -> TLSStatus { guard case .tlsStatus(let result) = try result(from: await send(IPCRequest(method: .tlsInstall))) else { throw CoreClientError.invalidResponse }; return result.tls }
+    public func tlsRemove() async throws -> TLSStatus { guard case .tlsStatus(let result) = try result(from: await send(IPCRequest(method: .tlsRemove))) else { throw CoreClientError.invalidResponse }; return result.tls }
+    public func portsStatus() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsStatus))) else { throw CoreClientError.invalidResponse }; return result.ports }
+    public func portsInstall() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsInstall))) else { throw CoreClientError.invalidResponse }; return result.ports }
+    public func portsRemove() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsRemove))) else { throw CoreClientError.invalidResponse }; return result.ports }
 
     public func disconnect() async {
         connected = false

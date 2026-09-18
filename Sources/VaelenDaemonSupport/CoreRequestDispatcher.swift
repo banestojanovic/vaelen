@@ -9,11 +9,14 @@ public actor CoreRequestDispatcher {
     private let php: PHPModule?
     private let router: any Router
     private let routeRepository: RouteIntentRepository?
+    private let dns: DNSCapability
+    private let tls: TLSCapability
+    private let ports: StandardPortsCapability
     private var routeIntents: [RouteID: RouteIntent]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil) {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.router = router; self.routeRepository = routeRepository
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
         self.routeIntents = Dictionary(uniqueKeysWithValues: (try? routeRepository?.all() ?? [])?.map { ($0.route.id, $0) } ?? [])
     }
 
@@ -107,6 +110,25 @@ public actor CoreRequestDispatcher {
                 try repository.remove(id: params.id); routeIntents.removeValue(forKey: params.id)
                 if (await router.status()).state == .running { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
                 return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
+            case .dnsStatus:
+                return (.init(id: request.id, result: .dnsStatus(.init(dns: await dns.status()))), true)
+            case .dnsInstall:
+                let params = try request.params?.decode(DNSInstallRequest.self) ?? .init()
+                return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.install(takeover: params.takeover)))), true)
+            case .dnsRemove:
+                return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.remove()))), true)
+            case .tlsStatus:
+                return (.init(id: request.id, result: .tlsStatus(.init(tls: await tls.status()))), true)
+            case .tlsInstall:
+                return (.init(id: request.id, result: .tlsStatus(.init(tls: try await tls.install()))), true)
+            case .tlsRemove:
+                return (.init(id: request.id, result: .tlsStatus(.init(tls: try await tls.remove()))), true)
+            case .portsStatus:
+                return (.init(id: request.id, result: .portsStatus(.init(ports: await ports.status()))), true)
+            case .portsInstall:
+                return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.install()))), true)
+            case .portsRemove:
+                return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.remove()))), true)
             case .handshake:
                 fatalError("handled above")
             }
@@ -119,6 +141,15 @@ public actor CoreRequestDispatcher {
             return (.init(id: request.id, error: map(error)), true)
         } catch let error as IPCErrorPayload {
             return (.init(id: request.id, error: error), true)
+        } catch let error as StandardPortsError {
+            switch error {
+            case .helperUnavailable: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Local Ports require approval in Vaelen.app.")), true)
+            case .authorizationRequired(let detail): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports authorization failed: \(detail)")), true)
+            case .externalConflict(let detail): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports conflict: \(detail)")), true)
+            case .ownershipMismatch: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports ownership mismatch: external state changed.")), true)
+            case .backendUnavailable: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports require the backend router to be running.")), true)
+            case .unavailable(let detail): return (.init(id: request.id, error: .init(code: .internalError, message: "Standard Ports are unavailable: \(detail)")), true)
+            }
         } catch {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
             return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
