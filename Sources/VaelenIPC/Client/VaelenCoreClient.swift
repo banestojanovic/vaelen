@@ -122,7 +122,7 @@ public actor VaelenCoreClient {
         guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpInstall, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version }) ?? result.installed.last else { throw CoreClientError.invalidResponse }; return package
     }
     public func phpUse(_ version: String) async throws -> PHPPackageWire {
-        guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpUse, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version || $0.version.split(separator: ".").prefix(2).joined(separator: ".") == version }) else { throw CoreClientError.invalidResponse }; return package
+        guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpUse, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let resolved = PHPVersionResolver.resolve(version, versionStrings: result.installed.map(\.version)), let package = result.installed.first(where: { $0.version == resolved }) else { throw CoreClientError.invalidResponse }; return package
     }
     public func phpExec(version: String? = nil, workingDirectory: String, arguments: [String]) async throws -> PHPExecResult {
         guard case .phpExec(let result) = try result(from: await send(IPCRequest(method: .phpExec, params: .phpExec(.init(version: version, workingDirectory: workingDirectory, arguments: arguments))))) else { throw CoreClientError.invalidResponse }; return result

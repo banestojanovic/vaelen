@@ -1,6 +1,93 @@
 import Foundation
 import Darwin
 
+public struct PHPVersion: Codable, Comparable, Hashable, Sendable, CustomStringConvertible {
+    public let major: Int
+    public let minor: Int
+    public let patch: Int
+    public let prerelease: String?
+
+    public init?(_ value: String) {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let major = Int(parts[0]),
+              let minor = Int(parts[1]),
+              !parts[2].isEmpty else { return nil }
+        let patchPart = parts[2].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let patch = Int(patchPart[0]), patch >= 0,
+              major >= 0, minor >= 0 else { return nil }
+        self.major = major
+        self.minor = minor
+        self.patch = patch
+        self.prerelease = patchPart.count == 2 && !patchPart[1].isEmpty ? String(patchPart[1]) : nil
+    }
+
+    public init(major: Int, minor: Int, patch: Int, prerelease: String? = nil) {
+        self.major = major; self.minor = minor; self.patch = patch; self.prerelease = prerelease
+    }
+
+    public var isStable: Bool { prerelease == nil }
+    public var family: String { "\(major).\(minor)" }
+    public var description: String { "\(major).\(minor).\(patch)\(prerelease.map { "-\($0)" } ?? "")" }
+
+    public static func < (lhs: PHPVersion, rhs: PHPVersion) -> Bool {
+        if lhs.major != rhs.major { return lhs.major < rhs.major }
+        if lhs.minor != rhs.minor { return lhs.minor < rhs.minor }
+        if lhs.patch != rhs.patch { return lhs.patch < rhs.patch }
+        switch (lhs.prerelease, rhs.prerelease) {
+        case (nil, nil): return false
+        case (nil, _): return false
+        case (_, nil): return true
+        case let (left?, right?): return left < right
+        }
+    }
+}
+
+public struct PHPFamily: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let major: Int
+    public let minor: Int
+
+    public init?(_ value: String) {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 2, let major = Int(parts[0]), let minor = Int(parts[1]), major >= 0, minor >= 0 else { return nil }
+        self.major = major; self.minor = minor
+    }
+
+    public var description: String { "\(major).\(minor)" }
+}
+
+public enum PHPVersionResolver {
+    public static func resolve(_ requested: String, versions: [PHPVersion]) -> PHPVersion? {
+        let stable = versions.filter(\.isStable)
+        if requested == "latest" { return stable.max() }
+        if let exact = PHPVersion(requested), exact.isStable { return stable.first(where: { $0 == exact }) }
+        guard let family = PHPFamily(requested) else { return nil }
+        return stable.filter { $0.major == family.major && $0.minor == family.minor }.max()
+    }
+
+    public static func resolve(_ requested: String, versionStrings: [String]) -> String? {
+        guard let version = resolve(requested, versions: versionStrings.compactMap(PHPVersion.init)) else { return nil }
+        return version.description
+    }
+}
+
+public enum PHPPackageEligibility: String, Codable, Sendable {
+    case eligible
+    case invalid
+    case ambiguous
+}
+
+public struct PHPInstalledPackageObservation: Codable, Equatable, Sendable {
+    public let package: PHPPackage?
+    public let version: String?
+    public let eligibility: PHPPackageEligibility
+    public let reason: String?
+
+    public init(package: PHPPackage?, version: String?, eligibility: PHPPackageEligibility, reason: String? = nil) {
+        self.package = package; self.version = version; self.eligibility = eligibility; self.reason = reason
+    }
+}
+
 public struct PHPArtifact: Codable, Equatable, Sendable {
     public let file: String
     public let url: String
@@ -104,6 +191,7 @@ private struct PHPProcessRecord: Codable, Sendable {
     let arguments: [String]
     let configPath: String
     let socketPath: String
+    let startedAt: String?
 }
 
 private struct PHPDevelopmentConfiguration: Codable, Sendable {
@@ -134,8 +222,36 @@ public final class PHPModule: @unchecked Sendable {
     public func availableVersions() throws -> [String] { [try location.manifest().phpVersion] }
 
     public func installedVersions() -> [PHPPackage] {
+        packageObservations().compactMap(\.package).sorted { lhs, rhs in
+            guard let left = PHPVersion(lhs.version), let right = PHPVersion(rhs.version) else { return lhs.version < rhs.version }
+            return left < right
+        }
+    }
+
+    public func packageObservations() -> [PHPInstalledPackageObservation] {
         guard let entries = try? manager.contentsOfDirectory(at: layout.phpPackagesDirectoryURL, includingPropertiesForKeys: nil) else { return [] }
-        return entries.compactMap { try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: $0.appendingPathComponent(".vaelen-package.json"))) }.sorted { $0.version < $1.version }
+        let observations = entries.map { observePackage(at: $0) }
+        let eligibleVersions = observations.compactMap { observation -> String? in
+            guard observation.eligibility == .eligible, let package = observation.package else { return nil }
+            return package.version
+        }
+        let duplicateVersions = Set(eligibleVersions.filter { version in eligibleVersions.filter { $0 == version }.count > 1 })
+        return observations.map { observation in
+            guard let version = observation.package?.version, duplicateVersions.contains(version), observation.eligibility == .eligible else { return observation }
+            return .init(package: observation.package, version: version, eligibility: .ambiguous, reason: "Duplicate eligible package identity for PHP \(version).")
+        }
+    }
+
+    public func eligibleInstalledVersions() -> [PHPPackage] {
+        packageObservations().filter { $0.eligibility == .eligible }.compactMap(\.package).sorted { lhs, rhs in
+            PHPVersion(lhs.version)! < PHPVersion(rhs.version)!
+        }
+    }
+
+    public func resolveEligible(_ requested: String) throws -> PHPPackage {
+        let packages = eligibleInstalledVersions()
+        if let version = PHPVersionResolver.resolve(requested, versionStrings: packages.map(\.version)), let value = packages.first(where: { $0.version == version }) { return value }
+        throw PHPModuleError.packageMissing(requested)
     }
 
     public func install(requestedVersion: String) throws -> PHPPackage {
@@ -169,7 +285,7 @@ public final class PHPModule: @unchecked Sendable {
     }
 
     public func setDefault(requestedVersion: String) throws -> PHPPackage {
-        let package = try resolveInstalled(requestedVersion)
+        let package = try resolveEligible(requestedVersion)
         try makeDirectories([layout.configurationDirectoryURL])
         try atomicWrite(package.version, to: layout.configurationDirectoryURL.appendingPathComponent("php-default.json"))
         return package
@@ -199,12 +315,12 @@ public final class PHPModule: @unchecked Sendable {
             }
             return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "identity-unverified", isDefault: defaultVersion() == version)
         }
-        let healthy = manager.fileExists(atPath: socket) && isSocket(socket)
+        let healthy = manager.fileExists(atPath: socket) && isSocket(socket) && isSocketReady(socket)
         return PHPStatus(version: version, package: package, state: healthy ? .running : .degraded, pid: record.pid, socket: socket, health: healthy ? "healthy" : "not-ready", isDefault: defaultVersion() == version)
     }
 
     public func start(requestedVersion: String) throws -> PHPStatus {
-        let package = try resolveInstalled(requestedVersion); let current = try status(requestedVersion: package.version)
+        let package = try resolveEligible(requestedVersion); let current = try status(requestedVersion: package.version)
         if current.state == .running { return current }
         if current.state == .degraded {
             if let record = processRecord(package.version), processExists(record.pid) {
@@ -221,9 +337,9 @@ public final class PHPModule: @unchecked Sendable {
         if !manager.fileExists(atPath: log.path) { manager.createFile(atPath: log.path, contents: nil) }
         let process = Process(); process.executableURL = URL(fileURLWithPath: package.fpmPath); process.arguments = ["-y", config.path, "-F"]; process.standardOutput = try FileHandle(forWritingTo: log); process.standardError = process.standardOutput
         try process.run()
-        let record = PHPProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.fpmPath, arguments: process.arguments ?? [], configPath: config.path, socketPath: socket)
+        let record = PHPProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.fpmPath, arguments: process.arguments ?? [], configPath: config.path, socketPath: socket, startedAt: processStartIdentity(process.processIdentifier))
         try atomicWrite(record, to: processRecordURL(package.version));
-        for _ in 0..<40 { if let result = try? status(requestedVersion: package.version), result.state == .running { return result }; usleep(50_000) }
+        for _ in 0..<40 { if let result = try? status(requestedVersion: package.version), result.state == .running, result.health == "healthy" { return result }; usleep(50_000) }
         if processMatches(record) { _ = kill(record.pid, SIGQUIT) }
         try? manager.removeItem(at: processRecordURL(package.version))
         try? manager.removeItem(atPath: socket)
@@ -239,10 +355,36 @@ public final class PHPModule: @unchecked Sendable {
     }
 
     private func resolveInstalled(_ requested: String) throws -> PHPPackage {
-        let packages = installedVersions(); if requested == "latest", let value = packages.last { return value }
-        if let exact = packages.first(where: { $0.version == requested }) { return exact }
-        if let minor = packages.filter({ $0.version.split(separator: ".").prefix(2).joined(separator: ".") == requested }).last { return minor }
+        let packages = installedVersions()
+        if let version = PHPVersionResolver.resolve(requested, versionStrings: packages.map(\.version)), let value = packages.first(where: { $0.version == version }) { return value }
         throw PHPModuleError.packageMissing(requested)
+    }
+
+    private func observePackage(at directory: URL) -> PHPInstalledPackageObservation {
+        let metadataURL = directory.appendingPathComponent(".vaelen-package.json")
+        guard let data = try? Data(contentsOf: metadataURL), let package = try? JSONDecoder().decode(PHPPackage.self, from: data) else {
+            return .init(package: nil, version: directory.lastPathComponent, eligibility: .invalid, reason: "Package metadata is missing or invalid.")
+        }
+        guard let version = PHPVersion(package.version) else { return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package version is malformed.") }
+        guard version.isStable else { return .init(package: package, version: package.version, eligibility: .invalid, reason: "Prerelease PHP packages are not eligible for project resolution.") }
+        guard URL(fileURLWithPath: package.packagePath).standardizedFileURL == directory.standardizedFileURL,
+              directory.lastPathComponent == package.version else { return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package metadata does not match its package directory.") }
+        guard package.architecture == "arm64" else { return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package architecture is incompatible.") }
+        do {
+            try validateInstalledExecutable(package.cliPath, expected: package.version, name: "php")
+            try validateInstalledExecutable(package.fpmPath, expected: package.version, name: "php-fpm")
+        } catch {
+            return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package executable validation failed.")
+        }
+        return .init(package: package, version: package.version, eligibility: .eligible)
+    }
+
+    private func validateInstalledExecutable(_ path: String, expected: String, name: String) throws {
+        guard manager.isExecutableFile(atPath: path) else { throw PHPModuleError.validationFailed("missing \(name)") }
+        let fileOutput = try command("/usr/bin/file", [path])
+        guard fileOutput.contains("Mach-O 64-bit executable arm64") else { throw PHPModuleError.validationFailed("unexpected \(name) architecture") }
+        let output = try command(path, ["-v"])
+        guard output.contains(expected) else { throw PHPModuleError.validationFailed("unexpected \(name) version") }
     }
     private func acquire(_ artifact: PHPArtifact, base: URL?) throws -> URL {
         let destination = layout.downloadsDirectoryURL.appendingPathComponent(artifact.file)
@@ -279,8 +421,22 @@ public final class PHPModule: @unchecked Sendable {
     private func processRecordURL(_ version: String) -> URL { layout.phpInstancesDirectoryURL.appendingPathComponent(version).appendingPathComponent("process.json") }
     private func processRecord(_ version: String) -> PHPProcessRecord? { try? JSONDecoder().decode(PHPProcessRecord.self, from: Data(contentsOf: processRecordURL(version))) }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
-    private func processMatches(_ record: PHPProcessRecord) -> Bool { guard processExists(record.pid) else { return false }; let output = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])) ?? ""; let executableName = URL(fileURLWithPath: record.executable).lastPathComponent; return output.contains(executableName) && output.contains(record.configPath) }
-    private func isSocket(_ path: String) -> Bool { var info = stat(); return lstat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFSOCK }
+    private func processMatches(_ record: PHPProcessRecord) -> Bool {
+        guard processExists(record.pid) else { return false }
+        let user = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "user="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let startedAt = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let openExecutable = (try? command("/usr/sbin/lsof", ["-p", "\(record.pid)", "-a", "-d", "txt", "-Fn"])) ?? ""
+        let executableMatches = openExecutable.split(separator: "\n").contains { $0 == Substring("n\(record.executable)") }
+        let configMatches = manager.fileExists(atPath: record.configPath)
+        return executableMatches && configMatches && user == NSUserName() && (record.startedAt == nil || record.startedAt == startedAt)
+    }
+    private func isSocket(_ path: String) -> Bool { var info = stat(); return lstat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFSOCK && info.st_uid == getuid() }
+    private func isSocketReady(_ path: String) -> Bool {
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0); guard descriptor >= 0 else { return false }; defer { close(descriptor) }
+        var address = sockaddr_un(); address.sun_family = sa_family_t(AF_UNIX); path.withCString { pointer in withUnsafeMutableBytes(of: &address.sun_path) { bytes in bytes.copyBytes(from: UnsafeRawBufferPointer(start: pointer, count: min(path.utf8.count + 1, bytes.count))) } }
+        return withUnsafePointer(to: &address) { pointer in pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0 } }
+    }
+    private func processStartIdentity(_ pid: Int32) -> String? { try? command("/bin/ps", ["-p", "\(pid)", "-o", "lstart="]).trimmingCharacters(in: .whitespacesAndNewlines) }
     private func makeDirectories(_ urls: [URL]) throws { for url in urls { try manager.createDirectory(at: url, withIntermediateDirectories: true); try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path) } }
     private func atomicWrite<T: Encodable>(_ value: T, to url: URL) throws { try atomicWrite(IPCJSON.encoder.encode(value), to: url) }
     private func atomicWrite(_ value: String, to url: URL) throws { try atomicWrite(Data(value.utf8), to: url) }

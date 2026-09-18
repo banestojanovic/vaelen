@@ -2,6 +2,28 @@ import XCTest
 @testable import VaelenCore
 
 final class PHPModuleTests: XCTestCase {
+    func testNumericPHPVersionResolutionUsesHighestStablePatch() {
+        XCTAssertEqual(PHPVersionResolver.resolve("8.4", versionStrings: ["8.4.9", "8.4.23", "8.3.99"]), "8.4.23")
+        XCTAssertEqual(PHPVersionResolver.resolve("8.4.9", versionStrings: ["8.4.9", "8.4.23"]), "8.4.9")
+        XCTAssertEqual(PHPVersionResolver.resolve("latest", versionStrings: ["8.4.9", "8.4.23", "8.3.30"]), "8.4.23")
+        XCTAssertNil(PHPVersionResolver.resolve("8.5", versionStrings: ["8.4.23"]))
+        XCTAssertNil(PHPVersionResolver.resolve("8.4", versionStrings: ["8.4.23-beta1"]))
+    }
+
+    func testInvalidInstalledPHPMetadataIsObservedButIneligible() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageRoot = root.appendingPathComponent("support/packages/php/8.4.23")
+        try FileManager.default.createDirectory(at: packageRoot, withIntermediateDirectories: true)
+        let package = PHPPackage(version: "8.4.23", architecture: "arm64", packagePath: packageRoot.path, cliPath: "/missing/php", fpmPath: "/missing/php-fpm", source: "fixture", cliSHA256: String(repeating: "0", count: 64), fpmSHA256: String(repeating: "0", count: 64), installedAt: Date())
+        try JSONEncoder().encode(package).write(to: packageRoot.appendingPathComponent(".vaelen-package.json"))
+        let module = PHPModule(layout: VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support")), location: FilePHPManifestLocation(manifestURL: root.appendingPathComponent("manifest.json")))
+        let observation = try XCTUnwrap(module.packageObservations().first)
+        XCTAssertEqual(observation.version, "8.4.23")
+        XCTAssertEqual(observation.eligibility, .invalid)
+        XCTAssertTrue(module.eligibleInstalledVersions().isEmpty)
+    }
+
     func testChecksumFailureDoesNotCreatePackage() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let release = root.appendingPathComponent("release")

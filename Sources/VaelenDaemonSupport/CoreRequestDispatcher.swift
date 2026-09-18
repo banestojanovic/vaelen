@@ -232,7 +232,9 @@ public actor CoreRequestDispatcher {
     }
 
     private func projectEnvironmentReport(for project: Project) async throws -> ProjectEnvironmentReport {
-        let phpPackages = php?.installedVersions() ?? []
+        let phpObservations = php?.packageObservations() ?? []
+        let phpPackages = phpObservations.filter { $0.eligibility == .eligible }.compactMap(\.package)
+        let invalidPHPVersions = phpObservations.filter { $0.eligibility != .eligible }.compactMap(\.version)
         let phpStatuses = phpPackages.compactMap { try? php?.status(requestedVersion: $0.version) }.compactMap { $0 }
         let routerStatus = await router.status()
         let report = ProjectEnvironmentInspector().inspect(
@@ -246,17 +248,21 @@ public actor CoreRequestDispatcher {
             router: routerStatus,
             dns: await dns.status(),
             tls: await tls.status(),
-            standardPorts: await ports.status()
+            standardPorts: await ports.status(),
+            invalidPHPVersions: invalidPHPVersions
         )
         return report
     }
 
     private func activate(project: Project) async throws -> ProjectReconciliationExecutionResult {
         let planner = ProjectReconciliationPlanner()
-        let initialPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
-        let freshPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        let initialReport = try await projectEnvironmentReport(for: project)
+        let initialPlan = planner.plan(report: initialReport)
+        let freshReport = try await projectEnvironmentReport(for: project)
+        let freshPlan = planner.plan(report: freshReport)
         var results = [ProjectReconciliationOperationResult]()
         var startedMailpit = false
+        var startedPHP = false
 
         for operation in initialPlan.operations {
             guard operation.disposition != .satisfied else {
@@ -267,20 +273,35 @@ public actor CoreRequestDispatcher {
                 results.append(.init(operationID: operation.id, state: .blocked, message: operation.reason ?? "Operation is not executable in M8 Slice 1.", verified: false))
                 continue
             }
-            guard operation.id == "mailpit.start", let current = freshPlan.operations.first(where: { $0.id == operation.id }), current.disposition == .actionable else {
+            guard let current = freshPlan.operations.first(where: { $0.id == operation.id }), current.disposition == .actionable else {
                 results.append(.init(operationID: operation.id, state: .skipped, message: "The plan became stale before execution; no mutation performed.", verified: false))
                 continue
             }
-            guard let mailpit else {
-                results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit module is unavailable.", verified: false))
-                continue
-            }
-            do {
-                _ = try mailpit.start()
-                startedMailpit = true
-                results.append(.init(operationID: operation.id, state: .succeeded, message: "Mailpit start requested; final health verification follows.", verified: false))
-            } catch {
-                results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit start failed; actual state was re-observed.", verified: false))
+            switch operation.id {
+            case "mailpit.start":
+                guard let mailpit else {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit module is unavailable.", verified: false)); continue
+                }
+                do {
+                    _ = try mailpit.start()
+                    startedMailpit = true
+                    results.append(.init(operationID: operation.id, state: .succeeded, message: "Mailpit start requested; final health verification follows.", verified: false))
+                } catch {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit start failed; actual state was re-observed.", verified: false))
+                }
+            case "php.fpm.start":
+                guard let php, let version = freshReport.observed.php.resolvedVersion else {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "The desired PHP runtime is unavailable at execution time.", verified: false)); continue
+                }
+                do {
+                    _ = try php.start(requestedVersion: version)
+                    startedPHP = true
+                    results.append(.init(operationID: operation.id, state: .succeeded, message: "PHP-FPM start requested; final socket and readiness verification follows.", verified: false))
+                } catch {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "PHP-FPM start failed; actual state was re-observed.", verified: false))
+                }
+            default:
+                results.append(.init(operationID: operation.id, state: .skipped, message: "This operation is not executable in M9.", verified: false))
             }
         }
 
@@ -288,6 +309,10 @@ public actor CoreRequestDispatcher {
         if startedMailpit, let resultIndex = results.firstIndex(where: { $0.operationID == "mailpit.start" }) {
             let healthy = finalPlan.operations.first(where: { $0.id == "mailpit.start" })?.disposition == .satisfied
             results[resultIndex] = .init(operationID: "mailpit.start", state: healthy ? .succeeded : .failed, message: healthy ? "Mailpit is healthy after activation." : "Mailpit did not verify healthy after activation.", verified: healthy)
+        }
+        if startedPHP, let resultIndex = results.firstIndex(where: { $0.operationID == "php.fpm.start" }) {
+            let healthy = finalPlan.operations.first(where: { $0.id == "php.fpm.start" })?.disposition == .satisfied
+            results[resultIndex] = .init(operationID: "php.fpm.start", state: healthy ? .succeeded : .failed, message: healthy ? "PHP-FPM is healthy after activation." : "PHP-FPM did not verify healthy after activation.", verified: healthy)
         }
         let state: ProjectReconciliationExecutionState
         if finalPlan.state == .satisfied && results.allSatisfy({ $0.state == .satisfied || $0.state == .succeeded }) {

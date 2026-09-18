@@ -3,7 +3,7 @@ import XCTest
 @testable import VaelenCore
 
 final class ProjectReconciliationTests: XCTestCase {
-    private func report(php: String? = "8.4", resolvedPHP: String? = "8.4.23", phpRunning: Bool = true, mysql: MySQLStatus? = nil, mailpit: MailpitStatus? = nil, secureWeb: Bool? = true, dbMatches: Bool? = true, mailMatches: Bool? = true, dnsHealth: String = "healthy", registration: ProjectRegistrationKind = .linked) -> ProjectEnvironmentReport {
+    private func report(php: String? = "8.4", resolvedPHP: String? = "8.4.23", phpRunning: Bool = true, mysql: MySQLStatus? = nil, mailpit: MailpitStatus? = nil, secureWeb: Bool? = true, dbMatches: Bool? = true, mailMatches: Bool? = true, dnsHealth: String = "healthy", registration: ProjectRegistrationKind = .linked, routeTargetMatchesPHP: Bool? = nil) -> ProjectEnvironmentReport {
         let root = CanonicalPath(url: URL(fileURLWithPath: "/tmp/reconciliation-fixture", isDirectory: true))
         let project = Project(id: registration == .linked ? ProjectID() : nil, name: "fixture", rootPath: root, registrationKind: registration, availability: .available)
         let desired = ProjectDesiredEnvironment(file: .valid, php: php, secureWeb: secureWeb, mysql: mysql != nil, mailpit: mailpit != nil)
@@ -11,7 +11,7 @@ final class ProjectReconciliationTests: XCTestCase {
         let observedPHP = ProjectObservedPHP(installedVersions: resolvedPHP.map { [$0] } ?? [], runningVersions: phpRunning ? (resolvedPHP.map { [$0] } ?? []) : [], resolvedVersion: resolvedPHP, resolvedState: resolvedPHP == nil ? "unresolved" : (phpRunning ? "running" : "not-running"), defaultVersion: resolvedPHP)
         let observedRoute = ProjectObservedRoute(intentExists: true, hostname: "fixture.test", documentRoot: "/tmp/reconciliation-fixture/public", target: "fastcgi socket", tls: .local, routerState: .running, routerHealth: .healthy)
         let observed = ProjectObservedEnvironment(php: observedPHP, mysql: mysql, mailpit: mailpit, route: observedRoute, dns: DNSStatus(state: .installed, ownership: .vaelen, health: dnsHealth), tls: TLSStatus(state: .trusted, trustObserved: true), standardPorts: StandardPortsStatus(state: .healthy))
-        let derived = ProjectDerivedEnvironment(framework: ProjectFrameworkInspection(framework: "Laravel", confidence: .high, evidence: ["artisan"], suggestedDocumentRoot: "public/"), phpResolution: resolvedPHP == nil ? "desired \(php ?? "unknown") is unavailable" : "\(php ?? "unknown") resolves to \(resolvedPHP!)", dbEndpoint: .init(configuredHost: "127.0.0.1", configuredPort: "13306", expectedHost: "127.0.0.1", expectedPort: 13306, matches: dbMatches), mailEndpoint: .init(configuredHost: "127.0.0.1", configuredPort: "11025", expectedHost: "127.0.0.1", expectedPort: 11025, matches: mailMatches), mailAuthentication: .init(requirement: .unknown), routeDocumentRootMatches: true, configCache: .init(state: "absent", cachePath: root.string + "/bootstrap/cache/config.php"))
+        let derived = ProjectDerivedEnvironment(framework: ProjectFrameworkInspection(framework: "Laravel", confidence: .high, evidence: ["artisan"], suggestedDocumentRoot: "public/"), phpResolution: resolvedPHP == nil ? "desired \(php ?? "unknown") is unavailable" : "\(php ?? "unknown") resolves to \(resolvedPHP!)", dbEndpoint: .init(configuredHost: "127.0.0.1", configuredPort: "13306", expectedHost: "127.0.0.1", expectedPort: 13306, matches: dbMatches), mailEndpoint: .init(configuredHost: "127.0.0.1", configuredPort: "11025", expectedHost: "127.0.0.1", expectedPort: 11025, matches: mailMatches), mailAuthentication: .init(requirement: .unknown), routeDocumentRootMatches: true, routeTargetMatchesPHP: routeTargetMatchesPHP, configCache: .init(state: "absent", cachePath: root.string + "/bootstrap/cache/config.php"))
         return ProjectEnvironmentReport(identity: .init(project: project), desired: desired, configured: configured, observed: observed, derived: derived, secret: .init(databasePassword: .available, mailPassword: .missing), diagnostics: [])
     }
 
@@ -50,7 +50,7 @@ final class ProjectReconciliationTests: XCTestCase {
         XCTAssertEqual(plan.state, .blocked)
         XCTAssertTrue(plan.operations.contains { $0.id == "application.db-endpoint" && $0.mutationClass == .applicationMutation })
         XCTAssertTrue(plan.operations.contains { $0.id == "application.mail-endpoint" && $0.mutationClass == .applicationMutation })
-        XCTAssertTrue(plan.operations.contains { $0.id == "php.install" && $0.reason?.contains("PHP_FAMILY_UNAVAILABLE") == true })
+        XCTAssertTrue(plan.operations.contains { $0.id == "php.fpm.start" && $0.reason?.contains("PHP_FAMILY_UNAVAILABLE") == true })
         let encoded = String(decoding: try JSONEncoder().encode(plan), as: UTF8.self)
         XCTAssertFalse(encoded.contains("password"))
         XCTAssertFalse(encoded.contains("app-key"))
@@ -67,5 +67,26 @@ final class ProjectReconciliationTests: XCTestCase {
         let plan = ProjectReconciliationPlanner().plan(report: report(mysql: nil, mailpit: healthyMailpit(), dnsHealth: "stopped"))
         XCTAssertEqual(plan.operations.first { $0.id == "dns.install" }?.disposition, .authorizationRequired)
         XCTAssertEqual(plan.operations.first { $0.id == "dns.install" }?.requiresPrivilege, true)
+    }
+
+    func testStoppedPHPFPMIsActionable() {
+        let plan = ProjectReconciliationPlanner().plan(report: report(phpRunning: false, mysql: nil, mailpit: healthyMailpit()))
+        XCTAssertEqual(plan.operations.first { $0.id == "php.fpm.start" }?.disposition, .actionable)
+        XCTAssertEqual(plan.operations.first { $0.id == "php.fpm.start" }?.requiresNetwork, false)
+        XCTAssertEqual(plan.operations.first { $0.id == "php.fpm.start" }?.requiresPrivilege, false)
+    }
+
+    func testDNSBlockerDoesNotMakeStoppedPHPNonActionable() {
+        let plan = ProjectReconciliationPlanner().plan(report: report(phpRunning: false, mysql: nil, mailpit: healthyMailpit(), dnsHealth: "stopped"))
+        XCTAssertEqual(plan.state, .blocked)
+        XCTAssertEqual(plan.operations.first { $0.id == "php.fpm.start" }?.disposition, .actionable)
+        XCTAssertEqual(plan.operations.first { $0.id == "dns.install" }?.disposition, .authorizationRequired)
+    }
+
+    func testRoutePHPMismatchIsBlockedAndReadOnly() {
+        let plan = ProjectReconciliationPlanner().plan(report: report(mysql: nil, mailpit: healthyMailpit(), routeTargetMatchesPHP: false))
+        let route = plan.operations.first { $0.id == "route.reconcile" }
+        XCTAssertEqual(route?.disposition, .blocked)
+        XCTAssertTrue(route?.reason?.contains("does not mutate routes") == true)
     }
 }

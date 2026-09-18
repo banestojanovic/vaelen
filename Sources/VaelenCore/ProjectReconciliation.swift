@@ -77,6 +77,7 @@ public enum ProjectReconciliationResourceState: String, Codable, Equatable, Send
     case unhealthy
     case mismatch
     case conflict
+    case invalid
     case unknown
 }
 
@@ -183,15 +184,22 @@ public struct ProjectReconciliationPlanner: Sendable {
 
     private func appendPHP(report: ProjectEnvironmentReport, to operations: inout [ProjectReconciliationOperation]) {
         guard let desired = report.desired.php else { return }
-        if report.derived.phpResolution.contains("unavailable") {
-            operations.append(.init(id: "php.install", resource: .php, action: .install, currentState: .unavailable, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .deferred, reason: "PHP_FAMILY_UNAVAILABLE: desired PHP family \(desired) is not installed; package installation is deferred in M8 Slice 1.", requiresNetwork: true))
+        if report.observed.php.resolutionState == .unavailable {
+            operations.append(.init(id: "php.fpm.start", resource: .php, action: .start, currentState: .unavailable, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "PHP_FAMILY_UNAVAILABLE: desired family \(desired) has no eligible installed PHP package; installation is not performed by project activation."))
             return
         }
-        let status = report.observed.php.runningVersions.contains { $0 == report.observed.php.resolvedVersion }
-        if status {
-            operations.append(satisfied(id: "php.start", resource: .php, state: .running, ownership: .vaelen))
+        if report.observed.php.resolutionState == .invalid {
+            operations.append(.init(id: "php.fpm.start", resource: .php, action: .start, currentState: .invalid, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "The desired PHP family has installed package material, but no package passed eligibility validation."))
+            return
+        }
+        if report.observed.php.resolutionState != .resolved {
+            operations.append(.init(id: "php.fpm.start", resource: .php, action: .start, currentState: .unknown, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "The desired PHP family could not be resolved safely."))
+        } else if report.observed.php.resolvedState == PHPFPMState.running.rawValue && report.observed.php.fpmHealth == "healthy" {
+            operations.append(satisfied(id: "php.fpm.start", resource: .php, state: .running, ownership: .vaelen))
+        } else if report.observed.php.resolvedState == PHPFPMState.stopped.rawValue || report.observed.php.fpmHealth == "stopped" || report.observed.php.fpmHealth == "not-running" {
+            operations.append(.init(id: "php.fpm.start", resource: .php, action: .start, currentState: .stopped, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .actionable, reason: "The eligible Vaelen PHP-FPM runtime \(report.observed.php.resolvedVersion ?? desired) is stopped.", preconditions: ["PHP family resolves to an eligible exact package", "FPM executable belongs to that package", "No process or socket ownership conflict exists", "FPM socket is verified after start"]))
         } else {
-            operations.append(.init(id: "php.start", resource: .php, action: .start, currentState: .stopped, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .deferred, reason: "PHP-FPM start is deferred in M8 Slice 1."))
+            operations.append(.init(id: "php.fpm.start", resource: .php, action: .start, currentState: .unhealthy, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "The eligible PHP-FPM runtime is not healthy or safely startable."))
         }
     }
 
@@ -232,6 +240,8 @@ public struct ProjectReconciliationPlanner: Sendable {
             operations.append(.init(id: "route.reconcile", resource: .route, action: .reconcile, currentState: .missing, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .deferred, reason: "Route creation is deferred; M8 Slice 1 does not invent a hostname or mutate route_intents."))
         } else if report.derived.routeDocumentRootMatches == false {
             operations.append(.init(id: "route.reconcile", resource: .route, action: .reconcile, currentState: .mismatch, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "The existing route document root does not match the framework-derived document root."))
+        } else if report.derived.routeTargetMatchesPHP == false {
+            operations.append(.init(id: "route.reconcile", resource: .route, action: .reconcile, currentState: .mismatch, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "The existing route targets a different PHP socket; M9 observes this mismatch but does not mutate routes."))
         } else if report.observed.route.routerState == .running && report.observed.route.routerHealth == .healthy {
             operations.append(satisfied(id: "route.reconcile", resource: .route, state: .satisfied, ownership: .vaelen))
         } else {

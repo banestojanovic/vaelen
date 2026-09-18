@@ -33,6 +33,13 @@ public enum ProjectMailAuthenticationRequirement: String, Codable, Sendable {
     case notApplicable
 }
 
+public enum PHPResolutionState: String, Codable, Sendable {
+    case notRequested
+    case resolved
+    case unavailable
+    case invalid
+}
+
 public struct ProjectMailAuthentication: Codable, Equatable, Sendable {
     public let requirement: ProjectMailAuthenticationRequirement
     public let evidence: [String]
@@ -179,17 +186,27 @@ public struct ProjectEndpointObservation: Codable, Equatable, Sendable {
 
 public struct ProjectObservedPHP: Codable, Equatable, Sendable {
     public let installedVersions: [String]
+    public let invalidVersions: [String]
     public let runningVersions: [String]
     public let resolvedVersion: String?
     public let resolvedState: String
     public let defaultVersion: String?
+    public let resolutionState: PHPResolutionState
+    public let fpmPID: Int32?
+    public let fpmSocket: String?
+    public let fpmHealth: String
 
-    public init(installedVersions: [String], runningVersions: [String], resolvedVersion: String?, resolvedState: String, defaultVersion: String?) {
+    public init(installedVersions: [String], invalidVersions: [String] = [], runningVersions: [String], resolvedVersion: String?, resolvedState: String, defaultVersion: String?, resolutionState: PHPResolutionState? = nil, fpmPID: Int32? = nil, fpmSocket: String? = nil, fpmHealth: String? = nil) {
         self.installedVersions = installedVersions
+        self.invalidVersions = invalidVersions
         self.runningVersions = runningVersions
         self.resolvedVersion = resolvedVersion
         self.resolvedState = resolvedState
         self.defaultVersion = defaultVersion
+        self.resolutionState = resolutionState ?? (resolvedVersion == nil ? .unavailable : .resolved)
+        self.fpmPID = fpmPID
+        self.fpmSocket = fpmSocket
+        self.fpmHealth = fpmHealth ?? (resolvedState == PHPFPMState.running.rawValue ? "healthy" : resolvedState)
     }
 }
 
@@ -240,15 +257,17 @@ public struct ProjectDerivedEnvironment: Codable, Equatable, Sendable {
     public let mailEndpoint: ProjectEndpointObservation
     public let mailAuthentication: ProjectMailAuthentication
     public let routeDocumentRootMatches: Bool?
+    public let routeTargetMatchesPHP: Bool?
     public let configCache: ProjectConfigCacheObservation
 
-    public init(framework: ProjectFrameworkInspection, phpResolution: String, dbEndpoint: ProjectEndpointObservation, mailEndpoint: ProjectEndpointObservation, mailAuthentication: ProjectMailAuthentication, routeDocumentRootMatches: Bool?, configCache: ProjectConfigCacheObservation) {
+    public init(framework: ProjectFrameworkInspection, phpResolution: String, dbEndpoint: ProjectEndpointObservation, mailEndpoint: ProjectEndpointObservation, mailAuthentication: ProjectMailAuthentication, routeDocumentRootMatches: Bool?, routeTargetMatchesPHP: Bool? = nil, configCache: ProjectConfigCacheObservation) {
         self.framework = framework
         self.phpResolution = phpResolution
         self.dbEndpoint = dbEndpoint
         self.mailEndpoint = mailEndpoint
         self.mailAuthentication = mailAuthentication
         self.routeDocumentRootMatches = routeDocumentRootMatches
+        self.routeTargetMatchesPHP = routeTargetMatchesPHP
         self.configCache = configCache
     }
 }
@@ -304,26 +323,40 @@ public enum ProjectEnvironmentInspectionError: Error, Equatable, Sendable {
 public struct ProjectEnvironmentInspector: Sendable {
     public init() {}
 
-    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus) -> ProjectEnvironmentReport {
+    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = []) -> ProjectEnvironmentReport {
         let root = URL(fileURLWithPath: project.rootPath.string, isDirectory: true)
         let framework = inspectFramework(root: root)
         let desiredResult = readDesiredState(root: root)
         let env = readDotenv(root: root)
         let cache = inspectConfigCache(root: root, envPath: root.appendingPathComponent(".env"))
         let route = routeObservation(project: project, framework: framework, routes: routes, router: router)
-        let installed = phpPackages.map(\.version).sorted()
-        let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted()
+        let installed = phpPackages.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
+        let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
         let resolved = resolvePHP(family: desiredResult.state.php, packages: phpPackages)
-        let phpState = resolved == nil ? "unresolved" : (phpStatuses.first(where: { $0.version == resolved })?.state.rawValue ?? "not-running")
-        let observedPHP = ProjectObservedPHP(installedVersions: installed, runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault)
+        let resolvedStatus = resolved.flatMap { version in phpStatuses.first(where: { $0.version == version }) }
+        let phpState = resolved == nil ? "unresolved" : (resolvedStatus?.state.rawValue ?? "not-running")
+        let resolutionState: PHPResolutionState
+        if desiredResult.state.php == nil { resolutionState = .notRequested }
+        else if resolved != nil { resolutionState = .resolved }
+        else if invalidPHPVersions.contains(where: { PHPVersion($0)?.family == PHPFamily(desiredResult.state.php!)?.description }) { resolutionState = .invalid }
+        else { resolutionState = .unavailable }
+        let observedPHP = ProjectObservedPHP(installedVersions: installed, invalidVersions: invalidPHPVersions.sorted(), runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault, resolutionState: resolutionState, fpmPID: resolvedStatus?.pid, fpmSocket: resolvedStatus?.socket, fpmHealth: resolvedStatus?.health ?? "not-running")
         let dbEndpoint = endpointObservation(host: env.dbHost, port: env.dbPort, expectedHost: "127.0.0.1", expectedPort: mysql?.port, matches: endpointMatches(host: env.dbHost, port: env.dbPort, expectedPort: mysql?.port))
         let mailEndpoint = endpointObservation(host: env.mailHost, port: env.mailPort, expectedHost: "127.0.0.1", expectedPort: mailpit?.smtpPort, matches: endpointMatches(host: env.mailHost, port: env.mailPort, expectedPort: mailpit?.smtpPort))
         let mailAuthentication = mailAuthentication(env: env, mailpit: mailpit, endpointMatches: mailEndpoint.matches)
         let routeRootMatch = framework.suggestedDocumentRoot.map { root.appendingPathComponent($0).path } == route.documentRoot
-        let derived = ProjectDerivedEnvironment(framework: framework, phpResolution: phpResolution(desired: desiredResult.state.php, resolved: resolved), dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication, routeDocumentRootMatches: route.documentRoot == nil ? nil : routeRootMatch, configCache: cache)
+        let routeTargetMatchesPHP: Bool?
+        if let resolvedStatus, let routeIntent = routes.first(where: { $0.route.hostname == route.hostname }), case .fastCGI(let socket, _) = routeIntent.route.target {
+            routeTargetMatchesPHP = socket == resolvedStatus.socket
+        } else if route.intentExists, resolved != nil {
+            routeTargetMatchesPHP = false
+        } else {
+            routeTargetMatchesPHP = nil
+        }
+        let derived = ProjectDerivedEnvironment(framework: framework, phpResolution: phpResolution(desired: desiredResult.state.php, resolved: resolved), dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication, routeDocumentRootMatches: route.documentRoot == nil ? nil : routeRootMatch, routeTargetMatchesPHP: routeTargetMatchesPHP, configCache: cache)
         let observed = ProjectObservedEnvironment(php: observedPHP, mysql: mysql, mailpit: mailpit, route: route, dns: dns, tls: tls, standardPorts: standardPorts)
         let secrets = ProjectSecretEnvironment(databasePassword: env.databasePassword, mailPassword: env.mailPassword, notes: ["Secret values are never returned by inspection."])
-        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication))
+        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, invalidPHPVersions: invalidPHPVersions, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication))
     }
 
     private struct DesiredRead { let state: ProjectDesiredEnvironment; let error: String? }
@@ -425,7 +458,7 @@ public struct ProjectEnvironmentInspector: Sendable {
 
     private func resolvePHP(family: String?, packages: [PHPPackage]) -> String? {
         guard let family else { return nil }
-        return packages.filter { $0.version == family || $0.version.split(separator: ".").prefix(2).joined(separator: ".") == family }.sorted { $0.version < $1.version }.last?.version
+        return PHPVersionResolver.resolve(family, versionStrings: packages.map(\.version))
     }
 
     private func phpResolution(desired: String?, resolved: String?) -> String { guard let desired else { return "unknown" }; guard let resolved else { return "desired \(desired) is unavailable" }; return "\(desired) resolves to \(resolved)" }
@@ -442,11 +475,14 @@ public struct ProjectEnvironmentInspector: Sendable {
         return .init(requirement: .notRequired, evidence: ["Configured SMTP endpoint matches healthy Vaelen-managed Mailpit.", "Vaelen Mailpit is configured without SMTP authentication."])
     }
 
-    private func diagnostics(project: Project, desired: ProjectDesiredEnvironment, desiredError: String?, framework: ProjectFrameworkInspection, env: EnvRead, cache: ProjectConfigCacheObservation, route: ProjectObservedRoute, resolvedPHP: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, routeRootMatch: Bool?, dbEndpoint: ProjectEndpointObservation, mailEndpoint: ProjectEndpointObservation, mailAuthentication: ProjectMailAuthentication) -> [ProjectDiagnostic] {
+    private func diagnostics(project: Project, desired: ProjectDesiredEnvironment, desiredError: String?, framework: ProjectFrameworkInspection, env: EnvRead, cache: ProjectConfigCacheObservation, route: ProjectObservedRoute, resolvedPHP: String?, invalidPHPVersions: [String], mysql: MySQLStatus?, mailpit: MailpitStatus?, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, routeRootMatch: Bool?, dbEndpoint: ProjectEndpointObservation, mailEndpoint: ProjectEndpointObservation, mailAuthentication: ProjectMailAuthentication) -> [ProjectDiagnostic] {
         var result = [ProjectDiagnostic]()
         if project.registrationKind == .discovered { result.append(.init(code: "PROJECT_DISCOVERED_EPHEMERAL", severity: .info, message: "This project is discovered and can be inspected read-only; durable environment ownership requires linking it.", suggestion: "Link the project before assigning durable Vaelen environment state.")) }
         if let desiredError { result.append(.init(code: "VAELEN_CONFIG_INVALID", severity: .error, message: "vaelen.yml is invalid: \(desiredError)", suggestion: "Correct vaelen.yml version, fields, and types.")) }
-        if desired.php != nil && resolvedPHP == nil { result.append(.init(code: "PHP_FAMILY_UNAVAILABLE", severity: .warning, message: "The desired PHP family is not installed in Vaelen.", suggestion: "Install a compatible Vaelen PHP package explicitly.")) }
+        if let desiredPHP = desired.php, resolvedPHP == nil {
+            let invalid = invalidPHPVersions.contains { PHPVersion($0)?.family == PHPFamily(desiredPHP)?.description }
+            result.append(.init(code: invalid ? "PHP_PACKAGE_INVALID" : "PHP_FAMILY_UNAVAILABLE", severity: .warning, message: invalid ? "Installed PHP material matches the desired family but is not eligible for project activation." : "The desired PHP family is not installed as an eligible Vaelen runtime.", suggestion: "Install or repair a compatible Vaelen PHP package explicitly."))
+        }
         if desired.mysql == true, mysql?.state != .running { result.append(.init(code: "MYSQL_NOT_HEALTHY", severity: .warning, message: "The project requests MySQL, but the Vaelen MySQL service is not running healthy.", suggestion: "Start or inspect MySQL explicitly.")) }
         if desired.mailpit == true, mailpit?.state != .running { result.append(.init(code: "MAILPIT_NOT_HEALTHY", severity: .warning, message: "The project requests Mailpit, but the Vaelen Mailpit service is not running healthy.", suggestion: "Start or inspect Mailpit explicitly.")) }
         if desired.mysql == true, dbEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "DB_ENDPOINT_MISMATCH", service: "database", endpoint: dbEndpoint)) }
@@ -463,6 +499,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         if project.availability != .available { result.append(.init(code: "PROJECT_UNAVAILABLE", severity: .error, message: "The registered project path is unavailable.", suggestion: "Restore the project path before inspecting runtime integration.")) }
         return result
     }
+
 
     private func endpointMismatchDiagnostic(code: String, service: String, endpoint: ProjectEndpointObservation) -> ProjectDiagnostic {
         let configured = "\(endpoint.configuredHost ?? "unknown"):\(endpoint.configuredPort ?? "unknown")"
