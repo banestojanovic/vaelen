@@ -17,7 +17,7 @@ final class ProjectEnvironmentTests: XCTestCase {
                 availability: .available)
     }
 
-    private func inspect(_ project: Project, routes: [RouteIntent] = []) -> ProjectEnvironmentReport {
+    private func inspect(_ project: Project, routes: [RouteIntent] = [], mailpit: MailpitStatus? = nil) -> ProjectEnvironmentReport {
         ProjectEnvironmentInspector().inspect(
             project: project,
             routes: routes,
@@ -25,12 +25,20 @@ final class ProjectEnvironmentTests: XCTestCase {
             phpStatuses: [],
             phpDefault: nil,
             mysql: MySQLStatus(state: .stopped, health: "stopped", installedVersion: nil, selectedVersion: nil, pid: nil, port: 3306, socket: "", datadir: "", executablePath: ""),
-            mailpit: MailpitStatus(state: .stopped, health: "stopped", installedVersion: nil, pid: nil, smtpPort: 1025, httpPort: 8025, database: "", uiEndpoint: "", executablePath: ""),
+            mailpit: mailpit ?? MailpitStatus(state: .stopped, health: "stopped", installedVersion: nil, pid: nil, smtpPort: 1025, httpPort: 8025, database: "", uiEndpoint: "", executablePath: ""),
             router: RouterStatus(provider: "test", state: .stopped, health: .unknown, routeCount: 0),
             dns: DNSStatus(state: .installed, ownership: .vaelen, health: "healthy"),
             tls: TLSStatus(state: .absent),
             standardPorts: StandardPortsStatus(state: .absent)
         )
+    }
+
+    private func healthyMailpit(port: Int = 1025) -> MailpitStatus {
+        MailpitStatus(state: .running, health: "healthy", installedVersion: "1.31.1", pid: 1, smtpPort: port, httpPort: port + 7000, database: "", uiEndpoint: "", executablePath: "")
+    }
+
+    private func writeMailEnvironment(_ root: URL, mailer: String = "smtp", host: String = "127.0.0.1", port: Int = 1025, password: String = "null") throws {
+        try Data("MAIL_MAILER=\(mailer)\nMAIL_HOST=\(host)\nMAIL_PORT=\(port)\nMAIL_PASSWORD=\(password)\n".utf8).write(to: root.appendingPathComponent(".env"))
     }
 
     func testValidLaravelEnvironmentIsObservedWithoutReturningSecrets() throws {
@@ -97,5 +105,70 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertTrue(codes.contains("ROUTE_INTENT_MISSING"))
         XCTAssertTrue(codes.contains("MYSQL_NOT_HEALTHY"))
         XCTAssertTrue(codes.contains("MAILPIT_NOT_HEALTHY"))
+    }
+
+    func testVaelenMailpitDoesNotRequireAnSMTPPassword() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMailEnvironment(root, port: 1025)
+        let report = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertEqual(report.configured.mailPassword, .missing)
+        XCTAssertEqual(report.derived.mailAuthentication.requirement, .notRequired)
+        XCTAssertTrue(report.derived.mailAuthentication.evidence.contains { $0.contains("Vaelen-managed Mailpit") })
+        XCTAssertFalse(report.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
+
+        try writeMailEnvironment(root, port: 1025, password: "")
+        let empty = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertEqual(empty.configured.mailPassword, .missing)
+        XCTAssertEqual(empty.derived.mailAuthentication.requirement, .notRequired)
+        XCTAssertFalse(empty.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
+    }
+
+    func testArbitrarySMTPDoesNotInferAuthenticationRequirement() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMailEnvironment(root, host: "smtp.example.test", port: 587)
+        let missing = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertEqual(missing.derived.mailAuthentication.requirement, .unknown)
+        XCTAssertFalse(missing.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
+
+        try writeMailEnvironment(root, host: "smtp.example.test", port: 587, password: "configured")
+        let configured = inspect(project(at: root), mailpit: healthyMailpit())
+        XCTAssertEqual(configured.configured.mailPassword, .available)
+        XCTAssertEqual(configured.derived.mailAuthentication.requirement, .unknown)
+        XCTAssertFalse(configured.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
+    }
+
+    func testMailpitInferenceRequiresLoopbackAndMatchingObservedPortAndService() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMailEnvironment(root, host: "localhost", port: 1025)
+        XCTAssertEqual(inspect(project(at: root), mailpit: healthyMailpit()).derived.mailAuthentication.requirement, .unknown)
+
+        try writeMailEnvironment(root, port: 1026)
+        XCTAssertEqual(inspect(project(at: root), mailpit: healthyMailpit()).derived.mailAuthentication.requirement, .unknown)
+
+        try writeMailEnvironment(root, port: 1025)
+        let stopped = MailpitStatus(state: .stopped, health: "stopped", installedVersion: "1.31.1", pid: nil, smtpPort: 1025, httpPort: 8025, database: "", uiEndpoint: "", executablePath: "")
+        XCTAssertEqual(inspect(project(at: root), mailpit: stopped).derived.mailAuthentication.requirement, .unknown)
+    }
+
+    func testMailAuthenticationDiagnosticRuleRequiresExplicitRequiredState() throws {
+        XCTAssertNotNil(ProjectEnvironmentInspector.mailPasswordDiagnostic(authentication: .required, password: .missing))
+        XCTAssertNil(ProjectEnvironmentInspector.mailPasswordDiagnostic(authentication: .required, password: .available))
+        XCTAssertNil(ProjectEnvironmentInspector.mailPasswordDiagnostic(authentication: .unknown, password: .missing))
+        XCTAssertNil(ProjectEnvironmentInspector.mailPasswordDiagnostic(authentication: .notRequired, password: .missing))
+        XCTAssertNil(ProjectEnvironmentInspector.mailPasswordDiagnostic(authentication: .notApplicable, password: .missing))
+    }
+
+    func testNonSMTPTransportDoesNotProduceSMTPPasswordDiagnosticOrExposeSecrets() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMailEnvironment(root, mailer: "log", password: "secret-value")
+        let report = inspect(project(at: root))
+        XCTAssertEqual(report.derived.mailAuthentication.requirement, .notApplicable)
+        XCTAssertFalse(report.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
+        let encoded = String(decoding: try JSONEncoder().encode(report), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("secret-value"))
     }
 }
