@@ -11,6 +11,9 @@ private enum CLICommand {
     case park(path: String?)
     case unpark(path: String?)
     case paths(json: Bool)
+    case projectStatus(selector: String?, json: Bool)
+    case projectInspect(selector: String?, json: Bool)
+    case projectDoctor(selector: String?, json: Bool)
     case phpVersions(json: Bool)
     case phpInstall(String)
     case phpUse(String)
@@ -88,6 +91,15 @@ struct VaelenCLIMain {
         case "status": return .status(json: args.dropFirst().elementsEqual(["--json"]))
         case "links": return .links(json: args.dropFirst().elementsEqual(["--json"]))
         case "paths": return .paths(json: args.dropFirst().elementsEqual(["--json"]))
+        case "project":
+            guard args.count >= 2 else { throw CLIError.usage }
+            let parsed = try projectEnvironmentArguments(Array(args.dropFirst(2)))
+            switch args[1] {
+            case "status": return .projectStatus(selector: parsed.selector, json: parsed.json)
+            case "inspect": return .projectInspect(selector: parsed.selector, json: parsed.json)
+            case "doctor": return .projectDoctor(selector: parsed.selector, json: parsed.json)
+            default: throw CLIError.usage
+            }
         case "link":
             var path: String?; var name: String?
             var index = 1
@@ -211,6 +223,17 @@ struct VaelenCLIMain {
         return rest.first
     }
 
+    private static func projectEnvironmentArguments(_ args: [String]) throws -> (selector: String?, json: Bool) {
+        var selector: String?
+        var json = false
+        for argument in args {
+            if argument == "--json" { guard !json else { throw CLIError.usage }; json = true }
+            else if argument.hasPrefix("--") || selector != nil { throw CLIError.usage }
+            else { selector = argument }
+        }
+        return (selector, json)
+    }
+
     private static func execute(_ command: CLICommand, client: VaelenCoreClient, workingDirectory: String) async throws {
         switch command {
         case .status(let json):
@@ -243,6 +266,15 @@ struct VaelenCLIMain {
             let paths = try await client.parkedPaths()
             if json { print(String(decoding: try IPCCodec.encode(ParkedPathListEnvelope(paths: paths)), as: UTF8.self)) }
             else { paths.forEach { print("\(displayPath($0.path))\t\($0.availability)") } }
+        case .projectStatus(let selector, let json):
+            let report = try await client.projectStatus(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectSummary(report)) }
+        case .projectInspect(let selector, let json):
+            let report = try await client.projectInspect(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectInspection(report)) }
+        case .projectDoctor(let selector, let json):
+            let report = try await client.projectDoctor(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectDoctor(report)) }
         case .phpVersions(let json):
             let result = try await client.phpVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Available  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))\nDefault    \(result.default ?? "none")") }
         case .phpInstall(let version): let result = try await client.phpInstall(version); print("Installed PHP \(result.version)")
@@ -328,6 +360,25 @@ struct VaelenCLIMain {
         }
     }
 
+    private static func projectSummary(_ report: ProjectEnvironmentReport) -> String {
+        let desiredPHP = report.desired.php ?? "none"
+        let mysql = report.desired.mysql == true ? "requested / \(report.observed.mysql?.state.rawValue ?? "unknown")" : "not requested"
+        let mailpit = report.desired.mailpit == true ? "requested / \(report.observed.mailpit?.state.rawValue ?? "unknown")" : "not requested"
+        let warnings = report.diagnostics.filter { $0.severity != .info }.count
+        return "Project \(report.identity.name)\nPath       \(displayPath(report.identity.path))\nFramework  \(report.derived.framework.framework) (\(report.derived.framework.confidence.rawValue))\nPHP        desired \(desiredPHP); \(report.derived.phpResolution)\nMySQL      \(mysql)\nMailpit    \(mailpit)\nRoute      \(report.observed.route.intentExists ? (report.observed.route.hostname ?? "present") : "missing")\nDNS        \(report.observed.dns.health)\nTLS        \(report.observed.tls.trustObserved ? "trusted" : "not trusted")\nWarnings   \(warnings)"
+    }
+
+    private static func projectInspection(_ report: ProjectEnvironmentReport) -> String {
+        let evidence = report.derived.framework.evidence.joined(separator: ", ")
+        let diagnostics = report.diagnostics.map { "\($0.severity.rawValue.uppercased()) \($0.code): \($0.message)" }.joined(separator: "\n")
+        return "\(projectSummary(report))\n\nDesired\n  vaelen.yml: \(report.desired.file.rawValue)\n  PHP: \(report.desired.php ?? "unknown")\n  Secure web: \(report.desired.secureWeb.map(String.init) ?? "unknown")\n  MySQL: \(report.desired.mysql.map(String.init) ?? "unknown")\n  Mailpit: \(report.desired.mailpit.map(String.init) ?? "unknown")\n\nConfigured\n  DB: \(report.configured.dbConnection ?? "unknown") \(report.configured.dbHost ?? "unknown"): \(report.configured.dbPort ?? "unknown")\n  Mail: \(report.configured.mailer ?? "unknown") \(report.configured.mailHost ?? "unknown"): \(report.configured.mailPort ?? "unknown")\n  Secrets: database \(report.secret.databasePassword.rawValue), mail \(report.secret.mailPassword.rawValue)\n\nDerived\n  Evidence: \(evidence.isEmpty ? "none" : evidence)\n  Document root: \(report.derived.framework.suggestedDocumentRoot ?? "unknown")\n  Config cache: \(report.derived.configCache.state)\n\nDiagnostics\n\(diagnostics.isEmpty ? "none" : diagnostics)"
+    }
+
+    private static func projectDoctor(_ report: ProjectEnvironmentReport) -> String {
+        if report.diagnostics.isEmpty { return "No diagnostic findings for \(report.identity.name)." }
+        return report.diagnostics.map { "\($0.severity.rawValue.uppercased()) \($0.code)\n  \($0.message)\($0.suggestion.map { "\n  Suggested: \($0)" } ?? "")" }.joined(separator: "\n")
+    }
+
     private static func message(for error: Error) -> String {
         if let error = error as? CLIError { return error.description }
         return "val failed: \(error)"
@@ -339,5 +390,5 @@ struct VaelenCLIMain {
 private enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status | val routing status|start|stop | val route list|add|remove | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return "Usage: val status | val project status|inspect|doctor [project] [--json] | val routing status|start|stop | val route list|add|remove | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
 }

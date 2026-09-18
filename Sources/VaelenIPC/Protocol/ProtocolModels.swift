@@ -35,6 +35,9 @@ public enum CoreMethod: String, Sendable {
     case projectUnlink = "project.unlink"
     case projectLinks = "project.links"
     case projectList = "project.list"
+    case projectStatus = "project.status"
+    case projectInspect = "project.inspect"
+    case projectDoctor = "project.doctor"
     case pathPark = "path.park"
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
@@ -79,6 +82,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case link(LinkProjectRequest)
     case unlink(UnlinkProjectRequest)
     case listProjects(ListProjectsRequest)
+    case projectEnvironment(ProjectEnvironmentRequest)
     case park(ParkPathRequest)
     case unpark(UnparkPathRequest)
     case phpVersion(PHPVersionRequest)
@@ -95,6 +99,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .link(let value): try value.encode(to: encoder)
         case .unlink(let value): try value.encode(to: encoder)
         case .listProjects(let value): try value.encode(to: encoder)
+        case .projectEnvironment(let value): try value.encode(to: encoder)
         case .park(let value): try value.encode(to: encoder)
         case .unpark(let value): try value.encode(to: encoder)
         case .phpVersion(let value): try value.encode(to: encoder)
@@ -239,6 +244,11 @@ public struct ProjectListResult: Codable, Equatable, Sendable {
     public init(projects: [ProjectWire]) { self.projects = projects }
 }
 
+public struct ProjectEnvironmentResult: Codable, Equatable, Sendable {
+    public let report: ProjectEnvironmentReport
+    public init(report: ProjectEnvironmentReport) { self.report = report }
+}
+
 public struct ParkedPathListResult: Codable, Equatable, Sendable {
     public let paths: [ParkedPathWire]
     public init(paths: [ParkedPathWire]) { self.paths = paths }
@@ -271,6 +281,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case status(CoreStatusResponse)
     case projectMutation(ProjectMutationResult)
     case projectList(ProjectListResult)
+    case projectEnvironment(ProjectEnvironmentResult)
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
@@ -294,6 +305,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .status(let value): try value.encode(to: encoder)
         case .projectMutation(let value): try value.encode(to: encoder)
         case .projectList(let value): try value.encode(to: encoder)
+        case .projectEnvironment(let value): try value.encode(to: encoder)
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
@@ -320,6 +332,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         if fields["core"] != nil, let result = try? IPCCodec.decode(CoreStatusResponse.self, from: data) { self = .status(result) }
         else if fields["coreVersion"] != nil, let result = try? IPCCodec.decode(HandshakeResult.self, from: data) { self = .handshake(result) }
         else if fields["projects"] != nil, let result = try? IPCCodec.decode(ProjectListResult.self, from: data) { self = .projectList(result) }
+        else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
         else if fields["project"] != nil, let result = try? IPCCodec.decode(ProjectMutationResult.self, from: data) { self = .projectMutation(result) }
         else if fields["paths"] != nil, let result = try? IPCCodec.decode(ParkedPathListResult.self, from: data) { self = .parkedPathList(result) }
         else if fields["path"] != nil, let result = try? IPCCodec.decode(ParkedPathMutationResult.self, from: data) { self = .parkedPathMutation(result) }

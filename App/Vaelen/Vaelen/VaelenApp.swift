@@ -29,6 +29,7 @@ final class AppModel {
     }
 
     private(set) var state: State = .connecting
+    private(set) var projectReports: [ProjectEnvironmentReport] = []
     private(set) var trustError: String?
     private var client: VaelenCoreClient?
     private var refreshGeneration = 0
@@ -48,6 +49,16 @@ final class AppModel {
             try await client.connect()
             let status = try await client.status()
             let projects = try await client.projectList()
+            let reports = await withTaskGroup(of: ProjectEnvironmentReport?.self, returning: [ProjectEnvironmentReport].self) { group in
+                for project in projects {
+                    group.addTask { try? await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path) }
+                }
+                var reports = [ProjectEnvironmentReport]()
+                while let report = await group.next() {
+                    if let report { reports.append(report) }
+                }
+                return reports
+            }
             let php = try? await client.phpVersions()
             let routing = try? await client.routingStatus()
             let dns = try? await client.dnsStatus()
@@ -56,6 +67,7 @@ final class AppModel {
             let mysql = try? await client.mysqlStatus()
             let mailpit = try? await client.mailpitStatus()
             guard generation == refreshGeneration else { await client.disconnect(); return }
+            projectReports = reports
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
@@ -178,6 +190,14 @@ struct StatusView: View {
                 ForEach(projects.prefix(5), id: \.path) { project in
                     Text("\(project.name) (\(project.registration))")
                         .font(.caption)
+                    if let report = model.projectReports.first(where: { $0.identity.path == project.path }) {
+                        Text("  \(report.diagnostics.count) diagnostics")
+                            .font(.caption2)
+                            .foregroundStyle(report.diagnostics.contains { $0.severity == .error } ? .red : .secondary)
+                        if let diagnostic = report.diagnostics.first {
+                            Text("  \(diagnostic.code)").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             Divider()

@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import VaelenCore
 
 final class MySQLModuleTests: XCTestCase {
@@ -34,7 +35,7 @@ final class MySQLModuleTests: XCTestCase {
         defer { makeWritableAndRemove(root) }
         let source = MySQLManifest.official8_4_11
         let manifest = MySQLManifest(version: source.version, platform: source.platform, architecture: source.architecture, artifactFile: source.artifactFile, artifactURL: archive, artifactSHA256: source.artifactSHA256, signatureURL: source.signatureURL, license: source.license)
-        let module = MySQLModule(layout: VaelenFilesystemLayout(rootURL: root), manifest: manifest)
+        let module = MySQLModule(layout: VaelenFilesystemLayout(rootURL: root), manifest: manifest, port: try availableLoopbackPort())
         let package = try module.install(requestedVersion: "8.4.11")
         _ = try module.use("8.4.11")
         try module.initialize()
@@ -64,6 +65,28 @@ final class MySQLModuleTests: XCTestCase {
         }
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
         try? FileManager.default.removeItem(at: root)
+    }
+
+    private func availableLoopbackPort() throws -> Int {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw NSError(domain: "MySQLModuleTests", code: 1) }
+        defer { close(descriptor) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { throw NSError(domain: "MySQLModuleTests", code: 2) }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        guard getsockname(descriptor, withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
+        }, &length) == 0 else { throw NSError(domain: "MySQLModuleTests", code: 3) }
+        return Int(UInt16(bigEndian: address.sin_port))
     }
 }
 

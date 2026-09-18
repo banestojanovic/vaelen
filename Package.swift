@@ -13,8 +13,11 @@ let package = Package(
         .executable(name: "val", targets: ["VaelenCLI"]),
         .executable(name: "vaelen-privileged-helper", targets: ["VaelenPrivilegedHelper"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/jpsim/Yams.git", from: "5.0.6")
+    ],
     targets: [
-        .target(name: "VaelenCore", linkerSettings: [.linkedLibrary("sqlite3")]),
+        .target(name: "VaelenCore", dependencies: [.product(name: "Yams", package: "Yams")], linkerSettings: [.linkedLibrary("sqlite3")]),
         .target(name: "VaelenIPC", dependencies: ["VaelenCore"]),
         .target(name: "VaelenDaemonSupport", dependencies: ["VaelenCore", "VaelenIPC"]),
         .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenDaemonSupport"]),

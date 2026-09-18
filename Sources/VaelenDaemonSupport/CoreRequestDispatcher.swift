@@ -58,6 +58,11 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .projectList(.init(projects: try await registry.linkedProjects().map(ProjectWire.init)))), true)
             case .projectList:
                 return (.init(id: request.id, result: .projectList(.init(projects: try await registry.projectsList().map(ProjectWire.init)))), true)
+            case .projectStatus, .projectInspect, .projectDoctor:
+                let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project environment parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                let report = try await projectEnvironmentReport(for: project)
+                return (.init(id: request.id, result: .projectEnvironment(.init(report: report))), true)
             case .pathPark:
                 let params = try request.params?.decode(ParkPathRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Park parameters are required.") }()
                 let path = try await registry.parkWithCreation(path: params.path, workingDirectory: params.workingDirectory)
@@ -194,6 +199,48 @@ public actor CoreRequestDispatcher {
     private func phpModule() throws -> PHPModule { guard let php else { throw IPCErrorPayload(code: .internalError, message: "PHP distribution manifest is not configured.") }; return php }
     private func mysqlModule() throws -> MySQLModule { guard let mysql else { throw IPCErrorPayload(code: .internalError, message: "MySQL module is not configured.") }; return mysql }
     private func mailpitModule() throws -> MailpitModule { guard let mailpit else { throw IPCErrorPayload(code: .internalError, message: "Mailpit module is not configured.") }; return mailpit }
+
+    private func resolveProject(selector: String?, workingDirectory: String) async throws -> Project {
+        let projects = try await registry.projectsList()
+        let pathService = CanonicalPathService()
+        guard let selector, !selector.isEmpty else {
+            let current = pathService.canonicalize(workingDirectory).string
+            guard let project = projects.first(where: { $0.rootPath.string == current }) else { throw ProjectRegistryError.projectNotFound }
+            return project
+        }
+        if let uuid = UUID(uuidString: selector), let project = projects.first(where: { $0.id?.rawValue == uuid }) { return project }
+        if selector.hasPrefix("/") || selector.hasPrefix("~") || selector.contains("/") {
+            let path = pathService.canonicalize(selector, relativeTo: workingDirectory).string
+            guard let project = projects.first(where: { $0.rootPath.string == path }) else { throw ProjectRegistryError.projectNotFound }
+            return project
+        }
+        let matches = projects.filter { $0.name == selector || $0.id?.description == selector }
+        guard matches.count == 1, let project = matches.first else {
+            if matches.count > 1 { throw ProjectRegistryError.projectNameAmbiguous }
+            throw ProjectRegistryError.projectNotFound
+        }
+        return project
+    }
+
+    private func projectEnvironmentReport(for project: Project) async throws -> ProjectEnvironmentReport {
+        let phpPackages = php?.installedVersions() ?? []
+        let phpStatuses = phpPackages.compactMap { try? php?.status(requestedVersion: $0.version) }.compactMap { $0 }
+        let routerStatus = await router.status()
+        let report = ProjectEnvironmentInspector().inspect(
+            project: project,
+            routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname },
+            phpPackages: phpPackages,
+            phpStatuses: phpStatuses,
+            phpDefault: php?.defaultVersion(),
+            mysql: mysql?.status(),
+            mailpit: mailpit?.status(),
+            router: routerStatus,
+            dns: await dns.status(),
+            tls: await tls.status(),
+            standardPorts: await ports.status()
+        )
+        return report
+    }
 
     private func map(_ error: MySQLModuleError) -> IPCErrorPayload {
         switch error {

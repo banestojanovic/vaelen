@@ -71,6 +71,23 @@ public actor VaelenCoreClient {
         return result.projects
     }
 
+    public func projectStatus(selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironment(method: .projectStatus, selector: selector, workingDirectory: workingDirectory)
+    }
+
+    public func projectInspect(selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironment(method: .projectInspect, selector: selector, workingDirectory: workingDirectory)
+    }
+
+    public func projectDoctor(selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironment(method: .projectDoctor, selector: selector, workingDirectory: workingDirectory)
+    }
+
+    private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
+        guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
+        return result.report
+    }
+
     public func park(path: String?, workingDirectory: String) async throws -> ParkedPathMutationResult {
         let request = IPCRequest(method: .pathPark, params: .park(ParkPathRequest(path: path, workingDirectory: workingDirectory)))
         guard case .parkedPathMutation(let result) = try result(from: await send(request)) else { throw CoreClientError.invalidResponse }
