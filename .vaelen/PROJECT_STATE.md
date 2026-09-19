@@ -16,10 +16,30 @@ accepted milestone records remain authoritative for architecture.
 ## Active milestone
 
 - Milestone: M14 — Core Daemon Installation and Lifecycle.
-- Phase: disposable platform/lifecycle validation and evidence review.
+- Phase: architecture/design convergence and evidence review; production
+  implementation remains unauthorized.
 - Production M14 implementation: **not authorized**.
-- ADR-0014: not accepted or frozen.
-- No M14 crash/recovery mutation is currently authorized by this state record.
+- ADR-0014: **accepted**; M14 is not accepted or frozen.
+- The single authorized repaired-A crash/recovery mutation was executed once on
+  2026-09-19; no further crash/recovery mutation is authorized by this state
+  record.
+- Accepted architecture: per-user `SMAppService.agent` plus launchd
+  supervision, with Core as sole semantic lifecycle authority.
+- ADR: `docs/adr/ADR-0014-core-daemon-installation-and-lifecycle.md`.
+  Production implementation and evidence remain incomplete and
+  NOT-YET-PROVEN where recorded by the ADR.
+- Class C decision: Core owns lifecycle intent, authorization, provenance,
+  reconciliation, fail-closed destructive decisions, and GUI/CLI results. A
+  platform executor, if needed for ServiceManagement context, is only a
+  constrained Core-issued side-effect executor and is not a second authority.
+- Additional Class C decisions: the signed app/controller may perform only the
+  fixed, explicit Core-absent bootstrap operation as a constrained executor;
+  replacement, updater, rollback, version handoff, and old-bundle cleanup are
+  deferred beyond minimum M14. The bootstrap reservation/handoff contract is
+  recorded in accepted ADR-0014; its implementation and product evidence remain
+  unauthorized and NOT-YET-PROVEN.
+- Architecture status: ADR-0014 accepted by Class C decision. M14 remains active
+  and unfrozen; production implementation remains unauthorized.
 
 ## Established M14 facts
 
@@ -35,7 +55,8 @@ accepted milestone records remain authoritative for architecture.
   `dev.vaelen.m14-lifecycle-experiment.agent`.
 - Repaired-A TeamIdentifier is `TFKZJV643G`.
 
-Evidence references: E-002 (stable baseline) and E-004 (path repair).
+Evidence references: E-002 (stable baseline), E-004 (path repair), and E-006
+(single bounded crash/recovery observation).
 
 ## Invalidated or unresolved
 
@@ -44,22 +65,26 @@ Evidence references: E-002 (stable baseline) and E-004 (path repair).
 - Do not claim that changing the helper CodeDirectory identifier caused the
   historical launch-admission difference.
 - The historical launch-constraint discrepancy remains unresolved.
-- A stable repaired-A baseline does not establish crash/recovery behavior.
+- A stable repaired-A baseline alone does not establish crash/recovery behavior;
+  the bounded recovery observation is recorded in E-006.
 
-Acceptance gates currently remain `NOT-YET-PROVEN` for launchd crash/recovery,
-replacement PID/generation, and any production M14 implementation. No state in
-this file authorizes milestone acceptance or freeze.
+Acceptance gates are `RUNTIME-PROVEN` for this bounded repaired-A launchd
+crash/recovery observation, replacement PID/generation, registration
+continuity, and observed post-recovery identity/ownership. They remain
+`NOT-YET-PROVEN` for universal macOS guarantees, broader failure modes, public
+product acceptance, and any production M14 implementation. No state in this
+file authorizes milestone acceptance or freeze.
 
 ## Current authorized boundary
 
-The next bounded M14 step may be planned as a single repaired-A launchd
-recovery observation, but it requires explicit authorization before
-`terminate-agent` is executed. Until then, only read-only inspection and
-documentation are authorized.
+The single repaired-A launchd recovery observation has been executed. Read-only
+architecture investigation, specialist review, and draft ADR documentation are
+authorized within this boundary. No production implementation or additional
+destructive lifecycle experiment is authorized.
 
-The existing authorization for exactly one bounded repaired-A `terminate-agent`
-crash/recovery experiment remains **VALID and UNUSED**; cleanup did not consume
-it.
+The authorization for exactly one bounded repaired-A `terminate-agent`
+crash/recovery experiment is **CONSUMED**. The controller recorded and issued
+SIGKILL once to verified PID 6130; no second termination was performed.
 
 Any implementation must remain disposable and experiment-only. Production
 Vaelen, Syncproof, frozen ADRs, milestone freeze, release, commit, tag, and

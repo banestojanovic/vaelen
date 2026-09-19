@@ -45,3 +45,81 @@ The disposable probe and failed shell/Git acceptance attempts are recorded as
 non-invalidating transport/permission failures. No lifecycle operation,
 experiment-controller invocation, production change, frozen ADR change, or
 Experiments/ change is authorized by this cleanup.
+
+## D-006 — Single repaired-A recovery observation consumed
+
+The one explicitly authorized repaired-A `terminate-agent` operation was
+executed once against verified disposable PID 6130. The preserved experiment
+evidence reports launchd recovery to PID 10313, generation 3, with the same
+experiment label/BTM UUID, UID/EUID 501, exact helper path validation, status
+`SMAppServiceStatus(rawValue: 1)`, and continued heartbeats. This authorizes no
+additional lifecycle mutation, production implementation, ADR change, or
+milestone acceptance.
+
+## D-007 — Lifecycle architecture convergence authorized
+
+Bane authorized research and draft design convergence around per-user
+`SMAppService.agent` with launchd lifecycle supervision. This does not accept or
+freeze ADR-0014 and does not authorize production implementation. The draft must
+preserve separate registration, process, endpoint, protocol, readiness, and
+ownership observations; fail closed on ambiguous destructive authority; and
+leave unresolved Class C choices explicit, including the sole owner of
+install/register/unregister/replacement mutations.
+
+## D-008 — Core-owned lifecycle semantic authority
+
+Bane selected Core as the sole semantic authority for daemon lifecycle. Core
+owns desired intent, authorization, provenance evaluation, mutation journaling,
+reconciliation, fail-closed destructive decisions, and the semantic results
+returned to GUI and CLI. GUI and CLI must not mutate ServiceManagement or
+implement independent lifecycle paths. A narrowly scoped platform executor may
+perform a Core-issued ServiceManagement side effect only; it has no desired
+state, ownership, adoption, replacement, retry, or client authority.
+
+The draft must preserve durable intent/provenance/journal state separately from
+fresh platform identity and ephemeral runtime identity. Off must fence stale On
+work and require authoritative postconditions before success. This decision
+does not accept or freeze ADR-0014 and does not authorize production
+implementation.
+
+## D-009 — Core-absent bootstrap and replacement deferral
+
+Bane authorized a signed app/controller as a strictly constrained executor for
+the fixed canonical Core registration only when Core is absent. It may not
+choose desired state, adopt an existing registration, or publish lifecycle
+truth. The draft requires an atomic pre-mutation bootstrap reservation in the
+existing SQLite store, fixed identity/epoch/operation/nonce, lock and endpoint
+exclusion, one authenticated receipt, Core reconnect, fresh post-observation,
+and Core-only promotion. Reservation-only or ambiguous API outcomes are
+`unknown/recovery-required`; matching observation cannot silently promote or
+adopt.
+
+Replacement, updater, rollback, same-label handoff, old-bundle cleanup, and
+version handoff are deferred beyond minimum M14. M14 must not implement or
+experiment on them, while retaining immutable-bundle and identity-conflict
+fail-closed boundaries.
+
+## D-010 — Explicit bootstrap reactivation after Off
+
+Implicit or background bootstrap must refuse a durable Off barrier. An explicit
+user-invoked `val start` may submit the fixed bootstrap operation with a
+one-time invocation authorization bound to the canonical identity and
+bootstrap receipt. The bootstrap executor still cannot choose arbitrary desired
+state or publish lifecycle truth. Core alone validates the receipt and fresh
+platform state, then commits a new On generation superseding Off. Invalid,
+expired, replayed, ambiguous, or non-explicit bootstrap requests remain refused
+or `unknown/recovery-required`; stale recovery never reverses Off.
+
+## D-011 — ADR-0014 accepted; M14 remains active
+
+Bane accepted ADR-0014: Core Daemon Installation and Lifecycle. The accepted
+architecture establishes per-user `SMAppService.agent`, launchd as sole process
+supervisor, Core as sole semantic lifecycle authority, constrained Core-absent
+bootstrap, narrow durable lifecycle evidence, fresh observation, fail-closed
+destructive authority, typed Core IPC, and explicit replacement/update/
+rollback deferral.
+
+ADR-0014 acceptance does not accept or freeze M14, authorize production
+implementation, establish production packaging/readiness/Off evidence, or
+promote E-002/E-004/E-006 beyond bounded disposable runtime proof. No tag,
+push, lifecycle mutation, or Syncproof change is authorized.
