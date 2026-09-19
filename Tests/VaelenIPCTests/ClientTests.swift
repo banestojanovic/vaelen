@@ -1,4 +1,5 @@
 import XCTest
+@testable import VaelenCore
 @testable import VaelenIPC
 
 final class ClientTests: XCTestCase {
@@ -37,6 +38,38 @@ final class ClientTests: XCTestCase {
 
         XCTAssertEqual(status.core.pid, 99)
         XCTAssertEqual(status.core.version, "0.0.1-dev")
+    }
+
+    func testClientSendsParameterlessTrustOperationsAndDecodesTypedResults() async throws {
+        let pair = InMemoryTransport.pair()
+        let recorder = RequestRecorder()
+        let server = Task {
+            try await pair.server.connect()
+            var decoder = FrameDecoder()
+            while !Task.isCancelled {
+                let data = try await pair.server.read()
+                for frame in try decoder.append(data) {
+                    let request = try IPCCodec.decode(IPCRequest.self, from: frame)
+                    recorder.append(request.method)
+                    let response: IPCResponse
+                    if request.knownMethod == .handshake {
+                        response = IPCResponse(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))
+                    } else {
+                        let status = TLSStatus(state: .trusted, trustObserved: true, ownership: .owned, trustProvenance: .confirmedByVaelen)
+                        let result = TLSTrustResult(status: status, operation: .confirmed, message: "ok")
+                        response = IPCResponse(id: request.id, result: .tlsTrust(.init(result: result)))
+                    }
+                    try await pair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
+                }
+            }
+        }
+        let client = VaelenCoreClient(transport: pair.client, identity: ClientIdentity(name: "test", version: VaelenBuildInfo.version))
+        try await client.connect()
+        _ = try await client.tlsTrustLocalCA()
+        _ = try await client.tlsRemoveLocalCATrust()
+        await client.disconnect()
+        server.cancel()
+        XCTAssertEqual(recorder.methods, [CoreMethod.handshake.rawValue, CoreMethod.tlsTrustLocalCA.rawValue, CoreMethod.tlsRemoveLocalCATrust.rawValue])
     }
 
     func testOlderCoreMissingSchemaIdentityFailsBeforeNormalDispatch() async throws {

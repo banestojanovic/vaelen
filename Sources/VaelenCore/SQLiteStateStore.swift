@@ -9,7 +9,7 @@ public enum SQLiteStateError: Error, Equatable, Sendable {
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public final class SQLiteStateStore: @unchecked Sendable {
-    public static let schemaVersion = 5
+    public static let schemaVersion = 6
     private var database: OpaquePointer?
     internal var databasePointer: OpaquePointer? { database }
 
@@ -108,15 +108,61 @@ public final class SQLiteStateStore: @unchecked Sendable {
                 try execute("CREATE TABLE IF NOT EXISTS route_target_transitions (route_id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, previous_route_json BLOB NOT NULL, desired_route_json BLOB NOT NULL, previous_provider_json BLOB NOT NULL, desired_provider_json BLOB NOT NULL, previous_socket TEXT NOT NULL, desired_socket TEXT NOT NULL, state TEXT NOT NULL CHECK (state = 'providerPending'))")
                 try execute("PRAGMA user_version = 5")
             }
+            if version <= 5 {
+                try execute("ALTER TABLE tls_capability RENAME TO tls_capability_legacy")
+                try execute("CREATE TABLE tls_capability (id INTEGER PRIMARY KEY CHECK (id = 1), ca_fingerprint TEXT NOT NULL, ca_certificate_path TEXT NOT NULL, key_application_tag TEXT NOT NULL, public_key_fingerprint TEXT NULL, ca_ownership_state TEXT NOT NULL CHECK (ca_ownership_state IN ('unverified', 'owned', 'mismatch')), trust_domain TEXT NOT NULL CHECK (trust_domain = 'user'), trust_provenance TEXT NOT NULL CHECK (trust_provenance IN ('none', 'confirmedByVaelen')), trust_settings_fingerprint TEXT NULL)")
+                try execute("INSERT INTO tls_capability (id, ca_fingerprint, ca_certificate_path, key_application_tag, public_key_fingerprint, ca_ownership_state, trust_domain, trust_provenance, trust_settings_fingerprint) SELECT id, ca_fingerprint, ca_certificate_path, 'dev.vaelen.local-ca', NULL, 'unverified', 'user', 'none', NULL FROM tls_capability_legacy")
+                try execute("DROP TABLE tls_capability_legacy")
+                try execute("PRAGMA user_version = 6")
+            }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }
     }
 
-    private func pragmaVersion() throws -> Int {
+    internal func pragmaVersion() throws -> Int {
         var result = 0
         try query("PRAGMA user_version") { result = Int(sqlite3_column_int($0, 0)) }
         return result
     }
 
     private var message: String { String(cString: sqlite3_errmsg(database)) }
+}
+
+internal enum TLSDurableOwnershipState: String, Sendable {
+    case unverified, owned, mismatch
+}
+
+internal enum TLSDurableTrustProvenance: String, Sendable {
+    case none, confirmedByVaelen
+}
+
+internal struct TLSDurableRecord: Equatable, Sendable {
+    let fingerprint: String
+    let certificatePath: String
+    let keyApplicationTag: String
+    let publicKeyFingerprint: String?
+    let ownership: TLSDurableOwnershipState
+    let trustDomain: String
+    let trustProvenance: TLSDurableTrustProvenance
+    let trustSettingsFingerprint: String?
+}
+
+extension SQLiteStateStore {
+    internal func tlsRecord() throws -> TLSDurableRecord? {
+        var record: TLSDurableRecord?
+        try query("SELECT ca_fingerprint, ca_certificate_path, key_application_tag, public_key_fingerprint, ca_ownership_state, trust_domain, trust_provenance, trust_settings_fingerprint FROM tls_capability WHERE id = 1") { statement in
+            guard let fingerprint = columnString(statement, 0), let path = columnString(statement, 1), let tag = columnString(statement, 2), let ownership = columnString(statement, 4).flatMap(TLSDurableOwnershipState.init(rawValue:)), let domain = columnString(statement, 5), let provenance = columnString(statement, 6).flatMap(TLSDurableTrustProvenance.init(rawValue:)) else { throw SQLiteStateError.invalidRecord }
+            record = TLSDurableRecord(fingerprint: fingerprint, certificatePath: path, keyApplicationTag: tag, publicKeyFingerprint: columnString(statement, 3), ownership: ownership, trustDomain: domain, trustProvenance: provenance, trustSettingsFingerprint: columnString(statement, 7))
+        }
+        return record
+    }
+
+    internal func saveTLSRecord(_ record: TLSDurableRecord) throws {
+        let publicKey = record.publicKeyFingerprint.map { "'\(sqlQuote($0))'" } ?? "NULL"
+        let settings = record.trustSettingsFingerprint.map { "'\(sqlQuote($0))'" } ?? "NULL"
+        let sql = "INSERT OR REPLACE INTO tls_capability (id, ca_fingerprint, ca_certificate_path, key_application_tag, public_key_fingerprint, ca_ownership_state, trust_domain, trust_provenance, trust_settings_fingerprint) VALUES (1, '\(sqlQuote(record.fingerprint))', '\(sqlQuote(record.certificatePath))', '\(sqlQuote(record.keyApplicationTag))', \(publicKey), '\(record.ownership.rawValue)', '\(record.trustDomain)', '\(record.trustProvenance.rawValue)', \(settings))"
+        try execute(sql)
+    }
+
+    private func sqlQuote(_ value: String) -> String { value.replacingOccurrences(of: "'", with: "''") }
 }

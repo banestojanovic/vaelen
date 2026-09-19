@@ -193,6 +193,10 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .tlsStatus(.init(tls: try await tls.install()))), true)
             case .tlsRemove:
                 return (.init(id: request.id, result: .tlsStatus(.init(tls: try await tls.remove()))), true)
+            case .tlsTrustLocalCA:
+                return (.init(id: request.id, result: .tlsTrust(.init(result: try await tls.trustLocalCA()))), true)
+            case .tlsRemoveLocalCATrust:
+                return (.init(id: request.id, result: .tlsTrust(.init(result: try await tls.removeLocalCATrust()))), true)
             case .portsStatus:
                 return (.init(id: request.id, result: .portsStatus(.init(ports: await ports.status()))), true)
             case .portsInstall:
@@ -224,6 +228,8 @@ public actor CoreRequestDispatcher {
             case .backendUnavailable: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports require the backend router to be running.")), true)
             case .unavailable(let detail): return (.init(id: request.id, error: .init(code: .internalError, message: "Standard Ports are unavailable: \(detail)")), true)
             }
+        } catch let error as TLSError {
+            return (.init(id: request.id, error: map(error)), true)
         } catch {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
             return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
@@ -429,6 +435,19 @@ public actor CoreRequestDispatcher {
         case .processIdentityMismatch: return .init(code: .invalidRequest, message: "Mailpit process identity could not be verified; no process was signaled.")
         case .unhealthy(let detail): return .init(code: .invalidRequest, message: "Mailpit is unhealthy: \(detail)")
         default: return .init(code: .internalError, message: "Mailpit operation failed: \(error)")
+        }
+    }
+
+    private func map(_ error: TLSError) -> IPCErrorPayload {
+        switch error {
+        case .ownershipMismatch: return .init(code: .tlsIdentityMismatch, message: error.localizedDescription)
+        case .keyCertificateMismatch: return .init(code: .tlsKeyCertificateMismatch, message: error.localizedDescription)
+        case .trustProvenanceUnavailable: return .init(code: .tlsOwnershipUnavailable, message: error.localizedDescription)
+        case .trustSettingsMismatch: return .init(code: .tlsRemovalBlocked, message: error.localizedDescription)
+        case .trustSettingsUnsupported: return .init(code: .tlsTrustSettingsUnsupported, message: error.localizedDescription)
+        case .trustObservationFailed: return .init(code: .tlsObservationFailed, message: error.localizedDescription)
+        case .trustRemovalUnverified, .keychain, .certificate, .unavailable, .unsupportedHostname:
+            return .init(code: .tlsTrustOperationFailed, message: error.localizedDescription)
         }
     }
 

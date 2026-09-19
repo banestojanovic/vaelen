@@ -7,7 +7,7 @@ public enum ProtocolVersion: Int, Codable, Sendable {
 
 public enum IPCCompatibility {
     // Increment when an existing client/Core pair can no longer share command models or semantics.
-    public static let schemaVersion = 4
+    public static let schemaVersion = 5
 }
 
 public struct ClientIdentity: Codable, Equatable, Sendable {
@@ -89,6 +89,8 @@ public enum CoreMethod: String, Sendable {
     case tlsStatus = "tls.status"
     case tlsInstall = "tls.install"
     case tlsRemove = "tls.remove"
+    case tlsTrustLocalCA = "tls.trustLocalCA"
+    case tlsRemoveLocalCATrust = "tls.removeLocalCATrust"
     case portsStatus = "ports.status"
     case portsInstall = "ports.install"
     case portsRemove = "ports.remove"
@@ -180,6 +182,13 @@ public enum IPCErrorCode: String, Codable, Sendable {
     case pathNotDirectory = "PATH_NOT_DIRECTORY"
     case pathUnreadable = "PATH_UNREADABLE"
     case parkedPathNotFound = "PARKED_PATH_NOT_FOUND"
+    case tlsOwnershipUnavailable = "TLS_OWNERSHIP_UNAVAILABLE"
+    case tlsIdentityMismatch = "TLS_IDENTITY_MISMATCH"
+    case tlsKeyCertificateMismatch = "TLS_KEY_CERTIFICATE_MISMATCH"
+    case tlsTrustSettingsUnsupported = "TLS_TRUST_SETTINGS_UNSUPPORTED"
+    case tlsTrustOperationFailed = "TLS_TRUST_OPERATION_FAILED"
+    case tlsRemovalBlocked = "TLS_REMOVAL_BLOCKED"
+    case tlsObservationFailed = "TLS_OBSERVATION_FAILED"
 }
 
 public struct IPCErrorPayload: Codable, Equatable, Sendable, Error {
@@ -314,6 +323,7 @@ public struct RouteListResult: Codable, Equatable, Sendable { public let routes:
 public struct DNSInstallRequest: Codable, Equatable, Sendable { public let takeover: Bool; public init(takeover: Bool = false) { self.takeover = takeover } }
 public struct DNSStatusResult: Codable, Equatable, Sendable { public let dns: DNSStatus; public init(dns: DNSStatus) { self.dns = dns } }
 public struct TLSStatusResult: Codable, Equatable, Sendable { public let tls: TLSStatus; public init(tls: TLSStatus) { self.tls = tls } }
+public struct TLSTrustResultWire: Codable, Equatable, Sendable { public let result: TLSTrustResult; public init(result: TLSTrustResult) { self.result = result } }
 public struct PortsStatusResult: Codable, Equatable, Sendable { public let ports: StandardPortsStatus; public init(ports: StandardPortsStatus) { self.ports = ports } }
 
 public enum ResponseResult: Codable, Equatable, Sendable {
@@ -340,6 +350,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case routePHPTargetUpdate(RoutePHPTargetUpdateResult)
     case dnsStatus(DNSStatusResult)
     case tlsStatus(TLSStatusResult)
+    case tlsTrust(TLSTrustResultWire)
     case portsStatus(PortsStatusResult)
     case raw(JSONValue)
 
@@ -368,6 +379,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .routePHPTargetUpdate(let value): try value.encode(to: encoder)
         case .dnsStatus(let value): try value.encode(to: encoder)
         case .tlsStatus(let value): try value.encode(to: encoder)
+        case .tlsTrust(let value): try value.encode(to: encoder)
         case .portsStatus(let value): try value.encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
@@ -399,7 +411,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["observation"] != nil, let result = try? IPCCodec.decode(RoutePHPTargetUpdateResult.self, from: data) { self = .routePHPTargetUpdate(result) }
         else if fields["route"] != nil, let result = try? IPCCodec.decode(RouteIntent.self, from: data) { self = .routeMutation(result) }
         else if fields["dns"] != nil, let result = try? IPCCodec.decode(DNSStatusResult.self, from: data) { self = .dnsStatus(result) }
-        else if fields["tls"] != nil, let result = try? IPCCodec.decode(TLSStatusResult.self, from: data) { self = .tlsStatus(result) }
+         else if fields["result"] != nil, let result = try? IPCCodec.decode(TLSTrustResultWire.self, from: data) { self = .tlsTrust(result) }
+         else if fields["tls"] != nil, let result = try? IPCCodec.decode(TLSStatusResult.self, from: data) { self = .tlsStatus(result) }
         else if fields["ports"] != nil, let result = try? IPCCodec.decode(PortsStatusResult.self, from: data) { self = .portsStatus(result) }
         else { self = .raw(value) }
     }

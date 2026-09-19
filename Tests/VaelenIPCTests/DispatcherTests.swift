@@ -4,7 +4,42 @@ import Darwin
 @testable import VaelenIPC
 @testable import VaelenDaemonSupport
 
+private final class DispatcherTrustFake: @unchecked Sendable, TLSTrustBoundary {
+    var trusted = false
+    func observe(certificateData: Data) throws -> LocalCATrustService.Observation {
+        trusted ? .init(trusted: true, canonical: "trust:empty-array", fingerprint: "empty-fingerprint") : .init(trusted: false, canonical: "trust:nil", fingerprint: nil)
+    }
+    func trust(certificateData: Data) throws { trusted = true }
+    func removeTrust(certificateData: Data) throws { trusted = false }
+}
+
 final class DispatcherTests: XCTestCase {
+    func testM13TrustAndUntrustTraverseDispatcherWithParameterlessRequests() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let fake = DispatcherTrustFake()
+        let keychain = LocalCAKeychain(tag: "dev.vaelen.ipc.\(UUID().uuidString)")
+        defer { try? keychain.removeCAKey() }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let tls = TLSCapability(layout: layout, store: store, keychain: keychain, trustBoundary: fake)
+        _ = try await tls.install()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: registry, tls: tls)
+        let handshake = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "test", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))), handshaken: false)
+        XCTAssertTrue(handshake.handshaken)
+
+        let trusted = await dispatcher.dispatch(IPCRequest(method: .tlsTrustLocalCA), handshaken: true)
+        guard case .tlsTrust(let trust)? = trusted.response.result else { return XCTFail("missing typed trust response") }
+        XCTAssertEqual(trust.result.operation, .confirmed)
+        XCTAssertNil(IPCRequest(method: .tlsTrustLocalCA).params)
+
+        let untrusted = await dispatcher.dispatch(IPCRequest(method: .tlsRemoveLocalCATrust), handshaken: true)
+        guard case .tlsTrust(let remove)? = untrusted.response.result else { return XCTFail("missing typed untrust response") }
+        XCTAssertEqual(remove.result.operation, .removed)
+        XCTAssertNil(IPCRequest(method: .tlsRemoveLocalCATrust).params)
+    }
+
     func testDispatcherHandshakeRequiresMatchingSchemaBeforeNormalDispatch() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

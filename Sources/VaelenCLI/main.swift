@@ -49,6 +49,8 @@ private enum CLICommand {
     case tlsStatus(json: Bool)
     case tlsInstall
     case tlsRemove
+    case tlsTrust
+    case tlsUntrust
     case portsStatus(json: Bool)
     case portsInstall
     case portsRemove
@@ -212,6 +214,8 @@ struct VaelenCLIMain {
             case "status": return .tlsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
             case "install": guard args.count == 2 else { throw CLIError.usage }; return .tlsInstall
             case "remove": guard args.count == 2 else { throw CLIError.usage }; return .tlsRemove
+            case "trust": guard args.count == 2 else { throw CLIError.usage }; return .tlsTrust
+            case "untrust": guard args.count == 2 else { throw CLIError.usage }; return .tlsUntrust
             default: throw CLIError.usage
             }
         case "ports":
@@ -355,6 +359,10 @@ struct VaelenCLIMain {
             let result = try await client.tlsInstall(); print("Local CA \(result.state.rawValue). Trust requires approval in Vaelen.app.")
         case .tlsRemove:
             let result = try await client.tlsRemove(); print("Local TLS \(result.state.rawValue)")
+        case .tlsTrust:
+            let result = try await client.tlsTrustLocalCA(); print("Local TLS \(result.operation.rawValue): \(result.message)")
+        case .tlsUntrust:
+            let result = try await client.tlsRemoveLocalCATrust(); print("Local TLS \(result.operation.rawValue): \(result.message)")
         case .portsStatus(let json):
             let result = try await client.portsStatus()
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }

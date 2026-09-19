@@ -3,6 +3,9 @@ import Security
 import CryptoKit
 
 public enum TLSCapabilityState: String, Codable, Sendable { case absent, createdButUntrusted, trusted, unhealthy, ownershipMismatch }
+public enum TLSOwnershipState: String, Codable, Sendable { case unverified, owned, mismatch }
+public enum TLSTrustProvenance: String, Codable, Sendable { case none, confirmedByVaelen }
+public enum TLSTrustOperationState: String, Codable, Sendable { case trusted, alreadyTrustedUnknownProvenance, confirmed, untrusted, removed }
 public struct TLSStatus: Codable, Equatable, Sendable {
     public let state: TLSCapabilityState
     public let caFingerprint: String?
@@ -10,10 +13,19 @@ public struct TLSStatus: Codable, Equatable, Sendable {
     public let trustObserved: Bool
     public let tlsPort: Int
     public let detail: String?
-    public init(state: TLSCapabilityState, caFingerprint: String? = nil, caCertificatePath: String? = nil, trustObserved: Bool = false, tlsPort: Int = VaelenNetworkPorts.httpsBackend, detail: String? = nil) { self.state = state; self.caFingerprint = caFingerprint; self.caCertificatePath = caCertificatePath; self.trustObserved = trustObserved; self.tlsPort = tlsPort; self.detail = detail }
+    public let ownership: TLSOwnershipState
+    public let trustProvenance: TLSTrustProvenance
+    public let trustSettingsFingerprint: String?
+    public init(state: TLSCapabilityState, caFingerprint: String? = nil, caCertificatePath: String? = nil, trustObserved: Bool = false, tlsPort: Int = VaelenNetworkPorts.httpsBackend, detail: String? = nil, ownership: TLSOwnershipState = .unverified, trustProvenance: TLSTrustProvenance = .none, trustSettingsFingerprint: String? = nil) { self.state = state; self.caFingerprint = caFingerprint; self.caCertificatePath = caCertificatePath; self.trustObserved = trustObserved; self.tlsPort = tlsPort; self.detail = detail; self.ownership = ownership; self.trustProvenance = trustProvenance; self.trustSettingsFingerprint = trustSettingsFingerprint }
+}
+public struct TLSTrustResult: Codable, Equatable, Sendable {
+    public let status: TLSStatus
+    public let operation: TLSTrustOperationState
+    public let message: String
+    public init(status: TLSStatus, operation: TLSTrustOperationState, message: String) { self.status = status; self.operation = operation; self.message = message }
 }
 
-public enum TLSError: Error, Equatable, Sendable { case unsupportedHostname(String), keychain(OSStatus), certificate(String), ownershipMismatch, unavailable }
+public enum TLSError: Error, Equatable, Sendable { case unsupportedHostname(String), keychain(OSStatus), certificate(String), ownershipMismatch, unavailable, keyCertificateMismatch, trustProvenanceUnavailable, trustSettingsMismatch, trustObservationFailed(String), trustSettingsUnsupported, trustRemovalUnverified }
 
 extension TLSError: LocalizedError {
     public var errorDescription: String? {
@@ -25,6 +37,12 @@ extension TLSError: LocalizedError {
         case .certificate(let detail): return "Certificate error: \(detail)"
         case .ownershipMismatch: return "Vaelen TLS ownership mismatch"
         case .unavailable: return "Vaelen TLS is unavailable"
+        case .keyCertificateMismatch: return "Vaelen TLS certificate and private-key identities do not match"
+        case .trustProvenanceUnavailable: return "Vaelen TLS trust provenance is unavailable"
+        case .trustSettingsMismatch: return "Vaelen TLS trust settings do not match recorded Vaelen state"
+        case .trustObservationFailed(let detail): return "Unable to observe Vaelen TLS trust: \(detail)"
+        case .trustSettingsUnsupported: return "Vaelen TLS trust settings are unsupported or ambiguous"
+        case .trustRemovalUnverified: return "Vaelen TLS trust removal was not verified"
         }
     }
 }
@@ -47,6 +65,7 @@ public struct TLSLeafMaterial: Sendable { public let certificateURL: URL; public
 public final class LocalCAKeychain: @unchecked Sendable {
     private let tag: Data
     public init(tag: String = "dev.vaelen.local-ca") { self.tag = Data(tag.utf8) }
+    internal var applicationTag: String { String(decoding: tag, as: UTF8.self) }
 
     public func caKey() throws -> SecKey {
         let query: [CFString: Any] = [kSecClass: kSecClassKey, kSecAttrApplicationTag: tag, kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecReturnRef: true]
@@ -59,15 +78,42 @@ public final class LocalCAKeychain: @unchecked Sendable {
         guard let key = SecKeyCreateRandomKey(parameters as CFDictionary, &error) else { throw TLSError.certificate((error?.takeRetainedValue() as Error?)?.localizedDescription ?? "CA key generation failed") }
         return key
     }
+    public func existingCAKey() throws -> SecKey {
+        let query: [CFString: Any] = [kSecClass: kSecClassKey, kSecAttrApplicationTag: tag, kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecReturnRef: true]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let key = item as! SecKey? else { throw TLSError.keychain(status) }
+        return key
+    }
     public func removeCAKey() throws { let status = SecItemDelete([kSecClass: kSecClassKey, kSecAttrApplicationTag: tag, kSecAttrKeyType: kSecAttrKeyTypeRSA] as CFDictionary); guard status == errSecSuccess || status == errSecItemNotFound else { throw TLSError.keychain(status) } }
 }
 
-public final class LocalCATrustService: @unchecked Sendable {
+internal protocol TLSTrustBoundary: Sendable {
+    func observe(certificateData: Data) throws -> LocalCATrustService.Observation
+    func trust(certificateData: Data) throws
+    func removeTrust(certificateData: Data) throws
+}
+
+public final class LocalCATrustService: @unchecked Sendable, TLSTrustBoundary {
     public init() {}
+    internal struct Observation: Equatable, Sendable {
+        let trusted: Bool
+        let canonical: String
+        let fingerprint: String?
+    }
     public func isTrusted(certificateData: Data) -> Bool {
-        guard let certificate = SecCertificateCreateWithData(nil, certificateData as CFData) else { return false }
+        (try? observe(certificateData: certificateData).trusted) == true
+    }
+    internal func observe(certificateData: Data) throws -> Observation {
+        guard let certificate = SecCertificateCreateWithData(nil, certificateData as CFData) else { throw TLSError.certificate("invalid CA certificate") }
         var settings: CFArray?
-        return SecTrustSettingsCopyTrustSettings(certificate, .user, &settings) == errSecSuccess
+        let status = SecTrustSettingsCopyTrustSettings(certificate, .user, &settings)
+        if status == errSecItemNotFound { return Observation(trusted: false, canonical: "trust:nil", fingerprint: nil) }
+        guard status == errSecSuccess else { throw TLSError.trustObservationFailed("OSStatus \(status)") }
+        guard let settings else { throw TLSError.trustSettingsUnsupported }
+        guard CFArrayGetCount(settings) == 0 else { throw TLSError.trustSettingsUnsupported }
+        let canonical = "trust:empty-array"
+        return Observation(trusted: true, canonical: canonical, fingerprint: Self.digest(canonical))
     }
     public func evaluateServerTrust(leafData: Data, caData: Data, hostname: String) -> Bool {
         evaluateServerTrustResult(leafData: leafData, caData: caData, hostname: hostname).trusted
@@ -98,6 +144,8 @@ public final class LocalCATrustService: @unchecked Sendable {
         guard status == errSecSuccess || status == errSecItemNotFound else { throw TLSError.keychain(status) }
     }
 
+    private static func digest(_ value: String) -> String { SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() }
+
     private func keychainCertificate(_ certificateData: Data) -> SecCertificate? {
         var item: CFTypeRef?
         let query: [CFString: Any] = [kSecClass: kSecClassCertificate, kSecValueData: certificateData, kSecReturnRef: true]
@@ -117,15 +165,26 @@ public actor TLSCapability {
     public let layout: VaelenFilesystemLayout
     public let tlsPort: Int
     private let keychain: LocalCAKeychain
-    private let trust: LocalCATrustService
+    private let trust: any TLSTrustBoundary
     private let store: SQLiteStateStore?
     public init(layout: VaelenFilesystemLayout = .init(), store: SQLiteStateStore? = nil, tlsPort: Int = VaelenNetworkPorts.httpsBackend, keychain: LocalCAKeychain = .init(), trust: LocalCATrustService = .init()) { self.layout = layout; self.store = store; self.tlsPort = tlsPort; self.keychain = keychain; self.trust = trust }
+    internal init(layout: VaelenFilesystemLayout, store: SQLiteStateStore?, tlsPort: Int = VaelenNetworkPorts.httpsBackend, keychain: LocalCAKeychain, trustBoundary: any TLSTrustBoundary) { self.layout = layout; self.store = store; self.tlsPort = tlsPort; self.keychain = keychain; self.trust = trustBoundary }
     public func status() -> TLSStatus {
         let path = layout.tlsCertificatesDirectoryURL.appendingPathComponent("ca.der")
-        guard let data = try? Data(contentsOf: path), let _ = SecCertificateCreateWithData(nil, data as CFData) else { return TLSStatus(state: .absent, tlsPort: tlsPort) }
-        let fingerprint = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        let trusted = trust.isTrusted(certificateData: data)
-        return TLSStatus(state: trusted ? .trusted : .createdButUntrusted, caFingerprint: fingerprint, caCertificatePath: path.path, trustObserved: trusted, tlsPort: tlsPort)
+        guard FileManager.default.fileExists(atPath: path.path) else { return TLSStatus(state: .absent, tlsPort: tlsPort) }
+        let context: ManagedContext
+        do {
+            context = try managedContext(path: path)
+        } catch let error as TLSError {
+            let state: TLSCapabilityState = (error == .ownershipMismatch || error == .keyCertificateMismatch) ? .ownershipMismatch : .unhealthy
+            return TLSStatus(state: state, caCertificatePath: path.path, tlsPort: tlsPort, detail: error.localizedDescription, ownership: state == .ownershipMismatch ? .mismatch : .unverified)
+        } catch {
+            return TLSStatus(state: .unhealthy, caCertificatePath: path.path, tlsPort: tlsPort, detail: error.localizedDescription)
+        }
+        let ownership: TLSOwnershipState = context.record.ownership == .owned ? .owned : .mismatch
+        let provenance: TLSTrustProvenance = context.record.trustProvenance == .confirmedByVaelen ? .confirmedByVaelen : .none
+        guard let observation = try? trust.observe(certificateData: context.certificateData) else { return TLSStatus(state: .unhealthy, caFingerprint: context.fingerprint, caCertificatePath: path.path, tlsPort: tlsPort, detail: "TLS trust settings are unavailable or unsupported", ownership: ownership, trustProvenance: provenance) }
+        return TLSStatus(state: observation.trusted ? .trusted : .createdButUntrusted, caFingerprint: context.fingerprint, caCertificatePath: path.path, trustObserved: observation.trusted, tlsPort: tlsPort, ownership: ownership, trustProvenance: provenance, trustSettingsFingerprint: observation.fingerprint)
     }
     public func install() throws -> TLSStatus {
         let key = try keychain.caKey()
@@ -134,9 +193,50 @@ public actor TLSCapability {
         if !FileManager.default.fileExists(atPath: path.path) { try LocalCertificateBuilder.ca(key: key).write(to: path, options: .atomic); try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path.path) }
         return status()
     }
+
+    public func trustLocalCA() throws -> TLSTrustResult {
+        guard store != nil else { throw TLSError.unavailable }
+        let path = layout.tlsCertificatesDirectoryURL.appendingPathComponent("ca.der")
+        let context = try managedContext(path: path)
+        let before = try trust.observe(certificateData: context.certificateData)
+        if before.trusted {
+            let provenance: TLSTrustProvenance = context.record.trustProvenance == .confirmedByVaelen ? .confirmedByVaelen : .none
+            let status = TLSStatus(state: .trusted, caFingerprint: context.fingerprint, caCertificatePath: path.path, trustObserved: true, tlsPort: tlsPort, ownership: .owned, trustProvenance: provenance, trustSettingsFingerprint: before.fingerprint)
+            return TLSTrustResult(status: status, operation: context.record.trustProvenance == .confirmedByVaelen ? .confirmed : .alreadyTrustedUnknownProvenance, message: context.record.trustProvenance == .confirmedByVaelen ? "Vaelen Local CA is already trusted." : "Vaelen Local CA is already trusted, but trust provenance is unknown.")
+        }
+        try trust.trust(certificateData: context.certificateData)
+        let after = try trust.observe(certificateData: context.certificateData)
+        guard after.trusted, let settingsFingerprint = after.fingerprint else { throw TLSError.trustObservationFailed("trust did not produce the expected user trust settings") }
+        let confirmed = TLSDurableRecord(fingerprint: context.fingerprint, certificatePath: path.path, keyApplicationTag: keychain.applicationTag, publicKeyFingerprint: context.publicKeyFingerprint, ownership: .owned, trustDomain: "user", trustProvenance: .confirmedByVaelen, trustSettingsFingerprint: settingsFingerprint)
+        try store?.saveTLSRecord(confirmed)
+        let status = TLSStatus(state: .trusted, caFingerprint: context.fingerprint, caCertificatePath: path.path, trustObserved: true, tlsPort: tlsPort, ownership: .owned, trustProvenance: .confirmedByVaelen, trustSettingsFingerprint: settingsFingerprint)
+        return TLSTrustResult(status: status, operation: .confirmed, message: "Vaelen Local CA trust was confirmed through Core.")
+    }
+
+    public func removeLocalCATrust() throws -> TLSTrustResult {
+        guard store != nil else { throw TLSError.unavailable }
+        let path = layout.tlsCertificatesDirectoryURL.appendingPathComponent("ca.der")
+        let context = try managedContext(path: path)
+        guard context.record.trustProvenance == .confirmedByVaelen else { throw TLSError.trustProvenanceUnavailable }
+        let before = try trust.observe(certificateData: context.certificateData)
+        guard before.trusted else {
+            let cleared = TLSDurableRecord(fingerprint: context.fingerprint, certificatePath: path.path, keyApplicationTag: keychain.applicationTag, publicKeyFingerprint: context.publicKeyFingerprint, ownership: .owned, trustDomain: "user", trustProvenance: .none, trustSettingsFingerprint: nil)
+            try store?.saveTLSRecord(cleared)
+            let status = TLSStatus(state: .createdButUntrusted, caFingerprint: context.fingerprint, caCertificatePath: path.path, trustObserved: false, tlsPort: tlsPort, ownership: .owned, trustProvenance: .none)
+            return TLSTrustResult(status: status, operation: .untrusted, message: "Vaelen Local CA was already untrusted; stale provenance was cleared.")
+        }
+        guard before.fingerprint == context.record.trustSettingsFingerprint else { throw TLSError.trustSettingsMismatch }
+        try trust.removeTrust(certificateData: context.certificateData)
+        let after = try trust.observe(certificateData: context.certificateData)
+        guard !after.trusted else { throw TLSError.trustRemovalUnverified }
+        let cleared = TLSDurableRecord(fingerprint: context.fingerprint, certificatePath: path.path, keyApplicationTag: keychain.applicationTag, publicKeyFingerprint: context.publicKeyFingerprint, ownership: .owned, trustDomain: "user", trustProvenance: .none, trustSettingsFingerprint: nil)
+        try store?.saveTLSRecord(cleared)
+        let status = TLSStatus(state: .createdButUntrusted, caFingerprint: context.fingerprint, caCertificatePath: path.path, trustObserved: false, tlsPort: tlsPort, ownership: .owned, trustProvenance: .none)
+        return TLSTrustResult(status: status, operation: .removed, message: "Vaelen Local CA trust was removed through Core.")
+    }
     public func remove() throws -> TLSStatus {
         let path = layout.tlsCertificatesDirectoryURL.appendingPathComponent("ca.der")
-        if let data = try? Data(contentsOf: path), trust.isTrusted(certificateData: data) { throw TLSError.ownershipMismatch }
+        if let data = try? Data(contentsOf: path), (try? trust.observe(certificateData: data).trusted) == true { throw TLSError.ownershipMismatch }
         try? FileManager.default.removeItem(at: path); try keychain.removeCAKey()
         return status()
     }
@@ -162,6 +262,34 @@ public actor TLSCapability {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path); try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: certURL.path)
         return TLSLeafMaterial(certificateURL: certURL, keyURL: keyURL)
     }
+
+    private struct ManagedContext {
+        let certificateData: Data
+        let fingerprint: String
+        let publicKeyFingerprint: String
+        let record: TLSDurableRecord
+    }
+
+    private func managedContext(path: URL) throws -> ManagedContext {
+        guard let certificateData = try? Data(contentsOf: path), let certificate = SecCertificateCreateWithData(nil, certificateData as CFData) else { throw TLSError.unavailable }
+        let fingerprint = Self.digest(certificateData)
+        let key = try keychain.existingCAKey()
+        guard let certificateKey = SecCertificateCopyKey(certificate), let publicKey = SecKeyCopyPublicKey(key), let certificatePublic = SecKeyCopyExternalRepresentation(certificateKey, nil) as Data?, let managedPublic = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?, certificatePublic == managedPublic else { throw TLSError.keyCertificateMismatch }
+        let publicKeyFingerprint = Self.digest(managedPublic)
+        let existing = try store?.tlsRecord()
+        if let existing {
+            guard existing.trustDomain == "user", existing.fingerprint == fingerprint, existing.certificatePath == path.path, existing.keyApplicationTag == keychain.applicationTag, existing.publicKeyFingerprint == nil || existing.publicKeyFingerprint == publicKeyFingerprint else { throw TLSError.ownershipMismatch }
+            guard existing.ownership != .mismatch else { throw TLSError.ownershipMismatch }
+            let owned = existing.ownership == .owned ? existing : TLSDurableRecord(fingerprint: fingerprint, certificatePath: path.path, keyApplicationTag: keychain.applicationTag, publicKeyFingerprint: publicKeyFingerprint, ownership: .owned, trustDomain: "user", trustProvenance: existing.trustProvenance, trustSettingsFingerprint: existing.trustSettingsFingerprint)
+            if owned != existing { try store?.saveTLSRecord(owned) }
+            return ManagedContext(certificateData: certificateData, fingerprint: fingerprint, publicKeyFingerprint: publicKeyFingerprint, record: owned)
+        }
+        let record = TLSDurableRecord(fingerprint: fingerprint, certificatePath: path.path, keyApplicationTag: keychain.applicationTag, publicKeyFingerprint: publicKeyFingerprint, ownership: .owned, trustDomain: "user", trustProvenance: .none, trustSettingsFingerprint: nil)
+        try store?.saveTLSRecord(record)
+        return ManagedContext(certificateData: certificateData, fingerprint: fingerprint, publicKeyFingerprint: publicKeyFingerprint, record: record)
+    }
+
+    private static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
     private static func derCertificateData(_ data: Data) -> Data {
         guard SecCertificateCreateWithData(nil, data as CFData) == nil,

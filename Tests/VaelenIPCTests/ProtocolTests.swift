@@ -39,6 +39,20 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(decoded, request)
     }
 
+    func testM13TrustCommandsAreParameterlessAndTyped() throws {
+        let trust = IPCRequest(method: .tlsTrustLocalCA)
+        let untrust = IPCRequest(method: .tlsRemoveLocalCATrust)
+        XCTAssertNil(trust.params)
+        XCTAssertNil(untrust.params)
+
+        let status = TLSStatus(state: .trusted, trustObserved: true, ownership: .owned, trustProvenance: .confirmedByVaelen)
+        let payload = TLSTrustResult(status: status, operation: .confirmed, message: "confirmed")
+        let response = IPCResponse(id: trust.id, result: .tlsTrust(.init(result: payload)))
+        let decoded = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .tlsTrust(let wire)? = decoded.result else { return XCTFail("M13 trust result did not round-trip") }
+        XCTAssertEqual(wire.result, payload)
+    }
+
     func testPHPExecRequestCarriesWorkingDirectoryAndArguments() throws {
         let request = IPCRequest(
             method: .phpExec,

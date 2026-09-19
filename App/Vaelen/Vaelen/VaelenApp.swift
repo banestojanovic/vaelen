@@ -87,14 +87,14 @@ final class AppModel {
 
     func trustLocalCA() async {
         trustError = nil
-        guard case .running(_, _, _, _, _, let tls, _, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
-        do { try LocalCATrustService().trust(certificateData: data); await refresh() } catch { trustError = error.localizedDescription }
+        guard let client else { return }
+        do { _ = try await client.tlsTrustLocalCA(); await refresh() } catch { trustError = error.localizedDescription }
     }
 
     func removeLocalCATrust() async {
         trustError = nil
-        guard case .running(_, _, _, _, _, let tls, _, _, _) = state, let path = tls?.caCertificatePath, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
-        do { try LocalCATrustService().removeTrust(certificateData: data); await refresh() } catch { trustError = error.localizedDescription }
+        guard let client else { return }
+        do { _ = try await client.tlsRemoveLocalCATrust(); await refresh() } catch { trustError = error.localizedDescription }
     }
 
     func installStandardPorts() async {
