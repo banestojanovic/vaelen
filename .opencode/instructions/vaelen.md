@@ -2,9 +2,10 @@
 
 ## Frozen Baseline
 
-- M12 is frozen at `v0.0.13-m12`.
-- Frozen commit: `e76e260b69b6b1e0216fdc8985ce13cfa4c79964`.
-- ADR-0012 and all earlier accepted ADRs are authoritative.
+- M0–M13 are frozen. M12 is frozen at `v0.0.13-m12` and commit
+  `e76e260b69b6b1e0216fdc8985ce13cfa4c79964`; M13 is frozen at
+  `v0.0.14-m13` and commit `534da3618895717624cb9d4bf7dd685f5dfd571b`.
+- ADR-0013 and all earlier accepted ADRs are authoritative.
 - Do not casually reopen frozen architecture.
 - Concrete implementation evidence may expose a defect or contradiction. Stop
   and report it rather than silently redesigning frozen architecture.
@@ -37,7 +38,8 @@
 - Implementation success does not freeze architecture.
 - ADR and release freeze occur only after explicit acceptance.
 - Commit, tag, push, and freeze require explicit user instruction.
-- M13 must not start until explicitly authorized.
+- M14 is currently validation-only; production M14 implementation and
+  ADR-0014 are not authorized or frozen.
 - Only `vaelen-lead` normally edits the checkout.
 
 ## Evidence Discipline
