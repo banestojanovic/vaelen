@@ -125,6 +125,7 @@ public protocol Router: Sendable {
     func addRoute(_ route: Route) async throws
     func updateRoute(_ route: Route) async throws
     func removeRoute(id: RouteID) async throws
+    func observedRoutes() async throws -> [Route]
 }
 
 /// Deterministic provider used by Core tests until the external router is integrated.
@@ -181,4 +182,6 @@ public actor InMemoryRouter: Router {
         guard state == .running else { throw RouterError.notRunning }
         guard routes.removeValue(forKey: id) != nil else { throw RouterError.routeNotFound(id) }
     }
+
+    public func observedRoutes() async throws -> [Route] { Array(routes.values) }
 }

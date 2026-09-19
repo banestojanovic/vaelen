@@ -107,6 +107,91 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertTrue(codes.contains("MAILPIT_NOT_HEALTHY"))
     }
 
+    func testRouteTargetDivergenceRequiresExactDurableTransitionProvenance() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for path in ["bootstrap", "config", "public"] { try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true) }
+        try Data("<?php".utf8).write(to: root.appendingPathComponent("artisan"))
+        try Data("<?php".utf8).write(to: root.appendingPathComponent("public/index.php"))
+        try Data("version: 1\nphp: \"8.4\"\nweb:\n  secure: true\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let project = project(at: root)
+        let projectID = try XCTUnwrap(project.id?.rawValue)
+        let previous = Route(hostname: "transition.test", target: .fastCGI(socketPath: "/tmp/php-a.sock", documentRoot: root.appendingPathComponent("public").path), tls: .local)
+        let desired = Route(id: previous.id, hostname: previous.hostname, target: .fastCGI(socketPath: "/tmp/php-b.sock", documentRoot: root.appendingPathComponent("public").path), tls: previous.tls)
+        let package = PHPPackage(version: "8.4.23", architecture: "arm64", packagePath: "/tmp/php", cliPath: "/tmp/php", fpmPath: "/tmp/php-fpm", source: "test", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())
+        let status = PHPStatus(version: "8.4.23", package: package, state: .running, pid: 1, socket: "/tmp/php-b.sock", health: "healthy", isDefault: true)
+        let common = ProjectEnvironmentInspector()
+        let inspect: ([RouteIntent], [Route], [RouteTargetTransition]) -> ProjectEnvironmentReport = { intents, runtime, transitions in
+            common.inspect(project: project, routes: intents, phpPackages: [package], phpStatuses: [status], phpDefault: "8.4", mysql: nil, mailpit: nil, router: RouterStatus(provider: "test", state: .running, health: .healthy, routeCount: runtime.count), dns: DNSStatus(state: .installed, ownership: .vaelen, health: "healthy"), tls: TLSStatus(state: .trusted, trustObserved: true), standardPorts: StandardPortsStatus(state: .healthy), registeredProjects: [project], runtimeRoutes: runtime, pendingTransitions: transitions)
+        }
+        let intent = RouteIntent(route: desired, projectID: projectID, projectPath: root.path)
+        let unexplained = inspect([intent], [previous], [])
+        XCTAssertEqual(unexplained.routeTargets.first?.disposition, .blocked)
+        let unexplainedPlan = ProjectReconciliationPlanner().plan(report: unexplained)
+        XCTAssertEqual(unexplainedPlan.operations.first { $0.id.hasPrefix("route.php-target.update.") }?.disposition, .blocked)
+        let transition = RouteTargetTransition(routeID: previous.id, projectID: projectID, previousRoute: previous, desiredRoute: desired, previousProviderFingerprint: try routeProviderFingerprint(previous), desiredProviderFingerprint: try routeProviderFingerprint(desired), previousSocket: "/tmp/php-a.sock", desiredSocket: "/tmp/php-b.sock")
+        let knownPartial = inspect([intent], [previous], [transition])
+        XCTAssertEqual(knownPartial.routeTargets.first?.disposition, .pending)
+        let wrongProvider = inspect([intent], [Route(id: previous.id, hostname: previous.hostname, target: .fastCGI(socketPath: "/tmp/php-c.sock", documentRoot: root.appendingPathComponent("public").path), tls: previous.tls)], [transition])
+        XCTAssertEqual(wrongProvider.routeTargets.first?.disposition, .blocked)
+
+        let wrongProject = RouteTargetTransition(routeID: previous.id, projectID: UUID(), previousRoute: previous, desiredRoute: desired, previousProviderFingerprint: try routeProviderFingerprint(previous), desiredProviderFingerprint: try routeProviderFingerprint(desired), previousSocket: "/tmp/php-a.sock", desiredSocket: "/tmp/php-b.sock")
+        XCTAssertEqual(inspect([intent], [previous], [wrongProject]).routeTargets.first?.disposition, .blocked)
+        let changedAssociation = RouteIntent(route: desired, projectID: UUID(), projectPath: root.path)
+        let changedAssociationReport = inspect([changedAssociation], [previous], [transition])
+        XCTAssertTrue(changedAssociationReport.routeTargets.isEmpty)
+        XCTAssertEqual(changedAssociationReport.observed.route.associationState, .orphaned)
+        let orphaned = common.inspect(project: project, routes: [changedAssociation], phpPackages: [package], phpStatuses: [status], phpDefault: "8.4", mysql: nil, mailpit: nil, router: RouterStatus(provider: "test", state: .running, health: .healthy, routeCount: 1), dns: DNSStatus(state: .installed, ownership: .vaelen, health: "healthy"), tls: TLSStatus(state: .trusted, trustObserved: true), standardPorts: StandardPortsStatus(state: .healthy), registeredProjects: [project], runtimeRoutes: [previous], pendingTransitions: [transition])
+        XCTAssertTrue(orphaned.routeTargets.isEmpty)
+        XCTAssertEqual(orphaned.observed.route.associationState, .orphaned)
+
+        let packageC = PHPPackage(version: "8.4.24", architecture: "arm64", packagePath: "/tmp/php-c", cliPath: "/tmp/php-c", fpmPath: "/tmp/php-fpm-c", source: "test", cliSHA256: "cli-c", fpmSHA256: "fpm-c", installedAt: Date())
+        let statusC = PHPStatus(version: "8.4.24", package: packageC, state: .running, pid: 1, socket: "/tmp/php-c.sock", health: "healthy", isDefault: true)
+        let staleDesired = common.inspect(project: project, routes: [intent], phpPackages: [packageC], phpStatuses: [statusC], phpDefault: "8.4", mysql: nil, mailpit: nil, router: RouterStatus(provider: "test", state: .running, health: .healthy, routeCount: 1), dns: DNSStatus(state: .installed, ownership: .vaelen, health: "healthy"), tls: TLSStatus(state: .trusted, trustObserved: true), standardPorts: StandardPortsStatus(state: .healthy), registeredProjects: [project], runtimeRoutes: [previous], pendingTransitions: [transition])
+        XCTAssertEqual(staleDesired.routeTargets.first?.disposition, .blocked)
+
+        let semanticVariants = [
+            Route(id: previous.id, hostname: "changed.test", target: desired.target, tls: desired.tls),
+            Route(id: previous.id, hostname: desired.hostname, target: .fastCGI(socketPath: desired.target.fastCGISocket!, documentRoot: "/tmp/other/public"), tls: desired.tls),
+            Route(id: previous.id, hostname: desired.hostname, target: desired.target, tls: .disabled)
+        ]
+        for variant in semanticVariants {
+            XCTAssertEqual(inspect([RouteIntent(route: variant, projectID: projectID, projectPath: root.path)], [previous], [transition]).routeTargets.first?.disposition, .blocked)
+        }
+
+        let missingProvider = inspect([intent], [], [transition])
+        XCTAssertEqual(missingProvider.routeTargets.first?.disposition, .blocked)
+
+        let neitherExpected = inspect([intent], [Route(id: previous.id, hostname: previous.hostname, target: .fastCGI(socketPath: "/tmp/php-z.sock", documentRoot: root.appendingPathComponent("public").path), tls: previous.tls)], [transition])
+        XCTAssertEqual(neitherExpected.routeTargets.first?.disposition, .blocked)
+
+        let noTransition = { (router: RouterStatus, statuses: [PHPStatus], runtime: [Route]?) in
+            common.inspect(project: project, routes: [intent], phpPackages: [package], phpStatuses: statuses, phpDefault: "8.4", mysql: nil, mailpit: nil, router: router, dns: DNSStatus(state: .installed, ownership: .vaelen, health: "healthy"), tls: TLSStatus(state: .trusted, trustObserved: true), standardPorts: StandardPortsStatus(state: .healthy), registeredProjects: [project], runtimeRoutes: runtime, pendingTransitions: [])
+        }
+        let stopped = noTransition(RouterStatus(provider: "test", state: .stopped, health: .unknown, routeCount: 1), [status], [desired])
+        let unhealthy = noTransition(RouterStatus(provider: "test", state: .running, health: .unhealthy, routeCount: 1), [status], [desired])
+        let adminUnavailable = noTransition(RouterStatus(provider: "test", state: .running, health: .healthy, routeCount: 0), [status], nil)
+        let ownershipUnproven = noTransition(RouterStatus(provider: "test", state: .running, health: .healthy, routeCount: 1), [PHPStatus(version: "8.4.23", package: nil, state: .running, pid: 1, socket: "/tmp/php-b.sock", health: "healthy", isDefault: true)], [desired])
+        let fpmUnhealthy = noTransition(RouterStatus(provider: "test", state: .running, health: .healthy, routeCount: 1), [PHPStatus(version: "8.4.23", package: package, state: .running, pid: 1, socket: "/tmp/php-b.sock", health: "unhealthy", isDefault: true)], [desired])
+        for report in [stopped, unhealthy, adminUnavailable, ownershipUnproven] {
+            XCTAssertEqual(report.routeTargets.first?.disposition, .blocked)
+        }
+        XCTAssertEqual(fpmUnhealthy.routeTargets.first?.disposition, .deferred)
+    }
+
+    func testRouteProviderFingerprintCoversAllProviderSemantics() throws {
+        let base = Route(hostname: "fingerprint.test", target: .fastCGI(socketPath: "/tmp/php-a.sock", documentRoot: "/tmp/public"), tls: .local)
+        let variants = [
+            Route(id: base.id, hostname: "other.test", target: base.target, tls: base.tls),
+            Route(id: base.id, hostname: base.hostname, target: .fastCGI(socketPath: "/tmp/php-b.sock", documentRoot: "/tmp/public"), tls: base.tls),
+            Route(id: base.id, hostname: base.hostname, target: .fastCGI(socketPath: "/tmp/php-a.sock", documentRoot: "/tmp/other"), tls: base.tls),
+            Route(id: base.id, hostname: base.hostname, target: base.target, tls: .disabled),
+            Route(id: base.id, hostname: base.hostname, target: .staticFiles(documentRoot: "/tmp/public"), tls: base.tls)
+        ]
+        let original = try routeProviderFingerprint(base)
+        XCTAssertTrue(try variants.allSatisfy { try routeProviderFingerprint($0) != original })
+    }
+
     func testEndpointMismatchDiagnosticsRespectTriStateAndRequestedState() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

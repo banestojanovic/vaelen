@@ -1,8 +1,19 @@
 # Vaelen
 
-Vaelen is a native macOS developer control center. Milestone 1 contains the
-authoritative per-user `vaelend` Core daemon, structured UNIX-socket IPC,
-project registration, and shallow parked-directory discovery.
+Vaelen is a native macOS developer control center. The current frozen release
+is M12, Project PHP Route Target Convergence, with an authoritative per-user
+`vaelend` Core daemon, structured UNIX-socket IPC, project registration, and
+managed local development infrastructure.
+
+## Release Status
+
+- **M12:** frozen and complete
+- **Version:** `0.0.13-dev`
+- **Build identity:** `m12-php-route-target-convergence-schema-4`
+- **SQLite schema:** `5`
+- **IPC schema:** `4`
+- **Acceptance record:** `docs/m12-acceptance.md`
+- **Architecture decision:** `docs/adr/ADR-0012-php-route-target-convergence.md`
 
 ## Requirements
 
@@ -96,8 +107,9 @@ directly.
 
 ## Scope
 
-PHP runtime management, Caddy, routing, DNS/TLS, modules, reconciliation,
-privileged helpers, Docker, Electron, and Homebrew-managed infrastructure remain
-deferred. The controlled PHP distribution build inputs and CI workflow live
-under `Distribution/PHP` and `.github/workflows/build-php.yml`; no PHP binaries
-are stored in the repository.
+M12 includes managed PHP runtime selection, Caddy routing, DNS/TLS, standard
+ports, project reconciliation, durable PHP route-target convergence, and the
+associated ownership and privileged-helper boundaries. The controlled PHP
+distribution build inputs and CI workflow live under `Distribution/PHP` and
+`.github/workflows/build-php.yml`; no PHP binaries are stored in the
+repository. Future milestone scope remains outside this release.

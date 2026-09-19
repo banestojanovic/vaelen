@@ -89,4 +89,34 @@ final class ProjectReconciliationTests: XCTestCase {
         XCTAssertEqual(route?.disposition, .blocked)
         XCTAssertTrue(route?.reason?.contains("does not mutate routes") == true)
     }
+
+    func testPendingRouteTargetRemainsExplicitlyPending() {
+        let base = report(mysql: nil, mailpit: healthyMailpit())
+        let route = ProjectPHPRouteTargetObservation(
+            projectID: base.identity.id!.rawValue,
+            routeID: RouteID(),
+            hostname: "fixture.test",
+            persistedDocumentRoot: "/tmp/reconciliation-fixture/public",
+            observedDocumentRoot: "/tmp/reconciliation-fixture/public",
+            persistedTLS: .local,
+            observedTLS: .local,
+            persistedSocket: "/tmp/php-8.4.23.sock",
+            observedSocket: "/tmp/php-8.4.22.sock",
+            currentPHPVersion: "8.4.22",
+            desiredPHPDeclaration: "8.4",
+            resolvedPHPVersion: "8.4.23",
+            desiredSocket: "/tmp/php-8.4.23.sock",
+            associationAuthority: .allowed,
+            currentTargetOwnership: .proven,
+            desiredTargetOwnership: .proven,
+            providerAgreement: .diverged,
+            disposition: .pending,
+            reason: "provider apply failed"
+        )
+        let report = ProjectEnvironmentReport(identity: base.identity, desired: base.desired, configured: base.configured, observed: base.observed, derived: base.derived, secret: base.secret, diagnostics: base.diagnostics, routeTargets: [route])
+        let operation = ProjectReconciliationPlanner().plan(report: report).operations.first { $0.id.hasPrefix("route.php-target.update.") }
+        XCTAssertNotNil(operation)
+        XCTAssertEqual(operation?.disposition, ProjectReconciliationDisposition.pending)
+        XCTAssertEqual(operation?.currentState, ProjectReconciliationResourceState.unknown)
+    }
 }

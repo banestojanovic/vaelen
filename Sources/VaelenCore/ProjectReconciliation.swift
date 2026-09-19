@@ -19,6 +19,7 @@ public enum ProjectReconciliationOperationResultState: String, Codable, Equatabl
     case skipped
     case failed
     case blocked
+    case pending
 }
 
 public enum ProjectReconciliationMutationClass: String, Codable, Equatable, Sendable {
@@ -34,6 +35,7 @@ public enum ProjectReconciliationDisposition: String, Codable, Equatable, Sendab
     case satisfied
     case actionable
     case blocked
+    case pending
     case authorizationRequired
     case deferred
     case unsupported
@@ -173,7 +175,7 @@ public struct ProjectReconciliationPlanner: Sendable {
         appendWeb(report: report, to: &operations)
         appendEndpointBlockers(report: report, to: &operations)
         let state: ProjectReconciliationPlanState
-        if operations.contains(where: { [.blocked, .authorizationRequired, .deferred, .unsupported].contains($0.disposition) }) {
+        if operations.contains(where: { [.blocked, .authorizationRequired, .deferred, .unsupported, .pending].contains($0.disposition) }) {
             state = .blocked
         } else if operations.contains(where: { $0.disposition == .actionable }) {
             state = .actionable
@@ -240,7 +242,13 @@ public struct ProjectReconciliationPlanner: Sendable {
         if report.observed.route.associationState == .safelyAssociable {
             operations.append(.init(id: "route.project-association.attach", resource: .route, action: .associate, currentState: .mismatch, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .actionable, reason: "A unique legacy route has corroborated project evidence; explicit route association is required before route mutation."))
         }
-        if !report.observed.route.intentExists {
+        if !report.routeTargets.isEmpty {
+            for target in report.routeTargets.sorted(by: { $0.routeID.description < $1.routeID.description }) {
+                let operationID = "route.php-target.update.\(target.routeID.description)"
+                let dependencies = target.disposition == .deferred ? ["php.fpm.start"] : []
+                operations.append(.init(id: operationID, resource: .route, action: .reconcile, currentState: target.disposition == .satisfied ? .satisfied : target.disposition == .actionable ? .mismatch : .unknown, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: target.disposition, reason: target.reason, dependencies: dependencies, preconditions: ["Durable ProjectID association", "Persisted and live Caddy route semantics agree", "Current and desired PHP targets are Vaelen-owned" ]))
+            }
+        } else if !report.observed.route.intentExists {
             operations.append(.init(id: "route.reconcile", resource: .route, action: .reconcile, currentState: .missing, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .deferred, reason: "Route creation is deferred; M8 Slice 1 does not invent a hostname or mutate route_intents."))
         } else if report.derived.routeDocumentRootMatches == false {
             operations.append(.init(id: "route.reconcile", resource: .route, action: .reconcile, currentState: .mismatch, targetState: .satisfied, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "The existing route document root does not match the framework-derived document root."))

@@ -20,6 +20,7 @@ public actor CoreRequestDispatcher {
     public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) throws {
         self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
         let persistedRoutes = try routeRepository?.all() ?? []
+        _ = try routeRepository?.pendingTransitions()
         self.routeIntents = Dictionary(uniqueKeysWithValues: persistedRoutes.map { ($0.route.id, $0) })
     }
 
@@ -175,6 +176,10 @@ public actor CoreRequestDispatcher {
                 let associated = RouteIntent(route: intent.route, projectID: params.projectID.rawValue, projectPath: path)
                 routeIntents[params.routeID] = associated
                 return (.init(id: request.id, result: .routeAssociation(.init(route: associated, state: .associated))), true)
+            case .routePHPTargetUpdate:
+                let params = try request.params?.decode(RoutePHPTargetUpdateRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route target update parameters are required.") }()
+                let result = try await updatePHPTarget(projectID: params.projectID, routeID: params.routeID, expectedCurrentSocket: params.expectedCurrentSocket)
+                return (.init(id: request.id, result: .routePHPTargetUpdate(result)), true)
             case .dnsStatus:
                 return (.init(id: request.id, result: .dnsStatus(.init(dns: await dns.status()))), true)
             case .dnsInstall:
@@ -262,6 +267,9 @@ public actor CoreRequestDispatcher {
         let invalidPHPVersions = phpObservations.filter { $0.eligibility != .eligible }.compactMap(\.version)
         let phpStatuses = phpPackages.compactMap { try? php?.status(requestedVersion: $0.version) }.compactMap { $0 }
         let routerStatus = await router.status()
+        let runtimeRoutes = try? await router.observedRoutes()
+        let linkedProjects = try await registry.linkedProjects()
+        let pendingTransitions = try routeRepository?.pendingTransitions() ?? []
         let report = ProjectEnvironmentInspector().inspect(
             project: project,
             routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname },
@@ -275,8 +283,14 @@ public actor CoreRequestDispatcher {
             tls: await tls.status(),
             standardPorts: await ports.status(),
             invalidPHPVersions: invalidPHPVersions,
-            registeredProjects: try await registry.linkedProjects()
+            registeredProjects: linkedProjects, runtimeRoutes: runtimeRoutes, pendingTransitions: pendingTransitions
         )
+        if let routeRepository, let projectID = project.id?.rawValue, runtimeRoutes != nil, routerStatus.state == .running, routerStatus.health == .healthy, report.observed.php.fpmHealth == "healthy", let resolvedVersion = report.observed.php.resolvedVersion, let desiredSocket = report.observed.php.fpmSocket {
+            for transition in pendingTransitions where transition.projectID == projectID && transition.desiredSocket == desiredSocket && transition.desiredRoute.target.fastCGISocket == desiredSocket {
+                guard linkedProjects.contains(where: { $0.id?.rawValue == projectID }), let target = report.routeTargets.first(where: { $0.routeID == transition.routeID }), target.disposition == .satisfied, target.resolvedPHPVersion == resolvedVersion, let runtime = runtimeRoutes?.first(where: { $0.hostname == transition.desiredRoute.hostname }), (try? routeProviderFingerprint(runtime)) == transition.desiredProviderFingerprint else { continue }
+                try routeRepository.completeFastCGITargetTransition(id: transition.routeID, projectID: projectID, desiredRoute: transition.desiredRoute)
+            }
+        }
         return report
     }
 
@@ -295,11 +309,11 @@ public actor CoreRequestDispatcher {
                 results.append(.init(operationID: operation.id, state: .satisfied, message: "Already satisfied; no mutation performed.", verified: true))
                 continue
             }
-            guard operation.disposition == .actionable else {
+            guard operation.disposition == .actionable || operation.disposition == .pending else {
                 results.append(.init(operationID: operation.id, state: .blocked, message: operation.reason ?? "Operation is not executable in M8 Slice 1.", verified: false))
                 continue
             }
-            guard let current = freshPlan.operations.first(where: { $0.id == operation.id }), current.disposition == .actionable else {
+            guard let current = freshPlan.operations.first(where: { $0.id == operation.id }), current.disposition == .actionable || current.disposition == .pending else {
                 results.append(.init(operationID: operation.id, state: .skipped, message: "The plan became stale before execution; no mutation performed.", verified: false))
                 continue
             }
@@ -326,12 +340,14 @@ public actor CoreRequestDispatcher {
                 } catch {
                     results.append(.init(operationID: operation.id, state: .failed, message: "PHP-FPM start failed; actual state was re-observed.", verified: false))
                 }
+            case let id where id.hasPrefix("route.php-target.update."):
+                continue
             default:
                 results.append(.init(operationID: operation.id, state: .skipped, message: "This operation is not executable in M9.", verified: false))
             }
         }
 
-        let finalPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        var finalPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
         if startedMailpit, let resultIndex = results.firstIndex(where: { $0.operationID == "mailpit.start" }) {
             let healthy = finalPlan.operations.first(where: { $0.id == "mailpit.start" })?.disposition == .satisfied
             results[resultIndex] = .init(operationID: "mailpit.start", state: healthy ? .succeeded : .failed, message: healthy ? "Mailpit is healthy after activation." : "Mailpit did not verify healthy after activation.", verified: healthy)
@@ -340,6 +356,18 @@ public actor CoreRequestDispatcher {
             let healthy = finalPlan.operations.first(where: { $0.id == "php.fpm.start" })?.disposition == .satisfied
             results[resultIndex] = .init(operationID: "php.fpm.start", state: healthy ? .succeeded : .failed, message: healthy ? "PHP-FPM is healthy after activation." : "PHP-FPM did not verify healthy after activation.", verified: healthy)
         }
+        for operation in finalPlan.operations where operation.id.hasPrefix("route.php-target.update.") && (operation.disposition == .actionable || operation.disposition == .pending) {
+            guard let routeID = UUID(uuidString: String(operation.id.dropFirst("route.php-target.update.".count))), let projectID = project.id else { continue }
+            guard let observation = (try await projectEnvironmentReport(for: project)).routeTargets.first(where: { $0.routeID == RouteID(rawValue: routeID) }) else { continue }
+            do {
+                let result = try await updatePHPTarget(projectID: projectID, routeID: RouteID(rawValue: routeID), expectedCurrentSocket: observation.persistedSocket)
+                let state: ProjectReconciliationOperationResultState = result.state == .pending ? .pending : result.state == .satisfied ? .satisfied : .succeeded
+                results.append(.init(operationID: operation.id, state: state, message: result.state == .pending ? "Desired route target is persisted; Caddy provider application is pending." : result.state == .satisfied ? "Route target already satisfied; no mutation performed." : "FastCGI route target converged.", verified: result.state != .pending))
+            } catch {
+                results.append(.init(operationID: operation.id, state: .failed, message: "Route target convergence failed: \(error)", verified: false))
+            }
+        }
+        finalPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
         let state: ProjectReconciliationExecutionState
         if finalPlan.state == .satisfied && results.allSatisfy({ $0.state == .satisfied || $0.state == .succeeded }) {
             state = .succeeded
@@ -351,6 +379,37 @@ public actor CoreRequestDispatcher {
             state = .blocked
         }
         return .init(initialPlan: initialPlan, operations: results, finalPlan: finalPlan, state: state)
+    }
+
+    private func updatePHPTarget(projectID: ProjectID, routeID: RouteID, expectedCurrentSocket: String) async throws -> RoutePHPTargetUpdateResult {
+        guard let repository = routeRepository, let project = try await registry.linkedProject(id: projectID), project.registrationKind == .linked else { throw IPCErrorPayload(code: .invalidRequest, message: "Route target convergence requires a linked project.") }
+        let report = try await projectEnvironmentReport(for: project)
+        guard let observation = report.routeTargets.first(where: { $0.routeID == routeID }) else { throw IPCErrorPayload(code: .invalidRequest, message: "The route is not an eligible durable FastCGI route for this project.") }
+        guard observation.persistedSocket == expectedCurrentSocket else { throw IPCErrorPayload(code: .invalidRequest, message: "The route target plan is stale; the persisted socket changed.") }
+        if observation.disposition == .satisfied {
+            return .init(observation: observation, state: .satisfied)
+        }
+        guard observation.disposition == .actionable || observation.disposition == .pending, let desiredSocket = observation.desiredSocket else { throw IPCErrorPayload(code: .invalidRequest, message: observation.reason ?? "Route target convergence is blocked.") }
+        let currentIntent = routeIntents[routeID]
+        guard currentIntent != nil else { throw IPCErrorPayload(code: .invalidRequest, message: "The route disappeared before target convergence.") }
+        if currentIntent?.route.target.fastCGISocket != desiredSocket {
+            guard observation.disposition == .actionable else { throw IPCErrorPayload(code: .invalidRequest, message: "The pending transition is not valid for the current route state.") }
+            let updated = try repository.persistFastCGITargetTransition(id: routeID, projectID: projectID.rawValue, expectedSocket: observation.persistedSocket, desiredSocket: desiredSocket).intent
+            routeIntents[routeID] = updated
+        }
+        do {
+            guard (await router.status()).state == .running, (await router.status()).health == .healthy else { throw RouterError.notRunning }
+            try await router.reconcile(routes: routeIntents.values.map(\.route))
+            let verifiedReport = try await projectEnvironmentReport(for: project)
+            guard let verified = verifiedReport.routeTargets.first(where: { $0.routeID == routeID }), verified.disposition == .satisfied else {
+                return .init(observation: verifiedReport.routeTargets.first(where: { $0.routeID == routeID }) ?? observation, state: .pending)
+            }
+            return .init(observation: verified, state: .updated)
+        } catch {
+            let pendingReport = try await projectEnvironmentReport(for: project)
+            let pendingObservation = pendingReport.routeTargets.first(where: { $0.routeID == routeID }) ?? observation
+            return .init(observation: pendingObservation, state: .pending)
+        }
     }
 
     private func map(_ error: MySQLModuleError) -> IPCErrorPayload {

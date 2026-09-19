@@ -168,6 +168,18 @@ final class DispatcherTests: XCTestCase {
         }
     }
 
+    func testDispatcherRejectsMalformedTransitionProvenanceAtStartup() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        try store.execute("INSERT INTO route_target_transitions (route_id,project_id,previous_route_json,desired_route_json,previous_provider_json,desired_provider_json,previous_socket,desired_socket,state) VALUES ('bad','bad',X'00',X'00',X'00',X'00','a','b','providerPending')")
+        let registry = ProjectRegistry(store: store)
+        XCTAssertThrowsError(try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, routeRepository: RouteIntentRepository(store: store))) { error in
+            XCTAssertEqual(error as? SQLiteStateError, .invalidRecord)
+        }
+    }
+
     func testProjectReconciliationRejectsDiscoveredProjects() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let projectRoot = root.appendingPathComponent("discovered")

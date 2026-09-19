@@ -9,8 +9,9 @@ public enum SQLiteStateError: Error, Equatable, Sendable {
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public final class SQLiteStateStore: @unchecked Sendable {
-    public static let schemaVersion = 4
+    public static let schemaVersion = 5
     private var database: OpaquePointer?
+    internal var databasePointer: OpaquePointer? { database }
 
     public init(databaseURL: URL) throws {
         try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -33,6 +34,26 @@ public final class SQLiteStateStore: @unchecked Sendable {
         }
     }
 
+    internal func execute(_ sql: String, bind: ((OpaquePointer) -> Void)) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw SQLiteStateError.execute(message) }
+        defer { sqlite3_finalize(statement) }
+        bind(statement!)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw SQLiteStateError.execute(message) }
+    }
+
+    internal func transaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let result = try body()
+            try execute("COMMIT")
+            return result
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
     internal func query(_ sql: String, bind: ((OpaquePointer) -> Void) = { _ in }, row: (OpaquePointer) throws -> Void) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw SQLiteStateError.execute(message) }
@@ -48,6 +69,12 @@ public final class SQLiteStateStore: @unchecked Sendable {
 
     internal func bind(_ value: String, to statement: OpaquePointer, index: Int32) {
         sqlite3_bind_text(statement, index, value, -1, sqliteTransient)
+    }
+
+    internal func bind(_ value: Data, to statement: OpaquePointer, index: Int32) {
+        _ = value.withUnsafeBytes { buffer in
+            sqlite3_bind_blob(statement, index, buffer.baseAddress, Int32(value.count), sqliteTransient)
+        }
     }
 
     internal func columnString(_ statement: OpaquePointer, _ index: Int32) -> String? {
@@ -76,6 +103,10 @@ public final class SQLiteStateStore: @unchecked Sendable {
             if version <= 3 {
                 try execute("CREATE TABLE IF NOT EXISTS tls_capability (id INTEGER PRIMARY KEY CHECK (id = 1), ca_fingerprint TEXT NOT NULL, ca_certificate_path TEXT NOT NULL, active INTEGER NOT NULL)")
                 try execute("PRAGMA user_version = 4")
+            }
+            if version <= 4 {
+                try execute("CREATE TABLE IF NOT EXISTS route_target_transitions (route_id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, previous_route_json BLOB NOT NULL, desired_route_json BLOB NOT NULL, previous_provider_json BLOB NOT NULL, desired_provider_json BLOB NOT NULL, previous_socket TEXT NOT NULL, desired_socket TEXT NOT NULL, state TEXT NOT NULL CHECK (state = 'providerPending'))")
+                try execute("PRAGMA user_version = 5")
             }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

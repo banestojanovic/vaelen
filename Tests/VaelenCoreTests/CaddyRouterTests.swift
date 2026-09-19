@@ -72,6 +72,48 @@ final class CaddyRouterTests: XCTestCase {
         XCTAssertEqual(asset.body, "asset response")
     }
 
+    func testOfficialCaddyRoundTripsNormalizedFastCGIRoute() async throws {
+        let root = URL(fileURLWithPath: "/tmp/vaelen-fastcgi-observation-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let configuration = try CaddyTestSupport.configuration()
+        let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
+        await supervisor.installPackage(try resolveCaddyPackage())
+        let tls = TLSCapability(layout: layout)
+        _ = try await tls.install()
+        let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
+        addTeardownBlock {
+            try? await router.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        try await router.start()
+        let route = Route(hostname: "roundtrip.test", target: .fastCGI(socketPath: "/tmp/vaelen-roundtrip.sock", documentRoot: root.appendingPathComponent("public").path), tls: .local)
+        try await router.reconcile(routes: [route])
+
+        let observed = try await router.observedRoutes()
+        XCTAssertEqual(observed.count, 1)
+        XCTAssertEqual(observed[0].hostname, route.hostname)
+        XCTAssertEqual(observed[0].target, route.target)
+        XCTAssertEqual(observed[0].tls, route.tls)
+    }
+
+    func testObservedRoutesRejectsMalformedProviderSemantics() throws {
+        let cases: [[[String: Any]]] = [
+            [["match": [["host": []]], "handle": [["handler": "file_server", "root": "/tmp"]]]],
+            [["match": [["host": ["malformed.test"]]], "handle": [["handler": "vars", "root": "/tmp"], ["handler": "reverse_proxy", "transport": ["protocol": "fastcgi"], "upstreams": [["dial": "unix//"]]]]]],
+            [["match": [["host": ["malformed.test"]]], "handle": [["handler": "reverse_proxy", "upstreams": [["dial": "not-a-supported-target"]]]]]]
+        ]
+
+        for routes in cases {
+            let configuration: [String: Any] = [
+                "apps": ["http": ["servers": ["vaelen-http": ["routes": routes]]]]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: configuration)
+            XCTAssertThrowsError(try CaddyRouter.decodeObservedRoutes(data))
+        }
+    }
+
     func testOfficialCaddyReachesSyncproofLaravelFrontController() async throws {
         guard let php = PHPModule.development(), let phpPackage = php.installedVersions().last else {
             throw XCTSkip("M2 PHP-FPM package is not installed")
@@ -80,6 +122,10 @@ final class CaddyRouterTests: XCTestCase {
         let project = URL(fileURLWithPath: "/Users/banes/Code/syncproof", isDirectory: true)
         guard FileManager.default.fileExists(atPath: project.appendingPathComponent("public/index.php").path) else {
             throw XCTSkip("syncproof project is not available")
+        }
+        let database = syncproofDatabaseEndpoint(project: project)
+        guard canConnectTCP(host: database.host, port: database.port) else {
+            throw XCTSkip("syncproof MySQL is unavailable at \(database.host):\(database.port)")
         }
         let root = URL(fileURLWithPath: "/tmp/vaelen-syncproof-\(UUID().uuidString)", isDirectory: true)
         let layout = VaelenFilesystemLayout(rootURL: root)
@@ -197,6 +243,25 @@ final class CaddyRouterTests: XCTestCase {
         defer { close(descriptor) }
         var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(port).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
         return withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 } }
+    }
+
+    private func syncproofDatabaseEndpoint(project: URL) -> (host: String, port: Int) {
+        let env = (try? String(contentsOf: project.appendingPathComponent(".env"), encoding: .utf8)) ?? ""
+        func value(_ key: String) -> String? {
+            env.split(separator: "\n").map({ $0.trimmingCharacters(in: .whitespaces) }).first(where: { $0.hasPrefix(key + "=") }).map({ String($0.dropFirst(key.count + 1)).trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) })
+        }
+        return (value("DB_HOST") ?? "127.0.0.1", Int(value("DB_PORT") ?? "") ?? 3306)
+    }
+
+    private func canConnectTCP(host: String, port: Int) -> Bool {
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM, ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, String(port), &hints, &result) == 0, let address = result else { return false }
+        defer { freeaddrinfo(address) }
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        return Darwin.connect(descriptor, address.pointee.ai_addr, address.pointee.ai_addrlen) == 0
     }
 
     private func runHTTP(host: String, port: Int, path: String) throws -> (status: Int, headers: String, body: String) {

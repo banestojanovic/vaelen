@@ -300,8 +300,9 @@ public struct ProjectEnvironmentReport: Codable, Equatable, Sendable {
     public let derived: ProjectDerivedEnvironment
     public let secret: ProjectSecretEnvironment
     public let diagnostics: [ProjectDiagnostic]
+    public let routeTargets: [ProjectPHPRouteTargetObservation]
 
-    public init(identity: ProjectEnvironmentIdentity, desired: ProjectDesiredEnvironment, configured: ProjectConfiguredEnvironment, observed: ProjectObservedEnvironment, derived: ProjectDerivedEnvironment, secret: ProjectSecretEnvironment, diagnostics: [ProjectDiagnostic]) {
+    public init(identity: ProjectEnvironmentIdentity, desired: ProjectDesiredEnvironment, configured: ProjectConfiguredEnvironment, observed: ProjectObservedEnvironment, derived: ProjectDerivedEnvironment, secret: ProjectSecretEnvironment, diagnostics: [ProjectDiagnostic], routeTargets: [ProjectPHPRouteTargetObservation] = []) {
         self.identity = identity
         self.desired = desired
         self.configured = configured
@@ -309,6 +310,7 @@ public struct ProjectEnvironmentReport: Codable, Equatable, Sendable {
         self.derived = derived
         self.secret = secret
         self.diagnostics = diagnostics
+        self.routeTargets = routeTargets
     }
 }
 
@@ -331,7 +333,7 @@ public enum ProjectEnvironmentInspectionError: Error, Equatable, Sendable {
 public struct ProjectEnvironmentInspector: Sendable {
     public init() {}
 
-    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = [], registeredProjects: [Project] = []) -> ProjectEnvironmentReport {
+    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = [], registeredProjects: [Project] = [], runtimeRoutes: [Route]? = nil, pendingTransitions: [RouteTargetTransition] = []) -> ProjectEnvironmentReport {
         let root = URL(fileURLWithPath: project.rootPath.string, isDirectory: true)
         let framework = inspectFramework(root: root)
         let desiredResult = readDesiredState(root: root)
@@ -364,7 +366,9 @@ public struct ProjectEnvironmentInspector: Sendable {
         let derived = ProjectDerivedEnvironment(framework: framework, phpResolution: phpResolution(desired: desiredResult.state.php, resolved: resolved), dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication, routeDocumentRootMatches: route.documentRoot == nil ? nil : routeRootMatch, routeTargetMatchesPHP: routeTargetMatchesPHP, configCache: cache)
         let observed = ProjectObservedEnvironment(php: observedPHP, mysql: mysql, mailpit: mailpit, route: route, dns: dns, tls: tls, standardPorts: standardPorts)
         let secrets = ProjectSecretEnvironment(databasePassword: env.databasePassword, mailPassword: env.mailPassword, notes: ["Secret values are never returned by inspection."])
-        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, invalidPHPVersions: invalidPHPVersions, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication))
+        let reportDiagnostics = diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, invalidPHPVersions: invalidPHPVersions, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication)
+        let targets = routeTargetObservations(project: project, framework: framework, desiredPHP: desiredResult.state.php, resolvedPHP: resolved, routes: routes, runtimeRoutes: runtimeRoutes, phpStatuses: phpStatuses, router: router, association: RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects), pendingTransitions: pendingTransitions)
+        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: reportDiagnostics, routeTargets: targets)
     }
 
     private struct DesiredRead { let state: ProjectDesiredEnvironment; let error: String? }
@@ -452,6 +456,53 @@ public struct ProjectEnvironmentInspector: Sendable {
         case .http(let host, let port): documentRoot = nil; target = "http \(host):\(port)"
         }
         return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason)
+    }
+
+    private func routeTargetObservations(project: Project, framework: ProjectFrameworkInspection, desiredPHP: String?, resolvedPHP: String?, routes: [RouteIntent], runtimeRoutes: [Route]?, phpStatuses: [PHPStatus], router: RouterStatus, association: RouteAssociationResult, pendingTransitions: [RouteTargetTransition]) -> [ProjectPHPRouteTargetObservation] {
+        guard let projectID = project.id?.rawValue else { return [] }
+        let durable = routes.filter { $0.projectID == projectID && $0.route.target.isFastCGI }
+        return durable.sorted { $0.route.id.description < $1.route.id.description }.map { intent in
+            guard case .fastCGI(let persistedSocket, let persistedRoot) = intent.route.target else { fatalError("FastCGI route filter invariant failed") }
+            let candidates = runtimeRoutes?.filter { $0.hostname == intent.route.hostname } ?? []
+            let runtime = candidates.count == 1 ? candidates[0] : nil
+            let runtimeFastCGI: (socket: String, root: String)? = runtime.flatMap {
+                guard case .fastCGI(let socket, let root) = $0.target else { return nil }
+                return (socket, root)
+            }
+            let currentStatus = phpStatuses.first { $0.socket == persistedSocket && $0.package != nil }
+            let currentOwnership: PHPRouteTargetOwnership = currentStatus == nil ? .unknown : .proven
+            let desiredStatus = resolvedPHP.flatMap { version in phpStatuses.first { $0.version == version } }
+            let desiredSocket = desiredStatus?.socket
+            let desiredOwnership: PHPRouteTargetOwnership = desiredStatus?.package != nil ? .proven : .unavailable
+            let providerAgreement: PHPRouteProviderAgreement
+            if runtimeRoutes == nil { providerAgreement = .unreadable }
+            else if runtime == nil { providerAgreement = .missing }
+            else if runtimeFastCGI?.socket == persistedSocket, runtimeFastCGI?.root == persistedRoot, runtime?.tls == intent.route.tls { providerAgreement = .agreed }
+            else { providerAgreement = .diverged }
+            let rootMatches = framework.suggestedDocumentRoot.map { project.rootPath.string + "/" + $0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) } == persistedRoot
+            let transition = pendingTransitions.first { $0.routeID == intent.route.id }
+            let transitionMatchesPersisted = transition.map { $0.projectID == projectID && $0.desiredRoute == intent.route && $0.desiredSocket == persistedSocket } ?? false
+            let transitionMatchesProvider = transition.flatMap { transition in runtime.flatMap { try? routeProviderFingerprint($0) == transition.previousProviderFingerprint } } ?? false
+            let transitionMatchesDesiredProvider = transition.flatMap { transition in runtime.flatMap { try? routeProviderFingerprint($0) == transition.desiredProviderFingerprint } } ?? false
+            let transitionMatchesDesiredPHP = transition?.desiredSocket == desiredSocket && desiredOwnership == .proven && desiredStatus?.health == "healthy"
+            let transitionValid = transition?.projectID == projectID && transitionMatchesPersisted && transitionMatchesProvider && transitionMatchesDesiredPHP && intent.projectID == projectID
+            let disposition: ProjectReconciliationDisposition
+            let reason: String?
+            if association.state != .durable { disposition = .blocked; reason = "The route does not have durable ProjectID mutation authority." }
+            else if !rootMatches { disposition = .blocked; reason = "The persisted document root does not match the validated project document root." }
+            else if transition != nil && transition?.projectID == projectID && transitionMatchesDesiredProvider && persistedSocket == desiredSocket && transitionMatchesPersisted && transitionMatchesDesiredPHP { disposition = .satisfied; reason = nil }
+            else if transition != nil && !transitionValid { disposition = .blocked; reason = "The durable route-target transition no longer matches the project, persisted route, provider route, or desired PHP state." }
+            else if transitionValid && providerAgreement == .diverged { disposition = .pending; reason = "The desired target is persisted and the provider is behind after a known M12 apply failure." }
+            else if providerAgreement != .agreed { disposition = .blocked; reason = providerAgreement == .missing ? "The persisted route is missing from the live Caddy configuration." : providerAgreement == .unreadable ? "The live Caddy route configuration is unreadable." : "Persisted route semantics diverge from the live Caddy route." }
+            else if router.state != .running || router.health != .healthy { disposition = .blocked; reason = "Caddy must be running and healthy; M12 will not start it implicitly." }
+            else if currentOwnership != .proven { disposition = .blocked; reason = currentOwnership == .external ? "The current FastCGI target is external and cannot be adopted." : "The current FastCGI target ownership cannot be proven." }
+            else if desiredPHP == nil || resolvedPHP == nil || desiredSocket == nil { disposition = .blocked; reason = "The declared PHP family has no eligible exact installed target." }
+            else if desiredOwnership != .proven { disposition = .blocked; reason = "The desired PHP target is not a proven Vaelen-managed runtime." }
+            else if desiredStatus?.health != "healthy" { disposition = .deferred; reason = "The desired PHP-FPM runtime must be healthy before route convergence." }
+            else if persistedSocket == desiredSocket { disposition = .satisfied; reason = nil }
+            else { disposition = .actionable; reason = "The route targets a different proven Vaelen PHP runtime." }
+            return ProjectPHPRouteTargetObservation(projectID: projectID, routeID: intent.route.id, hostname: intent.route.hostname, persistedDocumentRoot: persistedRoot, observedDocumentRoot: runtimeFastCGI?.root, persistedTLS: intent.route.tls, observedTLS: runtime?.tls, persistedSocket: persistedSocket, observedSocket: runtimeFastCGI?.socket, currentPHPVersion: currentStatus?.version, desiredPHPDeclaration: desiredPHP, resolvedPHPVersion: resolvedPHP, desiredSocket: desiredSocket, associationAuthority: association.mutationAuthority, currentTargetOwnership: currentOwnership, desiredTargetOwnership: desiredOwnership, providerAgreement: providerAgreement, disposition: disposition, reason: reason)
+        }
     }
 
     private func resolvePHP(family: String?, packages: [PHPPackage]) -> String? {

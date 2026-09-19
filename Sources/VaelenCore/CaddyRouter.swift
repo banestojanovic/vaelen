@@ -67,6 +67,66 @@ public actor CaddyRouter: Router {
         try await reconcile(routes: routes.values.filter { $0.id != id })
     }
 
+    public func observedRoutes() async throws -> [Route] {
+        let process = await supervisor.status()
+        guard process.state == .running, process.health == .healthy else { throw RouterError.notRunning }
+        return try Self.decodeObservedRoutes(try CaddyAdminClient(endpoint: process.adminEndpoint).getConfig())
+    }
+
+    static func decodeObservedRoutes(_ data: Data) throws -> [Route] {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let apps = root["apps"] as? [String: Any],
+              let http = apps["http"] as? [String: Any],
+              let servers = http["servers"] as? [String: Any] else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+
+        var byHostname = [String: [Route]]()
+        for (serverName, rawServer) in servers {
+            guard let server = rawServer as? [String: Any], let rawRoutes = server["routes"] as? [[String: Any]] else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+            let tls: TLSMode = serverName == "vaelen-https" ? .local : .disabled
+            for rawRoute in rawRoutes {
+                guard let matchers = rawRoute["match"] as? [[String: Any]],
+                      let hostMatcher = matchers.first,
+                      let hosts = hostMatcher["host"] as? [String],
+                      let hostname = hosts.first, !hostname.isEmpty,
+                      let handlers = rawRoute["handle"] as? [[String: Any]] else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+                if handlers.contains(where: { ($0["handler"] as? String) == "static_response" }) { continue }
+                let route: Route?
+                if let proxy = handlers.first(where: { ($0["handler"] as? String) == "reverse_proxy" }),
+                   let upstreams = proxy["upstreams"] as? [[String: Any]],
+                   let dial = upstreams.first?["dial"] as? String {
+                    if let transport = proxy["transport"] as? [String: Any], transport["protocol"] as? String == "fastcgi" {
+                        guard dial.hasPrefix("unix//"), dial.count > "unix//".count else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+                        let root = (handlers.first(where: { ($0["handler"] as? String) == "vars" })?["root"] as? String) ?? ""
+                        guard !root.isEmpty else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+                        route = Route(hostname: hostname, target: .fastCGI(socketPath: String(dial.dropFirst("unix//".count)), documentRoot: root), tls: tls)
+                    } else if let separator = dial.lastIndex(of: ":"), let port = Int(dial[dial.index(after: separator)...]) {
+                        route = Route(hostname: hostname, target: .http(host: String(dial[..<separator]), port: port), tls: tls)
+                    } else {
+                        throw RouterError.invalidRoute("Caddy runtime configuration is unreadable")
+                    }
+                } else if let fileServer = handlers.first(where: { ($0["handler"] as? String) == "file_server" }), let root = fileServer["root"] as? String {
+                    guard !root.isEmpty else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+                    route = Route(hostname: hostname, target: .staticFiles(documentRoot: root), tls: tls)
+                } else {
+                    throw RouterError.invalidRoute("Caddy runtime configuration is unreadable")
+                }
+                if let route { byHostname[hostname, default: []].append(route) }
+            }
+        }
+
+        var result = [Route]()
+        for routes in byHostname.values {
+            let unique = routes.reduce(into: [Route]()) { partial, route in
+                if !partial.contains(where: { $0.target == route.target && $0.hostname == route.hostname && $0.tls == route.tls }) { partial.append(route) }
+            }
+            let https = unique.filter { $0.tls == .local }
+            let selected = https.isEmpty ? unique : https
+            let fastCGI = selected.filter { $0.target.isFastCGI }
+            result.append(contentsOf: fastCGI.isEmpty ? selected : fastCGI)
+        }
+        return result
+    }
+
     private func makeConfiguration(routes: [Route]) async throws -> Data {
         let process = await supervisor.status()
         let runtimeConfiguration = supervisor.configuration
