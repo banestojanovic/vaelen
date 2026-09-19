@@ -28,3 +28,20 @@ the controller's verified `terminate-agent` operation. It must remain
 read-only until explicitly authorized, use one termination, and stop on any
 identity, ownership, admission, recovery, authorization, or service-state
 failure.
+
+## D-005 — Delegation cleanup boundary
+
+The disposable delegation probe is removed after successful PM -> Lead,
+nested Lead -> Investigator, and Investigator -> Lead -> PM propagation
+observations, including native read-only inspection through the chain. The PM
+retains authority to delegate to `vaelen-lead` and the approved read-only
+specialists; no mutation authority is added to `investigator`. The
+`default_agent` remains `vaelen-pm`, `subagent_depth` remains `2`, and
+`vaelen-lead` remains a `subagent`. The malformed/inconsistent Lead YAML
+indentation was repaired before Lead became launchable as a subagent; this is
+supported by controlled before/after evidence, not direct parser observation.
+
+The disposable probe and failed shell/Git acceptance attempts are recorded as
+non-invalidating transport/permission failures. No lifecycle operation,
+experiment-controller invocation, production change, frozen ADR change, or
+Experiments/ change is authorized by this cleanup.

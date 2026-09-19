@@ -17,14 +17,13 @@ permission:
   task: deny
   bash:
     "*": deny
-    "git status --short": allow
-    "git diff --stat": allow
-    "git diff --check": allow
-    "git log --oneline*": allow
-    "git show --stat*": allow
+    "git status*": allow
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
     "git rev-parse*": allow
-    "git describe*": allow
     "git ls-files*": allow
+    "git describe*": allow
     "swift package dump-package*": allow
     "swift --version": allow
   webfetch: deny

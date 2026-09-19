@@ -57,9 +57,30 @@ recovery observation, but it requires explicit authorization before
 `terminate-agent` is executed. Until then, only read-only inspection and
 documentation are authorized.
 
+The existing authorization for exactly one bounded repaired-A `terminate-agent`
+crash/recovery experiment remains **VALID and UNUSED**; cleanup did not consume
+it.
+
 Any implementation must remain disposable and experiment-only. Production
 Vaelen, Syncproof, frozen ADRs, milestone freeze, release, commit, tag, and
 push remain out of scope.
+
+## Delegation-preparation observations
+
+- Observed: PM -> `vaelen-lead` delegation works.
+- Observed: nested Lead -> `investigator` delegation works.
+- Observed: Investigator -> Lead -> PM result propagation works.
+- Observed: native read-only repository inspection works through that chain.
+- Observed: `opencode.json` retains `default_agent: vaelen-pm` and
+  `experimental.subagent_depth: 2`.
+- Observed: `vaelen-lead` retains `mode: subagent` and corrected YAML
+  indentation. Controlled before/after evidence strongly supports malformed
+  indentation as the cause of the prior rejection; parser normalization was
+  not directly observed.
+- Observed: the disposable delegation probe and failed shell/Git acceptance
+  attempts were transport/permission failures, not invalidating delegation
+  evidence. The final cleanup pass was completed through shell-free file
+  inspection and bounded edits.
 
 ## Human authority required
 

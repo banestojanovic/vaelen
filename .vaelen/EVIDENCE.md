@@ -98,3 +98,27 @@ validation materially matters.
 - `INVALIDATED`: prior conclusion contradicted by preserved evidence.
 - `FROZEN DECISION`: accepted architecture/milestone authority, not an
   empirical claim.
+
+## E-005 — Delegation-chain and configuration preparation
+
+- Provenance: controlled delegation observations and repository inspection;
+  no experiment artifact or production runtime mutation.
+- Observed: PM -> `vaelen-lead` delegation works; nested Lead ->
+  `investigator` delegation works; Investigator -> Lead -> PM result
+  propagation works; and native read-only repository inspection works through
+  the chain.
+- Observed: `opencode.json` retains `default_agent: vaelen-pm` and
+  `experimental.subagent_depth: 2`.
+- Observed: `vaelen-lead` remains `mode: subagent` with corrected YAML
+  indentation. Controlled before/after evidence strongly supports malformed
+  indentation as the cause of the prior rejection; parser normalization was
+  not directly observed.
+- Observed: the disposable probe and failed shell/Git acceptance attempts were
+  transport/permission failures. They do not invalidate the successful chain
+  observations. Cleanup was finally checked through shell-free file inspection.
+- Limitation: no `git diff --check` result was available because shell access
+  was denied in this session.
+- Claim status: `OBSERVED FACT` for the delegation/configuration observations;
+  bounded `INFERENCE` for the indentation cause.
+- Validation strength: `RUNTIME-PROVEN` for the controlled delegation chain;
+  `NOT-YET-PROVEN` for shell-based diff-check acceptance.

@@ -1,6 +1,6 @@
 ---
 description: Primary Vaelen implementation and synthesis agent; owns authorized milestone work and may delegate only to the three approved read-only specialists.
-mode: primary
+mode: subagent
 model: openai/gpt-5.6-luna
 color: primary
 permission:
@@ -68,19 +68,19 @@ permission:
     "M14_SIGNING_IDENTITY=* bash Experiments/M14CoreLifecycle/prepare-experiment.sh": allow
     "M14_SIGNING_IDENTITY=* bash ./Experiments/M14CoreLifecycle/prepare-experiment.sh": allow
     "M14_SIGNING_IDENTITY=* bash Experiments/M14CoreLifecycle/prepare-ab-experiment.sh A": allow
-     "M14_SIGNING_IDENTITY=* bash Experiments/M14CoreLifecycle/prepare-repaired-a.sh": allow
-     "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment status": allow
-     "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment evidence": allow
-     "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment agent-pid": allow
-     "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment register": allow
-     "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment unregister": allow
-     "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment terminate-agent *": allow
-     "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" status": allow
-     "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" evidence": allow
-     "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" agent-pid": allow
-     "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" register": allow
-     "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" unregister": allow
-     "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" terminate-agent *": allow
+    "M14_SIGNING_IDENTITY=* bash Experiments/M14CoreLifecycle/prepare-repaired-a.sh": allow
+    "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment status": allow
+    "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment evidence": allow
+    "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment agent-pid": allow
+    "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment register": allow
+    "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment unregister": allow
+    "/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment terminate-agent *": allow
+    "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" status": allow
+    "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" evidence": allow
+    "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" agent-pid": allow
+    "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" register": allow
+    "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" unregister": allow
+    "\"/Users/banes/Library/Application Support/M14CoreLifecycleExperiment/App/M14CoreLifecycleExperiment.app/Contents/MacOS/M14CoreLifecycleExperiment\" terminate-agent *": allow
     "git commit*": ask
     "git tag*": ask
     "git push*": ask
@@ -101,7 +101,7 @@ permission:
     "launchctl kickstart*": deny
     "launchctl enable*": deny
     "launchctl disable*": deny
-     "launchctl print gui/501/dev.vaelen.m14-lifecycle-experiment.agent": allow
+    "launchctl print gui/501/dev.vaelen.m14-lifecycle-experiment.agent": allow
     "pfctl *": deny
   webfetch: ask
   websearch: ask
