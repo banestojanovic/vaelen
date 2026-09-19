@@ -21,6 +21,11 @@ permission:
     "investigator": allow
   bash:
     "*": deny
+    "whoami": allow
+    "id": allow
+    "id -u": allow
+    "id -un": allow
+    "groups": allow
     "git status*": allow
     "git diff*": allow
     "git log*": allow
