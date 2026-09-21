@@ -6,6 +6,8 @@ public enum CoreClientError: Error, Equatable, Sendable {
     case protocolIncompatible(client: Int, core: Int)
     case coreIncompatible(reason: String)
     case invalidResponse
+    case readinessFailed(CoreReadiness)
+    case readinessTimedOut
     case remote(IPCErrorPayload)
 }
 
@@ -64,6 +66,64 @@ public actor VaelenCoreClient {
         let response = try await send(IPCRequest(method: .status))
         guard case .status(let status) = try result(from: response) else { throw CoreClientError.invalidResponse }
         return status
+    }
+
+    public func coreReadiness() async throws -> CoreReadinessResponse {
+        guard connected else { throw CoreClientError.coreUnavailable }
+        guard case .coreReadiness(let readiness) = try result(from: await send(IPCRequest(method: .readiness))) else { throw CoreClientError.invalidResponse }
+        guard readiness.protocolVersion == ProtocolVersion.v1.rawValue else {
+            throw CoreClientError.protocolIncompatible(client: ProtocolVersion.v1.rawValue, core: readiness.protocolVersion)
+        }
+        return readiness
+    }
+
+    /// Complete the daemon admission protocol.  A freshly started daemon
+    /// accepts only handshake followed by this canonical, read-only request
+    /// while it holds the admission lease.  Keep polling that same admitted
+    /// connection until Core explicitly reports ready; promotion must never
+    /// be sent before this method returns.
+    public func waitForCoreReadiness(timeoutNanoseconds: UInt64 = 10_000_000_000,
+                                     pollNanoseconds: UInt64 = 100_000_000) async throws -> CoreReadinessResponse {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
+        while true {
+            let readiness = try await coreReadiness()
+            switch readiness.readiness {
+            case .ready:
+                return readiness
+            case .starting:
+                guard DispatchTime.now().uptimeNanoseconds < deadline else { throw CoreClientError.readinessTimedOut }
+                try await Task.sleep(nanoseconds: pollNanoseconds)
+            case let failure:
+                throw CoreClientError.readinessFailed(failure)
+            }
+        }
+    }
+
+    public func lifecycleOn(actor: String = "client", target: LifecycleTargetIdentity) async throws -> LifecycleStatusResult {
+        try await lifecycle(method: .lifecycleOn, actor: actor, target: target)
+    }
+    public func lifecycleOff(actor: String = "client", target: LifecycleTargetIdentity) async throws -> LifecycleStatusResult {
+        try await lifecycle(method: .lifecycleOff, actor: actor, target: target)
+    }
+    public func lifecycleStatus() async throws -> LifecycleStatusResult {
+        guard connected else { throw CoreClientError.coreUnavailable }
+        guard case .lifecycle(let result) = try result(from: await send(IPCRequest(method: .lifecycleStatus))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+    public func lifecycleReadiness() async throws -> LifecycleReadinessResult {
+        guard connected else { throw CoreClientError.coreUnavailable }
+        guard case .lifecycleReadiness(let result) = try result(from: await send(IPCRequest(method: .lifecycleReadiness))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+    public func promoteBootstrap(invocationToken: String, epoch: UUID, operationID: UUID, nonce: UUID, observation: LifecycleObservationVector) async throws -> LifecycleStatusResult {
+        guard connected else { throw CoreClientError.coreUnavailable }
+        guard case .lifecycle(let result) = try result(from: await send(IPCRequest(method: .lifecycleBootstrapPromote, params: .bootstrapPromotion(.init(invocationToken: invocationToken, epoch: epoch, operationID: operationID, nonce: nonce, observation: observation))))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+    private func lifecycle(method: CoreMethod, actor: String, target: LifecycleTargetIdentity) async throws -> LifecycleStatusResult {
+        guard connected else { throw CoreClientError.coreUnavailable }
+        guard case .lifecycle(let result) = try result(from: await send(IPCRequest(method: method, params: .lifecycle(.init(actor: actor, target: target))))) else { throw CoreClientError.invalidResponse }
+        return result
     }
 
     public func link(path: String?, workingDirectory: String, name: String?) async throws -> ProjectMutationResult {

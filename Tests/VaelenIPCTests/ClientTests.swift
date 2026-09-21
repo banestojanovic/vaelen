@@ -22,6 +22,8 @@ final class ClientTests: XCTestCase {
                         response = IPCResponse(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))
                     case .status:
                         response = IPCResponse(id: request.id, result: .status(.init(core: .init(state: .running, version: "0.0.1-dev", pid: 99), protocolVersion: 1)))
+                    case .readiness:
+                        response = IPCResponse(id: request.id, result: .coreReadiness(.init(readiness: .ready, protocolVersion: 1)))
                     default:
                         XCTFail("Unexpected test method")
                         return
@@ -33,11 +35,161 @@ final class ClientTests: XCTestCase {
 
         try await client.connect()
         let status = try await client.status()
+        let readiness = try await client.coreReadiness()
         await client.disconnect()
         server.cancel()
 
         XCTAssertEqual(status.core.pid, 99)
         XCTAssertEqual(status.core.version, "0.0.1-dev")
+        XCTAssertEqual(readiness.readiness, .ready)
+    }
+
+    func testBootstrapHandoffOrdersReadinessBeforePromotion() async throws {
+        let pair = InMemoryTransport.pair()
+        let recorder = RequestRecorder()
+        let epoch = UUID(), operationID = UUID(), nonce = UUID()
+        let server = Task {
+            try await pair.server.connect()
+            var decoder = FrameDecoder()
+            var readinessResponses = 0
+            while !Task.isCancelled {
+                let data = try await pair.server.read()
+                for frame in try decoder.append(data) {
+                    let request = try IPCCodec.decode(IPCRequest.self, from: frame)
+                    recorder.append(request.method)
+                    let response: IPCResponse
+                    switch request.knownMethod {
+                    case .handshake:
+                        response = .init(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))
+                    case .readiness:
+                        readinessResponses += 1
+                        let state: CoreReadiness = readinessResponses == 1 ? .starting : .ready
+                        response = .init(id: request.id, result: .coreReadiness(.init(readiness: state, protocolVersion: 1)))
+                    case .lifecycleBootstrapPromote:
+                        let intent = LifecycleIntentRecord(intent: .on, generation: 1, operationID: operationID, actor: "controller", target: LifecycleCanonicalIdentity.target)
+                        response = .init(id: request.id, result: .lifecycle(.init(intent: intent, operation: nil, observation: .init(), readiness: .ready)))
+                    default:
+                        XCTFail("unexpected handoff request")
+                        return
+                    }
+                    try await pair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
+                }
+            }
+        }
+        let client = VaelenCoreClient(transport: pair.client, identity: .init(name: "test", version: VaelenBuildInfo.version))
+        try await client.connect()
+        _ = try await client.waitForCoreReadiness(pollNanoseconds: 1)
+        _ = try await client.promoteBootstrap(invocationToken: "token", epoch: epoch, operationID: operationID, nonce: nonce, observation: .init())
+        await client.disconnect(); server.cancel()
+        XCTAssertEqual(recorder.methods, [CoreMethod.handshake.rawValue, CoreMethod.readiness.rawValue, CoreMethod.readiness.rawValue, CoreMethod.lifecycleBootstrapPromote.rawValue])
+    }
+
+    func testBootstrapHandoffFailsClosedOnReadinessFailure() async throws {
+        let pair = InMemoryTransport.pair()
+        let recorder = RequestRecorder()
+        let server = Task {
+            try await pair.server.connect()
+            var decoder = FrameDecoder()
+            while !Task.isCancelled {
+                let data = try await pair.server.read()
+                for frame in try decoder.append(data) {
+                    let request = try IPCCodec.decode(IPCRequest.self, from: frame)
+                    recorder.append(request.method)
+                    let response: IPCResponse
+                    if request.knownMethod == .handshake {
+                        response = .init(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))
+                    } else {
+                        response = .init(id: request.id, result: .coreReadiness(.init(readiness: .unavailable, protocolVersion: 1)))
+                    }
+                    try await pair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
+                }
+            }
+        }
+        let client = VaelenCoreClient(transport: pair.client, identity: .init(name: "test", version: VaelenBuildInfo.version))
+        try await client.connect()
+        do {
+            _ = try await client.waitForCoreReadiness(pollNanoseconds: 1)
+            XCTFail("readiness failure must prevent promotion")
+        } catch let error as CoreClientError {
+            XCTAssertEqual(error, .readinessFailed(.unavailable))
+        }
+        await client.disconnect(); server.cancel()
+        XCTAssertEqual(recorder.methods, [CoreMethod.handshake.rawValue, CoreMethod.readiness.rawValue])
+    }
+
+    func testBootstrapHandoffReconnectsAfterAdmissionPeerCloses() async throws {
+        let admissionPair = InMemoryTransport.pair()
+        let promotionPair = InMemoryTransport.pair()
+        let recorder = RequestRecorder()
+        let epoch = UUID(), operationID = UUID(), nonce = UUID()
+
+        let admissionServer = Task {
+            try await admissionPair.server.connect()
+            var decoder = FrameDecoder()
+            while !Task.isCancelled {
+                let data = try await admissionPair.server.read()
+                for frame in try decoder.append(data) {
+                    let request = try IPCCodec.decode(IPCRequest.self, from: frame)
+                    recorder.append("admission.\(request.method)")
+                    let response: IPCResponse
+                    switch request.knownMethod {
+                    case .handshake:
+                        response = .init(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))
+                    case .readiness:
+                        response = .init(id: request.id, result: .coreReadiness(.init(readiness: .ready, protocolVersion: 1)))
+                        try await admissionPair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
+                        admissionPair.server.disconnectPeer()
+                        return
+                    default:
+                        XCTFail("promotion must not use the admission peer")
+                        return
+                    }
+                    try await admissionPair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
+                }
+            }
+        }
+        let promotionServer = Task {
+            try await promotionPair.server.connect()
+            var decoder = FrameDecoder()
+            while !Task.isCancelled {
+                let data = try await promotionPair.server.read()
+                for frame in try decoder.append(data) {
+                    let request = try IPCCodec.decode(IPCRequest.self, from: frame)
+                    recorder.append("promotion.\(request.method)")
+                    let response: IPCResponse
+                    switch request.knownMethod {
+                    case .handshake:
+                        response = .init(id: request.id, result: .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))
+                    case .lifecycleBootstrapPromote:
+                        let intent = LifecycleIntentRecord(intent: .on, generation: 1, operationID: operationID, actor: "controller", target: LifecycleCanonicalIdentity.target)
+                        response = .init(id: request.id, result: .lifecycle(.init(intent: intent, operation: nil, observation: .init(), readiness: .ready)))
+                    default:
+                        XCTFail("unexpected promotion connection request")
+                        return
+                    }
+                    try await promotionPair.server.write(FrameEncoder().encode(IPCCodec.encode(response)))
+                }
+            }
+        }
+
+        let admission = VaelenCoreClient(transport: admissionPair.client, identity: .init(name: "test", version: VaelenBuildInfo.version))
+        try await admission.connect()
+        _ = try await admission.waitForCoreReadiness(pollNanoseconds: 0)
+        // DaemonServer closes the admission connection after ready. Explicitly
+        // close our side too, then perform promotion on a new Core connection.
+        await admission.disconnect()
+        let promoter = VaelenCoreClient(transport: promotionPair.client, identity: .init(name: "test", version: VaelenBuildInfo.version))
+        try await promoter.connect()
+        _ = try await promoter.promoteBootstrap(invocationToken: "token", epoch: epoch, operationID: operationID, nonce: nonce, observation: .init())
+        await promoter.disconnect()
+        admissionServer.cancel(); promotionServer.cancel()
+
+        XCTAssertEqual(recorder.methods, [
+            "admission.\(CoreMethod.handshake.rawValue)",
+            "admission.\(CoreMethod.readiness.rawValue)",
+            "promotion.\(CoreMethod.handshake.rawValue)",
+            "promotion.\(CoreMethod.lifecycleBootstrapPromote.rawValue)",
+        ])
     }
 
     func testClientSendsParameterlessTrustOperationsAndDecodesTypedResults() async throws {

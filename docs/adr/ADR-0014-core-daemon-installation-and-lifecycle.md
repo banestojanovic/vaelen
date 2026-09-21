@@ -3,8 +3,9 @@
 * **Status:** Accepted — ADR accepted; M14 production implementation and evidence are not yet complete, and M14 is not accepted or frozen
 * **Date:** 2026-09-19
 * **Decision owners:** Vaelen maintainers
-* **Scope:** M14 architecture decision and boundary; no production implementation is
-  authorized by this document.
+* **Scope:** M14 architecture decision and boundary, including the accepted
+  canonical signing trust boundary; no lifecycle mutation or release scope is
+  implied by this document.
 
 > This ADR records the accepted M14 architecture and boundary. Production
 > implementation and supported-product evidence remain required before M14 can
@@ -94,7 +95,28 @@ readiness. No new lifecycle sidecar is part of this ADR.
    record alone never authorizes deletion, adoption, or signaling. External
    lifecycle facts must be re-observed and ownership must be proved before a
     destructive operation. The narrow durable model and fail-closed rule are
-    accepted decisions; their production implementation remains NOT-YET-PROVEN.
+     accepted decisions; their production implementation remains NOT-YET-PROVEN.
+
+### Canonical signing trust boundary (accepted Class C boundary)
+
+Production bootstrap preflight fails closed unless the candidate is a valid,
+non-ad-hoc Apple-signed `Vaelen.app` with bundle identifier `dev.vaelen.app`,
+TeamIdentifier exactly `TFKZJV643G`, and a valid nested
+`Contents/Resources/vaelend` executable whose signing identifier is exactly
+`vaelend` and whose TeamIdentifier is the same. The app and daemon are each
+checked against a valid designated requirement containing the canonical
+identifier, Apple generic anchor, and exact team ID; nested verification is
+performed as well. The LaunchAgent must be at the canonical
+`Contents/Library/LaunchAgents/dev.vaelen.vaelend.agent.plist` path with label
+`dev.vaelen.vaelend` and `BundleProgram` exactly
+`Contents/Resources/vaelend`; arbitrary `ProgramArguments` are rejected.
+
+This is an identity/product trust boundary, not an artifact fingerprint
+allowlist. Certificate leaf hashes, subject suffixes, SHA-256 values, and
+CDHashes are evidence only and are not pinned, so legitimate certificate
+rotation and rebuilt binaries with the same canonical identity remain in
+scope. Distribution, updater, replacement, rollback, and lifecycle mutation
+remain outside this narrow decision.
 
 ## Accepted architecture contract
 
@@ -214,9 +236,15 @@ durable intent was `Off`, that promotion is also the sole Core transaction
 that may commit a new `On` generation superseding `Off`; until it succeeds,
 `Off` remains the barrier. Promotion completes this operation; it is not
 adoption. Core is the sole writer of desired lifecycle and ownership truth
-after handoff. The bootstrap lock remains held through receipt commit and
-handoff, and the existing lifecycle lock/endpoint exclusion prevents
-Core/bootstrap races.
+ after handoff. The controller holds one canonical lifecycle-bootstrap lock
+ exclusively through barrier revalidation, receipt reservation, the single
+ platform call, and durable result recording. It releases that lease before
+ waiting for launchd or reconnecting. The daemon acquires the same exclusive
+ lock for admission, validates the durable receipt/journal and fresh runtime
+ identity, establishes endpoint/readiness, then releases it at the narrow
+ serving handoff point. No descriptor transfer, shared-to-exclusive upgrade,
+ or continuous flock crosses the controller/launchd boundary. The lock is
+ coordination only and never ownership provenance.
 
 Crash outcomes are bounded and never authorize blind replay. An `Off` barrier
 continues to block implicit or automatic recovery; only the same explicit
@@ -671,7 +699,7 @@ mutation requires explicit authority and a bounded disposable procedure.
 | Core/executor authority | GUI/CLI direct call, executor accepts client request, executor retries semantically, Core bypasses journal, two concurrent owners | trace one typed client→Core→optional executor→Core result path; executor has no semantic state or client ingress; Core serializes/authorizes and returns structured failure/unknown |
 | Operation generation/fencing | delayed On after durable Off, stale callback, duplicate/replayed result, old replacement result | monotonic generation and authenticated operation ID; stale work is rejected before dispatch/result commit and cannot resurrect registration |
 | Executor authentication/replay | forged request, wrong Core/session, replayed nonce, expired request, client ingress, timeout | boundary authentication and user/session binding; no client ingress; bounded timeout; replay rejection; bootstrap uses fixed identity and cannot choose state |
-| Core-absent bootstrap | implicit/background invocation with durable Off, explicit `val start` with absent/invalid/expired/mismatched authorization token, arbitrary input, unresolved journal, held lock, reachable Core, matching/conflicting registration, existing/orphan receipt, crash before reservation commit, during reservation commit, after reservation before API, during API, after API before result commit, before handoff or during promotion, duplicate/altered/expired receipt, failed reconnect | implicit/background recovery refuses and Off remains authoritative; explicit user token may authorize only the fixed operation; Core alone commits the new On generation; fixed canonical identity; immutable epoch/operation/nonce; existing lock/endpoint exclusion held through handoff; atomically reserve the sole narrow receipt before any ServiceManagement call; fault-injected proof that absent reservation means zero platform calls, while an existing reservation permits no second epoch/replay or blind retry; result/post-observation atomically update that receipt; API/result crash is unconditionally unknown/recovery-required unless authenticated result-bearing receipt or separately authorized recovery resolves it; signed preflight; no adoption; receipt integrity/authentication/expiry; fresh post-observation; Core-only operation-bound promotion; orphan quarantine and ambiguity fail closed |
+| Core-absent bootstrap | implicit/background invocation with durable Off, explicit `val start` with absent/invalid/expired/mismatched authorization token, arbitrary input, unresolved journal, held lock, reachable Core, matching/conflicting registration, existing/orphan receipt, crash before reservation commit, during reservation commit, after reservation before API, during API, after API before result commit, before handoff or during promotion, duplicate/altered/expired receipt, failed reconnect, second bootstrap, stale/wrong/Off daemon admission | implicit/background recovery refuses and Off remains authoritative; explicit user token may authorize only the fixed operation; Core alone commits the new On generation; fixed canonical identity; immutable epoch/operation/nonce; one canonical exclusive lock with controller release before daemon admission and daemon release after endpoint/readiness; no descriptor transfer, shared-to-exclusive upgrade, continuous flock, or lock-as-ownership proof; atomically reserve the sole narrow receipt before any ServiceManagement call; fault-injected proof that absent reservation means zero platform calls, while an existing reservation permits no second epoch/replay or blind retry; result/post-observation atomically update that receipt; API/result crash is unconditionally unknown/recovery-required unless authenticated result-bearing receipt or separately authorized recovery resolves it; signed preflight; no adoption; receipt integrity/authentication/expiry; fresh post-observation/runtime identity; Core-only operation-bound promotion; orphan quarantine and ambiguity fail closed |
 | Executor failure boundary | executor unavailable, timeout, process exit, API rejection, success without observable effect | durable intent and journal result; fresh Core observation; no hidden fallback, blind retry, adoption, or success claim on ambiguous result |
 | Journal state/idempotence | pending/in-flight crash, malformed/truncated/unknown state, invalid generation or operation relationship, schema/migration failure, client disconnect, retry of unknown operation | explicit pending/in-flight/succeeded/failed/unknown-recovery states plus durable On/Off intent; atomic commits, operation lookup, no blind replay, recovery/retention before completion |
 | Provenance completion | missing pre-observation, missing post-observation, result from another operation, identity-only match, owned-but-unrecorded registration | exact pre→authorized operation→executor/API result→exact post→SQLite sequence; operation-bound evidence only; observation-only match is not adoption; unresolved cleanup fails closed |

@@ -57,7 +57,7 @@ public final class UnixSocketTransport: CoreTransport, @unchecked Sendable {
             while true {
                 let count = Darwin.read(fd, &buffer, buffer.count)
                 if count > 0 { return Data(buffer[0..<count]) }
-                if count == 0 { throw CoreTransportError.unavailable }
+                if count == 0 { throw CoreTransportError.peerClosed }
                 if errno != EINTR { throw CoreTransportError.systemCallFailed("read", errno) }
             }
         }.value

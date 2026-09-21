@@ -13,7 +13,171 @@ private final class DispatcherTrustFake: @unchecked Sendable, TLSTrustBoundary {
     func removeTrust(certificateData: Data) throws { trusted = false }
 }
 
+private actor TimeoutRevocationExecutor: CoreIssuedLifecycleExecutor {
+    private var authorized: Set<UUID> = []
+    private var invalidated: Set<UUID> = []
+    private var invalidatedNonces: Set<UUID> = []
+    private var platformCalls = 0
+
+    func authorize(_ request: LifecycleExecutorRequest) async {
+        authorized.insert(request.operationID)
+    }
+
+    func invalidate(operationID: UUID, nonce: UUID) async {
+        authorized.remove(operationID)
+        invalidated.insert(operationID)
+        invalidatedNonces.insert(nonce)
+    }
+
+    func execute(_ request: LifecycleExecutorRequest) async -> LifecycleExecutorResult {
+        // Model an authorized request which has not entered the platform yet.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        guard authorized.contains(request.operationID), !invalidated.contains(request.operationID) else {
+            return .init(state: .rejected, detail: "revoked")
+        }
+        platformCalls += 1
+        return .init(state: .success)
+    }
+
+    func calls() -> Int { platformCalls }
+    func wasInvalidated(operationID: UUID) -> Bool { invalidated.contains(operationID) }
+    func invalidatedNonceCount() -> Int { invalidatedNonces.count }
+}
+
+private actor DirectLifecycleExecutor: LifecyclePlatformExecutor {
+    private var platformCalls = 0
+
+    func execute(_ request: LifecycleExecutorRequest) async -> LifecycleExecutorResult {
+        platformCalls += 1
+        return .init(state: .success)
+    }
+
+    func calls() -> Int { platformCalls }
+}
+
+private actor CountingCoreIssuedLifecycleExecutor: CoreIssuedLifecycleExecutor {
+    private var authorized: Set<UUID> = []
+    private var authorizationCount = 0
+    private var executionCount = 0
+
+    func authorize(_ request: LifecycleExecutorRequest) async {
+        authorizationCount += 1
+        authorized.insert(request.operationID)
+    }
+
+    func invalidate(operationID: UUID, nonce: UUID) async {
+        authorized.remove(operationID)
+    }
+
+    func execute(_ request: LifecycleExecutorRequest) async -> LifecycleExecutorResult {
+        guard authorized.remove(request.operationID) != nil else {
+            return .init(state: .rejected, detail: "not authorized")
+        }
+        executionCount += 1
+        return .init(state: .success)
+    }
+
+    func counts() -> (authorizations: Int, executions: Int) {
+        (authorizationCount, executionCount)
+    }
+}
+
+private struct LifecycleTestObservationProvider: LifecycleObservationProvider {
+    func observe(operationID: UUID, generation: Int64, intent: LifecycleIntent, target: LifecycleTargetIdentity) async -> LifecycleObservationVector {
+        .init(bundlePresent: .false, layoutValid: .false, signatureValid: .false,
+              registrationMatch: .false, processMatch: .false, endpointReachable: .false,
+              source: "test")
+    }
+}
+
+private struct LifecycleSuccessObservationProvider: LifecycleObservationProvider {
+    func observe(operationID: UUID, generation: Int64, intent: LifecycleIntent, target: LifecycleTargetIdentity) async -> LifecycleObservationVector {
+        .init(bundlePresent: .true, layoutValid: .true, signatureValid: .true,
+              registrationMatch: generation == 0 ? .false : .true, processMatch: .false, endpointReachable: .false,
+              signingTeam: "TESTTEAM", designatedRequirement: "test-requirement",
+              artifactHash: "test-artifact", source: "test")
+    }
+}
+
+private actor DelayedLifecyclePlatform: SMAppServiceLifecyclePlatform {
+    private var registerContinuation: CheckedContinuation<Void, Never>?
+    private var registerEntered = false
+    private(set) var registerCalls = 0
+    private(set) var unregisterCalls = 0
+
+    func register() async throws {
+        registerCalls += 1
+        registerEntered = true
+        await withCheckedContinuation { registerContinuation = $0 }
+    }
+
+    func unregister() async throws { unregisterCalls += 1 }
+
+    func waitUntilRegisterEntered() async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while !registerEntered && ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        return registerEntered
+    }
+
+    func releaseRegister() {
+        registerContinuation?.resume()
+        registerContinuation = nil
+    }
+}
+
+private actor ThrowingLifecyclePlatform: SMAppServiceLifecyclePlatform {
+    private(set) var registerCalls = 0
+    private(set) var unregisterCalls = 0
+
+    struct Failure: Error, LocalizedError {
+        var errorDescription: String? { "entered platform and failed" }
+    }
+
+    func register() async throws {
+        registerCalls += 1
+        throw Failure()
+    }
+
+    func unregister() async throws { unregisterCalls += 1 }
+}
+
+private struct LifecycleDispatchGate: LifecycleDispatchIdentityRevalidator {
+    func revalidateProcessIdentity(expected: LifecycleProcessIdentity,
+                                   target: LifecycleTargetIdentity) async -> ObservationValue { .true }
+    func revalidateOnRegistrationPreconditions(target: LifecycleTargetIdentity,
+                                               allowExistingRegistration: Bool) async -> ObservationValue { .true }
+}
+
 final class DispatcherTests: XCTestCase {
+    func testDaemonAdmissionDoesNotReleaseOnHandshakeOrStartingReadiness() throws {
+        let handshakeRequest = IPCRequest(method: .handshake)
+        let handshakeResponse = IPCResponse(id: handshakeRequest.id,
+                                             result: .handshake(.init(protocolVersion: 1, coreVersion: "test", schemaCompatibilityVersion: 1, buildIdentity: "test")))
+        XCTAssertFalse(DaemonServer.readinessEstablished(request: handshakeRequest, response: handshakeResponse))
+
+        let readinessRequest = IPCRequest(method: .readiness)
+        let startingResponse = IPCResponse(id: readinessRequest.id,
+                                           result: .coreReadiness(.init(readiness: .starting, protocolVersion: 1)))
+        XCTAssertFalse(DaemonServer.readinessEstablished(request: readinessRequest, response: startingResponse))
+    }
+
+    func testDaemonAdmissionReleasesOnlyAfterReadyEvidence() throws {
+        let readinessRequest = IPCRequest(method: .readiness)
+        let readyResponse = IPCResponse(id: readinessRequest.id,
+                                        result: .coreReadiness(.init(readiness: .ready, protocolVersion: 1)))
+        XCTAssertTrue(DaemonServer.readinessEstablished(request: readinessRequest, response: readyResponse))
+    }
+
+    func testDaemonAdmissionRejectsErrorOrNonCoreReadinessResponses() throws {
+        let request = IPCRequest(method: .readiness)
+        let error = IPCResponse(id: request.id, error: .init(code: .invalidRequest, message: "not ready"))
+        XCTAssertFalse(DaemonServer.readinessEstablished(request: request, response: error))
+        let raw = IPCResponse(id: request.id, result: .raw(.string("ready")))
+        XCTAssertFalse(DaemonServer.readinessEstablished(request: request, response: raw))
+    }
+
     func testM13TrustAndUntrustTraverseDispatcherWithParameterlessRequests() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -71,6 +235,31 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result.response.error?.message, "Handshake is required before other requests.")
     }
 
+    func testCoreReadinessIsASeparateDirectCoreResponse() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry)
+
+        let response = await dispatcher.dispatch(IPCRequest(method: .readiness), handshaken: true)
+        guard case .coreReadiness(let readiness) = response.response.result else { return XCTFail("missing Core readiness response") }
+        XCTAssertEqual(readiness.readiness, .ready)
+        XCTAssertEqual(readiness.protocolVersion, 1)
+    }
+
+    func testCoreReadinessCanBeFalseWhileEndpointIsServing() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1, isReady: false), registry: registry)
+
+        let response = await dispatcher.dispatch(IPCRequest(method: .readiness), handshaken: true)
+        guard case .coreReadiness(let readiness) = response.response.result else { return XCTFail("missing Core readiness response") }
+        XCTAssertEqual(readiness.readiness, .starting)
+    }
+
     func testDispatcherRejectsUnknownMethodStructurally() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -81,6 +270,243 @@ final class DispatcherTests: XCTestCase {
         let result = await dispatcher.dispatch(IPCRequest(rawMethod: "project.future"), handshaken: true)
 
         XCTAssertEqual(result.response.error?.code, .invalidRequest)
+    }
+
+    func testLifecycleDispatcherRejectsClientSelectedIdentityAndExposesJournalStatus() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, lifecycleStore: store)
+        let bad = LifecycleTargetIdentity(bundleID: "foreign.bundle", agentLabel: "foreign.agent", bundleProgram: "/tmp/foreign", endpoint: "/tmp/foreign.sock")
+        let rejected = await dispatcher.dispatch(IPCRequest(method: .lifecycleOn, params: .lifecycle(.init(actor: "client", target: bad))), handshaken: true)
+        XCTAssertEqual(rejected.response.error?.code, .invalidRequest)
+        XCTAssertNil(try LifecycleStateRepository(store: store).intent())
+
+        let canonical = LifecycleStateRepository(store: store).canonicalTarget
+        let accepted = await dispatcher.dispatch(IPCRequest(method: .lifecycleOn, params: .lifecycle(.init(actor: "client", target: canonical))), handshaken: true)
+        guard case .lifecycle(let result) = accepted.response.result else { return XCTFail("missing lifecycle result") }
+        XCTAssertEqual(result.operation?.state, .unknownRecoveryRequired)
+        let status = await dispatcher.dispatch(IPCRequest(method: .lifecycleStatus), handshaken: true)
+        guard case .lifecycle(let statusResult) = status.response.result else { return XCTFail("missing lifecycle status") }
+        XCTAssertEqual(statusResult.operation?.operationID, result.operation?.operationID)
+        XCTAssertEqual(statusResult.readiness, .unknown)
+    }
+
+    func testLifecycleExecutorUnknownIsPersistedAsRecoveryRequiredNotFailed() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let executor = FakeLifecycleExecutor(result: .init(state: .unknown, detail: "platform throw"))
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test"), registry: registry,
+            lifecycleStore: store, lifecycleExecutor: executor,
+            lifecycleObservationProvider: LifecycleTestObservationProvider())
+
+        let response = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOn,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+        guard case .lifecycle(let result) = response.response.result else {
+            return XCTFail("missing lifecycle result")
+        }
+        XCTAssertEqual(result.operation?.state, .unknownRecoveryRequired)
+        XCTAssertNotEqual(result.operation?.state, .failed)
+        XCTAssertTrue(result.operation?.error?.contains("platform throw") == true)
+        XCTAssertEqual(result.observation.source, "test")
+    }
+
+    func testDirectLifecycleExecutorIsRefusedBeforeAnyPlatformCall() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let executor = DirectLifecycleExecutor()
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test"), registry: registry,
+            lifecycleStore: store, lifecycleExecutor: executor,
+            lifecycleObservationProvider: LifecycleTestObservationProvider())
+
+        let response = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOn,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+
+        guard case .lifecycle(let result) = response.response.result else {
+            return XCTFail("missing lifecycle result")
+        }
+        XCTAssertEqual(result.operation?.state, .failed)
+        XCTAssertTrue(result.operation?.error?.contains("CoreIssuedLifecycleExecutor") == true)
+        let directCalls = await executor.calls()
+        XCTAssertEqual(directCalls, 0)
+    }
+
+    func testCoreIssuedLifecycleExecutorIsAuthorizedAndDispatched() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let executor = CountingCoreIssuedLifecycleExecutor()
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test"), registry: registry,
+            lifecycleStore: store, lifecycleExecutor: executor,
+            lifecycleObservationProvider: LifecycleSuccessObservationProvider())
+
+        let response = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOn,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+
+        guard case .lifecycle(let result) = response.response.result else {
+            return XCTFail("missing lifecycle result")
+        }
+        XCTAssertEqual(result.operation?.state, .succeeded)
+        let counts = await executor.counts()
+        XCTAssertEqual(counts.authorizations, 1)
+        XCTAssertEqual(counts.executions, 1)
+    }
+
+    func testTimedOutUnstartedLifecycleAuthorizationIsRevokedBeforePlatformCall() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let executor = TimeoutRevocationExecutor()
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test"), registry: registry,
+            lifecycleStore: store, lifecycleExecutor: executor,
+            lifecycleObservationProvider: LifecycleTestObservationProvider(),
+            lifecycleTimeoutNanoseconds: 1_000_000)
+
+        let response = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOn,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+        guard case .lifecycle(let result) = response.response.result else {
+            return XCTFail("missing lifecycle result")
+        }
+        XCTAssertEqual(result.operation?.state, .unknownRecoveryRequired)
+        try await Task.sleep(nanoseconds: 75_000_000)
+        let calls = await executor.calls()
+        guard let operationID = result.operation?.operationID else {
+            return XCTFail("missing lifecycle operation identity")
+        }
+        let wasInvalidated = await executor.wasInvalidated(operationID: operationID)
+        let invalidatedNonceCount = await executor.invalidatedNonceCount()
+        XCTAssertTrue(wasInvalidated)
+        XCTAssertEqual(invalidatedNonceCount, 1)
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testOffAfterOnCrossesPlatformBoundaryCannotReportStaleAbsenceSuccess() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let platform = DelayedLifecyclePlatform()
+        let session = UUID()
+        let executor = SMAppServiceLifecycleExecutor(sessionBinding: session, platform: platform,
+                                                     identityRevalidator: LifecycleDispatchGate())
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test"), registry: registry,
+            lifecycleStore: store, lifecycleExecutor: executor,
+            lifecycleObservationProvider: LifecycleTestObservationProvider(),
+            lifecycleSessionBinding: session)
+
+        let onTask = Task {
+            await dispatcher.dispatch(
+                IPCRequest(method: .lifecycleOn,
+                           params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+                handshaken: true)
+        }
+        guard await platform.waitUntilRegisterEntered() else {
+            await platform.releaseRegister()
+            _ = await onTask.value
+            return XCTFail("On did not enter the delayed platform call")
+        }
+
+        // Off observes the pre-call absence while On is already inside the
+        // platform boundary.  The platform is released only after Off has
+        // durably fenced On and returned its own recovery-required result.
+        let off = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOff,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+        guard case .lifecycle(let offResult) = off.response.result else {
+            return XCTFail("missing Off lifecycle result")
+        }
+        XCTAssertEqual(offResult.operation?.state, .unknownRecoveryRequired)
+        XCTAssertNotEqual(offResult.operation?.state, .succeeded)
+        XCTAssertEqual(offResult.observation.registrationMatch, .false)
+        XCTAssertEqual(offResult.observation.processMatch, .false)
+        XCTAssertEqual(offResult.observation.endpointReachable, .false)
+
+        await platform.releaseRegister()
+        let on = await onTask.value
+        guard case .lifecycle(let onResult) = on.response.result else {
+            return XCTFail("missing On lifecycle result")
+        }
+        XCTAssertEqual(onResult.operation?.state, .unknownRecoveryRequired)
+        XCTAssertNotEqual(onResult.operation?.state, .succeeded)
+        let registerCalls = await platform.registerCalls
+        let unregisterCalls = await platform.unregisterCalls
+        XCTAssertEqual(registerCalls, 1)
+        XCTAssertEqual(unregisterCalls, 0)
+        let repository = LifecycleStateRepository(store: store)
+        XCTAssertEqual(try repository.intent()?.intent, .off)
+        XCTAssertEqual(try repository.operation()?.operationID, offResult.operation?.operationID)
+        XCTAssertEqual(try repository.operation()?.state, .unknownRecoveryRequired)
+    }
+
+    func testOffAfterOnPlatformExceptionAndAbsentObservationRemainsRecoveryRequired() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let platform = ThrowingLifecyclePlatform()
+        let session = UUID()
+        let executor = SMAppServiceLifecycleExecutor(sessionBinding: session, platform: platform,
+                                                     identityRevalidator: LifecycleDispatchGate())
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test"), registry: registry,
+            lifecycleStore: store, lifecycleExecutor: executor,
+            lifecycleObservationProvider: LifecycleTestObservationProvider(),
+            lifecycleSessionBinding: session)
+
+        let on = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOn,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+        guard case .lifecycle(let onResult) = on.response.result else {
+            return XCTFail("missing On lifecycle result")
+        }
+        XCTAssertEqual(onResult.operation?.state, .unknownRecoveryRequired)
+
+        // The fresh observation is absent, but the exception happened after
+        // the platform API was entered. Off must not unregister or adopt.
+        let off = await dispatcher.dispatch(
+            IPCRequest(method: .lifecycleOff,
+                       params: .lifecycle(.init(actor: "test", target: LifecycleCanonicalIdentity.target))),
+            handshaken: true)
+        guard case .lifecycle(let offResult) = off.response.result else {
+            return XCTFail("missing Off lifecycle result")
+        }
+        XCTAssertEqual(offResult.operation?.state, .unknownRecoveryRequired)
+        XCTAssertNotEqual(offResult.operation?.state, .succeeded)
+        XCTAssertEqual(offResult.observation.registrationMatch, .false)
+        let registerCalls = await platform.registerCalls
+        let unregisterCalls = await platform.unregisterCalls
+        XCTAssertEqual(registerCalls, 1)
+        XCTAssertEqual(unregisterCalls, 0)
+        XCTAssertNil(try LifecycleStateRepository(store: store).ownership())
     }
 
     func testRouteMutationPersistsThroughCoreAndSurvivesDispatcherRecreation() async throws {

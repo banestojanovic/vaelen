@@ -35,4 +35,10 @@ public final class InMemoryTransport: CoreTransport, @unchecked Sendable {
     public func disconnect() async {
         inputContinuation.finish()
     }
+
+    /// Test/support transport hook for modeling a peer that closes its side
+    /// of a connection after writing its final response.
+    public func disconnectPeer() {
+        peerContinuation.finish()
+    }
 }

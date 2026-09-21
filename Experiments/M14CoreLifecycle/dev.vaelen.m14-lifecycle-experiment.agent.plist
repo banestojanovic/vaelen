@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.vaelen.m14-lifecycle-experiment.agent</string>
+	<key>BundleProgram</key>
+	<string>Contents/Resources/M14CoreLifecycleAgent</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>2</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>__M14_EXPERIMENT_ROOT__/agent.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__M14_EXPERIMENT_ROOT__/agent.stderr.log</string>
+</dict>
+</plist>

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import AppKit
 import VaelenCore
 import VaelenIPC
 
@@ -54,6 +55,12 @@ private enum CLICommand {
     case portsStatus(json: Bool)
     case portsInstall
     case portsRemove
+    case lifecycleStart
+    case lifecycleOn
+    case lifecycleOff
+    case lifecycleRecoverOff
+    case lifecycleStatus(json: Bool)
+    case lifecycleReadiness(json: Bool)
 }
 
 private struct ProjectListEnvelope: Encodable { let projects: [ProjectWire] }
@@ -72,8 +79,9 @@ private struct StatusPayload: Encodable {
 @main
 struct VaelenCLIMain {
     static func main() async {
+        var command = CLICommand.status(json: false)
         do {
-            let command = try parse(Array(CommandLine.arguments.dropFirst()))
+            command = try parse(Array(CommandLine.arguments.dropFirst()))
             let paths = CoreEndpointPaths()
             let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
             try await client.connect()
@@ -81,7 +89,111 @@ struct VaelenCLIMain {
             await client.disconnect()
             exit(0)
         } catch let error as CoreClientError {
-            if case .coreUnavailable = error { fail("Vaelen Core is not running.", code: 3) }
+            if case .coreUnavailable = error {
+                switch command {
+                case .lifecycleStart:
+                    do {
+                        let layout = VaelenFilesystemLayout()
+                         let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
+                        guard let app = LifecycleCanonicalIdentity.bootstrapControllerURL(),
+                              let preflight = ArtifactPreflight.validate(appURL: app) else {
+                            throw BootstrapError.refused("The exact canonical signed Vaelen.app controller failed preflight.")
+                        }
+                         let authorization = try store.mintBootstrapInvocation(controllerPath: preflight.appURL.path)
+                         let correlation = authorization.correlationID
+                         try? store.recordDiagnostic(.init(correlationID: correlation, phase: .urlConstruction, outcome: "started", detail: "canonical vaelen://start URL", databasePath: store.databaseURL.path, invocationID: correlation, tokenHash: SQLiteStateStore.safeTokenHash(authorization.token), user: NSUserName()))
+                        var components = URLComponents(); components.scheme = "vaelen"; components.host = "start"
+                        components.queryItems = [URLQueryItem(name: "token", value: authorization.token)]
+                         guard let invocation = components.url else {
+                             try? store.recordDiagnostic(.init(correlationID: correlation, phase: .urlConstruction, outcome: "failed", detail: "URLComponents could not construct invocation URL", databasePath: store.databaseURL.path, invocationID: correlation, tokenHash: SQLiteStateStore.safeTokenHash(authorization.token)))
+                             throw BootstrapError.refused("Unable to invoke the signed Vaelen.app controller.")
+                         }
+                        // `open` performs application activation and URL
+                        // delivery; it is not ServiceManagement and carries
+                        // no caller-selected executable or arguments.
+                        let launcher = Process()
+                        launcher.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                          // Force this exact signed candidate to receive the
+                          // URL. LaunchServices may otherwise route a
+                          // same-bundle-ID URL to an older validation copy.
+                          // LaunchServices URL delivery is not reliable for a
+                          // disposable same-bundle-ID validation copy. Pass
+                          // the already-minted token through the signed app's
+                          // bounded controller entrypoint instead; the token
+                          // remains the sole authorization and is still
+                          // consumed by CoreAbsentBootstrapExecutor.
+                          launcher.arguments = ["-n", "-a", app.path, "--args", "--vaelen-start-token", authorization.token]
+                         try launcher.run(); launcher.waitUntilExit()
+                         try? store.recordDiagnostic(.init(correlationID: correlation, phase: .urlOpen, outcome: launcher.terminationStatus == 0 ? "success" : "failed", detail: "open exit=\(launcher.terminationStatus)", databasePath: store.databaseURL.path, invocationID: correlation, tokenHash: SQLiteStateStore.safeTokenHash(authorization.token)))
+                         guard launcher.terminationStatus == 0 else { throw BootstrapError.refused("Unable to invoke the signed Vaelen.app controller.") }
+                         var admission: VaelenCoreClient?
+                         for _ in 0..<100 {
+                             let candidate = VaelenCoreClient(transport: UnixSocketTransport(path: CoreEndpointPaths().socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
+                             do { try await candidate.connect(); admission = candidate; break } catch { try? await Task.sleep(for: .milliseconds(100)) }
+                          }
+                           guard let admission, let handoff = try store.bootstrapReceiptHandoff(), handoff.phase == .succeeded else { throw CoreClientError.invalidResponse }
+                           try? store.recordDiagnostic(.init(correlationID: correlation, phase: .reconnect, outcome: "connected", detail: "daemon handshake completed", databasePath: store.databaseURL.path, invocationID: correlation, tokenHash: SQLiteStateStore.safeTokenHash(authorization.token), operationID: handoff.operationID))
+                          // Admission is held through handshake and the
+                          // canonical read-only readiness exchange.  The
+                          // daemon closes that short-lived admission peer
+                          // after ready, so promotion must use a fresh,
+                          // canonical Core connection.
+                          _ = try await admission.waitForCoreReadiness()
+                          await admission.disconnect()
+                          var promoter: VaelenCoreClient?
+                          for _ in 0..<100 {
+                              let candidate = VaelenCoreClient(transport: UnixSocketTransport(path: CoreEndpointPaths().socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
+                              do { try await candidate.connect(); promoter = candidate; break } catch { try? await Task.sleep(for: .milliseconds(100)) }
+                          }
+                          guard let promoter else { throw CoreClientError.coreUnavailable }
+                          let result = try await promoter.promoteBootstrap(invocationToken: handoff.invocationToken,
+                                                                           epoch: handoff.epoch,
+                                                                           operationID: handoff.operationID,
+                                                                           nonce: handoff.nonce,
+                                                                           observation: .init())
+                          try? store.recordDiagnostic(.init(correlationID: correlation, phase: .promotion, outcome: "success", detail: "Core promotion returned", databasePath: store.databaseURL.path, invocationID: correlation, tokenHash: SQLiteStateStore.safeTokenHash(authorization.token), operationID: handoff.operationID))
+                         print(String(decoding: try IPCCodec.encode(result), as: UTF8.self))
+                         await promoter.disconnect(); exit(0)
+                    } catch { fail("{\"code\":\"LIFECYCLE_UNKNOWN\",\"message\":\"Bootstrap completed ambiguously or Core did not reconnect; recovery is required.\"}", code: 3) }
+                case .lifecycleOn:
+                    fail("{\"code\":\"CORE_UNAVAILABLE\",\"message\":\"Core is unavailable; only explicit lifecycle start may bootstrap it.\"}", code: 3)
+                case .lifecycleRecoverOff:
+                    let app = LifecycleCanonicalIdentity.bootstrapControllerURL()!
+                    let launcher = Process(); launcher.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    launcher.arguments = ["-n", "-a", app.path, "--args", "--vaelen-authorized-off-recovery"]
+                    do { try launcher.run(); launcher.waitUntilExit() }
+                    catch { fail("Off recovery could not be invoked.", code: 3) }
+                    guard launcher.terminationStatus == 0 else { fail("Off recovery could not be invoked.", code: 3) }
+                    for _ in 0..<50 {
+                        if let store = try? SQLiteStateStore(databaseURL: VaelenFilesystemLayout().databaseURL),
+                           let op = try? LifecycleStateRepository(store: store).operation(), op.state == .succeeded { exit(0) }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                    fail("Off recovery did not durably complete.", code: 3)
+                case .lifecycleOff:
+                    // Controller unregister can terminate the daemon before
+                    // its IPC response is flushed. Complete only the exact
+                    // already-dispatched Off through signed Core recovery;
+                    // this never retries ServiceManagement unregister.
+                    let app = LifecycleCanonicalIdentity.bootstrapControllerURL()!
+                    let launcher = Process(); launcher.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    launcher.arguments = ["-n", "-a", app.path, "--args", "--vaelen-authorized-off-recovery"]
+                    do { try launcher.run(); launcher.waitUntilExit() } catch { fail("Off recovery could not be invoked.", code: 3) }
+                    guard launcher.terminationStatus == 0 else { fail("Off recovery could not be invoked.", code: 3) }
+                    for _ in 0..<50 {
+                        if let store = try? SQLiteStateStore(databaseURL: VaelenFilesystemLayout().databaseURL),
+                           let op = try? LifecycleStateRepository(store: store).operation(), op.state == .succeeded {
+                            print("Off recovered and durably succeeded after fresh absence observation."); exit(0)
+                        }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                    fail("Off recovery did not durably complete.", code: 3)
+                case .lifecycleStatus, .lifecycleReadiness:
+                    fail("{\"code\":\"CORE_UNAVAILABLE\",\"message\":\"Vaelen Core is unavailable.\"}", code: 3)
+                default:
+                    fail("Vaelen Core is not running.", code: 3)
+                }
+            }
             if case .protocolIncompatible(let client, let core) = error { fail("Vaelen Core uses an incompatible protocol version.\n\nClient: \(client)\nCore:   \(core)", code: 4) }
             if case .coreIncompatible = error { fail("The running Vaelen Core is incompatible with this client.\nRestart Vaelen Core and try again.", code: 4) }
             if case .remote(let payload) = error { fail(payload.message, code: 1) }
@@ -95,6 +207,7 @@ struct VaelenCLIMain {
         guard let first = args.first else { throw CLIError.usage }
         switch first {
         case "status": return .status(json: args.dropFirst().elementsEqual(["--json"]))
+        case "start": guard args.count == 1 else { throw CLIError.usage }; return .lifecycleStart
         case "links": return .links(json: args.dropFirst().elementsEqual(["--json"]))
         case "paths": return .paths(json: args.dropFirst().elementsEqual(["--json"]))
         case "project":
@@ -224,6 +337,18 @@ struct VaelenCLIMain {
             case "status": return .portsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
             case "install": guard args.count == 2 else { throw CLIError.usage }; return .portsInstall
             case "remove": guard args.count == 2 else { throw CLIError.usage }; return .portsRemove
+             default: throw CLIError.usage
+             }
+        case "lifecycle":
+            guard args.count == 2 || args.count == 3 else { throw CLIError.usage }
+            let json = args.count == 3 && args[2] == "--json"
+            guard args.count == 2 || json else { throw CLIError.usage }
+            switch args[1] {
+            case "start", "on": guard args.count == 2 else { throw CLIError.usage }; return args[1] == "start" ? .lifecycleStart : .lifecycleOn
+            case "off": guard args.count == 2 else { throw CLIError.usage }; return .lifecycleOff
+            case "recover-off": guard args.count == 2 else { throw CLIError.usage }; return .lifecycleRecoverOff
+            case "status": return .lifecycleStatus(json: json)
+            case "readiness": return .lifecycleReadiness(json: json)
             default: throw CLIError.usage
             }
         default: throw CLIError.usage
@@ -375,6 +500,26 @@ struct VaelenCLIMain {
             let result = try await client.portsInstall(); print("Standard Local Ports \(result.state.rawValue).")
         case .portsRemove:
             let result = try await client.portsRemove(); print("Standard Local Ports \(result.state.rawValue)")
+        case .lifecycleStart, .lifecycleOn:
+            let result = try await client.lifecycleOn(actor: "val", target: LifecycleCanonicalIdentity.target)
+            print(String(decoding: try IPCCodec.encode(result), as: UTF8.self))
+        case .lifecycleOff:
+            let result = try await client.lifecycleOff(actor: "val", target: LifecycleCanonicalIdentity.target)
+            print(String(decoding: try IPCCodec.encode(result), as: UTF8.self))
+        case .lifecycleRecoverOff:
+            throw CoreClientError.coreUnavailable
+        case .lifecycleStatus(let json):
+            let result = try await client.lifecycleStatus()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else {
+                let intent = result.intent?.intent.rawValue ?? "none"
+                let operation = result.operation?.state.rawValue ?? "none"
+                print("Lifecycle\nIntent     \(intent)\nOperation  \(operation)\nReadiness  \(result.readiness.rawValue)")
+            }
+        case .lifecycleReadiness(let json):
+            let result = try await client.lifecycleReadiness()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print("Lifecycle readiness: \(result.readiness.rawValue)") }
         }
     }
 

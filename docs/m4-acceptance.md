@@ -47,13 +47,13 @@ Standard-port health observes 80/443 while forwarding is active. Caddy health
 uses its Unix admin socket. Backend ports are implementation details and are
 not a supported direct-client interface.
 
-The four direct-backend Caddy integration tests skip only before starting
-when the 2-second PF wedge probe is present; a failure after the test starts
-remains a failure. They verify static routing/removal, PHP-FPM FastCGI, the
-Laravel front controller, and HTTP-to-HTTPS redirect/TLS. The same supported
-browser path was accepted on the real machine; CI hosts without the PF wedge
-execute the tests normally. Other skips are only missing development
-prerequisites or explicitly development-only distribution tests.
+The repository's current test suite does not implement the documented
+2-second PF wedge probe or the four direct-backend integration tests. Those
+claims are therefore not treated as current test evidence. The supported
+browser path was accepted on the real machine; direct-backend behavior remains
+an environment-specific finding until a probe and integration tests are added.
+Other skips are only missing development prerequisites or explicitly
+development-only distribution tests.
 
 ## Privilege And Distribution Boundary
 

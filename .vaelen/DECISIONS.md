@@ -123,3 +123,35 @@ ADR-0014 acceptance does not accept or freeze M14, authorize production
 implementation, establish production packaging/readiness/Off evidence, or
 promote E-002/E-004/E-006 beyond bounded disposable runtime proof. No tag,
 push, lifecycle mutation, or Syncproof change is authorized.
+
+## D-012 — Production M14 implementation authorized
+
+Bane authorized production implementation under accepted ADR-0014. Source,
+migrations, typed IPC/API changes, tests, and minimum packaging integration may
+proceed, while M14 remains active and unfrozen. This authorization does not
+authorize new destructive real-system lifecycle experiments, release, tag,
+ push, or commit. Production lifecycle claims remain `NOT-YET-PROVEN` until
+ their required evidence exists.
+
+## D-013 — Release-before-daemon-admission handoff
+
+Bane selected the Class C handoff contract: one canonical exclusive
+`lifecycle-bootstrap.lock`; the controller revalidates barriers, reserves the
+durable receipt, performs at most one fixed registration, records the result,
+and releases the lock before waiting/reconnecting. The launchd daemon acquires
+the same exclusive lock for operation-bound admission, validates durable
+receipt/journal, fresh identity, and generation, establishes endpoint/readiness,
+then releases it. No descriptor transfer, shared-to-exclusive upgrade, or
+continuous flock crosses the process boundary. Lock acquisition is never
+ownership provenance. No lifecycle mutation, release, tag, push, or commit is
+ authorized by this decision.
+
+## D-014 — Canonical Class C signing trust boundary
+
+Bane accepted the production preflight trust boundary: app and embedded daemon
+must each be valid Apple-signed code under TeamIdentifier `TFKZJV643G`, with
+canonical identities `dev.vaelen.app` and `vaelend`, respectively, coherent
+nested verification, and the canonical embedded path and LaunchAgent
+layout/label/BundleProgram. Certificate, subject, SHA-256, and CDHash values
+are evidence only and are not pinned. This does not authorize lifecycle
+mutation, updater/distribution scope, or milestone acceptance.

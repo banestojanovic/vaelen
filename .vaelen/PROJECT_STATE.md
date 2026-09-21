@@ -16,9 +16,10 @@ accepted milestone records remain authoritative for architecture.
 ## Active milestone
 
 - Milestone: M14 — Core Daemon Installation and Lifecycle.
-- Phase: architecture/design convergence and evidence review; production
-  implementation remains unauthorized.
-- Production M14 implementation: **not authorized**.
+- Phase: production implementation and evidence development; milestone remains
+  active and unfrozen.
+- Production M14 implementation: **authorized by Bane's Class C decision**;
+  production acceptance and runtime proof remain incomplete.
 - ADR-0014: **accepted**; M14 is not accepted or frozen.
 - The single authorized repaired-A crash/recovery mutation was executed once on
   2026-09-19; no further crash/recovery mutation is authorized by this state
@@ -37,9 +38,10 @@ accepted milestone records remain authoritative for architecture.
   replacement, updater, rollback, version handoff, and old-bundle cleanup are
   deferred beyond minimum M14. The bootstrap reservation/handoff contract is
   recorded in accepted ADR-0014; its implementation and product evidence remain
-  unauthorized and NOT-YET-PROVEN.
+  NOT-YET-PROVEN.
 - Architecture status: ADR-0014 accepted by Class C decision. M14 remains active
-  and unfrozen; production implementation remains unauthorized.
+  and unfrozen; production implementation is authorized, while production
+  acceptance remains NOT-YET-PROVEN.
 
 ## Established M14 facts
 
@@ -55,8 +57,9 @@ accepted milestone records remain authoritative for architecture.
   `dev.vaelen.m14-lifecycle-experiment.agent`.
 - Repaired-A TeamIdentifier is `TFKZJV643G`.
 
-Evidence references: E-002 (stable baseline), E-004 (path repair), and E-006
-(single bounded crash/recovery observation).
+Evidence references: E-002 (stable baseline), E-004 (path repair), E-006
+(single bounded crash/recovery observation), and E-012 (implementation
+foundation and isolated validation).
 
 ## Invalidated or unresolved
 
@@ -77,18 +80,33 @@ file authorizes milestone acceptance or freeze.
 
 ## Current authorized boundary
 
-The single repaired-A launchd recovery observation has been executed. Read-only
-architecture investigation, specialist review, and draft ADR documentation are
-authorized within this boundary. No production implementation or additional
-destructive lifecycle experiment is authorized.
+- The single Bane-authorized M14 production lifecycle validation attempt on
+  2026-09-20 stopped before mutation because a fresh canonical absence
+  snapshot could not be completed in the delegated environment. No product
+  controller was invoked and no lifecycle state was changed. Any further
+  production validation requires explicit current authority and a working
+  read-only pre-mutation inspection path.
+
+The single repaired-A launchd recovery observation has been executed. Production
+source, migrations, typed IPC/API changes, tests, and minimum packaging
+integration are authorized within accepted ADR-0014. New destructive real-system
+lifecycle experiments remain unauthorized.
 
 The authorization for exactly one bounded repaired-A `terminate-agent`
 crash/recovery experiment is **CONSUMED**. The controller recorded and issued
 SIGKILL once to verified PID 6130; no second termination was performed.
 
-Any implementation must remain disposable and experiment-only. Production
-Vaelen, Syncproof, frozen ADRs, milestone freeze, release, commit, tag, and
-push remain out of scope.
+Implementation must preserve M0-M13 and the accepted ADR boundary. Syncproof,
+milestone freeze, release, tag, and push remain out of scope; commit authority
+is not granted by this state record.
+
+## Canonical signing trust boundary
+
+- Exact TeamIdentifier `TFKZJV643G` is required for canonical app
+  `dev.vaelen.app` and nested daemon `vaelend`.
+- Valid Apple signatures, designated requirements, nested verification, and
+  canonical app/LaunchAgent layout are required; hashes, CDHashes, certificate
+  leaves, and subject suffixes remain non-pinned evidence only.
 
 ## Delegation-preparation observations
 
@@ -113,3 +131,25 @@ Bane must decide Class C matters: frozen architecture or ADR changes,
 security/trust/privilege changes, ownership or destructive semantics,
 milestone scope expansion, milestone freeze, irreversible migrations, and
 release/commit/tag/push authorization.
+
+## M14 final acceptance reconciliation — 2026-09-21
+
+Bane accepted M14 and explicitly authorized final evidence reconciliation, safe
+housekeeping, commit, the established M14 tag, and branch/tag push. The final
+read-only preservation baseline is 3 projects, 1 route intent, 0 route
+transitions, 1 pre-existing unchanged TLS capability row, and 1 system
+modification. Syncproof remains untouched.
+
+The accepted runtime sequence is Start generation 3, Off generation 4, and
+Start generation 5. Final durable intent is `on`, generation 5, with successful
+register/ownership evidence and no unresolved lifecycle rows. Final regression
+evidence is 218 passed and 14 skipped (0 failures).
+
+Build evidence: product version `0.0.14-dev`; build identity
+`m14-core-daemon-lifecycle-schema-7`; SQLite user version `13`; IPC protocol
+version `1`; IPC schema compatibility version `5`. Installed/running identity
+remains `/Applications/Vaelen.app` with the accepted signed `vaelend` under
+`dev.vaelen.vaelend`.
+
+This records Bane's acceptance and M14 freeze-readiness for the authorized
+finalization boundary. It does not independently freeze M14 or authorize M15.

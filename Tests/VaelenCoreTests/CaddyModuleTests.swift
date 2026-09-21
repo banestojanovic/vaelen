@@ -4,9 +4,15 @@ import XCTest
 final class CaddyModuleTests: XCTestCase {
     func testInstallVerifiesAndAtomicallyRecordsProvenanceWithoutStartingProcess() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("vaelen-caddy-\(UUID().uuidString)")
-        let source = URL(fileURLWithPath: "/var/folders/9b/1f1sf2v51_36ys9ngvlqzc8c0000gn/T/opencode")
+        guard let fixtureRoot = ProcessInfo.processInfo.environment["VAELEN_CADDY_TEST_FIXTURE_DIR"] else {
+            throw XCTSkip("Caddy authentic-upstream fixture unavailable; set VAELEN_CADDY_TEST_FIXTURE_DIR to an explicitly prepared fixture (unit test is not an upstream-release claim).")
+        }
+        let source = URL(fileURLWithPath: fixtureRoot, isDirectory: true)
         let archive = source.appendingPathComponent("caddy_mac_arm64.tar.gz")
         let checksum = source.appendingPathComponent("caddy_checksums.txt")
+        guard FileManager.default.isReadableFile(atPath: archive.path), FileManager.default.isReadableFile(atPath: checksum.path) else {
+            throw XCTSkip("Caddy authentic-upstream fixture is incomplete; expected readable archive and checksum files under VAELEN_CADDY_TEST_FIXTURE_DIR.")
+        }
         let layout = VaelenFilesystemLayout(rootURL: root)
         let manifest = CaddyManifest(version: "2.11.4", platform: "macos", architecture: "arm64", artifactFile: "caddy_2.11.4_mac_arm64.tar.gz", artifactURL: archive, artifactSHA512: "3190ae0df98b59ab4b6021556fa35adc3c526a4f3e138776b0eaec8a037cc26121cbbb1ad53453f565551b47d37d5ba4755e2c2c3652256737fe2ce9e53c8ec0", checksumURL: checksum, signatureURL: checksum, certificateURL: checksum, verificationMechanism: "test verifier", certificateIdentity: "test", certificateOIDCIssuer: "test", license: "Apache-2.0")
         let module = CaddyModule(layout: layout, manifest: manifest, downloader: CopyDownloader(), verifier: AcceptingVerifier())
@@ -21,9 +27,15 @@ final class CaddyModuleTests: XCTestCase {
 
     func testTamperedChecksumFailsBeforePackagePlacement() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("vaelen-caddy-\(UUID().uuidString)")
-        let source = URL(fileURLWithPath: "/var/folders/9b/1f1sf2v51_36ys9ngvlqzc8c0000gn/T/opencode")
+        guard let fixtureRoot = ProcessInfo.processInfo.environment["VAELEN_CADDY_TEST_FIXTURE_DIR"] else {
+            throw XCTSkip("Caddy authentic-upstream fixture unavailable; set VAELEN_CADDY_TEST_FIXTURE_DIR to an explicitly prepared fixture (unit test is not an upstream-release claim).")
+        }
+        let source = URL(fileURLWithPath: fixtureRoot, isDirectory: true)
         let archive = source.appendingPathComponent("caddy_mac_arm64.tar.gz")
         let checksum = source.appendingPathComponent("caddy_checksums.txt")
+        guard FileManager.default.isReadableFile(atPath: archive.path), FileManager.default.isReadableFile(atPath: checksum.path) else {
+            throw XCTSkip("Caddy authentic-upstream fixture is incomplete; expected readable archive and checksum files under VAELEN_CADDY_TEST_FIXTURE_DIR.")
+        }
         let layout = VaelenFilesystemLayout(rootURL: root)
         let manifest = CaddyManifest(version: "2.11.4", platform: "macos", architecture: "arm64", artifactFile: "caddy_2.11.4_mac_arm64.tar.gz", artifactURL: archive, artifactSHA512: String(repeating: "0", count: 128), checksumURL: checksum, signatureURL: checksum, certificateURL: checksum, verificationMechanism: "test verifier", certificateIdentity: "test", certificateOIDCIssuer: "test", license: "Apache-2.0")
         let module = CaddyModule(layout: layout, manifest: manifest, downloader: CopyDownloader(), verifier: AcceptingVerifier())
@@ -34,8 +46,9 @@ final class CaddyModuleTests: XCTestCase {
     }
 
     func testOfficialDistributionWithDevelopmentCosign() throws {
-        guard ProcessInfo.processInfo.environment["VAELEN_COSIGN_PATH"] != nil else {
-            throw XCTSkip("development-only official distribution test")
+        guard ProcessInfo.processInfo.environment["VAELEN_COSIGN_PATH"] != nil,
+              ProcessInfo.processInfo.environment["VAELEN_RUN_CADDY_NETWORK_TESTS"] == "1" else {
+            throw XCTSkip("authentic Caddy release test is opt-in; set VAELEN_RUN_CADDY_NETWORK_TESTS=1 and VAELEN_COSIGN_PATH")
         }
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("vaelen-caddy-official-\(UUID().uuidString)")
         let module = CaddyModule(layout: VaelenFilesystemLayout(rootURL: root))

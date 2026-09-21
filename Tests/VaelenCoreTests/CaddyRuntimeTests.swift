@@ -68,15 +68,16 @@ final class CaddyRuntimeTests: XCTestCase {
     }
 
     private func resolveCaddyPackage() throws -> CaddyPackage {
-        let module = CaddyModule(layout: VaelenFilesystemLayout())
-        do {
-            return try module.resolveInstalled(requestedVersion: "2.11.4")
-        } catch CaddyModuleError.packageMissing {
-            do {
-                return try module.install(requestedVersion: "2.11.4")
-            } catch {
-                throw XCTSkip("Caddy distribution prerequisite unavailable: \(error)")
-            }
+        guard let path = ProcessInfo.processInfo.environment["VAELEN_CADDY_TEST_PACKAGE"] else {
+            throw XCTSkip("Caddy runtime fixture unavailable; set VAELEN_CADDY_TEST_PACKAGE to an independently prepared authentic package (no network/live-state install in swift test).")
         }
+        let metadata = URL(fileURLWithPath: path).appendingPathComponent(".vaelen-package.json")
+        guard let data = try? Data(contentsOf: metadata), let package = try? JSONDecoder().decode(CaddyPackage.self, from: data) else {
+            throw XCTSkip("Caddy runtime fixture is missing .vaelen-package.json provenance.")
+        }
+        guard FileManager.default.isExecutableFile(atPath: package.executablePath) else {
+            throw XCTSkip("Caddy runtime fixture executable is absent or not executable: \(package.executablePath)")
+        }
+        return package
     }
 }

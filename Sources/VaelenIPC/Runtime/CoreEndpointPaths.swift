@@ -7,6 +7,7 @@ public struct CoreEndpointPaths: Sendable {
     public let locks: URL
     public let socket: URL
     public let lock: URL
+    public let bootstrapLock: URL
 
     public init(root: URL? = nil) {
         let base = root ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -17,6 +18,7 @@ public struct CoreEndpointPaths: Sendable {
         self.locks = base.appendingPathComponent("locks", isDirectory: true)
         self.socket = self.sockets.appendingPathComponent("core.sock", isDirectory: false)
         self.lock = self.locks.appendingPathComponent("vaelend.lock", isDirectory: false)
+        self.bootstrapLock = self.locks.appendingPathComponent("lifecycle-bootstrap.lock", isDirectory: false)
     }
 
     public init(layout: VaelenFilesystemLayout) {
@@ -26,6 +28,7 @@ public struct CoreEndpointPaths: Sendable {
         self.locks = base.appendingPathComponent("locks", isDirectory: true)
         self.socket = self.sockets.appendingPathComponent("core.sock", isDirectory: false)
         self.lock = self.locks.appendingPathComponent("vaelend.lock", isDirectory: false)
+        self.bootstrapLock = self.locks.appendingPathComponent("lifecycle-bootstrap.lock", isDirectory: false)
     }
 
     public func prepareDirectories() throws {

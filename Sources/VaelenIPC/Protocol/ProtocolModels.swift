@@ -41,9 +41,18 @@ public struct CoreStatusResponse: Codable, Equatable, Sendable {
     public init(core: CoreRuntimeStatus, protocolVersion: Int) { self.core = core; self.protocolVersion = protocolVersion }
 }
 
+/// Explicit Core application readiness. This is intentionally separate from
+/// `core.status`: a reachable process is not by itself a ready Core.
+public struct CoreReadinessResponse: Codable, Equatable, Sendable {
+    public let readiness: CoreReadiness
+    public let protocolVersion: Int
+    public init(readiness: CoreReadiness, protocolVersion: Int) { self.readiness = readiness; self.protocolVersion = protocolVersion }
+}
+
 public enum CoreMethod: String, Sendable {
     case handshake = "core.handshake"
     case status = "core.status"
+    case readiness = "core.readiness"
     case projectLink = "project.link"
     case projectUnlink = "project.unlink"
     case projectLinks = "project.links"
@@ -94,6 +103,11 @@ public enum CoreMethod: String, Sendable {
     case portsStatus = "ports.status"
     case portsInstall = "ports.install"
     case portsRemove = "ports.remove"
+    case lifecycleOn = "lifecycle.on"
+    case lifecycleOff = "lifecycle.off"
+    case lifecycleStatus = "lifecycle.status"
+    case lifecycleReadiness = "lifecycle.readiness"
+    case lifecycleBootstrapPromote = "lifecycle.bootstrap-promote"
 }
 
 public enum RequestParams: Codable, Equatable, Sendable {
@@ -111,6 +125,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case routeAssociation(RouteProjectAssociationRequest)
     case routePHPTargetUpdate(RoutePHPTargetUpdateRequest)
     case dnsInstall(DNSInstallRequest)
+    case lifecycle(LifecycleRequest)
+    case bootstrapPromotion(BootstrapPromotionRequest)
     case empty
     case raw(JSONValue)
 
@@ -130,6 +146,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .routeAssociation(let value): try value.encode(to: encoder)
         case .routePHPTargetUpdate(let value): try value.encode(to: encoder)
         case .dnsInstall(let value): try value.encode(to: encoder)
+        case .lifecycle(let value): try value.encode(to: encoder)
+        case .bootstrapPromotion(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
@@ -141,6 +159,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
             if fields["client"] != nil, let params = try? IPCCodec.decode(HandshakeParams.self, from: IPCCodec.encode(value)) {
                 self = .handshake(params); return
             }
+            if fields["target"] != nil, fields["actor"] != nil, let params = try? IPCCodec.decode(LifecycleRequest.self, from: IPCCodec.encode(value)) { self = .lifecycle(params); return }
+            if fields["invocationToken"] != nil, let params = try? IPCCodec.decode(BootstrapPromotionRequest.self, from: IPCCodec.encode(value)) { self = .bootstrapPromotion(params); return }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, fields["expectedCurrentSocket"] != nil, let params = try? IPCCodec.decode(RoutePHPTargetUpdateRequest.self, from: IPCCodec.encode(value)) { self = .routePHPTargetUpdate(params); return }
@@ -189,6 +209,9 @@ public enum IPCErrorCode: String, Codable, Sendable {
     case tlsTrustOperationFailed = "TLS_TRUST_OPERATION_FAILED"
     case tlsRemovalBlocked = "TLS_REMOVAL_BLOCKED"
     case tlsObservationFailed = "TLS_OBSERVATION_FAILED"
+    case lifecycleUnavailable = "LIFECYCLE_UNAVAILABLE"
+    case lifecycleUnknown = "LIFECYCLE_UNKNOWN"
+    case bootstrapRequired = "BOOTSTRAP_REQUIRED"
 }
 
 public struct IPCErrorPayload: Codable, Equatable, Sendable, Error {
@@ -321,6 +344,18 @@ public enum RoutePHPTargetMutationState: String, Codable, Equatable, Sendable { 
 public struct RoutePHPTargetUpdateResult: Codable, Equatable, Sendable { public let observation: ProjectPHPRouteTargetObservation; public let state: RoutePHPTargetMutationState; public init(observation: ProjectPHPRouteTargetObservation, state: RoutePHPTargetMutationState) { self.observation = observation; self.state = state } }
 public struct RouteListResult: Codable, Equatable, Sendable { public let routes: [RouteIntent]; public init(routes: [RouteIntent]) { self.routes = routes } }
 public struct DNSInstallRequest: Codable, Equatable, Sendable { public let takeover: Bool; public init(takeover: Bool = false) { self.takeover = takeover } }
+public struct LifecycleRequest: Codable, Equatable, Sendable { public let actor: String; public let target: LifecycleTargetIdentity; public init(actor: String = "client", target: LifecycleTargetIdentity) { self.actor = actor; self.target = target } }
+public struct BootstrapPromotionRequest: Codable, Equatable, Sendable {
+    public let invocationToken: String
+    public let epoch: UUID
+    public let operationID: UUID
+    public let nonce: UUID
+    public let observation: LifecycleObservationVector
+    public init(invocationToken: String, epoch: UUID, operationID: UUID, nonce: UUID, observation: LifecycleObservationVector) {
+        self.invocationToken = invocationToken; self.epoch = epoch; self.operationID = operationID; self.nonce = nonce; self.observation = observation
+    }
+}
+public struct LifecycleReadinessResult: Codable, Equatable, Sendable { public let readiness: CoreReadiness; public let observation: LifecycleObservationVector; public init(readiness: CoreReadiness, observation: LifecycleObservationVector) { self.readiness = readiness; self.observation = observation } }
 public struct DNSStatusResult: Codable, Equatable, Sendable { public let dns: DNSStatus; public init(dns: DNSStatus) { self.dns = dns } }
 public struct TLSStatusResult: Codable, Equatable, Sendable { public let tls: TLSStatus; public init(tls: TLSStatus) { self.tls = tls } }
 public struct TLSTrustResultWire: Codable, Equatable, Sendable { public let result: TLSTrustResult; public init(result: TLSTrustResult) { self.result = result } }
@@ -329,6 +364,7 @@ public struct PortsStatusResult: Codable, Equatable, Sendable { public let ports
 public enum ResponseResult: Codable, Equatable, Sendable {
     case handshake(HandshakeResult)
     case status(CoreStatusResponse)
+    case coreReadiness(CoreReadinessResponse)
     case projectMutation(ProjectMutationResult)
     case projectList(ProjectListResult)
     case projectEnvironment(ProjectEnvironmentResult)
@@ -352,12 +388,15 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case tlsStatus(TLSStatusResult)
     case tlsTrust(TLSTrustResultWire)
     case portsStatus(PortsStatusResult)
+    case lifecycle(LifecycleStatusResult)
+    case lifecycleReadiness(LifecycleReadinessResult)
     case raw(JSONValue)
 
     public func encode(to encoder: Encoder) throws {
         switch self {
         case .handshake(let value): try value.encode(to: encoder)
         case .status(let value): try value.encode(to: encoder)
+        case .coreReadiness(let value): try value.encode(to: encoder)
         case .projectMutation(let value): try value.encode(to: encoder)
         case .projectList(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
@@ -381,6 +420,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .tlsStatus(let value): try value.encode(to: encoder)
         case .tlsTrust(let value): try value.encode(to: encoder)
         case .portsStatus(let value): try value.encode(to: encoder)
+        case .lifecycle(let value): try value.encode(to: encoder)
+        case .lifecycleReadiness(let value): try value.encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
     }
@@ -389,7 +430,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         let value = try JSONValue(from: decoder)
         let data = try IPCCodec.encode(value)
         guard case .object(let fields) = value else { self = .raw(value); return }
-        if fields["core"] != nil, let result = try? IPCCodec.decode(CoreStatusResponse.self, from: data) { self = .status(result) }
+        if fields["readiness"] != nil, fields["protocolVersion"] != nil, let result = try? IPCCodec.decode(CoreReadinessResponse.self, from: data) { self = .coreReadiness(result) }
+        else if fields["core"] != nil, let result = try? IPCCodec.decode(CoreStatusResponse.self, from: data) { self = .status(result) }
         else if fields["coreVersion"] != nil, let result = try? IPCCodec.decode(HandshakeResult.self, from: data) { self = .handshake(result) }
         else if fields["projects"] != nil, let result = try? IPCCodec.decode(ProjectListResult.self, from: data) { self = .projectList(result) }
         else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
@@ -414,6 +456,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
          else if fields["result"] != nil, let result = try? IPCCodec.decode(TLSTrustResultWire.self, from: data) { self = .tlsTrust(result) }
          else if fields["tls"] != nil, let result = try? IPCCodec.decode(TLSStatusResult.self, from: data) { self = .tlsStatus(result) }
         else if fields["ports"] != nil, let result = try? IPCCodec.decode(PortsStatusResult.self, from: data) { self = .portsStatus(result) }
+        else if fields["intent"] != nil, let result = try? IPCCodec.decode(LifecycleStatusResult.self, from: data) { self = .lifecycle(result) }
+        else if fields["readiness"] != nil, fields["observation"] != nil, let result = try? IPCCodec.decode(LifecycleReadinessResult.self, from: data) { self = .lifecycleReadiness(result) }
         else { self = .raw(value) }
     }
 }

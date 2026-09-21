@@ -115,6 +115,9 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyReachesSyncproofLaravelFrontController() async throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_RUN_SYNCPROOF_INTEGRATION_TESTS"] == "1" else {
+            throw XCTSkip("Syncproof integration is opt-in; set VAELEN_RUN_SYNCPROOF_INTEGRATION_TESTS=1 with an explicitly prepared external project and database.")
+        }
         guard let php = PHPModule.development(), let phpPackage = php.installedVersions().last else {
             throw XCTSkip("M2 PHP-FPM package is not installed")
         }
@@ -217,16 +220,17 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     private func resolveCaddyPackage() throws -> CaddyPackage {
-        let module = CaddyModule(layout: VaelenFilesystemLayout())
-        do {
-            return try module.resolveInstalled(requestedVersion: "2.11.4")
-        } catch CaddyModuleError.packageMissing {
-            do {
-                return try module.install(requestedVersion: "2.11.4")
-            } catch {
-                throw XCTSkip("Caddy distribution prerequisite unavailable: \(error)")
-            }
+        guard let path = ProcessInfo.processInfo.environment["VAELEN_CADDY_TEST_PACKAGE"] else {
+            throw XCTSkip("Caddy runtime fixture unavailable; set VAELEN_CADDY_TEST_PACKAGE to an independently prepared authentic package (no network/live-state install in swift test).")
         }
+        let metadata = URL(fileURLWithPath: path).appendingPathComponent(".vaelen-package.json")
+        guard let data = try? Data(contentsOf: metadata), let package = try? JSONDecoder().decode(CaddyPackage.self, from: data) else {
+            throw XCTSkip("Caddy runtime fixture is missing .vaelen-package.json provenance.")
+        }
+        guard FileManager.default.isExecutableFile(atPath: package.executablePath) else {
+            throw XCTSkip("Caddy runtime fixture executable is absent or not executable: \(package.executablePath)")
+        }
+        return package
     }
 
     private func runCurl(host: String, port: Int, path: String = "/") throws -> String {

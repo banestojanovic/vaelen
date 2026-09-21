@@ -18,8 +18,13 @@ public struct CoreRuntimeStatus: Codable, Equatable, Sendable {
 
 public struct CoreRuntime: Sendable {
     public let status: CoreRuntimeStatus
+    /// Set only after Core has completed the initialization required to serve
+    /// product requests. The default preserves the existing test/runtime
+    /// construction contract.
+    public let isReady: Bool
 
-    public init(version: String, pid: Int32 = Int32(getpid())) {
+    public init(version: String, pid: Int32 = Int32(getpid()), isReady: Bool = true) {
         self.status = CoreRuntimeStatus(state: .running, version: version, pid: pid)
+        self.isReady = isReady
     }
 }

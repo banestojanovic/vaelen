@@ -20,7 +20,9 @@ let package = Package(
         .target(name: "VaelenCore", dependencies: [.product(name: "Yams", package: "Yams")], linkerSettings: [.linkedLibrary("sqlite3")]),
         .target(name: "VaelenIPC", dependencies: ["VaelenCore"]),
         .target(name: "VaelenDaemonSupport", dependencies: ["VaelenCore", "VaelenIPC"]),
-        .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenDaemonSupport"]),
+        .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenDaemonSupport"], linkerSettings: [
+            .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Frameworks"])
+        ]),
         .target(name: "VaelenDNSCore"),
         .executableTarget(name: "VaelenDNS", dependencies: ["VaelenDNSCore"]),
         .executableTarget(name: "VaelenCLI", dependencies: ["VaelenIPC"]),

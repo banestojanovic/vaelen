@@ -3,17 +3,45 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 60;
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1605D256305FFB05001889A8 /* vaelend in Frameworks */ = {isa = PBXBuildFile; productRef = A00000000000000000000022 /* vaelend */; };
 		A00000000000000000000001 /* VaelenApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000011 /* VaelenApp.swift */; };
 		A00000000000000000000002 /* VaelenIPC in Frameworks */ = {isa = PBXBuildFile; productRef = A00000000000000000000021 /* VaelenIPC */; };
+		A00000000000000000000003 /* vaelend in CopyFiles */ = {isa = PBXBuildFile; productRef = A00000000000000000000022 /* vaelend */; };
+		A00000000000000000000004 /* Resources/LaunchAgents/dev.vaelen.vaelend.agent.plist in CopyFiles */ = {isa = PBXBuildFile; fileRef = A00000000000000000000012 /* Resources/LaunchAgents/dev.vaelen.vaelend.agent.plist */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A00000000000000000000033 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = ../Library/LaunchAgents;
+			dstSubfolderSpec = 7;
+			files = (
+				A00000000000000000000004 /* Resources/LaunchAgents/dev.vaelen.vaelend.agent.plist in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000034 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 7;
+			files = (
+				A00000000000000000000003 /* vaelend in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		A00000000000000000000010 /* Vaelen.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vaelen.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000011 /* VaelenApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaelenApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000012 /* Resources/LaunchAgents/dev.vaelen.vaelend.agent.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Resources/LaunchAgents/dev.vaelen.vaelend.agent.plist; sourceTree = "<group>"; };
+		A00000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -21,6 +49,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1605D256305FFB05001889A8 /* vaelend in Frameworks */,
 				A00000000000000000000002 /* VaelenIPC in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -40,6 +69,8 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000011 /* VaelenApp.swift */,
+				A00000000000000000000012 /* Resources/LaunchAgents/dev.vaelen.vaelend.agent.plist */,
+				A00000000000000000000013 /* Info.plist */,
 			);
 			path = Vaelen;
 			sourceTree = "<group>";
@@ -62,6 +93,9 @@
 				A00000000000000000000030 /* Sources */,
 				A00000000000000000000031 /* Frameworks */,
 				A00000000000000000000032 /* Resources */,
+				A00000000000000000000033 /* CopyFiles */,
+				A00000000000000000000034 /* CopyFiles */,
+				A00000000000000000000035 /* Sign embedded daemon */,
 			);
 			buildRules = (
 			);
@@ -70,6 +104,7 @@
 			name = Vaelen;
 			packageProductDependencies = (
 				A00000000000000000000021 /* VaelenIPC */,
+				A00000000000000000000022 /* vaelend */,
 			);
 			productName = Vaelen;
 			productReference = A00000000000000000000010 /* Vaelen.app */;
@@ -83,51 +118,167 @@
 			attributes = {
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
-					A00000000000000000000050 = { CreatedOnToolsVersion = 16.0; };
+					A00000000000000000000050 = {
+						CreatedOnToolsVersion = 16.0;
+					};
 				};
 			};
 			buildConfigurationList = A00000000000000000000071 /* Build configuration list for PBXProject "Vaelen" */;
 			compatibilityVersion = "Xcode 15.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
-			knownRegions = ( en, Base, );
+			knownRegions = (
+				en,
+				Base,
+			);
 			mainGroup = A00000000000000000000040;
 			packageReferences = (
-				A00000000000000000000080 /* XCLocalSwiftPackageReference "Vaelen" */,
+				A00000000000000000000080 /* XCLocalSwiftPackageReference "../.." */,
 			);
 			productRefGroup = A00000000000000000000042 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = ( A00000000000000000000050 /* Vaelen */ );
+			targets = (
+				A00000000000000000000050 /* Vaelen */,
+			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		A00000000000000000000032 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000032 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A00000000000000000000030 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ( A00000000000000000000001 /* VaelenApp.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000030 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000001 /* VaelenApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		A00000000000000000000035 /* Sign embedded daemon */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/vaelend",
+			);
+			name = "Sign embedded daemon";
+			outputPaths = (
+			);
+			alwaysOutOfDate = 1;
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nDAEMON=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/vaelend\"\nif [ ! -x \"$DAEMON\" ]; then\n    echo \"error: embedded vaelend daemon is missing\" >&2\n    exit 1\nfi\nif [ -z \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ] || [ \"$EXPANDED_CODE_SIGN_IDENTITY\" = \"-\" ]; then\n    echo \"error: a legitimate Xcode signing identity is required for embedded vaelend\" >&2\n    exit 1\nfi\ncase \"${EXPANDED_CODE_SIGN_IDENTITY_NAME:-}\" in\n    Apple\\ Development:*) ;;\n    *) echo \"error: an Apple Development identity is required for embedded vaelend\" >&2; exit 1 ;;\nesac\n/usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --timestamp=none --generate-entitlement-der \"$DAEMON\"\n/usr/bin/codesign --verify --strict \"$DAEMON\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin XCBuildConfiguration section */
-		A00000000000000000000090 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SWIFT_VERSION = 6.0; }; name = Debug; };
-		A00000000000000000000091 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SWIFT_VERSION = 6.0; }; name = Release; };
-		A00000000000000000000092 /* App Debug */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_LSUIElement = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = dev.vaelen.app; PRODUCT_NAME = Vaelen; SWIFT_VERSION = 6.0; }; name = Debug; };
-		A00000000000000000000093 /* App Release */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_LSUIElement = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = dev.vaelen.app; PRODUCT_NAME = Vaelen; SWIFT_VERSION = 6.0; }; name = Release; };
+		A00000000000000000000090 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A00000000000000000000091 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A00000000000000000000092 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = TFKZJV643G;
+				INFOPLIST_FILE = Vaelen/Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.vaelen.app;
+				PRODUCT_NAME = Vaelen;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A00000000000000000000093 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				// Xcode 27 names this certificate class "Mac Development" during
+				// automatic resolution, while the canonical TeamIdentifier's
+				// installed keychain identity is "Apple Development". Keep the
+				// Release product explicitly bound to that exact identity.
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				DEVELOPMENT_TEAM = TFKZJV643G;
+				INFOPLIST_FILE = Vaelen/Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.vaelen.app;
+				PRODUCT_NAME = Vaelen;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A00000000000000000000070 /* Build configuration list for PBXNativeTarget "Vaelen" */ = {isa = XCConfigurationList; buildConfigurations = ( A00000000000000000000092 /* App Debug */, A00000000000000000000093 /* App Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-		A00000000000000000000071 /* Build configuration list for PBXProject "Vaelen" */ = {isa = XCConfigurationList; buildConfigurations = ( A00000000000000000000090 /* Debug */, A00000000000000000000091 /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A00000000000000000000070 /* Build configuration list for PBXNativeTarget "Vaelen" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000092 /* Debug */,
+				A00000000000000000000093 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000071 /* Build configuration list for PBXProject "Vaelen" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000090 /* Debug */,
+				A00000000000000000000091 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		A00000000000000000000080 /* XCLocalSwiftPackageReference "Vaelen" */ = {isa = XCLocalSwiftPackageReference; relativePath = ../..; };
+		A00000000000000000000080 /* XCLocalSwiftPackageReference "../.." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../..;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		A00000000000000000000021 /* VaelenIPC */ = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000080 /* XCLocalSwiftPackageReference "Vaelen" */; productName = VaelenIPC; };
+		A00000000000000000000021 /* VaelenIPC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00000000000000000000080 /* XCLocalSwiftPackageReference "../.." */;
+			productName = VaelenIPC;
+		};
+		A00000000000000000000022 /* vaelend */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00000000000000000000080 /* XCLocalSwiftPackageReference "../.." */;
+			productName = vaelend;
+		};
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A00000000000000000000060 /* Project object */;

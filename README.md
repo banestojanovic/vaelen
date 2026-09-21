@@ -1,19 +1,20 @@
 # Vaelen
 
 Vaelen is a native macOS developer control center. The current frozen release
-is M12, Project PHP Route Target Convergence, with an authoritative per-user
-`vaelend` Core daemon, structured UNIX-socket IPC, project registration, and
-managed local development infrastructure.
+is M13, Core-Authoritative Local TLS Trust Operations, with an authoritative
+per-user `vaelend` Core daemon, structured UNIX-socket IPC, project
+registration, and managed local development infrastructure. M14 lifecycle
+implementation is active but not accepted or frozen.
 
 ## Release Status
 
-- **M12:** frozen and complete
-- **Version:** `0.0.13-dev`
-- **Build identity:** `m12-php-route-target-convergence-schema-4`
-- **SQLite schema:** `5`
-- **IPC schema:** `4`
-- **Acceptance record:** `docs/m12-acceptance.md`
-- **Architecture decision:** `docs/adr/ADR-0012-php-route-target-convergence.md`
+- **M13:** frozen and complete
+- **M14:** active implementation; production acceptance remains incomplete
+- **Version:** `0.0.14-dev`
+- **Build identity:** `m14-core-daemon-lifecycle-schema-7`
+- **SQLite schema:** `7`
+- **IPC schema:** `5`
+- **Architecture decision:** `docs/adr/ADR-0013-core-authoritative-local-tls-trust-operations.md`
 
 ## Requirements
 
@@ -96,8 +97,10 @@ same path. Missing registrations remain visible as unavailable metadata.
 Vaelen never owns or modifies project source directories. Link, unlink, park,
 and unpark change only Vaelen's registry metadata.
 
-Milestone 0 uses manual daemon startup. LaunchAgent installation and
-socket-activation are intentionally deferred.
+Development runs may still use manual daemon startup. The Xcode app package
+contains the signed daemon and its LaunchAgent resource. Lifecycle observation
+is passive; registration, bootstrap, and socket activation are explicit
+app-controlled operations, not implicit side effects of ordinary CLI commands.
 
 ## App
 

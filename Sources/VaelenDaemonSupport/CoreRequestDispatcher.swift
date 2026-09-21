@@ -14,11 +14,26 @@ public actor CoreRequestDispatcher {
     private let dns: DNSCapability
     private let tls: TLSCapability
     private let ports: StandardPortsCapability
+    private let lifecycle: LifecycleStateRepository?
+    private let lifecycleExecutor: any CoreIssuedLifecycleExecutor
+    private let lifecycleObservationProvider: any LifecycleObservationProvider
+    private let lifecycleSessionBinding: UUID
+    private let lifecycleTimeoutNanoseconds: UInt64
     private var routeIntents: [RouteID: RouteIntent]
+    /// Envelopes which have crossed the Core authorization boundary but have
+    /// not yet returned.  A newer durable intent must revoke these before it
+    /// can dispatch its own operation; the durable generation fence alone is
+    /// not sufficient because the platform adapter is an asynchronous actor.
+    private var authorizedLifecycleRequests: [UUID: LifecycleExecutorRequest] = [:]
+    /// A timed-out On may still be suspended inside a non-cancellable
+    /// platform call after its authorization envelope is removed.  Retain
+    /// that ambiguity as an operation-level fence; a later Off must not use a
+    /// stale absent pre-observation as an idempotent success.
+    private var ambiguousLifecycleOnOperations: Set<UUID> = []
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) throws {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), lifecycleStore: SQLiteStateStore? = nil, lifecycleReceiptAuthenticator: (any BootstrapReceiptAuthenticator)? = nil, lifecycleExecutor: any LifecyclePlatformExecutor = UnavailableLifecycleExecutor(), lifecycleObservationProvider: any LifecycleObservationProvider = UnavailableLifecycleObservationProvider(), lifecycleSessionBinding: UUID? = nil, lifecycleTimeoutNanoseconds: UInt64 = 5_000_000_000) throws {
+         self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.lifecycle = lifecycleStore.map { LifecycleStateRepository(store: $0, receiptAuthenticator: lifecycleReceiptAuthenticator) }; self.lifecycleExecutor = (lifecycleExecutor as? any CoreIssuedLifecycleExecutor) ?? RefusingLifecycleExecutor(); self.lifecycleObservationProvider = lifecycleObservationProvider; self.lifecycleSessionBinding = lifecycleSessionBinding ?? UUID(); self.lifecycleTimeoutNanoseconds = lifecycleTimeoutNanoseconds
         let persistedRoutes = try routeRepository?.all() ?? []
         _ = try routeRepository?.pendingTransitions()
         self.routeIntents = Dictionary(uniqueKeysWithValues: persistedRoutes.map { ($0.route.id, $0) })
@@ -47,6 +62,175 @@ public actor CoreRequestDispatcher {
             switch method {
             case .status:
                 return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1))), true)
+            case .readiness:
+                // This is a direct Core-owned answer. It must not call the
+                // lifecycle observation provider (which itself probes this
+                // contract), or readiness would recursively observe itself.
+                return (.init(id: request.id, result: .coreReadiness(.init(readiness: runtime.isReady ? .ready : .starting, protocolVersion: 1))), true)
+            case .lifecycleOn, .lifecycleOff:
+                guard let lifecycle else { throw IPCErrorPayload(code: .lifecycleUnavailable, message: "Lifecycle persistence is unavailable.") }
+                // Read before attempting the lease as well as after acquiring
+                // it.  This ensures a bootstrap that already owns the shared
+                // lease is reported as recovery-required, rather than being
+                // flattened into an unrelated lock/refusal error.
+                try lifecycle.requireBootstrapPromotion()
+                // Bootstrap holds a shared handoff lease from reservation
+                // through promotion. Ordinary lifecycle mutations require
+                // the exclusive lease and must refuse rather than supersede
+                // that receipt or wait behind it.
+                 let lifecycleHandoffLock: BootstrapLock
+                  do { lifecycleHandoffLock = try BootstrapLock.acquireExclusive(endpoint: lifecycle.canonicalTarget.endpoint) }
+                 catch {
+                     // A bootstrap may have reserved between the first read
+                     // and the exclusive acquisition. Re-read the receipt so
+                     // that race is still the structured recovery boundary.
+                     try lifecycle.requireBootstrapPromotion()
+                      throw error
+                  }
+                  var lifecycleHandoffLockReleased = false
+                  defer { if !lifecycleHandoffLockReleased { lifecycleHandoffLock.release() } }
+                 // This barrier must be read after taking the exclusive lease
+                 // and before request(), which can supersede durable journal
+                 // state.  A reserved, succeeded, failed, unknown, or
+                 // malformed receipt therefore becomes structured recovery
+                 // required rather than a normal lifecycle mutation.
+                 try lifecycle.requireBootstrapPromotion()
+                 let params = try request.params?.decode(LifecycleRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Lifecycle target is required.") }()
+                guard params.target == lifecycle.canonicalTarget else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Lifecycle target identity is Core-owned and must be canonical.")
+                }
+                let intent: LifecycleIntent = method == .lifecycleOn ? .on : .off
+                 let operationID = UUID()
+                   // Revoke every older authorized envelope before installing
+                   // the newer generation.  This is the last Core-side fence
+                   // before an On envelope could cross into SMAppService.
+                   let superseded = Array(authorizedLifecycleRequests.values)
+                   // An authorized On may already be suspended inside the
+                   // non-cancellable platform call.  Its pre-observation can
+                   // therefore be stale by the time this Off observes the
+                   // platform.  Do not turn that ambiguity into an idempotent
+                   // Off success merely because the fresh observation happens
+                   // to be absent; the durable Off must remain recovery-required.
+                   let supersededPlatformOn = superseded.contains { $0.intent == .on } || !ambiguousLifecycleOnOperations.isEmpty
+                   for prior in superseded {
+                      await lifecycleExecutor.invalidate(operationID: prior.operationID, nonce: prior.nonce)
+                      authorizedLifecycleRequests.removeValue(forKey: prior.operationID)
+                  }
+                  let pre = await lifecycleObservationProvider.observe(operationID: operationID, generation: 0, intent: intent, target: lifecycle.canonicalTarget)
+                  let offOwned: Bool
+                  let onOwned: Bool
+                   if method == .lifecycleOff && pre.registrationMatch == .true && pre.signatureValid == .true {
+                        offOwned = try lifecycle.hasValidOwnership(for: lifecycle.canonicalTarget, observation: pre)
+                   } else { offOwned = false }
+                   if method == .lifecycleOn && pre.registrationMatch == .true {
+                       onOwned = try lifecycle.hasValidOwnership(for: lifecycle.canonicalTarget, observation: pre)
+                   } else { onOwned = false }
+                  if method == .lifecycleOff {
+                      // Off is always durable. An absent registration is an
+                      // idempotent no-op; an unowned/foreign registration is
+                      // fenced but never handed to SMAppService.
+                  } else if pre.registrationMatch == .true {
+                      guard onOwned else {
+                          throw IPCErrorPayload(code: .invalidRequest, message: "Lifecycle on refused: an existing registration cannot be adopted without durable ownership and provenance.")
+                      }
+                 }
+                  // Mint the executor credentials before the durable operation
+                  // row is written. The row is therefore a complete fence
+                  // before mark-in-flight or any platform call.
+                  let executorNonce = UUID()
+                  let executorSessionBinding = lifecycleSessionBinding
+                  let operation = try lifecycle.request(intent: intent, actor: params.actor, target: params.target, preObservation: pre, operationID: operationID, nonce: executorNonce, sessionBinding: executorSessionBinding, processIdentity: pre.processIdentity)
+                 guard try lifecycle.markInFlight(operationID: operation.operationID, generation: operation.generation) else {
+                     throw IPCErrorPayload(code: .invalidRequest, message: "Lifecycle operation was fenced before dispatch.")
+                 }
+                  // The durable pending row and the Core-issued envelope are
+                  // now fenced. Release the coordination lease before the
+                  // bounded external call so a newer Off can acquire it and
+                  // revoke this envelope while the executor is suspended.
+                  lifecycleHandoffLock.release()
+                  lifecycleHandoffLockReleased = true
+                  let deadline = Date().addingTimeInterval(Double(lifecycleTimeoutNanoseconds) / 1_000_000_000)
+                   let executorResult: LifecycleExecutorResult
+                    // The current Off supersedes in-flight work before this
+                    // point, so also consult historical unknown register rows
+                    // after request() has installed the durable Off barrier.
+                    let durableAmbiguousOn: Bool
+                    if method == .lifecycleOff {
+                        durableAmbiguousOn = try lifecycle.hasAmbiguousOnOperation()
+                    } else {
+                        durableAmbiguousOn = false
+                    }
+                    if method == .lifecycleOff && (supersededPlatformOn || durableAmbiguousOn) {
+                        executorResult = .init(state: .unknown, detail: "An On platform attempt is ambiguous; recovery observation is required before Off can complete.")
+                    } else if method == .lifecycleOff && !offOwned {
+                       executorResult = supersededPlatformOn
+                           ? .init(state: .unknown, detail: "An in-flight On may have crossed the platform boundary; recovery observation is required.")
+                           : .init(state: .success, detail: pre.registrationMatch == .false ? "No registration to unregister." : "Registration is not durably owned; platform mutation withheld.")
+                  } else {
+                         let executorRequest = LifecycleExecutorRequest(operationID: operation.operationID, generation: operation.generation, intent: intent, target: lifecycle.canonicalTarget, actor: params.actor, nonce: executorNonce, deadline: deadline, sessionBinding: executorSessionBinding, processIdentity: pre.processIdentity, allowExistingRegistration: onOwned)
+                        // Publish the pending envelope before the actor hop.
+                        // Core is re-entrant while authorize awaits; a newer
+                        // Off must therefore be able to discover and revoke
+                        // this request during that hop.
+                        authorizedLifecycleRequests[executorRequest.operationID] = executorRequest
+                        await lifecycleExecutor.authorize(executorRequest)
+                         executorResult = await boundedLifecycleExecution(executorRequest)
+                         authorizedLifecycleRequests.removeValue(forKey: executorRequest.operationID)
+                          // Unknown, timeout, and unavailable are conservative
+                          // platform-attempt outcomes for On. Record the
+                          // in-memory fence before returning/observing so a
+                          // re-entrant Off cannot treat absence as proof.
+                          if intent == .on && executorResult.state != .success && executorResult.state != .rejected {
+                              ambiguousLifecycleOnOperations.insert(executorRequest.operationID)
+                          }
+                         if executorResult.state == .timeout || executorResult.state == .unknown {
+                            await lifecycleExecutor.invalidate(operationID: executorRequest.operationID, nonce: executorRequest.nonce)
+                        }
+                  }
+                 let post = await lifecycleObservationProvider.observe(operationID: operation.operationID, generation: operation.generation, intent: intent, target: lifecycle.canonicalTarget)
+                guard try lifecycle.accepts(operationID: operation.operationID, generation: operation.generation) else {
+                    // A newer generation (most importantly Off) became the
+                    // barrier while the platform call was outstanding. The
+                    // result is intentionally not projected into the response
+                    // as success and cannot alter the newer journal row.
+                    let fenced = LifecycleObservationVector(reason: "Lifecycle executor result was fenced by a newer generation.")
+                    return (.init(id: request.id, result: .lifecycle(.init(intent: try lifecycle.intent(), operation: try lifecycle.operation(), observation: fenced, readiness: .unknown))), true)
+                }
+                 let successObservation = executorResult.state == .success && lifecycleSuccessGate(intent: intent, observation: post)
+                 let journalState: LifecycleJournalState = successObservation ? .succeeded : executorResult.state == .rejected ? .failed : .unknownRecoveryRequired
+                // The completion UPDATE repeats the operation/generation fence,
+                // so an Off (or any newer generation) cannot be reversed by a
+                // delayed executor result.
+                  try lifecycle.complete(operationID: operation.operationID, generation: operation.generation, state: journalState, postObservation: post, error: executorResult.detail)
+                   if intent == .on && successObservation {
+                       try lifecycle.saveOwnership(.init(target: lifecycle.canonicalTarget, signingTeam: post.signingTeam, designatedRequirement: post.designatedRequirement, artifactHash: post.artifactHash, operationID: operation.operationID, generation: operation.generation))
+                  }
+                let record = try lifecycle.intent()
+                return (.init(id: request.id, result: .lifecycle(.init(intent: record, operation: try lifecycle.operation(), observation: post, readiness: post.isReady ? .ready : .unknown))), true)
+            case .lifecycleStatus:
+                guard let lifecycle else { throw IPCErrorPayload(code: .lifecycleUnavailable, message: "Lifecycle persistence is unavailable.") }
+                 let observation = await lifecycleObservationProvider.observe(operationID: UUID(), generation: 0, intent: (try lifecycle.intent()?.intent ?? .on), target: lifecycle.canonicalTarget)
+                return (.init(id: request.id, result: .lifecycle(.init(intent: try lifecycle.intent(), operation: try lifecycle.operation(), observation: observation, readiness: observation.isReady ? .ready : .unknown))), true)
+            case .lifecycleReadiness:
+                 let observation = await lifecycleObservationProvider.observe(operationID: UUID(), generation: 0, intent: (try lifecycle?.intent()?.intent ?? .on), target: lifecycle?.canonicalTarget ?? LifecycleCanonicalIdentity.target)
+                 return (.init(id: request.id, result: .lifecycleReadiness(.init(readiness: observation.isReady ? .ready : .unknown, observation: observation))), true)
+            case .lifecycleBootstrapPromote:
+                guard let lifecycle else { throw IPCErrorPayload(code: .lifecycleUnavailable, message: "Lifecycle persistence is unavailable.") }
+                guard let params = try request.params?.decode(BootstrapPromotionRequest.self) else { throw IPCErrorPayload(code: .invalidRequest, message: "Bootstrap receipt promotion parameters are required.") }
+                 // The Core process has its own authenticator instance. Bind
+                 // it to the fresh signed observation before it reads the
+                 // receipt, while still allowing the CLI's authenticated
+                 // receipt to cross the process boundary.
+                 let observation = await lifecycleObservationProvider.observe(operationID: UUID(), generation: 0, intent: .on, target: lifecycle.canonicalTarget)
+                 guard let team = observation.signingTeam,
+                       let requirement = observation.designatedRequirement,
+                       let artifact = observation.artifactHash,
+                       observation.signatureValid == .true else { throw BootstrapError.invalidReceipt }
+                  try lifecycle.authorizeBootstrapReceiptAccess(provenance: .init(signingTeam: team, designatedRequirement: requirement, artifactHash: artifact))
+                  let context = try lifecycle.bootstrapPromotionContext(invocationToken: params.invocationToken, epoch: params.epoch, operationID: params.operationID, nonce: params.nonce)
+                  let promotedObservation = await lifecycleObservationProvider.observe(operationID: context.operationID, generation: context.generation, intent: .on, target: lifecycle.canonicalTarget)
+                  let promoted = try lifecycle.promoteBootstrap(invocationToken: params.invocationToken, observation: promotedObservation, epoch: params.epoch, operationID: params.operationID, nonce: params.nonce)
+                  return (.init(id: request.id, result: .lifecycle(promoted)), true)
             case .projectLink:
                 let params = try request.params?.decode(LinkProjectRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Link parameters are required.") }()
                 let mutation = try await registry.linkWithCreation(path: params.path, workingDirectory: params.workingDirectory, name: params.name)
@@ -230,13 +414,54 @@ public actor CoreRequestDispatcher {
             }
         } catch let error as TLSError {
             return (.init(id: request.id, error: map(error)), true)
+        } catch let error as BootstrapError {
+            switch error {
+            case .refused, .coreReachable:
+                return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Bootstrap promotion refused: \(error)")), true)
+            case .recoveryRequired:
+                return (.init(id: request.id, error: .init(code: .lifecycleUnknown, message: "Bootstrap recovery is required; no platform operation was attempted.")), true)
+            case .invalidReceipt:
+                return (.init(id: request.id, error: .init(code: .lifecycleUnknown, message: "Bootstrap receipt is orphaned or invalid; recovery is required.")), true)
+            case .platformAmbiguous:
+                return (.init(id: request.id, error: .init(code: .internalError, message: "Bootstrap state is ambiguous; recovery is required.")), true)
+            }
         } catch {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
             return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
         }
     }
 
+    private func boundedLifecycleExecution(_ request: LifecycleExecutorRequest) async -> LifecycleExecutorResult {
+        let latch = LifecycleExecutionLatch()
+        return await withCheckedContinuation { continuation in
+            latch.install(continuation)
+            Task { latch.resolve(await self.lifecycleExecutor.execute(request)) }
+            Task {
+                try? await Task.sleep(nanoseconds: self.lifecycleTimeoutNanoseconds)
+                latch.resolve(.init(state: .timeout, detail: "Lifecycle executor exceeded its bounded deadline."))
+            }
+        }
+    }
+
+    private func lifecycleSuccessGate(intent: LifecycleIntent, observation: LifecycleObservationVector) -> Bool {
+        guard observation.source != "core", observation.source != "synthetic" else { return false }
+        switch intent {
+        case .on:
+            // Registration success is confirmed by registration plus the
+            // immutable bundle/layout evidence. Readiness is a separate
+            // contract and may legitimately remain unknown after register.
+            return observation.bundlePresent == .true && observation.layoutValid == .true &&
+                observation.signatureValid == .true && observation.registrationMatch == .true
+        case .off:
+            return observation.registrationMatch == .false && observation.processMatch == .false &&
+                observation.endpointReachable == .false
+        }
+    }
+
     public func reconcilePersistedRoutesOnStartup() async throws {
+        // Pre-existing M0-M13 startup route reconciliation is intentionally
+        // unchanged. It is outside M14 lifecycle authority and must not be
+        // repurposed as lifecycle recovery or registration work.
         guard (await router.status()).state == .running else { return }
         try await router.reconcile(routes: routeIntents.values.map(\.route))
     }
@@ -463,5 +688,26 @@ public actor CoreRequestDispatcher {
         case .invalidName: return .init(code: .invalidRequest, message: "Project name is invalid.")
         case .parkedPathNotFound: return .init(code: .parkedPathNotFound, message: "Parked path was not found.")
         }
+    }
+}
+
+private final class LifecycleExecutionLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<LifecycleExecutorResult, Never>?
+    private var resolved = false
+
+    func install(_ continuation: CheckedContinuation<LifecycleExecutorResult, Never>) {
+        lock.lock(); defer { lock.unlock() }
+        self.continuation = continuation
+    }
+
+    func resolve(_ result: LifecycleExecutorResult) {
+        lock.lock()
+        guard !resolved else { lock.unlock(); return }
+        resolved = true
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: result)
     }
 }

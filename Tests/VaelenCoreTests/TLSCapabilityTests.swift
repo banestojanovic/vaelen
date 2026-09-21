@@ -66,7 +66,7 @@ final class TLSCapabilityTests: XCTestCase {
             let database = try makeLegacyTLSDatabase(active: active, withRow: true)
             defer { try? FileManager.default.removeItem(at: database.deletingLastPathComponent()) }
             let store = try SQLiteStateStore(databaseURL: database)
-            XCTAssertEqual(try store.pragmaVersion(), 6)
+            XCTAssertEqual(try store.pragmaVersion(), SQLiteStateStore.schemaVersion)
             let record = try XCTUnwrap(try store.tlsRecord())
             XCTAssertEqual(record.fingerprint, "legacy-fingerprint")
             XCTAssertEqual(record.certificatePath, "/legacy/ca.der")
@@ -76,7 +76,7 @@ final class TLSCapabilityTests: XCTestCase {
             XCTAssertNil(record.publicKeyFingerprint)
             XCTAssertNil(record.trustSettingsFingerprint)
             let reopened = try SQLiteStateStore(databaseURL: database)
-            XCTAssertEqual(try reopened.pragmaVersion(), 6)
+            XCTAssertEqual(try reopened.pragmaVersion(), SQLiteStateStore.schemaVersion)
             XCTAssertEqual(try reopened.tlsRecord(), record)
         }
     }
@@ -85,10 +85,10 @@ final class TLSCapabilityTests: XCTestCase {
         let database = try makeLegacyTLSDatabase(active: 1, withRow: false)
         defer { try? FileManager.default.removeItem(at: database.deletingLastPathComponent()) }
         let store = try SQLiteStateStore(databaseURL: database)
-        XCTAssertEqual(try store.pragmaVersion(), 6)
+        XCTAssertEqual(try store.pragmaVersion(), SQLiteStateStore.schemaVersion)
         XCTAssertNil(try store.tlsRecord())
         let reopened = try SQLiteStateStore(databaseURL: database)
-        XCTAssertEqual(try reopened.pragmaVersion(), 6)
+        XCTAssertEqual(try reopened.pragmaVersion(), SQLiteStateStore.schemaVersion)
         XCTAssertNil(try reopened.tlsRecord())
     }
 
