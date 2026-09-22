@@ -114,9 +114,9 @@ public actor CoreRequestDispatcher {
             case .pathList:
                 return (.init(id: request.id, result: .parkedPathList(.init(paths: try await registry.parkedPaths().map(ParkedPathWire.init)))), true)
             case .phpVersions:
-                let module = try phpModule(); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                let module = try phpModule(); return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpCatalog:
-                let module = try phpModule(); return (.init(id: request.id, result: .phpCatalog(.init(catalog: try module.runtimeCatalog()))), true)
+                let module = try phpModule(); return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
             case .phpInstall:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpUpdate:
@@ -292,10 +292,16 @@ public actor CoreRequestDispatcher {
             return .init(code: .invalidRequest, message: "PHP \(version) is the current default runtime and cannot be removed.")
         case .cannotRemoveActiveRuntime(let version):
             return .init(code: .invalidRequest, message: "PHP \(version) is running and cannot be removed.")
+        case .verificationFailed:
+            return .init(code: .invalidRequest, message: "PHP package could not be verified. Existing PHP runtimes were not changed.")
+        case .manifestUnavailable:
+            return .init(code: .invalidRequest, message: "PHP package metadata is unavailable. Installed runtimes remain usable.")
+        case .invalidManifest:
+            return .init(code: .invalidRequest, message: "PHP package metadata is invalid and cannot be installed.")
         case .processIdentityMismatch:
             return .init(code: .invalidRequest, message: "PHP-FPM could not be verified safely; no process was changed.")
         case .validationFailed, .processFailed:
-            return .init(code: .internalError, message: "PHP runtime could not be made healthy. The previous default remains selected.")
+            return .init(code: .internalError, message: "PHP runtime could not be made healthy. Existing PHP runtimes were not changed.")
         default:
             return .init(code: .internalError, message: "PHP operation could not be completed.")
         }
@@ -364,6 +370,22 @@ public actor CoreRequestDispatcher {
     private func projectPHPSelection(_ project: Project) async throws -> ProjectPHPSelection {
         let report = try await projectEnvironmentReport(for: project)
         return .init(project: .init(project), overrideVersion: report.observed.php.overrideVersion, defaultVersion: report.observed.php.defaultVersion, effectiveVersion: report.observed.php.resolvedVersion, observedVersion: report.observed.php.resolvedState == PHPFPMState.running.rawValue ? report.observed.php.resolvedVersion : nil, available: report.observed.php.resolutionState == .resolved)
+    }
+
+    private func phpCatalog(_ module: PHPModule) async throws -> PHPRuntimeCatalog {
+        let catalog = try module.runtimeCatalog()
+        let projects = try await registry.linkedProjects()
+        var usage = Dictionary(uniqueKeysWithValues: catalog.installedVersions.map { ($0.version, PHPProjectUsage(version: $0.version)) })
+        for project in projects {
+            guard let id = project.id else { continue }
+            let override = try await registry.phpOverride(for: id)
+            let version = override ?? catalog.defaultVersion
+            guard let version, var value = usage[version] else { continue }
+            if override == nil { value = PHPProjectUsage(version: version, explicit: value.explicit, inherited: value.inherited + 1) }
+            else { value = PHPProjectUsage(version: version, explicit: value.explicit + 1, inherited: value.inherited) }
+            usage[version] = value
+        }
+        return catalog.withProjectUsage(Array(usage.values))
     }
 
     private func activate(project: Project) async throws -> ProjectReconciliationExecutionResult {

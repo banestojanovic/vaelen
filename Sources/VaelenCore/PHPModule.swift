@@ -229,14 +229,20 @@ public struct PHPRuntimeVersion: Codable, Equatable, Sendable {
     public let isDefault: Bool
     public let updateAvailable: Bool?
     public let latestVersion: String?
+    public let usedByProjectCount: Int
+    public let explicitProjectCount: Int
+    public let inheritedProjectCount: Int
 
-    public init(version: String, series: String? = nil, running: Bool? = nil, isDefault: Bool = false, updateAvailable: Bool? = nil, latestVersion: String? = nil) {
+    public init(version: String, series: String? = nil, running: Bool? = nil, isDefault: Bool = false, updateAvailable: Bool? = nil, latestVersion: String? = nil, usedByProjectCount: Int = 0, explicitProjectCount: Int = 0, inheritedProjectCount: Int = 0) {
         self.version = version
         self.series = series ?? PHPVersion(version)?.family
         self.running = running
         self.isDefault = isDefault
         self.updateAvailable = updateAvailable
         self.latestVersion = latestVersion
+        self.usedByProjectCount = usedByProjectCount
+        self.explicitProjectCount = explicitProjectCount
+        self.inheritedProjectCount = inheritedProjectCount
     }
 }
 
@@ -245,8 +251,9 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
     public let installedVersions: [PHPRuntimeVersion]
     public let defaultVersion: String?
     public let runningVersions: [String]
+    public let availableVersionsKnown: Bool
 
-    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String]) {
+    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String], availableVersionsKnown: Bool = true) {
         self.availableVersions = Self.sortedUnique(availableVersions)
         self.installedVersions = installedVersions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
             guard result[value.version] == nil else { return }
@@ -254,6 +261,16 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
         }.values.sorted { Self.versionSort($0.version, $1.version) }
         self.defaultVersion = defaultVersion
         self.runningVersions = Self.sortedUnique(runningVersions)
+        self.availableVersionsKnown = availableVersionsKnown
+    }
+
+    public func withProjectUsage(_ usage: [PHPProjectUsage]) -> PHPRuntimeCatalog {
+        let byVersion = Dictionary(uniqueKeysWithValues: usage.map { ($0.version, $0) })
+        let updated = installedVersions.map { runtime in
+            let value = byVersion[runtime.version]
+            return PHPRuntimeVersion(version: runtime.version, series: runtime.series, running: runtime.running, isDefault: runtime.isDefault, updateAvailable: runtime.updateAvailable, latestVersion: runtime.latestVersion, usedByProjectCount: value?.total ?? 0, explicitProjectCount: value?.explicit ?? 0, inheritedProjectCount: value?.inherited ?? 0)
+        }
+        return PHPRuntimeCatalog(availableVersions: availableVersions, installedVersions: updated, defaultVersion: defaultVersion, runningVersions: runningVersions, availableVersionsKnown: availableVersionsKnown)
     }
 
     public init(availableVersions: [String], packages: [PHPPackage], statuses: [PHPStatus], defaultVersion: String?, updates: [PHPUpdateObservation] = []) {
@@ -268,10 +285,14 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
                                      updateAvailable: update?.updateAvailable,
                                      latestVersion: update?.latestVersion)
         }
-        self.init(availableVersions: availableVersions,
-                  installedVersions: versions,
-                  defaultVersion: defaultVersion,
-                  runningVersions: statuses.filter { $0.state == .running }.map(\.version))
+        self.availableVersions = Self.sortedUnique(availableVersions)
+        self.installedVersions = versions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
+            guard result[value.version] == nil else { return }
+            result[value.version] = value
+        }.values.sorted { Self.versionSort($0.version, $1.version) }
+        self.defaultVersion = defaultVersion
+        self.runningVersions = Self.sortedUnique(statuses.filter { $0.state == .running }.map(\.version))
+        self.availableVersionsKnown = true
     }
 
     private static func sortedUnique(_ values: [String]) -> [String] {
@@ -282,6 +303,14 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
         guard let left = PHPVersion(lhs), let right = PHPVersion(rhs) else { return lhs < rhs }
         return left < right
     }
+}
+
+public struct PHPProjectUsage: Codable, Equatable, Sendable {
+    public let version: String
+    public let explicit: Int
+    public let inherited: Int
+    public var total: Int { explicit + inherited }
+    public init(version: String, explicit: Int = 0, inherited: Int = 0) { self.version = version; self.explicit = explicit; self.inherited = inherited }
 }
 
 public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove, defaultSelection }
@@ -334,12 +363,22 @@ public final class PHPModule: @unchecked Sendable {
         return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base))
     }
 
-    public func availableVersions() throws -> [String] { try location.manifests().map(\.phpVersion).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) } }
+    public func availableVersions() throws -> [String] {
+        try location.manifests().filter(isInstallableManifest).map(\.phpVersion).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
+    }
 
     public func runtimeCatalog(updates: [PHPUpdateObservation] = []) throws -> PHPRuntimeCatalog {
         let packages = eligibleInstalledVersions()
         let statuses = packages.compactMap { try? status(requestedVersion: $0.version) }
-        return PHPRuntimeCatalog(availableVersions: try availableVersions(), packages: packages, statuses: statuses, defaultVersion: defaultVersion(), updates: updates)
+        let availableResult = Result { try availableVersions() }
+        let available = (try? availableResult.get()) ?? []
+        let effectiveUpdates = updates.isEmpty ? packages.compactMap { package -> PHPUpdateObservation? in
+            guard let installed = PHPVersion(package.version), let latest = available.compactMap(PHPVersion.init).filter({ $0.family == installed.family }).max(), latest > installed else { return nil }
+            return PHPUpdateObservation(installedVersion: package.version, latestVersion: latest.description)
+        } : updates
+        let catalog = PHPRuntimeCatalog(availableVersions: available, packages: packages, statuses: statuses, defaultVersion: defaultVersion(), updates: effectiveUpdates)
+        if case .failure = availableResult { return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: false) }
+        return catalog
     }
 
     public func operationState() -> PHPOperationState? {
@@ -467,14 +506,27 @@ public final class PHPModule: @unchecked Sendable {
 
     private func manifest(for requestedVersion: String) throws -> PHPManifest {
         let manifests = try location.manifests()
+        let installable = manifests.filter(isInstallableManifest)
         guard let exact = PHPVersion(requestedVersion), exact.isStable,
-              let manifest = manifests.first(where: { $0.phpVersion == exact.description }) else {
-            guard let family = PHPFamily(requestedVersion), let manifest = manifests.filter({ PHPVersion($0.phpVersion)?.family == family.description }).max(by: { (PHPVersion($0.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1.phpVersion) ?? .init(major: 0, minor: 0, patch: 0) ) }) else {
+              let manifest = installable.first(where: { $0.phpVersion == exact.description }) else {
+            guard let family = PHPFamily(requestedVersion), let manifest = installable.filter({ PHPVersion($0.phpVersion)?.family == family.description }).max(by: { (PHPVersion($0.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1.phpVersion) ?? .init(major: 0, minor: 0, patch: 0) ) }) else {
                 throw PHPModuleError.unsupportedVersion(requestedVersion)
             }
             return manifest
         }
         return manifest
+    }
+
+    private func isInstallableManifest(_ manifest: PHPManifest) -> Bool {
+        manifest.module == "php" &&
+        manifest.schemaVersion == 1 &&
+        manifest.platform == "macos" &&
+        manifest.architecture == "arm64" &&
+        manifest.verification.algorithm.lowercased() == "sha256" &&
+        !manifest.verification.authenticity.isEmpty &&
+        PHPVersion(manifest.phpVersion)?.isStable == true &&
+        manifest.artifacts["cli"] != nil &&
+        manifest.artifacts["fpm"] != nil
     }
 
     private func executeOperation<T>(kind: PHPOperationKind, targetVersion: String, body: () throws -> T) throws -> T {

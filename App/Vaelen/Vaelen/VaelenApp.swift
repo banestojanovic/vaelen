@@ -1022,7 +1022,7 @@ struct PHPSettingsView: View {
     let model: AppModel
 
     var body: some View {
-        SettingsContent(title: "PHP", subtitle: "Manage Vaelen’s installed PHP runtimes without changing project configuration.") {
+        SettingsContent(title: "PHP", subtitle: "Manage PHP runtimes installed by Vaelen.") {
             if let catalog = model.phpCatalog {
                 SettingsGroup(title: "Default Runtime", footer: "Used when a project does not select another PHP runtime.") {
                     if let version = catalog.defaultVersion {
@@ -1052,7 +1052,12 @@ struct PHPSettingsView: View {
                 SettingsGroup(title: "Available Versions") {
                     let installed = Set(catalog.installedVersions.map(\.version))
                     let available = catalog.availableVersions.filter { !installed.contains($0) }
-                    if available.isEmpty {
+                    if !catalog.availableVersionsKnown {
+                        Text("Available versions could not be refreshed. Installed runtimes remain available.")
+                            .font(.subheadline)
+                            .foregroundStyle(.orange)
+                            .padding(.vertical, VaelenUI.spacing8)
+                    } else if available.isEmpty {
                         Text("No additional PHP versions are currently available.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -1092,7 +1097,7 @@ struct PHPSettingsView: View {
             if let target = model.phpRequestTarget {
                 HStack(spacing: VaelenUI.spacing8) {
                     ProgressView().controlSize(.small)
-                    Text("Working on PHP \(target)…")
+                    Text(phpOperationDescription(target: target, operation: model.phpOperation))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1106,6 +1111,18 @@ struct PHPSettingsView: View {
                     .padding(.top, VaelenUI.spacing6)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    private func phpOperationDescription(target: String, operation: PHPOperationState?) -> String {
+        guard let operation, operation.targetVersion == target else { return "Working on PHP \(target)…" }
+        switch operation.phase {
+        case .starting: return "Starting PHP \(target)…"
+        case .downloading: return "Downloading PHP \(target)…"
+        case .verifying: return "Verifying PHP \(target)…"
+        case .installing: return "Installing PHP \(target)…"
+        case .removing: return "Removing PHP \(target)…"
+        default: return "Working on PHP \(target)…"
         }
     }
 }
@@ -1160,6 +1177,11 @@ private struct PHPVersionRow: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                if runtime.usedByProjectCount > 0 {
+                    Text("Used by \(runtime.usedByProjectCount) project\(runtime.usedByProjectCount == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: VaelenUI.spacing8)
             if runtime.isDefault {
@@ -1183,7 +1205,7 @@ private struct PHPVersionRow: View {
             if canRemove {
                 Menu {
                     Button("Remove PHP \(runtime.version)", systemImage: "trash", role: .destructive) {
-                        Task { await model.removePHP(runtime.version) }
+                        showRemovalConfirmation = true
                     }
                     .accessibilityLabel("Remove PHP \(runtime.version)")
                 } label: {
@@ -1200,7 +1222,15 @@ private struct PHPVersionRow: View {
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("PHP \(runtime.version)")
+        .confirmationDialog("Remove PHP \(runtime.version)?", isPresented: $showRemovalConfirmation, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { Task { await model.removePHP(runtime.version) } }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This removes the Vaelen-managed PHP runtime from this Mac. Project files are not changed.")
+        }
     }
+
+    @State private var showRemovalConfirmation = false
 }
 
 private enum PHPSeriesLabel {

@@ -36,10 +36,11 @@ final class PHPModuleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let verification = PHPVerification(algorithm: "sha256", authenticity: "fixture")
+        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "cli.tar.gz", sha256: "a"), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "fpm.tar.gz", sha256: "b")]
         let manifests = [
-            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: verification),
-            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.25", platform: "macos", architecture: "arm64", artifacts: [:], verification: verification),
-            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.5.0", platform: "macos", architecture: "arm64", artifacts: [:], verification: verification)
+            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: verification),
+            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.25", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: verification),
+            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.5.0", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: verification)
         ]
         let manifestURL = root.appendingPathComponent("php-distribution.json")
         try JSONEncoder().encode(manifests[0]).write(to: manifestURL)
@@ -49,6 +50,20 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertThrowsError(try module.install(requestedVersion: "8.4.25"))
         XCTAssertEqual(module.operationState()?.phase, .failed)
         XCTAssertTrue(module.installedVersions().isEmpty)
+    }
+
+    func testCatalogFiltersUnsupportedProductionEntries() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let artifact = ["cli": PHPArtifact(file: "cli", url: "cli", sha256: "a"), "fpm": PHPArtifact(file: "fpm", url: "fpm", sha256: "b")]
+        let valid = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.25", platform: "macos", architecture: "arm64", artifacts: artifact, verification: .init(algorithm: "sha256", authenticity: "trusted"))
+        let unsupported = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.5.0", platform: "linux", architecture: "arm64", artifacts: artifact, verification: .init(algorithm: "sha256", authenticity: "trusted"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(valid).write(to: manifestURL)
+        try JSONEncoder().encode(PHPManifestCatalog(manifests: [valid, unsupported])).write(to: root.appendingPathComponent("php-catalog.json"))
+        let module = PHPModule(layout: VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support")), location: FilePHPManifestLocation(manifestURL: manifestURL))
+        XCTAssertEqual(try module.availableVersions(), ["8.4.25"])
     }
 
     func testUnknownPHPInstallDoesNotCreateRuntimeOrClaimInstalledState() throws {
