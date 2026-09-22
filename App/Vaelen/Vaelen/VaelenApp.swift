@@ -13,7 +13,8 @@ struct VaelenApp: App {
         MenuBarExtra {
             StatusView(model: model)
         } label: {
-            Label("Vaelen", systemImage: "wrench.and.screwdriver")
+            Image(nsImage: VaelenBrand.menuBarImage)
+                .accessibilityLabel("Vaelen")
                 .onAppear { model.startMonitoring() }
         }
         .menuBarExtraStyle(.window)
@@ -22,6 +23,29 @@ struct VaelenApp: App {
             SettingsView(model: model)
         }
     }
+}
+
+/// Official Vaelen brand assets are kept in the app bundle. The current-color
+/// SVG is used here as an AppKit template image so macOS supplies the correct
+/// menu-bar tint for light, dark, and highlighted states.
+private enum VaelenBrand {
+    static let menuBarImage: NSImage = {
+        guard let url = Bundle.main.url(forResource: "vaelen-mark-currentcolor", withExtension: "svg"),
+              let image = NSImage(contentsOf: url) else {
+            return NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: "Vaelen") ?? NSImage()
+        }
+        image.size = NSSize(width: 18, height: 12)
+        image.isTemplate = true
+        return image
+    }()
+
+    static let settingsImage: NSImage = {
+        guard let url = Bundle.main.url(forResource: "vaelen-mark-currentcolor", withExtension: "svg"),
+              let image = NSImage(contentsOf: url) else { return menuBarImage }
+        image.size = NSSize(width: 36, height: 24)
+        image.isTemplate = true
+        return image
+    }()
 }
 
 @MainActor
@@ -39,8 +63,11 @@ final class AppModel {
     private(set) var parkedFolders: [ParkedPathWire] = []
     private(set) var linkedProjects: [ProjectWire] = []
     private(set) var trustError: String?
+    private(set) var serviceOperation: String?
+    private(set) var serviceError: String?
     private(set) var refreshError: String?
     private(set) var relationshipError: String?
+    private(set) var relationshipOperation: String?
     private(set) var relationshipMutationInFlight = false
     private var client: VaelenCoreClient?
     private var refreshGeneration = 0
@@ -128,20 +155,18 @@ final class AppModel {
     }
 
     func trustLocalCA() async {
-        trustError = nil
-        guard let client else { return }
+        guard beginServiceOperation("Trusting Local HTTPS…"), let client else { return }
         do { _ = try await client.tlsTrustLocalCA(); await refresh() } catch { trustError = error.localizedDescription }
+        finishServiceOperation(error: trustError)
     }
 
     func removeLocalCATrust() async {
-        trustError = nil
-        guard let client else { return }
-        do { _ = try await client.tlsRemoveLocalCATrust(); await refresh() } catch { trustError = error.localizedDescription }
+        guard beginServiceOperation("Removing Local HTTPS trust…"), let client else { return }
+        do { _ = try await client.tlsRemoveLocalCATrust(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) }
     }
 
     func installStandardPorts() async {
-        trustError = nil
-        guard let client else { return }
+        guard beginServiceOperation("Enabling standard ports…"), let client else { return }
         do {
             // Production path: register the signed helper through macOS; the
             // system owns authentication and Vaelen never sees credentials.
@@ -152,22 +177,29 @@ final class AppModel {
                 if service.status != .enabled { try service.register() }
             }
             _ = try await client.portsInstall(); await refresh()
-        } catch { trustError = error.localizedDescription }
+        } catch { finishServiceOperation(error: error.localizedDescription); return }
+        finishServiceOperation()
     }
 
     func removeStandardPorts() async {
-        trustError = nil
-        guard let client else { return }
-        do { _ = try await client.portsRemove(); await refresh() } catch { trustError = error.localizedDescription }
+        guard beginServiceOperation("Disabling standard ports…"), let client else { return }
+        do { _ = try await client.portsRemove(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) }
     }
 
-    func installMySQL() async { trustError = nil; guard let client else { return }; do { _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion); await refresh() } catch { trustError = error.localizedDescription } }
-    func startMySQL() async { trustError = nil; guard let client else { return }; do { let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart(); await refresh() } catch { trustError = error.localizedDescription } }
-    func stopMySQL() async { trustError = nil; guard let client else { return }; do { _ = try await client.mysqlStop(); await refresh() } catch { trustError = error.localizedDescription } }
-    func installMailpit() async { trustError = nil; guard let client else { return }; do { _ = try await client.mailpitInstall(MailpitModule.defaultVersion); await refresh() } catch { trustError = error.localizedDescription } }
-    func startMailpit() async { trustError = nil; guard let client else { return }; do { _ = try await client.mailpitStart(); await refresh() } catch { trustError = error.localizedDescription } }
-    func stopMailpit() async { trustError = nil; guard let client else { return }; do { _ = try await client.mailpitStop(); await refresh() } catch { trustError = error.localizedDescription } }
-    func openMailpit() async { trustError = nil; guard let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); } catch { trustError = error.localizedDescription } }
+    func installMySQL() async { guard beginServiceOperation("Installing MySQL…"), let client else { return }; do { _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func startMySQL() async { guard beginServiceOperation("Starting MySQL…"), let client else { return }; do { let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func stopMySQL() async { guard beginServiceOperation("Stopping MySQL…"), let client else { return }; do { _ = try await client.mysqlStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func installMailpit() async { guard beginServiceOperation("Installing Mailpit…"), let client else { return }; do { _ = try await client.mailpitInstall(MailpitModule.defaultVersion); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func startMailpit() async { guard beginServiceOperation("Starting Mailpit…"), let client else { return }; do { _ = try await client.mailpitStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func stopMailpit() async { guard beginServiceOperation("Stopping Mailpit…"), let client else { return }; do { _ = try await client.mailpitStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func openMailpit() async { guard beginServiceOperation("Opening Mailpit…"), let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func startRouting() async { guard beginServiceOperation("Starting Caddy…"), let client else { return }; do { _ = try await client.routingStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func stopRouting() async { guard beginServiceOperation("Stopping Caddy…"), let client else { return }; do { _ = try await client.routingStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+
+    func serviceOperationIs(for title: String) -> Bool {
+        guard let operation = serviceOperation else { return false }
+        return operation.localizedCaseInsensitiveContains(title)
+    }
 
     func openProjectFolder(_ project: ProjectWire) {
         guard canOpenProjectFolder(project) else { return }
@@ -182,23 +214,7 @@ final class AppModel {
     }
 
     func projectSiteURL(_ report: ProjectEnvironmentReport) -> URL? {
-        let route = report.observed.route
-        guard route.intentExists,
-              route.associationState == .durable,
-              route.routerState == .running,
-              route.routerHealth == .healthy,
-              let hostname = route.hostname,
-              !hostname.isEmpty,
-              report.observed.dns.state == .installed,
-              report.observed.dns.ownership == .vaelen,
-              report.observed.dns.health == "healthy",
-              report.observed.standardPorts.state == .healthy else { return nil }
-        if route.tls == .local {
-            guard report.observed.tls.state == .trusted,
-                  report.observed.tls.trustObserved,
-                  report.observed.tls.ownership == .owned else { return nil }
-        }
-        return URL(string: "\(route.tls == .local ? "https" : "http")://\(hostname)")
+        report.usableSiteURL
     }
 
     func openProjectSite(_ report: ProjectEnvironmentReport) {
@@ -206,8 +222,18 @@ final class AppModel {
         NSWorkspace.shared.open(url)
     }
 
+    func copyProjectPath(_ project: ProjectWire) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(project.path, forType: .string)
+    }
+
+    var projects: [ProjectWire] {
+        guard case .running(_, let projects, _, _, _, _, _, _, _) = state else { return [] }
+        return projects
+    }
+
     func parkFolder(at path: String) async {
-        guard beginRelationshipMutation(), let client else { return }
+        guard beginRelationshipMutation("Adding workspace folder…"), let client else { return }
         do {
             _ = try await client.park(path: path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
             finishRelationshipMutation()
@@ -218,7 +244,7 @@ final class AppModel {
     }
 
     func removeParkedFolder(_ folder: ParkedPathWire) async {
-        guard beginRelationshipMutation(), let client else { return }
+        guard beginRelationshipMutation("Removing workspace folder…"), let client else { return }
         do {
             try await client.unpark(path: folder.path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
             finishRelationshipMutation()
@@ -229,7 +255,7 @@ final class AppModel {
     }
 
     func linkProject(at path: String) async {
-        guard beginRelationshipMutation(), let client else { return }
+        guard beginRelationshipMutation("Linking project…"), let client else { return }
         do {
             _ = try await client.link(path: path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path, name: nil)
             finishRelationshipMutation()
@@ -240,7 +266,7 @@ final class AppModel {
     }
 
     func unlinkProject(_ project: ProjectWire) async {
-        guard beginRelationshipMutation(), let client else { return }
+        guard beginRelationshipMutation("Unlinking project…"), let client else { return }
         do {
             try await client.unlink(path: project.path, name: nil, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
             finishRelationshipMutation()
@@ -271,7 +297,7 @@ final class AppModel {
         }
     }
 
-    private func beginRelationshipMutation() -> Bool {
+    private func beginRelationshipMutation(_ operation: String) -> Bool {
         guard !relationshipMutationInFlight else { return false }
         guard !refreshInFlight else {
             relationshipError = "Please wait for Vaelen to finish refreshing."
@@ -282,13 +308,86 @@ final class AppModel {
             return false
         }
         relationshipError = nil
+        relationshipOperation = operation
         relationshipMutationInFlight = true
         return true
     }
 
+    private func beginServiceOperation(_ operation: String) -> Bool {
+        guard serviceOperation == nil else { return false }
+        guard client != nil else {
+            serviceError = "Vaelen Core is unavailable."
+            trustError = serviceError
+            return false
+        }
+        serviceError = nil
+        trustError = nil
+        serviceOperation = operation
+        return true
+    }
+
+    private func finishServiceOperation(error: String? = nil) {
+        serviceOperation = nil
+        serviceError = error
+        trustError = error
+    }
+
     private func finishRelationshipMutation(error: Error? = nil) {
         relationshipMutationInFlight = false
+        relationshipOperation = nil
         relationshipError = error?.localizedDescription
+    }
+}
+
+/// Small, product-facing presentation constants used by the current shell.
+/// This is intentionally local to the app until repeated patterns justify more.
+private enum VaelenUI {
+    static let spacing6: CGFloat = 6
+    static let spacing8: CGFloat = 8
+    static let spacing10: CGFloat = 10
+    static let spacing12: CGFloat = 12
+    static let popoverPadding: CGFloat = 14
+    static let cornerRadius: CGFloat = 8
+}
+
+private struct VaelenStatusLabel: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+
+    init(_ title: String, systemImage: String, tint: Color) {
+        self.title = title
+        self.systemImage = systemImage
+        self.tint = tint
+    }
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .foregroundStyle(tint)
+            .accessibilityElement(children: .combine)
+    }
+}
+
+private struct VaelenEmptyState: View {
+    let title: String
+    let systemImage: String
+    let message: String
+
+    var body: some View {
+        VStack(spacing: VaelenUI.spacing8) {
+            Image(systemName: systemImage)
+                .font(.title2)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(title).font(.headline)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title). \(message)")
     }
 }
 
@@ -302,7 +401,7 @@ struct StatusView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: VaelenUI.spacing12) {
             HStack {
                 Text("Vaelen").font(.headline)
                 Spacer()
@@ -327,6 +426,7 @@ struct StatusView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                .accessibilityLabel("Vaelen section")
 
                 switch selectedSection {
                 case .projects:
@@ -335,31 +435,41 @@ struct StatusView: View {
                     ServicesView(status: status, php: php, routing: routing, dns: dns, tls: tls, ports: ports, mysql: mysql, mailpit: mailpit, model: model)
                 }
             }
-            Divider()
+            Divider().opacity(0.65)
             HStack {
-                Button("Refresh") { Task { await model.refresh() } }
+                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                    .labelStyle(.titleAndIcon)
+                    .controlSize(.small)
+                    .accessibilityHint("Refresh Vaelen state")
                 Spacer()
                 SettingsLink { Text("Settings…") }
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
         }
-        .padding(16)
-        .frame(width: 380)
-        .frame(minHeight: 280)
+        .padding(VaelenUI.popoverPadding)
+        .frame(width: 400)
+        .frame(height: popoverHeight)
         .onAppear { model.startMonitoring() }
+    }
+
+    private var popoverHeight: CGFloat {
+        let visibleHeight = NSScreen.main?.visibleFrame.height ?? 900
+        let preferred = min(660, visibleHeight * 0.72)
+        let usefulMinimum = min(510, visibleHeight * 0.68)
+        return max(usefulMinimum, preferred)
     }
 
     @ViewBuilder
     private var coreStatus: some View {
         switch model.state {
         case .connecting:
-            Label("Connecting", systemImage: "circle.dotted")
+            VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
         case .running:
-            Label("Core Running", systemImage: "circle.fill").foregroundStyle(.green)
+            VaelenStatusLabel("Ready", systemImage: "circle.fill", tint: .secondary)
         case .unavailable:
-            Label("Core Unavailable", systemImage: "circle")
+            VaelenStatusLabel("Core Unavailable", systemImage: "circle", tint: .secondary)
         case .incompatible:
-            Label("Core Incompatible", systemImage: "exclamationmark.circle").foregroundStyle(.orange)
+            VaelenStatusLabel("Core Incompatible", systemImage: "exclamationmark.circle", tint: .orange)
         }
     }
 }
@@ -371,17 +481,17 @@ struct ProjectsView: View {
 
     var body: some View {
         if projects.isEmpty {
-            ContentUnavailableView("No Projects", systemImage: "folder", description: Text("Known Core projects will appear here."))
+            VaelenEmptyState(title: "No Projects", systemImage: "folder", message: "Known Core projects will appear here.")
                 .frame(minHeight: 180)
         } else {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
+                LazyVStack(alignment: .leading, spacing: VaelenUI.spacing8) {
                     ForEach(projects, id: \.path) { project in
                         ProjectCard(project: project, report: reports.first { $0.identity.path == project.path }, model: model)
                     }
                 }
             }
-            .frame(maxHeight: 390)
+            .frame(maxHeight: .infinity)
         }
     }
 }
@@ -392,35 +502,160 @@ struct ProjectCard: View {
     let model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(alignment: .top, spacing: VaelenUI.spacing10) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: VaelenUI.spacing6) {
             HStack {
                 Text(project.name).font(.headline)
                 Spacer()
-                Text(project.registration).font(.caption).foregroundStyle(.secondary)
             }
-            Text(displayPath(project.path)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            if let framework = project.detectedFramework, !framework.isEmpty {
+                Text(framework)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Text(displayPath(project.path))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             if let report {
                 if let url = model.projectSiteURL(report) {
-                    Text(url.absoluteString).font(.caption).foregroundStyle(.secondary)
+                    Text(url.absoluteString)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text("\(report.diagnostics.count) diagnostics")
-                    .font(.caption2)
-                    .foregroundStyle(report.diagnostics.contains { $0.severity == .error } ? .red : .secondary)
+                if let summary = environmentSummary(report), !summary.isEmpty {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if let attention = attentionDiagnostic(report) {
+                    VaelenStatusLabel(attention.message, systemImage: attention.severity == .error ? "exclamationmark.triangle.fill" : "exclamationmark.circle", tint: attention.severity == .error ? .red : .orange)
+                        .font(.caption2)
+                        .lineLimit(2)
+                }
             } else {
-                Text("Project status unavailable").font(.caption2).foregroundStyle(.secondary)
+                VaelenStatusLabel("Project status unavailable", systemImage: "clock", tint: .secondary)
+                    .font(.caption2)
+            }
+            if project.availability != PathAvailability.available.rawValue {
+                VaelenStatusLabel("Folder unavailable", systemImage: "exclamationmark.triangle", tint: .orange)
+                    .font(.caption2)
             }
             HStack {
-                Button("Open Folder") { model.openProjectFolder(project) }
-                    .disabled(!model.canOpenProjectFolder(project))
-                if let report {
-                    Button("Open Site") { model.openProjectSite(report) }
-                        .disabled(model.projectSiteURL(report) == nil)
+                if let report, model.projectSiteURL(report) != nil {
+                    Button("Open Site", systemImage: "safari") { model.openProjectSite(report) }
                 }
+                Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }
+                    .disabled(!model.canOpenProjectFolder(project))
             }
             .buttonStyle(.borderless)
+            .controlSize(.small)
+            }
+            Spacer(minLength: 0)
+            Menu {
+                Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("More actions for \(project.name)")
         }
-        .padding(10)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, VaelenUI.spacing6)
+        .padding(.horizontal, VaelenUI.spacing8)
+        .background(.quaternary.opacity(0.20), in: RoundedRectangle(cornerRadius: VaelenUI.cornerRadius))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Project \(project.name)")
+    }
+
+    private func environmentSummary(_ report: ProjectEnvironmentReport) -> String? {
+        var values = [String]()
+        if let version = report.observed.php.resolvedVersion {
+            values.append("PHP \(version.split(separator: ".").prefix(2).joined(separator: "."))")
+        }
+        if report.desired.mysql == true, let mysql = report.observed.mysql, let version = mysql.selectedVersion ?? mysql.installedVersion {
+            values.append("MySQL \(version)")
+        }
+        if model.projectSiteURL(report)?.scheme == "https" { values.append("HTTPS ✓") }
+        return values.isEmpty ? nil : values.joined(separator: " · ")
+    }
+
+    private func attentionDiagnostic(_ report: ProjectEnvironmentReport) -> ProjectDiagnostic? {
+        // Discovery is intentionally read-only. Its normal lack of a route or
+        // requested services is not an error in the Projects surface.
+        guard report.identity.registration == .linked else { return nil }
+        return report.diagnostics.first { diagnostic in
+            guard diagnostic.severity == .error || diagnostic.severity == .warning else { return false }
+            if diagnostic.code == "ROUTE_INTENT_MISSING" && report.desired.secureWeb != true { return false }
+            return true
+        }
+    }
+}
+
+private struct ServicePresentation {
+    let title: String
+    let symbol: String
+    let tint: Color
+
+    init(_ title: String, _ symbol: String, _ tint: Color) {
+        self.title = title
+        self.symbol = symbol
+        self.tint = tint
+    }
+}
+
+private struct ServiceRow<Actions: View>: View {
+    let title: String
+    let subtitle: String?
+    let state: String
+    let stateSymbol: String
+    let stateTint: Color
+    let busy: Bool
+    let actions: Actions
+
+    init(title: String, subtitle: String?, state: String, stateSymbol: String, stateTint: Color, busy: Bool = false, @ViewBuilder actions: () -> Actions) {
+        self.title = title
+        self.subtitle = subtitle
+        self.state = state
+        self.stateSymbol = stateSymbol
+        self.stateTint = stateTint
+        self.busy = busy
+        self.actions = actions()
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: VaelenUI.spacing8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.body)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: VaelenUI.spacing8)
+            VaelenStatusLabel(state, systemImage: stateSymbol, tint: stateTint)
+                .font(.caption)
+                .lineLimit(1)
+            if busy { ProgressView().controlSize(.small) }
+            actions
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(busy)
+        }
+        .padding(.vertical, VaelenUI.spacing8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(title), \(state)")
     }
 }
 
@@ -437,60 +672,154 @@ struct ServicesView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Version  \(status.core.version)")
-                Text("PID       \(status.core.pid)")
-                Text("Protocol  \(status.protocolVersion)")
-                if let php { Text("PHP       \(php.installed.map(\.version).joined(separator: ", "))") }
-                if let routing { Text("Routing   \(routing.state.rawValue) (\(routing.routeCount))") }
-                if let dns { Text("DNS       \(dns.state.rawValue)") }
-                if let tls {
-                    Text("Local CA  \(tls.state.rawValue)")
-                    Text("Trust     \(tls.trustObserved ? "Trusted" : "Not Trusted")")
-                    if let trustError = model.trustError { Text(trustError).font(.caption).foregroundStyle(.red) }
-                    if tls.state == .createdButUntrusted { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
-                    if tls.trustObserved { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Runtimes")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .padding(.bottom, VaelenUI.spacing6)
+                if let php {
+                    ServiceRow(title: "PHP", subtitle: php.installed.isEmpty ? "Not installed" : php.installed.map(\.version).joined(separator: " · "), state: php.default.map { "Default \($0)" } ?? "Ready", stateSymbol: "circle.fill", stateTint: .secondary) {
+                        EmptyView()
+                    }
                 }
-                if let ports {
-                    Text("Std Ports \(ports.state.rawValue)")
-                    if ports.state == .absent || ports.state == .unhealthy { Button("Enable Standard Ports") { Task { await model.installStandardPorts() } } }
-                    if ports.state == .healthy || ports.state == .installed { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
-                }
+
+                Text("Services")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .padding(.top, VaelenUI.spacing12)
+                    .padding(.bottom, VaelenUI.spacing6)
                 if let mysql {
-                    Text("MySQL     \(mysql.state.rawValue)")
-                    Text("Version   \(mysql.selectedVersion ?? "none")")
-                    Text("Port      \(mysql.port)")
-                    if let pid = mysql.pid { Text("PID       \(pid)") }
-                    if mysql.state == .notInstalled { Button("Install MySQL") { Task { await model.installMySQL() } } }
-                    else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy { Button(mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL") { Task { await model.startMySQL() } } }
-                    if mysql.state == .running { Button("Stop MySQL") { Task { await model.stopMySQL() } } }
+                    ServiceRow(title: "MySQL", subtitle: mysqlSubtitle(mysql), state: mysqlState(mysql).title, stateSymbol: mysqlState(mysql).symbol, stateTint: mysqlState(mysql).tint, busy: model.serviceOperationIs(for: "MySQL")) {
+                        mysqlActions(mysql)
+                    }
+                }
+                if let routing {
+                    ServiceRow(title: "Caddy", subtitle: caddySubtitle(routing), state: routingState(routing).title, stateSymbol: routingState(routing).symbol, stateTint: routingState(routing).tint, busy: model.serviceOperationIs(for: "Caddy")) {
+                        if routing.state == .running { Button("Stop Caddy") { Task { await model.stopRouting() } } }
+                        else { Button("Start Caddy") { Task { await model.startRouting() } } }
+                    }
                 }
                 if let mailpit {
-                    Text("Mailpit    \(mailpit.state.rawValue)")
-                    Text("Version    \(mailpit.installedVersion ?? "none")")
-                    Text("SMTP       \(mailpit.smtpPort)")
-                    Text("UI         \(mailpit.httpPort)")
-                    if mailpit.state == .notInstalled { Button("Install Mailpit") { Task { await model.installMailpit() } } }
-                    else if mailpit.state == .installed || mailpit.state == .stopped || mailpit.state == .unhealthy || mailpit.state == .conflict { Button("Start Mailpit") { Task { await model.startMailpit() } } }
-                    if mailpit.state == .running { Button("Stop Mailpit") { Task { await model.stopMailpit() } }; Button("Open Mailpit") { Task { await model.openMailpit() } } }
+                    ServiceRow(title: "Mailpit", subtitle: mailpitSubtitle(mailpit), state: mailpitState(mailpit).title, stateSymbol: mailpitState(mailpit).symbol, stateTint: mailpitState(mailpit).tint, busy: model.serviceOperationIs(for: "Mailpit")) {
+                        mailpitActions(mailpit)
+                    }
+                }
+
+                Text("Networking")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .padding(.top, VaelenUI.spacing12)
+                    .padding(.bottom, VaelenUI.spacing6)
+                if let dns {
+                    ServiceRow(title: "DNS", subtitle: nil, state: dnsState(dns).title, stateSymbol: dnsState(dns).symbol, stateTint: dnsState(dns).tint) { EmptyView() }
+                }
+                if let tls {
+                    ServiceRow(title: "Local HTTPS", subtitle: nil, state: tls.trustObserved ? "Trusted" : "Needs attention", stateSymbol: tls.trustObserved ? "checkmark" : "exclamationmark.triangle", stateTint: tls.trustObserved ? .secondary : .orange, busy: model.serviceOperationIs(for: "Local HTTPS")) {
+                        if tls.state == .createdButUntrusted { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
+                        if tls.trustObserved { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
+                    }
+                }
+                if let ports {
+                    ServiceRow(title: "Standard Ports", subtitle: nil, state: ports.state == .healthy ? "Enabled" : "Needs attention", stateSymbol: ports.state == .healthy ? "checkmark" : "exclamationmark.triangle", stateTint: ports.state == .healthy ? .secondary : .orange, busy: model.serviceOperationIs(for: "standard ports")) {
+                        if ports.state == .absent || ports.state == .unhealthy { Button("Enable Standard Ports") { Task { await model.installStandardPorts() } } }
+                        if ports.state == .healthy || ports.state == .installed { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
+                    }
+                }
+                if let operation = model.serviceOperation {
+                    VaelenStatusLabel(operation, systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
+                        .font(.caption)
+                        .padding(.top, VaelenUI.spacing8)
+                }
+                if let error = model.serviceError ?? model.trustError {
+                    VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red)
+                        .font(.caption)
+                        .padding(.top, VaelenUI.spacing8)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxHeight: 390)
+        .frame(maxHeight: .infinity)
+    }
+
+    private func mysqlSubtitle(_ mysql: MySQLStatus) -> String {
+        let version = mysql.selectedVersion ?? mysql.installedVersion
+        return [version, mysql.state == .notInstalled ? nil : "Port \(mysql.port)"].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func mailpitSubtitle(_ mailpit: MailpitStatus) -> String? {
+        if mailpit.state == .notInstalled { return "Local mail testing" }
+        return [mailpit.installedVersion, "SMTP \(mailpit.smtpPort)"].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func caddySubtitle(_ routing: RouterStatus) -> String {
+        [routing.providerVersion, routing.routeCount == 1 ? "1 routed project" : "\(routing.routeCount) routed projects"].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func mysqlState(_ mysql: MySQLStatus) -> ServicePresentation {
+        switch mysql.state {
+        case .running where mysql.health == "healthy": return .init("Running", "circle.fill", .secondary)
+        case .notInstalled: return .init("Not installed", "circle", .secondary)
+        case .conflict, .unhealthy: return .init("Needs attention", "exclamationmark.triangle", .orange)
+        default: return .init(mysql.state.rawValue.capitalized, "circle", .secondary)
+        }
+    }
+
+    private func mailpitState(_ mailpit: MailpitStatus) -> ServicePresentation {
+        switch mailpit.state {
+        case .running where mailpit.health == "healthy": return .init("Running", "circle.fill", .secondary)
+        case .notInstalled: return .init("Not installed", "circle", .secondary)
+        case .conflict, .unhealthy: return .init("Needs attention", "exclamationmark.triangle", .orange)
+        default: return .init(mailpit.state.rawValue.capitalized, "circle", .secondary)
+        }
+    }
+
+    private func routingState(_ routing: RouterStatus) -> ServicePresentation {
+        routing.state == .running && routing.health == .healthy ? .init("Running", "circle.fill", .secondary) : .init("Needs attention", "exclamationmark.triangle", .orange)
+    }
+
+    private func dnsState(_ dns: DNSStatus) -> ServicePresentation {
+        dns.supportsLocalResolution ? .init("Ready", "checkmark", .secondary) : .init("Needs attention", "exclamationmark.triangle", .orange)
+    }
+
+    @ViewBuilder private func mysqlActions(_ mysql: MySQLStatus) -> some View {
+        if mysql.state == .notInstalled { Button("Install MySQL") { Task { await model.installMySQL() } } }
+        else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy { Button(mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL") { Task { await model.startMySQL() } } }
+        if mysql.state == .running { Button("Stop MySQL") { Task { await model.stopMySQL() } } }
+    }
+
+    @ViewBuilder private func mailpitActions(_ mailpit: MailpitStatus) -> some View {
+        if mailpit.state == .notInstalled { Button("Install Mailpit") { Task { await model.installMailpit() } } }
+        else if mailpit.state == .installed || mailpit.state == .stopped || mailpit.state == .unhealthy || mailpit.state == .conflict { Button("Start Mailpit") { Task { await model.startMailpit() } } }
+        if mailpit.state == .running { Button("Stop Mailpit") { Task { await model.stopMailpit() } }; Button("Open Mailpit") { Task { await model.openMailpit() } } }
     }
 }
 
 struct SettingsView: View {
     let model: AppModel
+    @State private var selection = SettingsPage.general
+
+    private enum SettingsPage: Hashable { case general, projects }
 
     var body: some View {
-        TabView {
-            GeneralSettingsView(model: model)
-                .tabItem { Label("General", systemImage: "gearshape") }
-            ProjectSettingsView(model: model)
-                .tabItem { Label("Projects", systemImage: "folder") }
+        NavigationSplitView {
+            List(selection: $selection) {
+                Section("GENERAL") {
+                    Label("General", systemImage: "gearshape").tag(SettingsPage.general)
+                    Label("Projects", systemImage: "folder").tag(SettingsPage.projects)
+                }
+            }
+            .listStyle(.sidebar)
+            .navigationTitle("Settings")
+        } detail: {
+            switch selection {
+            case .general: GeneralSettingsView(model: model)
+            case .projects: ProjectSettingsView(model: model)
+            }
         }
-        .frame(width: 560, height: 400)
+        .frame(width: 760, height: 520)
         .onAppear { model.startMonitoring() }
     }
 }
@@ -499,24 +828,33 @@ struct GeneralSettingsView: View {
     let model: AppModel
 
     var body: some View {
-        Form {
-            Section("General") {
-                Text("Vaelen keeps its Core connection and project state available from the menu bar.")
-                    .foregroundStyle(.secondary)
-                switch model.state {
-                case .running:
-                    Label("Core Running", systemImage: "circle.fill").foregroundStyle(.green)
-                case .connecting:
-                    Label("Core Connecting", systemImage: "circle.dotted")
-                case .unavailable:
-                    Label("Core Unavailable", systemImage: "circle")
-                case .incompatible:
-                    Label("Core Incompatible", systemImage: "exclamationmark.circle").foregroundStyle(.orange)
+        SettingsContent(title: "General", subtitle: "Vaelen keeps your local development environment ready from the menu bar.") {
+            HStack(spacing: VaelenUI.spacing8) {
+                Image(nsImage: VaelenBrand.settingsImage)
+                    .accessibilityLabel("Vaelen mark")
+                Text("Vaelen")
+                    .font(.headline)
+            }
+            .padding(.bottom, VaelenUI.spacing6)
+            SettingsGroup(title: "Status") {
+                HStack {
+                    switch model.state {
+                    case .running: VaelenStatusLabel("Ready", systemImage: "circle.fill", tint: .secondary)
+                    case .connecting: VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
+                    case .unavailable: VaelenStatusLabel("Unavailable", systemImage: "circle", tint: .secondary)
+                    case .incompatible: VaelenStatusLabel("Needs attention", systemImage: "exclamationmark.circle", tint: .orange)
+                    }
+                    Spacer()
+                    Text("Version \(VaelenBuildInfo.version)").font(.caption).foregroundStyle(.secondary)
+                }
+                if let refreshError = model.refreshError {
+                    VaelenStatusLabel("Showing last known state", systemImage: "clock.arrow.circlepath", tint: .orange)
+                        .font(.caption)
+                        .padding(.top, VaelenUI.spacing6)
+                        .help(refreshError)
                 }
             }
         }
-        .formStyle(.grouped)
-        .padding()
     }
 }
 
@@ -524,73 +862,164 @@ struct ProjectSettingsView: View {
     let model: AppModel
 
     var body: some View {
-        Form {
-            Section("Parked Folders") {
+        SettingsContent(title: "Projects", subtitle: "Choose which workspace folders Vaelen discovers and which projects you manage explicitly.") {
+            if let refreshError = model.refreshError {
+                VaelenStatusLabel("Showing last known project state", systemImage: "clock.arrow.circlepath", tint: .orange)
+                    .font(.caption)
+                    .help(refreshError)
+            }
+            SettingsGroup(title: "Workspace Folders", footer: "Projects found in these folders appear in the menu bar without changing their files.") {
                 if model.parkedFolders.isEmpty {
-                    Text("No parked folders.").foregroundStyle(.secondary)
+                    VaelenEmptyState(title: "No Workspace Folders", systemImage: "folder", message: "Add a folder to discover projects.").padding(.vertical, VaelenUI.spacing8)
                 } else {
                     ForEach(model.parkedFolders, id: \.id) { folder in
-                        relationshipRow(title: displayPath(folder.path), detail: folder.availability) {
-                            Task { await model.removeParkedFolder(folder) }
-                        } actionLabel: {
-                            Text("Remove")
-                        }
+                        WorkspaceFolderRow(folder: folder, discoveredCount: discoveredCount(in: folder, from: model.projects), model: model)
                     }
                 }
-                Button("Add Folder…") {
-                    guard let path = chooseDirectory(title: "Choose a Folder to Park", prompt: "Add Folder") else { return }
+                Button("Add Workspace Folder…", systemImage: "plus") {
+                    guard let path = chooseDirectory(title: "Choose a Workspace Folder", prompt: "Add Workspace Folder") else { return }
                     Task { await model.parkFolder(at: path) }
                 }
                 .disabled(model.relationshipMutationInFlight)
+                .padding(.top, VaelenUI.spacing8)
             }
-
-            Section("Linked Projects") {
+            SettingsGroup(title: "Linked Projects", footer: "Linked projects can receive project-specific configuration.") {
                 if model.linkedProjects.isEmpty {
-                    Text("No linked projects.").foregroundStyle(.secondary)
+                    VaelenEmptyState(title: "No Linked Projects", systemImage: "shippingbox", message: "Link a project to manage it directly.").padding(.vertical, VaelenUI.spacing8)
                 } else {
                     ForEach(model.linkedProjects, id: \.path) { project in
-                        relationshipRow(title: project.name, detail: displayPath(project.path)) {
-                            Task { await model.unlinkProject(project) }
-                        } actionLabel: {
-                            Text("Unlink")
-                        }
+                        ExplicitProjectRow(project: project, model: model)
                     }
                 }
-                Button("Link Project…") {
+                Button("Link Project…", systemImage: "link") {
                     guard let path = chooseDirectory(title: "Choose a Project to Link", prompt: "Link Project") else { return }
                     Task { await model.linkProject(at: path) }
                 }
                 .disabled(model.relationshipMutationInFlight)
+                .padding(.top, VaelenUI.spacing8)
             }
-
+            if let operation = model.relationshipOperation {
+                HStack(spacing: VaelenUI.spacing8) { ProgressView().controlSize(.small); Text(operation).font(.caption).foregroundStyle(.secondary) }
+            }
             if let error = model.relationshipError {
-                Section {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.red)
+                VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red).font(.caption)
+            }
+        }
+    }
+}
+
+private struct SettingsContent<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let content: Content
+
+    init(title: String, subtitle: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: VaelenUI.spacing12) {
+                Text(title).font(.title2.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                Text(subtitle).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(24)
+        }
+    }
+}
+
+private struct SettingsGroup<Content: View>: View {
+    let title: String
+    let footer: String?
+    let content: Content
+
+    init(title: String, footer: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.footer = footer
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title).font(.headline).accessibilityAddTraits(.isHeader).padding(.bottom, VaelenUI.spacing6)
+            content
+            if let footer { Text(footer).font(.caption).foregroundStyle(.secondary).padding(.top, VaelenUI.spacing6) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct WorkspaceFolderRow: View {
+    let folder: ParkedPathWire
+    let discoveredCount: Int
+    let model: AppModel
+
+    var body: some View {
+        HStack(spacing: VaelenUI.spacing8) {
+            Image(systemName: "folder").foregroundStyle(.secondary).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayPath(folder.path)).lineLimit(1)
+                Text(folderDetail(folder, discoveredCount: discoveredCount))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Menu {
+                Button("Remove Workspace Folder", systemImage: "minus.circle") { Task { await model.removeParkedFolder(folder) } }
+                    .disabled(model.relationshipMutationInFlight)
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 24, height: 24)
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("Actions for workspace folder \(displayPath(folder.path))")
+        }
+        .padding(.vertical, VaelenUI.spacing6)
+        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+    }
+}
+
+private struct ExplicitProjectRow: View {
+    let project: ProjectWire
+    let model: AppModel
+
+    var body: some View {
+        HStack(spacing: VaelenUI.spacing8) {
+            Image(systemName: "shippingbox").foregroundStyle(.secondary).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(project.name).lineLimit(1)
+                if let framework = project.detectedFramework, !framework.isEmpty {
+                    Text("\(framework) · \(displayPath(project.path))").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                } else {
+                    Text(displayPath(project.path)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-        }
-        .formStyle(.grouped)
-        .padding()
-    }
-
-    private func relationshipRow<ActionLabel: View>(
-        title: String,
-        detail: String,
-        action: @escaping () -> Void,
-        @ViewBuilder actionLabel: () -> ActionLabel
-    ) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).lineLimit(1)
-                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            .help(title)
             Spacer()
-            Button(action: action, label: actionLabel)
-                .disabled(model.relationshipMutationInFlight)
+            Menu {
+                Button("Unlink Project", systemImage: "link.badge.minus") { Task { await model.unlinkProject(project) } }
+                    .disabled(model.relationshipMutationInFlight)
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 24, height: 24)
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("Actions for project \(project.name)")
         }
+        .padding(.vertical, VaelenUI.spacing6)
+        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
     }
+}
+
+private func discoveredCount(in folder: ParkedPathWire, from projects: [ProjectWire] = []) -> Int {
+    projects.filter { project in
+        project.registration == "discovered" && (project.path == folder.path || project.path.hasPrefix(folder.path + "/"))
+    }.count
+}
+
+private func folderDetail(_ folder: ParkedPathWire, discoveredCount: Int) -> String {
+    let projects = "\(discoveredCount) discovered project\(discoveredCount == 1 ? "" : "s")"
+    return folder.availability == PathAvailability.available.rawValue ? projects : "\(projects) · \(folder.availability)"
 }
 
 @MainActor

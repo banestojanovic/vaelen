@@ -9,11 +9,19 @@
 /* Begin PBXBuildFile section */
 		A00000000000000000000001 /* VaelenApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000011 /* VaelenApp.swift */; };
 		A00000000000000000000002 /* VaelenIPC in Frameworks */ = {isa = PBXBuildFile; productRef = A00000000000000000000021 /* VaelenIPC */; };
+		A00000000000000000000003 /* vaelen-mark-currentcolor.svg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000013 /* vaelen-mark-currentcolor.svg */; };
+		A00000000000000000000004 /* vaelen-mark-dark.svg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000014 /* vaelen-mark-dark.svg */; };
+		A00000000000000000000005 /* vaelen-mark-white.svg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000015 /* vaelen-mark-white.svg */; };
+		A00000000000000000000006 /* vaelen-mark-gradient.svg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000016 /* vaelen-mark-gradient.svg */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A00000000000000000000010 /* Vaelen.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vaelen.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000011 /* VaelenApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaelenApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000013 /* vaelen-mark-currentcolor.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = vaelen-mark-currentcolor.svg; sourceTree = "<group>"; };
+		A00000000000000000000014 /* vaelen-mark-dark.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = vaelen-mark-dark.svg; sourceTree = "<group>"; };
+		A00000000000000000000015 /* vaelen-mark-white.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = vaelen-mark-white.svg; sourceTree = "<group>"; };
+		A00000000000000000000016 /* vaelen-mark-gradient.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = vaelen-mark-gradient.svg; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -40,8 +48,21 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000011 /* VaelenApp.swift */,
+				A00000000000000000000043 /* Brand */,
 			);
 			path = Vaelen;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000043 /* Brand */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000013 /* vaelen-mark-currentcolor.svg */,
+				A00000000000000000000014 /* vaelen-mark-dark.svg */,
+				A00000000000000000000015 /* vaelen-mark-white.svg */,
+				A00000000000000000000016 /* vaelen-mark-gradient.svg */,
+			);
+			name = Brand;
+			path = Resources/Brand;
 			sourceTree = "<group>";
 		};
 		A00000000000000000000042 /* Products */ = {
@@ -103,7 +124,12 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		A00000000000000000000032 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000032 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (
+			A00000000000000000000003 /* vaelen-mark-currentcolor.svg in Resources */,
+			A00000000000000000000004 /* vaelen-mark-dark.svg in Resources */,
+			A00000000000000000000005 /* vaelen-mark-white.svg in Resources */,
+			A00000000000000000000006 /* vaelen-mark-gradient.svg in Resources */,
+		); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */

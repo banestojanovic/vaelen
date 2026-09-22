@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 218 145" role="img" aria-labelledby="title desc">
+  <title id="title">Vaelen</title>
+  <desc id="desc">Vaelen geometric mark with circular dot</desc>
+  <path d="M 8 0
+C 2.0 0 0 4.8 3.2 10.2
+L 79.0 135.0
+C 82.8 141.2 88.0 145.0 95.0 145.0
+C 102.0 145.0 107.0 141.8 111.0 135.8
+L 142.0 88.5
+C 145.8 82.8 145.8 78.0 142.2 72.0
+L 99.0 5.0
+C 96.8 1.7 93.0 0 88.0 0
+Z" fill="currentColor"/>
+  <circle cx="188" cy="25" r="25" fill="currentColor"/>
+</svg>

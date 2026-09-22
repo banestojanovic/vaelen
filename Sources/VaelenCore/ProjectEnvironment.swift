@@ -222,8 +222,11 @@ public struct ProjectObservedRoute: Codable, Equatable, Sendable {
     public let associationEvidence: RouteAssociationEvidence
     public let mutationAuthority: RouteMutationAuthority
     public let mutationAuthorityReason: String
+    /// Whether the selected route was observed in the live router configuration.
+    /// This is endpoint evidence, not permission to mutate the route.
+    public let runtimeRouteObserved: Bool?
 
-    public init(intentExists: Bool, hostname: String? = nil, documentRoot: String? = nil, target: String? = nil, tls: TLSMode? = nil, routerState: RouterState, routerHealth: RouterHealth, associationState: RouteAssociationState = .none, associationEvidence: RouteAssociationEvidence = .init(), mutationAuthority: RouteMutationAuthority = .blocked, mutationAuthorityReason: String = "No route association evidence was found.") {
+    public init(intentExists: Bool, hostname: String? = nil, documentRoot: String? = nil, target: String? = nil, tls: TLSMode? = nil, routerState: RouterState, routerHealth: RouterHealth, associationState: RouteAssociationState = .none, associationEvidence: RouteAssociationEvidence = .init(), mutationAuthority: RouteMutationAuthority = .blocked, mutationAuthorityReason: String = "No route association evidence was found.", runtimeRouteObserved: Bool? = nil) {
         self.intentExists = intentExists
         self.hostname = hostname
         self.documentRoot = documentRoot
@@ -235,6 +238,7 @@ public struct ProjectObservedRoute: Codable, Equatable, Sendable {
         self.associationEvidence = associationEvidence
         self.mutationAuthority = mutationAuthority
         self.mutationAuthorityReason = mutationAuthorityReason
+        self.runtimeRouteObserved = runtimeRouteObserved
     }
 }
 
@@ -343,7 +347,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         let desiredResult = readDesiredState(root: root)
         let env = readDotenv(root: root)
         let cache = inspectConfigCache(root: root, envPath: root.appendingPathComponent(".env"))
-        let route = routeObservation(project: project, framework: framework, routes: routes, router: router, registeredProjects: registeredProjects)
+        let route = routeObservation(project: project, framework: framework, routes: routes, router: router, registeredProjects: registeredProjects, runtimeRoutes: runtimeRoutes)
         let installed = phpPackages.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
         let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
         let resolved = resolvePHP(family: desiredResult.state.php, packages: phpPackages)
@@ -432,11 +436,11 @@ public struct ProjectEnvironmentInspector: Sendable {
         return .init(state: newer == true ? "present, .env is newer" : "present, appears current", cachePath: cache.path, cacheModifiedAt: cacheDate, envModifiedAt: envDate, envNewerThanCache: newer)
     }
 
-    private func routeObservation(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], router: RouterStatus, registeredProjects: [Project]) -> ProjectObservedRoute {
+    private func routeObservation(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], router: RouterStatus, registeredProjects: [Project], runtimeRoutes: [Route]?) -> ProjectObservedRoute {
         let association = RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects)
         let intent = association.selectedRouteID.flatMap { id in routes.first { $0.route.id == id } }
         let intentExists = !association.routeIDs.isEmpty
-        guard let route = intent?.route else { return .init(intentExists: intentExists, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason) }
+        guard let route = intent?.route else { return .init(intentExists: intentExists, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason, runtimeRouteObserved: nil) }
         let documentRoot: String?
         let target: String
         switch route.target {
@@ -444,7 +448,10 @@ public struct ProjectEnvironmentInspector: Sendable {
         case .staticFiles(let root): documentRoot = root; target = "static"
         case .http(let host, let port): documentRoot = nil; target = "http \(host):\(port)"
         }
-        return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason)
+        let runtimeRouteObserved = runtimeRoutes.map { runtime in
+            runtime.contains { $0.hostname == route.hostname && $0.target == route.target && $0.tls == route.tls }
+        }
+        return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason, runtimeRouteObserved: runtimeRouteObserved)
     }
 
     private func routeTargetObservations(project: Project, framework: ProjectFrameworkInspection, desiredPHP: String?, resolvedPHP: String?, routes: [RouteIntent], runtimeRoutes: [Route]?, phpStatuses: [PHPStatus], router: RouterStatus, association: RouteAssociationResult, pendingTransitions: [RouteTargetTransition]) -> [ProjectPHPRouteTargetObservation] {
@@ -616,5 +623,46 @@ private enum ProjectYAMLError: Error, CustomStringConvertible {
         case .unsupportedVersion(let version): return "unsupported schema version \(version)"
         case .invalidRoot: return "root must be a mapping"
         }
+    }
+}
+
+extension ProjectEnvironmentReport {
+    /// A read-only URL that Core can truthfully offer to open.
+    ///
+    /// This deliberately does not use route mutation authority. A route may be
+    /// legacy/inferred and still be openable when the live router, resolver,
+    /// TLS, and standard ports provide current endpoint evidence.
+    public var usableSiteURL: URL? {
+        let route = observed.route
+        guard route.intentExists,
+              route.associationState != .none,
+              route.associationState != .ambiguous,
+              route.associationState != .orphaned,
+              route.associationState != .conflicted,
+              route.runtimeRouteObserved == true,
+              route.routerState == .running,
+              route.routerHealth == .healthy,
+              let hostname = route.hostname,
+              !hostname.isEmpty,
+              observed.dns.supportsLocalResolution,
+              observed.standardPorts.state == .healthy else { return nil }
+        if route.tls == .local {
+            guard observed.tls.state == .trusted,
+                  observed.tls.trustObserved else { return nil }
+        }
+        return URL(string: "\(route.tls == .local ? "https" : "http")://\(hostname)")
+    }
+}
+
+extension DNSStatus {
+    /// Resolver evidence sufficient for opening a local URL. This is
+    /// intentionally weaker than DNS ownership: a resolver file whose
+    /// content points at a live Vaelen responder proves usability without
+    /// proving that Vaelen may replace or remove that file.
+    public var supportsLocalResolution: Bool {
+        guard pid != nil else { return false }
+        if state == .installed, ownership == .vaelen, health == "healthy" { return true }
+        let normalized = resolverContent?.split { $0 == " " || $0 == "\n" || $0 == "\t" }.map(String.init) ?? []
+        return normalized == ["nameserver", address, "port", String(port)]
     }
 }
