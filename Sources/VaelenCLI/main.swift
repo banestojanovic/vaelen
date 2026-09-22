@@ -27,6 +27,10 @@ enum CLICommand {
     case phpDefaultSet(String)
     case phpUse(String)
     case phpExec(version: String?, arguments: [String])
+    case phpResolvePath
+    case shellStatus
+    case shellInstall
+    case shellUninstall
     case phpStart(String)
     case phpStop(String)
     case phpStatus(String, json: Bool)
@@ -94,6 +98,8 @@ struct VaelenCLIMain {
       val routing status|start|stop
       val route list|add|remove|associate
       val php versions|default|install|update|remove|operation ...
+      val php resolve --path
+      val shell status|install|uninstall
       val mysql ...
       val mailpit versions|install|start|stop|status|open
     """
@@ -105,6 +111,12 @@ struct VaelenCLIMain {
                 print(usage)
                 exit(0)
             }
+            switch command {
+            case .shellStatus: print(try PHPShellIntegration.status()); exit(0)
+            case .shellInstall: print(try PHPShellIntegration.install()); exit(0)
+            case .shellUninstall: print(try PHPShellIntegration.uninstall()); exit(0)
+            default: break
+            }
             let paths = CoreEndpointPaths()
             let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
             try await client.connect()
@@ -112,10 +124,15 @@ struct VaelenCLIMain {
             await client.disconnect()
             exit(0)
         } catch let error as CoreClientError {
-            if case .coreUnavailable = error { fail("Vaelen Core is not running.", code: 3) }
+            if case .coreUnavailable = error { fail("Vaelen Core is not running. Start Vaelen and retry.", code: 3) }
             if case .protocolIncompatible(let client, let core) = error { fail("Vaelen Core uses an incompatible protocol version.\n\nClient: \(client)\nCore:   \(core)", code: 4) }
             if case .coreIncompatible = error { fail("The running Vaelen Core is incompatible with this client.\nRestart Vaelen Core and try again.", code: 4) }
-            if case .remote(let payload) = error { fail(payload.message, code: 1) }
+            if case .remote(let payload) = error {
+                if payload.message == "Unknown Core method: php.resolve." || payload.message == "Unknown Core method: php.resolve" {
+                    fail("Vaelen Core is too old for project-aware PHP resolution. Restart or update Vaelen, then retry.", code: 4)
+                }
+                fail(payload.message, code: 1)
+            }
             fail("Vaelen Core returned an invalid response.", code: 1)
         } catch {
             fail(message(for: error), code: 1)
@@ -172,8 +189,17 @@ struct VaelenCLIMain {
             case "status": guard args.count == 3 || args.count == 4 else { throw CLIError.usage }; return .phpStatus(args[2], json: args.count == 4 && args[3] == "--json")
             case "exec":
                 let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }; return .phpExec(version: nil, arguments: Array(rest.dropFirst(marker + 1)))
+            case "resolve": guard args.count == 3, args[2] == "--path" else { throw CLIError.usage }; return .phpResolvePath
              default: throw CLIError.usage
               }
+        case "shell":
+            guard args.count == 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "status": return .shellStatus
+            case "install": return .shellInstall
+            case "uninstall": return .shellUninstall
+            default: throw CLIError.usage
+            }
         case "mysql":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
@@ -349,6 +375,11 @@ struct VaelenCLIMain {
             let catalog = try await client.phpDefaultSet(version); print("Default PHP \(catalog.defaultVersion ?? version)")
         case .phpUse(let version): let result = try await client.phpUse(version); print("Using PHP \(result.version) for CLI")
         case .phpExec(let version, let arguments): let result = try await client.phpExec(version: version, workingDirectory: FileManager.default.currentDirectoryPath, arguments: arguments); print(result.output, terminator: ""); if result.exitStatus != 0 { exit(result.exitStatus) }
+        case .phpResolvePath:
+            print(try await resolvePHPPath(client: client, workingDirectory: workingDirectory))
+        case .shellStatus: print(try PHPShellIntegration.status())
+        case .shellInstall: print(try PHPShellIntegration.install())
+        case .shellUninstall: print(try PHPShellIntegration.uninstall())
         case .phpStart(let version): let result = try await client.phpStart(version); print("PHP \(result.version) FPM \(result.state.rawValue) \(result.health)")
         case .phpStop(let version): let result = try await client.phpStop(version); print("PHP \(result.version) FPM \(result.state.rawValue)")
         case .phpStatus(let version, let json): let result = try await client.phpStatus(version); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("PHP \(result.version)\nPackage    \(result.package == nil ? "Missing" : "Installed")\nFPM        \(result.state.rawValue)\nPID        \(result.pid.map(String.init) ?? "none")\nSocket     \(displayPath(result.socket))\nHealth     \(result.health)") }
@@ -426,6 +457,11 @@ struct VaelenCLIMain {
         case .portsRemove:
             let result = try await client.portsRemove(); print("Standard Local Ports \(result.state.rawValue)")
         }
+    }
+
+    private static func resolvePHPPath(client: VaelenCoreClient, workingDirectory: String) async throws -> String {
+        let resolution = try await client.resolvePHPExecutable(workingDirectory: workingDirectory)
+        return resolution.cliPath
     }
 
     private static func displayPath(_ path: String) -> String {

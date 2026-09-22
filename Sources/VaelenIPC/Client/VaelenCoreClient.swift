@@ -170,6 +170,11 @@ public actor VaelenCoreClient {
     public func phpExec(version: String? = nil, workingDirectory: String, arguments: [String]) async throws -> PHPExecResult {
         guard case .phpExec(let result) = try result(from: await send(IPCRequest(method: .phpExec, params: .phpExec(.init(version: version, workingDirectory: workingDirectory, arguments: arguments))))) else { throw CoreClientError.invalidResponse }; return result
     }
+
+    public func resolvePHPExecutable(workingDirectory: String) async throws -> PHPResolveResult {
+        guard case .phpResolve(let result) = try result(from: await send(IPCRequest(method: .phpResolve, params: .phpResolve(.init(workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
     public func phpStart(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStart, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
     public func phpStop(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStop, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
     public func phpStatus(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStatus, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }

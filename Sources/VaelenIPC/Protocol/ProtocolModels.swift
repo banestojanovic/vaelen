@@ -66,6 +66,7 @@ public enum CoreMethod: String, Sendable {
     case phpDefaultSet = "php.default.set"
     case phpUse = "php.use"
     case phpExec = "php.exec"
+    case phpResolve = "php.resolve"
     case phpStart = "php.start"
     case phpStop = "php.stop"
     case phpStatus = "php.status"
@@ -113,6 +114,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case unpark(UnparkPathRequest)
     case phpVersion(PHPVersionRequest)
     case phpExec(PHPExecRequest)
+    case phpResolve(PHPResolveRequest)
     case route(RouteIntent)
     case routeRemove(RouteRemoveRequest)
     case routeAssociation(RouteProjectAssociationRequest)
@@ -133,6 +135,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .unpark(let value): try value.encode(to: encoder)
         case .phpVersion(let value): try value.encode(to: encoder)
         case .phpExec(let value): try value.encode(to: encoder)
+        case .phpResolve(let value): try value.encode(to: encoder)
         case .route(let value): try value.encode(to: encoder)
         case .routeRemove(let value): try value.encode(to: encoder)
         case .routeAssociation(let value): try value.encode(to: encoder)
@@ -153,6 +156,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
                 self = .phpVersion(params); return
             }
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
+            if fields["workingDirectory"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPResolveRequest.self, from: IPCCodec.encode(value)) { self = .phpResolve(params); return }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, fields["expectedCurrentSocket"] != nil, let params = try? IPCCodec.decode(RoutePHPTargetUpdateRequest.self, from: IPCCodec.encode(value)) { self = .routePHPTargetUpdate(params); return }
@@ -331,6 +335,8 @@ public struct ParkedPathListResult: Codable, Equatable, Sendable {
 
 public struct PHPVersionRequest: Codable, Equatable, Sendable { public let version: String; public init(version: String) { self.version = version } }
 public struct PHPExecRequest: Codable, Equatable, Sendable { public let version: String?; public let workingDirectory: String; public let arguments: [String]; public init(version: String? = nil, workingDirectory: String, arguments: [String]) { self.version = version; self.workingDirectory = workingDirectory; self.arguments = arguments } }
+public struct PHPResolveRequest: Codable, Equatable, Sendable { public let workingDirectory: String; public init(workingDirectory: String) { self.workingDirectory = workingDirectory } }
+public struct PHPResolveResult: Codable, Equatable, Sendable { public let version: String; public let cliPath: String; public let projectName: String?; public init(version: String, cliPath: String, projectName: String?) { self.version = version; self.cliPath = cliPath; self.projectName = projectName } }
 public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
 public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
 public struct PHPRuntimeCatalogResult: Codable, Equatable, Sendable { public let catalog: PHPRuntimeCatalog; public init(catalog: PHPRuntimeCatalog) { self.catalog = catalog } }
@@ -392,6 +398,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case mailpitVersions(MailpitVersionsResult)
     case mailpitStatus(MailpitStatusResult)
     case phpExec(PHPExecResult)
+    case phpResolve(PHPResolveResult)
     case routingStatus(RouterStatusResult)
     case routeList(RouteListResult)
     case routeMutation(RouteIntent)
@@ -424,6 +431,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .mailpitVersions(let value): try value.encode(to: encoder)
         case .mailpitStatus(let value): try value.encode(to: encoder)
         case .phpExec(let value): try value.encode(to: encoder)
+        case .phpResolve(let value): try value.encode(to: encoder)
         case .routingStatus(let value): try value.encode(to: encoder)
         case .routeList(let value): try value.encode(to: encoder)
         case .routeMutation(let value): try value.encode(to: encoder)
@@ -460,6 +468,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }
         else if fields["status"] != nil, let result = try? IPCCodec.decode(PHPStatusResult.self, from: data) { self = .phpStatus(result) }
         else if fields["exitStatus"] != nil, let result = try? IPCCodec.decode(PHPExecResult.self, from: data) { self = .phpExec(result) }
+        else if fields["cliPath"] != nil, let result = try? IPCCodec.decode(PHPResolveResult.self, from: data) { self = .phpResolve(result) }
         else if fields["router"] != nil, let result = try? IPCCodec.decode(RouterStatusResult.self, from: data) { self = .routingStatus(result) }
         else if fields["routes"] != nil, let result = try? IPCCodec.decode(RouteListResult.self, from: data) { self = .routeList(result) }
         else if fields["route"] != nil, fields["state"] != nil, let result = try? IPCCodec.decode(RouteProjectAssociationResult.self, from: data) { self = .routeAssociation(result) }

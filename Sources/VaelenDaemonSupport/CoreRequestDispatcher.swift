@@ -135,6 +135,9 @@ public actor CoreRequestDispatcher {
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.selectDefault(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpExec:
                 let module = try phpModule(); let params = try request.params?.decode(PHPExecRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP execution parameters are required.") }(); let result = try module.exec(requestedVersion: params.version, workingDirectory: params.workingDirectory, arguments: params.arguments); return (.init(id: request.id, result: .phpExec(.init(exitStatus: result.status, output: result.output))), true)
+            case .phpResolve:
+                let params = try request.params?.decode(PHPResolveRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP resolution requires the current working directory.") }()
+                return (.init(id: request.id, result: .phpResolve(try await phpExecutableResolution(workingDirectory: params.workingDirectory))), true)
             case .phpStart:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.start(requestedVersion: params.version)))), true)
             case .phpStop:
@@ -329,6 +332,33 @@ public actor CoreRequestDispatcher {
             throw ProjectRegistryError.projectNotFound
         }
         return project
+    }
+
+    private func phpExecutableResolution(workingDirectory: String) async throws -> PHPResolveResult {
+        let module = try phpModule()
+        let paths = CanonicalPathService()
+        let current = paths.canonicalize(workingDirectory).string
+        let linked = try await registry.linkedProjects().filter { $0.availability == .available }
+        let project = linked
+            .filter { candidate in
+                let root = candidate.rootPath.string
+                return current == root || current.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+            }
+            .max { $0.rootPath.string.count < $1.rootPath.string.count }
+
+        let override: String?
+        if let project, let id = project.id { override = try await registry.phpOverride(for: id) }
+        else { override = nil }
+        guard let version = override ?? module.defaultVersion() else {
+            throw IPCErrorPayload(code: .invalidRequest, message: "Vaelen has no default PHP runtime. Install and select a PHP version first.")
+        }
+        guard let observation = module.packageObservations().first(where: { $0.version == version }),
+              observation.eligibility == .eligible,
+              let package = observation.package,
+              FileManager.default.isExecutableFile(atPath: package.cliPath) else {
+            throw IPCErrorPayload(code: .invalidRequest, message: "PHP \(version) is selected but its managed executable is unavailable. Repair the runtime in Vaelen and try again.")
+        }
+        return PHPResolveResult(version: version, cliPath: package.cliPath, projectName: project?.name)
     }
 
     private func projectEnvironmentReport(for project: Project) async throws -> ProjectEnvironmentReport {

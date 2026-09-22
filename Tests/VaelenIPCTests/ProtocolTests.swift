@@ -74,6 +74,21 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(params?.arguments, ["test.php", "--flag", "value with spaces"])
     }
 
+    func testPHPResolveRequestAndResponseRoundTripThroughJSON() throws {
+        let request = IPCRequest(method: .phpResolve, params: .phpResolve(.init(workingDirectory: "/Users/test/project")))
+        let restoredRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(restoredRequest.knownMethod, .phpResolve)
+        guard case .phpResolve(let params) = restoredRequest.params else { return XCTFail("PHP resolve params did not decode") }
+        XCTAssertEqual(params.workingDirectory, "/Users/test/project")
+
+        let response = IPCResponse(id: UUID(), result: .phpResolve(.init(version: "8.4.23", cliPath: "/managed/php/8.4.23/php", projectName: "sample")))
+        let restoredResponse = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .phpResolve(let result) = restoredResponse.result else { return XCTFail("PHP resolve result did not decode") }
+        XCTAssertEqual(result.version, "8.4.23")
+        XCTAssertEqual(result.cliPath, "/managed/php/8.4.23/php")
+        XCTAssertEqual(result.projectName, "sample")
+    }
+
     func testPHPCatalogMethodAndResponseRoundTripThroughJSON() throws {
         let request = IPCRequest(method: .phpCatalog)
         XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)).knownMethod, .phpCatalog)
