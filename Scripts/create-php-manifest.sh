@@ -26,6 +26,7 @@ fpm_hash=$(shasum -a 256 "$artifact_dir/$fpm_name" | cut -d ' ' -f 1)
 jq -n \
   --arg releaseTag "$release_tag" \
   --arg releaseURL "$release_base_url" \
+  --arg catalogURL "$release_base_url/php-catalog.json" \
   --arg manifestTrust "$manifest_trust" \
   --arg module "php" \
   --arg version "$version" \
@@ -46,8 +47,9 @@ jq -n \
     module: $module,
     phpVersion: $version,
     platform: $platform,
-    architecture: $architecture,
-    release: { tag: $releaseTag, url: $releaseURL },
+     architecture: $architecture,
+     catalogURL: $catalogURL,
+     release: { tag: $releaseTag, url: $releaseURL },
     build: {
       mechanism: "static-php-cli",
       version: $staticVersion,

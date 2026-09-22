@@ -22,6 +22,29 @@ added without changing the package model.
 The package build intentionally uses the static-php-cli build mechanism rather
 than republishing its hosted unsigned PHP archives.
 
+## Curated Runtime Catalog
+
+Each supported PHP version has a checked-in build configuration such as
+`php-8.4.23.json`. The configuration pins the static-php-cli source revision,
+the exact PHP source version, extensions, and Vaelen's `cli`/`fpm` artifact
+names. `Scripts/build-php.sh` emits a manifest containing the artifact URLs and
+SHA-256 values after validating both executables.
+
+When multiple Vaelen manifests are available, create the catalog shipped beside
+the primary manifest with:
+
+```text
+Scripts/create-php-catalog.sh php-catalog.json \
+  release/vaelen-php-manifest-8.4.23.json \
+  release/vaelen-php-manifest-8.3.29.json
+```
+
+The catalog contains only complete macOS arm64 PHP manifests. Vaelen reads the
+local catalog immediately and keeps installed runtime truth independent of its
+availability. Release publication should upload the catalog beside the
+versioned artifacts; no PHP version is advertised until its manifest and both
+validated artifacts are published.
+
 ## Local M2 Bootstrap
 
 Build and configure the local development distribution from the repository

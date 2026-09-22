@@ -2,6 +2,11 @@ name: Build Vaelen PHP
 
 on:
   workflow_dispatch:
+    inputs:
+      php_build_config:
+        description: "Vaelen PHP build configuration"
+        required: true
+        default: "Distribution/PHP/php-8.4.23.json"
   push:
     tags:
       - 'php-v*'
@@ -9,12 +14,9 @@ on:
 permissions:
   contents: write
 
-env:
-  PHP_BUILD_CONFIG: Distribution/PHP/php-8.4.23.json
-
 jobs:
   build:
-    name: Build PHP 8.4.23 arm64
+    name: Build Vaelen PHP arm64
     runs-on: macos-14
     timeout-minutes: 240
     steps:
@@ -24,7 +26,13 @@ jobs:
       - name: Read build configuration
         id: config
         run: |
-          echo "php-version=$(jq -r '.phpVersion' "$PHP_BUILD_CONFIG")" >> "$GITHUB_OUTPUT"
+          config="${{ inputs.php_build_config }}"
+          if [ -z "$config" ]; then
+            config="Distribution/PHP/php-${GITHUB_REF_NAME#php-v}.json"
+          fi
+          test -f "$config"
+          echo "path=$config" >> "$GITHUB_OUTPUT"
+          echo "php-version=$(jq -r '.phpVersion' "$config")" >> "$GITHUB_OUTPUT"
 
       - name: Set up build PHP
         uses: shivammathur/setup-php@v2
@@ -39,10 +47,38 @@ jobs:
         run: |
           release_tag="${GITHUB_REF_NAME:-php-v${{ steps.config.outputs.php-version }}}"
           release_base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}"
+          PHP_BUILD_CONFIG="${{ steps.config.outputs.path }}"
           VAELEN_RELEASE_TAG="$release_tag" \
           VAELEN_RELEASE_BASE_URL="$release_base_url" \
           VAELEN_MANIFEST_TRUST=trusted-vaelen-release-manifest \
             Scripts/build-php.sh "$PHP_BUILD_CONFIG"
+
+      - name: Prepare curated PHP catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          catalog_dir="$RUNNER_TEMP/php-catalog"
+          mkdir -p "$catalog_dir"
+          current_version="${{ steps.config.outputs.php-version }}"
+          cp .build/release/vaelen-php-manifest.json "$catalog_dir/vaelen-php-manifest-$current_version.json"
+          for config in Distribution/PHP/php-*.json; do
+            version=$(jq -r '.phpVersion' "$config")
+            [ "$version" = "$current_version" ] && continue
+            gh release download "php-v$version" \
+              --pattern vaelen-php-manifest.json \
+              --dir "$catalog_dir" --clobber 2>/dev/null || true
+            if [ -f "$catalog_dir/vaelen-php-manifest.json" ]; then
+              cli=$(jq -r '.artifacts.cli.file' "$catalog_dir/vaelen-php-manifest.json")
+              fpm=$(jq -r '.artifacts.fpm.file' "$catalog_dir/vaelen-php-manifest.json")
+              assets=$(gh release view "php-v$version" --json assets --jq '.assets[].name' 2>/dev/null || true)
+              if printf '%s\n' "$assets" | grep -Fxq "$cli" && printf '%s\n' "$assets" | grep -Fxq "$fpm"; then
+                mv "$catalog_dir/vaelen-php-manifest.json" "$catalog_dir/vaelen-php-manifest-$version.json"
+              else
+                rm -f "$catalog_dir/vaelen-php-manifest.json"
+              fi
+            fi
+          done
+          Scripts/create-php-catalog.sh .build/release/php-catalog.json "$catalog_dir"/*.json
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

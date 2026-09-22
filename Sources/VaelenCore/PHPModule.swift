@@ -103,8 +103,9 @@ public struct PHPManifest: Codable, Equatable, Sendable {
     public let build: PHPBuildConfiguration?
     public let artifacts: [String: PHPArtifact]
     public let verification: PHPVerification
+    public let catalogURL: String?
 
-    public init(schemaVersion: Int, module: String, phpVersion: String, platform: String, architecture: String, build: PHPBuildConfiguration? = nil, artifacts: [String: PHPArtifact], verification: PHPVerification) {
+    public init(schemaVersion: Int, module: String, phpVersion: String, platform: String, architecture: String, build: PHPBuildConfiguration? = nil, artifacts: [String: PHPArtifact], verification: PHPVerification, catalogURL: String? = nil) {
         self.schemaVersion = schemaVersion
         self.module = module
         self.phpVersion = phpVersion
@@ -113,6 +114,7 @@ public struct PHPManifest: Codable, Equatable, Sendable {
         self.build = build
         self.artifacts = artifacts
         self.verification = verification
+        self.catalogURL = catalogURL
     }
 }
 
@@ -135,10 +137,12 @@ public protocol PHPManifestLocation: Sendable {
     func manifest() throws -> PHPManifest
     func artifactBaseURL() -> URL?
     func manifests() throws -> [PHPManifest]
+    func refreshCatalogIfNeeded() throws
 }
 
 public extension PHPManifestLocation {
     func manifests() throws -> [PHPManifest] { [try manifest()] }
+    func refreshCatalogIfNeeded() throws {}
 }
 
 public struct PHPManifestCatalog: Codable, Equatable, Sendable {
@@ -149,11 +153,34 @@ public struct PHPManifestCatalog: Codable, Equatable, Sendable {
 public struct FilePHPManifestLocation: PHPManifestLocation {
     public let manifestURL: URL
     public let baseURL: URL?
-    public init(manifestURL: URL, baseURL: URL? = nil) { self.manifestURL = manifestURL; self.baseURL = baseURL }
+    public let catalogURL: URL?
+    public init(manifestURL: URL, baseURL: URL? = nil, catalogURL: URL? = nil) { self.manifestURL = manifestURL; self.baseURL = baseURL; self.catalogURL = catalogURL }
     public func manifest() throws -> PHPManifest {
         try JSONDecoder().decode(PHPManifest.self, from: Data(contentsOf: manifestURL))
     }
     public func artifactBaseURL() -> URL? { baseURL ?? manifestURL.deletingLastPathComponent() }
+    public func refreshCatalogIfNeeded() throws {
+        guard let catalogURL else { return }
+        let cacheURL = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog.json")
+        if let modified = try? FileManager.default.attributesOfItem(atPath: cacheURL.path)[.modificationDate] as? Date,
+           Date().timeIntervalSince(modified) < 900 { return }
+        var request = URLRequest(url: catalogURL)
+        request.timeoutInterval = 10
+        let semaphore = DispatchSemaphore(value: 0)
+        let result = PHPRemoteResultBox()
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            if let data { result.set(.success(data)) }
+            else { result.set(.failure(error ?? PHPModuleError.manifestUnavailable)) }
+            semaphore.signal()
+        }.resume()
+        semaphore.wait()
+        let data = try result.get()!.get()
+        let catalog = try JSONDecoder().decode(PHPManifestCatalog.self, from: data)
+        guard catalog.manifests.allSatisfy({ $0.verification.authenticity == "trusted-vaelen-release-manifest" }) else {
+            throw PHPModuleError.invalidManifest("catalog is not a trusted Vaelen release catalog")
+        }
+        try data.write(to: cacheURL, options: .atomic)
+    }
     public func manifests() throws -> [PHPManifest] {
         let catalogURL = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog.json")
         guard let data = try? Data(contentsOf: catalogURL) else { return [try manifest()] }
@@ -339,6 +366,14 @@ private struct PHPProcessRecord: Codable, Sendable {
 private struct PHPDevelopmentConfiguration: Codable, Sendable {
     let manifestPath: String
     let artifactBasePath: String
+    let catalogURL: String?
+}
+
+private final class PHPRemoteResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Result<Data, Error>?
+    func set(_ value: Result<Data, Error>) { lock.lock(); self.value = value; lock.unlock() }
+    func get() -> Result<Data, Error>? { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 public final class PHPModule: @unchecked Sendable {
@@ -360,7 +395,9 @@ public final class PHPModule: @unchecked Sendable {
         guard let manifest = environment["VAELEN_PHP_MANIFEST"] ?? configuration?.manifestPath else { return nil }
         let basePath = environment["VAELEN_PHP_ARTIFACT_BASE"] ?? configuration?.artifactBasePath
         let base = basePath.map { URL(fileURLWithPath: $0, isDirectory: true) }
-        return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base))
+        let manifestMetadata = try? JSONDecoder().decode(PHPManifest.self, from: Data(contentsOf: URL(fileURLWithPath: manifest)))
+        let catalog = environment["VAELEN_PHP_CATALOG_URL"] ?? configuration?.catalogURL ?? manifestMetadata?.catalogURL
+        return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base, catalogURL: catalog.flatMap(URL.init(string:))))
     }
 
     public func availableVersions() throws -> [String] {
@@ -380,6 +417,8 @@ public final class PHPModule: @unchecked Sendable {
         if case .failure = availableResult { return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: false) }
         return catalog
     }
+
+    public func refreshCatalogIfNeeded() throws { try location.refreshCatalogIfNeeded() }
 
     public func operationState() -> PHPOperationState? {
         lock.lock(); defer { lock.unlock() }; return activeOperation ?? lastOperation
@@ -486,8 +525,8 @@ public final class PHPModule: @unchecked Sendable {
         try extract(cliURL, to: staging); try extract(fpmURL, to: staging)
         let cliPath = staging.appendingPathComponent("php").path
         let fpmPath = staging.appendingPathComponent("php-fpm").path
-        try validateExecutable(cliPath, expected: version, name: "php")
-        try validateExecutable(fpmPath, expected: version, name: "php-fpm")
+        try validateExecutable(cliPath, expected: version, name: "php", build: manifest.build)
+        try validateExecutable(fpmPath, expected: version, name: "php-fpm", build: manifest.build)
         try makeDirectories([final.deletingLastPathComponent()])
         if manager.fileExists(atPath: final.path) { throw PHPModuleError.validationFailed("package directory already exists") }
         try manager.moveItem(at: staging, to: final)
@@ -680,15 +719,23 @@ public final class PHPModule: @unchecked Sendable {
             if sha256(destination) == artifact.sha256.lowercased() { return destination }
             try? manager.removeItem(at: destination)
         }
-        guard let base else { throw PHPModuleError.manifestUnavailable }
-        let source = base.isFileURL ? base.appendingPathComponent(artifact.file) : (URL(string: artifact.url, relativeTo: base) ?? base.appendingPathComponent(artifact.file))
+        let source: URL
+        if let base, base.isFileURL, manager.fileExists(atPath: base.appendingPathComponent(artifact.file).path) {
+            source = base.appendingPathComponent(artifact.file)
+        } else if let remote = URL(string: artifact.url), remote.scheme != nil {
+            source = remote
+        } else if let base {
+            source = base.appendingPathComponent(artifact.file)
+        } else {
+            throw PHPModuleError.manifestUnavailable
+        }
         let data = try Data(contentsOf: source)
         try data.write(to: destination, options: .atomic)
         guard sha256(destination) == artifact.sha256.lowercased() else { try? manager.removeItem(at: destination); throw PHPModuleError.verificationFailed(artifact.file) }
         return destination
     }
     private func extract(_ archive: URL, to directory: URL) throws { let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/tar"); process.arguments = ["-xzf", archive.path, "-C", directory.path]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw PHPModuleError.validationFailed("archive extraction failed") } }
-    private func validateExecutable(_ path: String, expected: String, name: String) throws {
+    private func validateExecutable(_ path: String, expected: String, name: String, build: PHPBuildConfiguration? = nil) throws {
         guard manager.isExecutableFile(atPath: path) else { throw PHPModuleError.validationFailed("missing \(name)") }
         let fileOutput = try command("/usr/bin/file", [path])
         guard fileOutput.contains("Mach-O 64-bit executable arm64") else { throw PHPModuleError.validationFailed("unexpected \(name) architecture") }
@@ -696,7 +743,7 @@ public final class PHPModule: @unchecked Sendable {
         guard !dependencies.contains("/opt/homebrew/") && !dependencies.contains("/usr/local/") && !dependencies.contains("Application Support/Herd") else { throw PHPModuleError.validationFailed("unexpected \(name) runtime dependency") }
         let output = try command(path, ["-v"])
         guard output.contains(expected) else { throw PHPModuleError.validationFailed("unexpected \(name) version") }
-        if name == "php", let build = try? location.manifest().build {
+        if name == "php", let build {
             let modules = try command(path, ["-m"]).split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             for extensionName in build.requiredExtensions where !modules.contains(extensionName.lowercased()) { throw PHPModuleError.validationFailed("missing PHP extension \(extensionName)") }
             if build.optionalExtensions.contains("imagick") && !modules.contains("imagick") { throw PHPModuleError.validationFailed("missing PHP extension imagick") }

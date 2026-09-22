@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "module": "php",
+  "phpVersion": "8.3.29",
+  "architecture": "arm64",
+  "platform": "macos",
+  "staticPhpCli": {
+    "repository": "https://github.com/crazywhalecc/static-php-cli.git",
+    "version": "2.8.5",
+    "commit": "4318ef8fa32a02460ec1554746674a7bc42b49fa"
+  },
+  "sapis": ["cli", "fpm"],
+  "buildExtensions": [
+    "apcu", "bcmath", "bz2", "calendar", "ctype", "curl", "dba", "dom",
+    "event", "exif", "fileinfo", "filter", "ftp", "gd", "gmp", "iconv",
+    "imap", "intl", "mbregex", "mbstring", "mysqli", "mysqlnd", "opcache",
+    "openssl", "pcntl", "pdo", "pdo_mysql", "pgsql", "phar", "posix",
+    "readline", "redis", "session", "simplexml", "soap", "sockets", "sodium",
+    "sqlite3", "tokenizer", "xml", "xmlreader", "xmlwriter", "xsl", "zip",
+    "zlib", "imagick"
+  ],
+  "requiredExtensions": [
+    "bcmath", "ctype", "curl", "dom", "fileinfo", "filter", "gd", "iconv",
+    "intl", "mbstring", "mysqli", "mysqlnd", "openssl", "pcntl", "pdo",
+    "pdo_mysql", "phar", "session", "simplexml", "sodium", "tokenizer",
+    "xml", "xmlreader", "xmlwriter", "zip"
+  ],
+  "optionalExtensions": ["imagick"],
+  "artifactNames": {
+    "cli": "php-8.3.29-cli-macos-arm64.tar.gz",
+    "fpm": "php-8.3.29-fpm-macos-arm64.tar.gz"
+  }
+}
