@@ -1,0 +1,229 @@
+{
+  "schemaVersion": 1,
+  "module": "php",
+  "manifests": [
+    {
+      "schemaVersion": 1,
+      "module": "php",
+      "phpVersion": "8.4.23",
+      "platform": "macos",
+      "architecture": "arm64",
+      "release": {
+        "tag": "php-v8.4.23",
+        "url": "https://localhost/releases/download/php-v8.4.23"
+      },
+      "build": {
+        "mechanism": "static-php-cli",
+        "version": "2.8.5",
+        "commit": "4318ef8fa32a02460ec1554746674a7bc42b49fa",
+        "configurationSha256": "9212f644d138c1fd50ffd8203fe0b243f49e5b13ab084d647c3a9c04916ec30a",
+        "buildExtensions": [
+          "apcu",
+          "bcmath",
+          "bz2",
+          "calendar",
+          "ctype",
+          "curl",
+          "dba",
+          "dom",
+          "event",
+          "exif",
+          "fileinfo",
+          "filter",
+          "ftp",
+          "gd",
+          "gmp",
+          "iconv",
+          "imap",
+          "intl",
+          "mbregex",
+          "mbstring",
+          "mysqli",
+          "mysqlnd",
+          "opcache",
+          "openssl",
+          "pcntl",
+          "pdo",
+          "pdo_mysql",
+          "pgsql",
+          "phar",
+          "posix",
+          "readline",
+          "redis",
+          "session",
+          "simplexml",
+          "soap",
+          "sockets",
+          "sodium",
+          "sqlite3",
+          "tokenizer",
+          "xml",
+          "xmlreader",
+          "xmlwriter",
+          "xsl",
+          "zip",
+          "zlib",
+          "imagick"
+        ],
+        "requiredExtensions": [
+          "bcmath",
+          "ctype",
+          "curl",
+          "dom",
+          "fileinfo",
+          "filter",
+          "gd",
+          "iconv",
+          "intl",
+          "mbstring",
+          "mysqli",
+          "mysqlnd",
+          "openssl",
+          "pcntl",
+          "pdo",
+          "pdo_mysql",
+          "phar",
+          "session",
+          "simplexml",
+          "sodium",
+          "tokenizer",
+          "xml",
+          "xmlreader",
+          "xmlwriter",
+          "zip"
+        ],
+        "optionalExtensions": [
+          "imagick"
+        ]
+      },
+      "verification": {
+        "algorithm": "sha256",
+        "authenticity": "bootstrap-local-machine"
+      },
+      "artifacts": {
+        "cli": {
+          "file": "php-8.4.23-cli-macos-arm64.tar.gz",
+          "url": "https://localhost/releases/download/php-v8.4.23/php-8.4.23-cli-macos-arm64.tar.gz",
+          "sha256": "3bc69486f38d1bc68b63c22c8a9da77ad962d4ad45bd21257c80d0395010b662"
+        },
+        "fpm": {
+          "file": "php-8.4.23-fpm-macos-arm64.tar.gz",
+          "url": "https://localhost/releases/download/php-v8.4.23/php-8.4.23-fpm-macos-arm64.tar.gz",
+          "sha256": "c42801e6107f578e4851f282585da54c1353b08ab5f3d10a9f0623549e97dfc5"
+        }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "module": "php",
+      "phpVersion": "8.3.29",
+      "platform": "macos",
+      "architecture": "arm64",
+      "catalogURL": "https://github.com/banestojanovic/vaelen/releases/download/php-v8.3.29/php-catalog.json",
+      "release": {
+        "tag": "php-v8.3.29",
+        "url": "https://github.com/banestojanovic/vaelen/releases/download/php-v8.3.29"
+      },
+      "build": {
+        "mechanism": "static-php-cli",
+        "version": "2.8.5",
+        "commit": "4318ef8fa32a02460ec1554746674a7bc42b49fa",
+        "configurationSha256": "356c71537b844884492a47556cd6b405461860d36c4f2a89107c27d5834172d2",
+        "buildExtensions": [
+          "apcu",
+          "bcmath",
+          "bz2",
+          "calendar",
+          "ctype",
+          "curl",
+          "dba",
+          "dom",
+          "event",
+          "exif",
+          "fileinfo",
+          "filter",
+          "ftp",
+          "gd",
+          "gmp",
+          "iconv",
+          "imap",
+          "intl",
+          "mbregex",
+          "mbstring",
+          "mysqli",
+          "mysqlnd",
+          "opcache",
+          "openssl",
+          "pcntl",
+          "pdo",
+          "pdo_mysql",
+          "pgsql",
+          "phar",
+          "posix",
+          "readline",
+          "redis",
+          "session",
+          "simplexml",
+          "soap",
+          "sockets",
+          "sodium",
+          "sqlite3",
+          "tokenizer",
+          "xml",
+          "xmlreader",
+          "xmlwriter",
+          "xsl",
+          "zip",
+          "zlib",
+          "imagick"
+        ],
+        "requiredExtensions": [
+          "bcmath",
+          "ctype",
+          "curl",
+          "dom",
+          "fileinfo",
+          "filter",
+          "gd",
+          "iconv",
+          "intl",
+          "mbstring",
+          "mysqli",
+          "mysqlnd",
+          "openssl",
+          "pcntl",
+          "pdo",
+          "pdo_mysql",
+          "phar",
+          "session",
+          "simplexml",
+          "sodium",
+          "tokenizer",
+          "xml",
+          "xmlreader",
+          "xmlwriter",
+          "zip"
+        ],
+        "optionalExtensions": [
+          "imagick"
+        ]
+      },
+      "verification": {
+        "algorithm": "sha256",
+        "authenticity": "trusted-vaelen-release-manifest"
+      },
+      "artifacts": {
+        "cli": {
+          "file": "php-8.3.29-cli-macos-arm64.tar.gz",
+          "url": "https://github.com/banestojanovic/vaelen/releases/download/php-v8.3.29/php-8.3.29-cli-macos-arm64.tar.gz",
+          "sha256": "252345fbded89710056efe0a3a8b3dda88ec2c9e63d850611066c11ff4b1dba8"
+        },
+        "fpm": {
+          "file": "php-8.3.29-fpm-macos-arm64.tar.gz",
+          "url": "https://github.com/banestojanovic/vaelen/releases/download/php-v8.3.29/php-8.3.29-fpm-macos-arm64.tar.gz",
+          "sha256": "e0cf0c96a687c26bb6db1e93306a4dc2adb837556a5b2a9f0579c53e9447399f"
+        }
+      }
+    }
+  ]
+}

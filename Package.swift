@@ -17,7 +17,7 @@ let package = Package(
         .package(url: "https://github.com/jpsim/Yams.git", from: "5.0.6")
     ],
     targets: [
-        .target(name: "VaelenCore", dependencies: [.product(name: "Yams", package: "Yams")], linkerSettings: [.linkedLibrary("sqlite3")]),
+        .target(name: "VaelenCore", dependencies: [.product(name: "Yams", package: "Yams")], resources: [.process("Resources")], linkerSettings: [.linkedLibrary("sqlite3")]),
         .target(name: "VaelenIPC", dependencies: ["VaelenCore"]),
         .target(name: "VaelenDaemonSupport", dependencies: ["VaelenCore", "VaelenIPC"]),
         .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenDaemonSupport"]),

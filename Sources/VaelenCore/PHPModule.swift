@@ -379,13 +379,14 @@ private final class PHPRemoteResultBox: @unchecked Sendable {
 public final class PHPModule: @unchecked Sendable {
     private let layout: VaelenFilesystemLayout
     private let location: any PHPManifestLocation
+    private let includesBundledCatalog: Bool
     private let manager = FileManager.default
     private let lock = NSLock()
     private var activeOperation: PHPOperationState?
     private var lastOperation: PHPOperationState?
 
-    public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation) {
-        self.layout = layout; self.location = location
+    public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false) {
+        self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog
     }
 
     public static func development(layout: VaelenFilesystemLayout = .init()) -> PHPModule? {
@@ -397,11 +398,11 @@ public final class PHPModule: @unchecked Sendable {
         let base = basePath.map { URL(fileURLWithPath: $0, isDirectory: true) }
         let manifestMetadata = try? JSONDecoder().decode(PHPManifest.self, from: Data(contentsOf: URL(fileURLWithPath: manifest)))
         let catalog = environment["VAELEN_PHP_CATALOG_URL"] ?? configuration?.catalogURL ?? manifestMetadata?.catalogURL
-        return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base, catalogURL: catalog.flatMap(URL.init(string:))))
+        return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base, catalogURL: catalog.flatMap(URL.init(string:))), includesBundledCatalog: true)
     }
 
     public func availableVersions() throws -> [String] {
-        try location.manifests().filter(isInstallableManifest).map(\.phpVersion).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
+        try allManifests().filter(isInstallableManifest).map(\.phpVersion).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
     }
 
     public func runtimeCatalog(updates: [PHPUpdateObservation] = []) throws -> PHPRuntimeCatalog {
@@ -544,7 +545,7 @@ public final class PHPModule: @unchecked Sendable {
     }
 
     private func manifest(for requestedVersion: String) throws -> PHPManifest {
-        let manifests = try location.manifests()
+        let manifests = try allManifests()
         let installable = manifests.filter(isInstallableManifest)
         guard let exact = PHPVersion(requestedVersion), exact.isStable,
               let manifest = installable.first(where: { $0.phpVersion == exact.description }) else {
@@ -556,16 +557,33 @@ public final class PHPModule: @unchecked Sendable {
         return manifest
     }
 
+    private func allManifests() throws -> [PHPManifest] {
+        let local = try location.manifests()
+        guard includesBundledCatalog,
+              let url = Bundle.module.url(forResource: "php-catalog", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let bundled = try? JSONDecoder().decode(PHPManifestCatalog.self, from: data) else { return local }
+        var byVersion = Dictionary(uniqueKeysWithValues: bundled.manifests.map { ($0.phpVersion, $0) })
+        for manifest in local { byVersion[manifest.phpVersion] = manifest }
+        return byVersion.values.sorted { (PHPVersion($0.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) }
+    }
+
     private func isInstallableManifest(_ manifest: PHPManifest) -> Bool {
-        manifest.module == "php" &&
+        guard manifest.module == "php",
         manifest.schemaVersion == 1 &&
         manifest.platform == "macos" &&
         manifest.architecture == "arm64" &&
         manifest.verification.algorithm.lowercased() == "sha256" &&
         !manifest.verification.authenticity.isEmpty &&
-        PHPVersion(manifest.phpVersion)?.isStable == true &&
-        manifest.artifacts["cli"] != nil &&
-        manifest.artifacts["fpm"] != nil
+        PHPVersion(manifest.phpVersion)?.isStable == true,
+        let cli = manifest.artifacts["cli"],
+        let fpm = manifest.artifacts["fpm"] else { return false }
+        return [cli, fpm].allSatisfy { artifact in
+            !artifact.file.isEmpty &&
+            artifact.sha256.count == 64 &&
+            artifact.sha256.allSatisfy { $0.isHexDigit } &&
+            URL(string: artifact.url)?.scheme != nil
+        }
     }
 
     private func executeOperation<T>(kind: PHPOperationKind, targetVersion: String, body: () throws -> T) throws -> T {

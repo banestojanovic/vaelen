@@ -31,12 +31,17 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.4.23" }?.series, "8.4")
     }
 
+    func testBundledCuratedCatalogExposesTheSecondSupportedRuntime() throws {
+        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
+        XCTAssertTrue(try module.availableVersions().contains("8.3.29"))
+    }
+
     func testCatalogFixtureCanDescribeMultipleAvailableReleasesWithoutNetwork() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let verification = PHPVerification(algorithm: "sha256", authenticity: "fixture")
-        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "cli.tar.gz", sha256: "a"), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "fpm.tar.gz", sha256: "b")]
+        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "https://example.test/cli.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "https://example.test/fpm.tar.gz", sha256: String(repeating: "b", count: 64))]
         let manifests = [
             PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: verification),
             PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.25", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: verification),
@@ -56,7 +61,7 @@ final class PHPModuleTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let artifact = ["cli": PHPArtifact(file: "cli", url: "cli", sha256: "a"), "fpm": PHPArtifact(file: "fpm", url: "fpm", sha256: "b")]
+        let artifact = ["cli": PHPArtifact(file: "cli", url: "https://example.test/cli", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm", url: "https://example.test/fpm", sha256: String(repeating: "b", count: 64))]
         let valid = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.25", platform: "macos", architecture: "arm64", artifacts: artifact, verification: .init(algorithm: "sha256", authenticity: "trusted"))
         let unsupported = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.5.0", platform: "linux", architecture: "arm64", artifacts: artifact, verification: .init(algorithm: "sha256", authenticity: "trusted"))
         let manifestURL = root.appendingPathComponent("manifest.json")
