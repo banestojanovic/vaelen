@@ -186,7 +186,7 @@ public struct ProjectReconciliationPlanner: Sendable {
     }
 
     private func appendPHP(report: ProjectEnvironmentReport, to operations: inout [ProjectReconciliationOperation]) {
-        guard let desired = report.desired.php else { return }
+        guard let desired = report.observed.php.resolvedVersion ?? report.desired.php else { return }
         if report.observed.php.resolutionState == .unavailable {
             operations.append(.init(id: "php.fpm.start", resource: .php, action: .start, currentState: .unavailable, targetState: .running, ownership: .vaelen, mutationClass: .vaelenInfrastructure, disposition: .blocked, reason: "PHP_FAMILY_UNAVAILABLE: desired family \(desired) has no eligible installed PHP package; installation is not performed by project activation."))
             return

@@ -185,6 +185,7 @@ public struct ProjectEndpointObservation: Codable, Equatable, Sendable {
 }
 
 public struct ProjectObservedPHP: Codable, Equatable, Sendable {
+    public let overrideVersion: String?
     public let installedVersions: [String]
     public let invalidVersions: [String]
     public let runningVersions: [String]
@@ -196,7 +197,8 @@ public struct ProjectObservedPHP: Codable, Equatable, Sendable {
     public let fpmSocket: String?
     public let fpmHealth: String
 
-    public init(installedVersions: [String], invalidVersions: [String] = [], runningVersions: [String], resolvedVersion: String?, resolvedState: String, defaultVersion: String?, resolutionState: PHPResolutionState? = nil, fpmPID: Int32? = nil, fpmSocket: String? = nil, fpmHealth: String? = nil) {
+    public init(installedVersions: [String], invalidVersions: [String] = [], runningVersions: [String], resolvedVersion: String?, resolvedState: String, defaultVersion: String?, overrideVersion: String? = nil, resolutionState: PHPResolutionState? = nil, fpmPID: Int32? = nil, fpmSocket: String? = nil, fpmHealth: String? = nil) {
+        self.overrideVersion = overrideVersion
         self.installedVersions = installedVersions
         self.invalidVersions = invalidVersions
         self.runningVersions = runningVersions
@@ -341,7 +343,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         self.frameworkDetector = frameworkDetector
     }
 
-    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = [], registeredProjects: [Project] = [], runtimeRoutes: [Route]? = nil, pendingTransitions: [RouteTargetTransition] = []) -> ProjectEnvironmentReport {
+    public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, phpOverride: String? = nil, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = [], registeredProjects: [Project] = [], runtimeRoutes: [Route]? = nil, pendingTransitions: [RouteTargetTransition] = []) -> ProjectEnvironmentReport {
         let root = URL(fileURLWithPath: project.rootPath.string, isDirectory: true)
         let framework = frameworkDetector.inspect(root: root)
         let desiredResult = readDesiredState(root: root)
@@ -350,15 +352,19 @@ public struct ProjectEnvironmentInspector: Sendable {
         let route = routeObservation(project: project, framework: framework, routes: routes, router: router, registeredProjects: registeredProjects, runtimeRoutes: runtimeRoutes)
         let installed = phpPackages.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
         let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
-        let resolved = resolvePHP(family: desiredResult.state.php, packages: phpPackages)
+        // PHP 5 project selection is Core-owned. A linked project without an
+        // override inherits the global exact default; project files remain
+        // observational and are never rewritten by this setting.
+        let selection = phpOverride ?? phpDefault
+        let resolved = selection.flatMap { selection in phpOverride != nil ? phpPackages.map(\.version).first(where: { $0 == selection }) : resolvePHP(family: selection, packages: phpPackages) }
         let resolvedStatus = resolved.flatMap { version in phpStatuses.first(where: { $0.version == version }) }
         let phpState = resolved == nil ? "unresolved" : (resolvedStatus?.state.rawValue ?? "not-running")
         let resolutionState: PHPResolutionState
-        if desiredResult.state.php == nil { resolutionState = .notRequested }
+        if selection == nil { resolutionState = .notRequested }
         else if resolved != nil { resolutionState = .resolved }
-        else if invalidPHPVersions.contains(where: { PHPVersion($0)?.family == PHPFamily(desiredResult.state.php!)?.description }) { resolutionState = .invalid }
+        else if let family = selection.flatMap(PHPFamily.init), invalidPHPVersions.contains(where: { PHPVersion($0)?.family == family.description }) { resolutionState = .invalid }
         else { resolutionState = .unavailable }
-        let observedPHP = ProjectObservedPHP(installedVersions: installed, invalidVersions: invalidPHPVersions.sorted(), runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault, resolutionState: resolutionState, fpmPID: resolvedStatus?.pid, fpmSocket: resolvedStatus?.socket, fpmHealth: resolvedStatus?.health ?? "not-running")
+        let observedPHP = ProjectObservedPHP(installedVersions: installed, invalidVersions: invalidPHPVersions.sorted(), runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault, overrideVersion: phpOverride, resolutionState: resolutionState, fpmPID: resolvedStatus?.pid, fpmSocket: resolvedStatus?.socket, fpmHealth: resolvedStatus?.health ?? "not-running")
         let dbEndpoint = endpointObservation(host: env.dbHost, port: env.dbPort, expectedHost: "127.0.0.1", expectedPort: mysql?.port, matches: endpointMatches(host: env.dbHost, port: env.dbPort, expectedPort: mysql?.port))
         let mailEndpoint = endpointObservation(host: env.mailHost, port: env.mailPort, expectedHost: "127.0.0.1", expectedPort: mailpit?.smtpPort, matches: endpointMatches(host: env.mailHost, port: env.mailPort, expectedPort: mailpit?.smtpPort))
         let mailAuthentication = mailAuthentication(env: env, mailpit: mailpit, endpointMatches: mailEndpoint.matches)
@@ -371,11 +377,11 @@ public struct ProjectEnvironmentInspector: Sendable {
         } else {
             routeTargetMatchesPHP = nil
         }
-        let derived = ProjectDerivedEnvironment(framework: framework, phpResolution: phpResolution(desired: desiredResult.state.php, resolved: resolved), dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication, routeDocumentRootMatches: route.documentRoot == nil ? nil : routeRootMatch, routeTargetMatchesPHP: routeTargetMatchesPHP, configCache: cache)
+        let derived = ProjectDerivedEnvironment(framework: framework, phpResolution: phpResolution(desired: selection, resolved: resolved), dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication, routeDocumentRootMatches: route.documentRoot == nil ? nil : routeRootMatch, routeTargetMatchesPHP: routeTargetMatchesPHP, configCache: cache)
         let observed = ProjectObservedEnvironment(php: observedPHP, mysql: mysql, mailpit: mailpit, route: route, dns: dns, tls: tls, standardPorts: standardPorts)
         let secrets = ProjectSecretEnvironment(databasePassword: env.databasePassword, mailPassword: env.mailPassword, notes: ["Secret values are never returned by inspection."])
         let reportDiagnostics = diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, invalidPHPVersions: invalidPHPVersions, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication)
-        let targets = routeTargetObservations(project: project, framework: framework, desiredPHP: desiredResult.state.php, resolvedPHP: resolved, routes: routes, runtimeRoutes: runtimeRoutes, phpStatuses: phpStatuses, router: router, association: RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects), pendingTransitions: pendingTransitions)
+        let targets = routeTargetObservations(project: project, framework: framework, desiredPHP: selection, resolvedPHP: resolved, routes: routes, runtimeRoutes: runtimeRoutes, phpStatuses: phpStatuses, router: router, association: RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects), pendingTransitions: pendingTransitions)
         return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: reportDiagnostics, routeTargets: targets)
     }
 

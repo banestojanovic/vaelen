@@ -10,6 +10,17 @@ public final class ProjectRepository: @unchecked Sendable {
             store.bind(record.id.description, to: statement, index: 1); store.bind(record.name, to: statement, index: 2); record.customName.map { store.bind($0, to: statement, index: 3) }; store.bind(record.canonicalPath, to: statement, index: 4)
         }) { _ in }
     }
+    public func phpOverride(for projectID: ProjectID) throws -> String? {
+        var value: String?
+        try store.query("SELECT php_override_version FROM projects WHERE id = ?", bind: { store.bind(projectID.description, to: $0, index: 1) }) { value = store.columnString($0, 0) }
+        return value
+    }
+    public func setPHPOverride(_ version: String?, for projectID: ProjectID) throws {
+        try store.query("UPDATE projects SET php_override_version = ? WHERE id = ?", bind: { statement in
+            if let version { store.bind(version, to: statement, index: 1) }
+            store.bind(projectID.description, to: statement, index: 2)
+        }) { _ in }
+    }
     public func remove(canonicalPath: String) throws {
         try store.query("DELETE FROM projects WHERE canonical_path = ?", bind: { store.bind(canonicalPath, to: $0, index: 1) }) { _ in }
     }

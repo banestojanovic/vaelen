@@ -111,6 +111,16 @@ public actor VaelenCoreClient {
         return result.execution
     }
 
+    public func projectPHP(selector: String?, workingDirectory: String) async throws -> ProjectPHPSelection {
+        guard case .projectPHP(let result) = try result(from: await send(IPCRequest(method: .projectPHP, params: .projectPHP(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
+    public func setProjectPHP(selector: String?, workingDirectory: String, version: String?, useDefault: Bool = false) async throws -> ProjectPHPSelection {
+        guard case .projectPHP(let result) = try result(from: await send(IPCRequest(method: .projectPHP, params: .projectPHP(.init(selector: selector, workingDirectory: workingDirectory, version: version, useDefault: useDefault))))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
     private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
         guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
         return result.report

@@ -3,6 +3,15 @@ import XCTest
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
+    func testProjectPHPSelectionRoundTripsThroughJSON() throws {
+        let request = IPCRequest(method: .projectPHP, params: .projectPHP(.init(selector: "syncproof", workingDirectory: "/tmp/syncproof", version: "8.4.23")))
+        let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(decoded.knownMethod, .projectPHP)
+        let response = IPCResponse(id: UUID(), result: .projectPHP(.init(project: .init(id: nil, name: "syncproof", path: "/tmp/syncproof", registration: "linked", availability: "available"), overrideVersion: "8.4.23", defaultVersion: "8.4.23", effectiveVersion: "8.4.23", observedVersion: "8.4.23", available: true)))
+        let restored = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .projectPHP(let selection) = restored.result else { return XCTFail("project PHP response did not decode") }
+        XCTAssertEqual(selection.overrideVersion, "8.4.23")
+    }
     func testUnknownProtocolVersionSurvivesEnvelopeDecoding() throws {
         let request = IPCRequest(rawMethod: "core.status", protocolVersion: 2)
         let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))

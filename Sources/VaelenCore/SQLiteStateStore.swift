@@ -115,6 +115,11 @@ public final class SQLiteStateStore: @unchecked Sendable {
                 try execute("DROP TABLE tls_capability_legacy")
                 try execute("PRAGMA user_version = 6")
             }
+            if version <= 6 {
+                if try !tableHasColumn("projects", column: "php_override_version") {
+                    try execute("ALTER TABLE projects ADD COLUMN php_override_version TEXT NULL")
+                }
+            }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }
     }
@@ -123,6 +128,14 @@ public final class SQLiteStateStore: @unchecked Sendable {
         var result = 0
         try query("PRAGMA user_version") { result = Int(sqlite3_column_int($0, 0)) }
         return result
+    }
+
+    private func tableHasColumn(_ table: String, column: String) throws -> Bool {
+        var found = false
+        try query("PRAGMA table_info(\(table))") { statement in
+            if columnString(statement, 1) == column { found = true }
+        }
+        return found
     }
 
     private var message: String { String(cString: sqlite3_errmsg(database)) }

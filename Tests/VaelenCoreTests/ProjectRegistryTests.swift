@@ -50,6 +50,26 @@ final class ProjectRegistryTests: XCTestCase {
         XCTAssertEqual(restoredPaths.count, 1)
     }
 
+    func testProjectPHPOverridePersistsAndUnlinkRemovesIntent() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("php-project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let database = root.appendingPathComponent("db.sqlite")
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: database))
+        let linked = try await registry.link(path: project)
+        guard let id = linked.id else { return XCTFail("linked project must have an id") }
+        try await registry.setPHPOverride("8.3.26", for: id)
+        let stored = try await registry.phpOverride(for: id)
+        XCTAssertEqual(stored, "8.3.26")
+        let reopened = ProjectRegistry(store: try SQLiteStateStore(databaseURL: database))
+        let restored = try await reopened.phpOverride(for: id)
+        XCTAssertEqual(restored, "8.3.26")
+        try await reopened.unlink(path: project)
+        let cleared = try await reopened.phpOverride(for: id)
+        XCTAssertNil(cleared)
+    }
+
     func testRecognizedDiscoveryAndExplicitLinkWins() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

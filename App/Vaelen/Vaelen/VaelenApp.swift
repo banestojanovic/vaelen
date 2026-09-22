@@ -318,6 +318,14 @@ final class AppModel {
         }
     }
 
+    func setProjectPHP(_ project: ProjectWire, version: String?, useDefault: Bool = false) async {
+        guard !relationshipMutationInFlight, let client else { return }
+        relationshipMutationInFlight = true; relationshipOperation = "Updating PHP for \(project.name)…"; relationshipError = nil
+        defer { relationshipMutationInFlight = false; relationshipOperation = nil }
+        do { _ = try await client.setProjectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: project.path, version: version, useDefault: useDefault); await refresh() }
+        catch { relationshipError = error.localizedDescription }
+    }
+
     func startMonitoring() {
         guard monitorTask == nil else { return }
         monitorTask = Task { [weak self] in await self?.monitor() }
@@ -718,8 +726,10 @@ struct ProjectCard: View {
 
     private func environmentSummary(_ report: ProjectEnvironmentReport) -> String? {
         var values = [String]()
-        if let version = report.observed.php.resolvedVersion {
-            values.append("PHP \(version.split(separator: ".").prefix(2).joined(separator: "."))")
+            if let version = report.observed.php.resolvedVersion {
+                values.append("PHP \(version.split(separator: ".").prefix(2).joined(separator: "."))" + (report.observed.php.overrideVersion == nil ? "" : " · Project Override"))
+            } else if let override = report.observed.php.overrideVersion {
+                values.append("PHP \(override) · Unavailable")
         }
         if report.desired.mysql == true, let mysql = report.observed.mysql, let version = mysql.selectedVersion ?? mysql.installedVersion {
             values.append("MySQL \(version)")
@@ -1328,6 +1338,7 @@ private struct ExplicitProjectRow: View {
     let model: AppModel
 
     var body: some View {
+        let report = model.projectReports.first { $0.identity.path == project.path }
         HStack(spacing: VaelenUI.spacing8) {
             Image(systemName: "shippingbox").foregroundStyle(.secondary).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
@@ -1337,8 +1348,10 @@ private struct ExplicitProjectRow: View {
                 } else {
                     Text(displayPath(project.path)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
+                projectPHPSummary(report)
             }
             Spacer()
+            ProjectPHPMenu(project: project, report: report, model: model)
             Menu {
                 Button("Unlink Project", systemImage: "link.badge.minus") { Task { await model.unlinkProject(project) } }
                     .disabled(model.relationshipMutationInFlight)
@@ -1350,6 +1363,62 @@ private struct ExplicitProjectRow: View {
         }
         .padding(.vertical, VaelenUI.spacing6)
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+    }
+
+    @ViewBuilder
+    private func projectPHPSummary(_ report: ProjectEnvironmentReport?) -> some View {
+        if let report, let override = report.observed.php.overrideVersion, report.observed.php.resolvedVersion == nil {
+            Label("PHP \(override) · Unavailable", systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityLabel("PHP \(override), unavailable")
+        } else if let report, let version = report.observed.php.resolvedVersion {
+            Text("PHP \(version) · \(report.observed.php.overrideVersion == nil ? "Uses Default" : "Project Override")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("PHP \(version), \(report.observed.php.overrideVersion == nil ? "Uses Default" : "Project Override")")
+        } else {
+            Text("PHP unavailable")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
+private struct ProjectPHPMenu: View {
+    let project: ProjectWire
+    let report: ProjectEnvironmentReport?
+    let model: AppModel
+
+    var body: some View {
+        Menu {
+            Button("Use Default · PHP \(report?.observed.php.defaultVersion ?? "none")") {
+                Task { await model.setProjectPHP(project, version: nil, useDefault: true) }
+            }
+            if let installed = model.phpCatalog?.installedVersions.map(\.version) {
+                ForEach(installed, id: \.self) { version in
+                    if version != report?.observed.php.defaultVersion {
+                        Button("PHP \(version) · Project Override") { Task { await model.setProjectPHP(project, version: version) } }
+                    }
+                }
+            }
+        } label: {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(report?.observed.php.resolvedVersion.map { "PHP \($0)" } ?? "PHP unavailable")
+                    .font(.caption)
+                Text(projectPHPMode)
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("PHP runtime for \(project.name)")
+        .disabled(model.relationshipMutationInFlight || report == nil)
+    }
+
+    private var projectPHPMode: String {
+        guard let report else { return "Unavailable" }
+        if report.observed.php.resolvedVersion == nil { return "Unavailable" }
+        return report.observed.php.overrideVersion == nil ? "Uses Default" : "Project Override"
     }
 }
 

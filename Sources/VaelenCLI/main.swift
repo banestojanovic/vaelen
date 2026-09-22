@@ -17,6 +17,7 @@ enum CLICommand {
     case projectDoctor(selector: String?, json: Bool)
     case projectPlan(selector: String?, json: Bool)
     case projectActivate(selector: String?, json: Bool)
+    case projectPHP(selector: String?, version: String?, useDefault: Bool, json: Bool)
     case phpVersions(json: Bool)
     case phpInstall(String)
     case phpUpdate(String)
@@ -88,7 +89,8 @@ struct VaelenCLIMain {
       val unlink <project-directory>
 
       val status [--json]
-      val project status|inspect|doctor|plan|activate [project] [--json]
+       val project status|inspect|doctor|plan|activate [project] [--json]
+       val project php [project] [--version <exact>] [--use-default] [--json]
       val routing status|start|stop
       val route list|add|remove|associate
       val php versions|default|install|update|remove|operation ...
@@ -131,6 +133,13 @@ struct VaelenCLIMain {
         case "parks", "paths": return .parks(json: try listJSONOption(args))
         case "project":
             guard args.count >= 2 else { throw CLIError.usage }
+            if args[1] == "php" {
+                var selector: String?; var version: String?; var useDefault = false; var json = false
+                var i = 2
+                while i < args.count { let value = args[i]; if value == "--json" { json = true } else if value == "--use-default" { useDefault = true } else if value == "--version" { i += 1; guard i < args.count else { throw CLIError.usage }; version = args[i] } else if selector == nil { selector = value } else { throw CLIError.usage }; i += 1 }
+                guard !(version != nil && useDefault) else { throw CLIError.usage }
+                return .projectPHP(selector: selector, version: version, useDefault: useDefault, json: json)
+            }
             let parsed = try projectEnvironmentArguments(Array(args.dropFirst(2)))
             switch args[1] {
             case "status": return .projectStatus(selector: parsed.selector, json: parsed.json)
@@ -323,6 +332,10 @@ struct VaelenCLIMain {
         case .projectActivate(let selector, let json):
             let execution = try await client.projectActivate(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(execution), as: UTF8.self)) } else { print(projectActivation(execution)) }
+        case .projectPHP(let selector, let version, let useDefault, let json):
+            let result = try await client.setProjectPHP(selector: selector, workingDirectory: workingDirectory, version: version, useDefault: useDefault)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print("Project \(result.project.name)\nOverride    \(result.overrideVersion ?? "Uses Default")\nDefault     \(result.defaultVersion ?? "none")\nEffective   \(result.effectiveVersion ?? "unavailable")\nObserved    \(result.observedVersion ?? "not running")") }
         case .phpVersions(let json):
             let result = try await client.phpCatalog(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Available  \(result.availableVersions.joined(separator: ", "))\nInstalled  \(result.installedVersions.map(\.version).joined(separator: ", "))\nDefault    \(result.defaultVersion ?? "none")\nRunning    \(result.runningVersions.joined(separator: ", ").isEmpty ? "none" : result.runningVersions.joined(separator: ", "))") }
         case .phpInstall(let version): let result = try await client.phpInstall(version); print("Installed PHP \(result.version)")

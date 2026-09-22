@@ -104,6 +104,9 @@ public actor ProjectRegistry {
 
     public func linkedProjects() throws -> [Project] { try projects.all().map(makeProject) }
     public func linkedProject(id: ProjectID) throws -> Project? { try linkedProjects().first { $0.id == id } }
+
+    public func phpOverride(for project: ProjectID) throws -> String? { try projects.phpOverride(for: project) }
+    public func setPHPOverride(_ version: String?, for project: ProjectID) throws { try projects.setPHPOverride(version, for: project) }
     public func parkedPaths() throws -> [ParkedPath] { try parked.all().map(makeParked) }
 
     public func projectsList() throws -> [Project] {

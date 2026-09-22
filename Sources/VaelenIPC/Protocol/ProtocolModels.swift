@@ -53,6 +53,7 @@ public enum CoreMethod: String, Sendable {
     case projectDoctor = "project.doctor"
     case projectPlan = "project.plan"
     case projectActivate = "project.activate"
+    case projectPHP = "project.php"
     case pathPark = "path.park"
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
@@ -107,6 +108,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case unlink(UnlinkProjectRequest)
     case listProjects(ListProjectsRequest)
     case projectEnvironment(ProjectEnvironmentRequest)
+    case projectPHP(ProjectPHPRequest)
     case park(ParkPathRequest)
     case unpark(UnparkPathRequest)
     case phpVersion(PHPVersionRequest)
@@ -126,6 +128,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .unlink(let value): try value.encode(to: encoder)
         case .listProjects(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
+        case .projectPHP(let value): try value.encode(to: encoder)
         case .park(let value): try value.encode(to: encoder)
         case .unpark(let value): try value.encode(to: encoder)
         case .phpVersion(let value): try value.encode(to: encoder)
@@ -149,6 +152,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
             if fields["version"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPVersionRequest.self, from: IPCCodec.encode(value)) {
                 self = .phpVersion(params); return
             }
+            if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, fields["expectedCurrentSocket"] != nil, let params = try? IPCCodec.decode(RoutePHPTargetUpdateRequest.self, from: IPCCodec.encode(value)) { self = .routePHPTargetUpdate(params); return }
@@ -216,6 +220,24 @@ public struct ProjectWire: Codable, Equatable, Sendable {
     public let sources: [String]?
     public init(id: UUID?, name: String, path: String, registration: String, availability: String, detectedFramework: String? = nil, sources: [String]? = nil) { self.id = id; self.name = name; self.path = path; self.registration = registration; self.availability = availability; self.detectedFramework = detectedFramework; self.sources = sources }
     public init(_ project: Project) { self.init(id: project.id?.rawValue, name: project.name, path: project.rootPath.string, registration: project.registrationKind.rawValue, availability: project.availability.rawValue, detectedFramework: project.detectedFramework, sources: project.visibilitySources?.map(\.rawValue)) }
+}
+
+public struct ProjectPHPRequest: Codable, Equatable, Sendable {
+    public let selector: String?
+    public let workingDirectory: String
+    public let version: String?
+    public let useDefault: Bool
+    public init(selector: String?, workingDirectory: String, version: String? = nil, useDefault: Bool = false) { self.selector = selector; self.workingDirectory = workingDirectory; self.version = version; self.useDefault = useDefault }
+}
+
+public struct ProjectPHPSelection: Codable, Equatable, Sendable {
+    public let project: ProjectWire
+    public let overrideVersion: String?
+    public let defaultVersion: String?
+    public let effectiveVersion: String?
+    public let observedVersion: String?
+    public let available: Bool
+    public init(project: ProjectWire, overrideVersion: String?, defaultVersion: String?, effectiveVersion: String?, observedVersion: String?, available: Bool) { self.project = project; self.overrideVersion = overrideVersion; self.defaultVersion = defaultVersion; self.effectiveVersion = effectiveVersion; self.observedVersion = observedVersion; self.available = available }
 }
 
 public struct ParkedPathWire: Codable, Equatable, Sendable {
@@ -358,6 +380,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectEnvironment(ProjectEnvironmentResult)
     case projectPlan(ProjectReconciliationPlanResult)
     case projectActivation(ProjectReconciliationExecutionResponse)
+    case projectPHP(ProjectPHPSelection)
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
@@ -389,6 +412,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectEnvironment(let value): try value.encode(to: encoder)
         case .projectPlan(let value): try value.encode(to: encoder)
         case .projectActivation(let value): try value.encode(to: encoder)
+        case .projectPHP(let value): try value.encode(to: encoder)
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
@@ -423,6 +447,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
         else if fields["plan"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationPlanResult.self, from: data) { self = .projectPlan(result) }
         else if fields["execution"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationExecutionResponse.self, from: data) { self = .projectActivation(result) }
+        else if fields["overrideVersion"] != nil || fields["effectiveVersion"] != nil, let result = try? IPCCodec.decode(ProjectPHPSelection.self, from: data) { self = .projectPHP(result) }
         else if fields["project"] != nil, let result = try? IPCCodec.decode(ProjectMutationResult.self, from: data) { self = .projectMutation(result) }
         else if fields["paths"] != nil, let result = try? IPCCodec.decode(ParkedPathListResult.self, from: data) { self = .parkedPathList(result) }
         else if fields["path"] != nil, let result = try? IPCCodec.decode(ParkedPathMutationResult.self, from: data) { self = .parkedPathMutation(result) }
