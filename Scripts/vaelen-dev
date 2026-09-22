@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# Minimal, repository-owned M13 development harness.
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+SUPPORT="$HOME/Library/Application Support/Vaelen"
+RUNTIME="$SUPPORT/runtime"
+LOG="$HOME/Library/Logs/Vaelen"
+ARTIFACTS="$HOME/Library/Application Support/Vaelen-dev-harness"
+SNAPSHOTS="$ARTIFACTS/snapshots"
+VAL="$ROOT/.build/release/val"
+CORE="$ROOT/.build/release/vaelend"
+DNS="$ROOT/.build/release/vaelendns"
+GUI="$ROOT/.build/app/Build/Products/Debug/Vaelen.app"
+CANONICAL_APP="/Applications/Vaelen.app"
+MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
+EXPECTED_LABEL="dev.vaelen.vaelend"
+EXPECTED_PARENT="dev.vaelen.app"
+EXPECTED_TEAM="TFKZJV643G"
+EXPECTED_BTM_UUID="C398D678-2DA1-4B8B-B304-DBDADBE36ACD"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+die() { echo "vaelen-dev: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
+stage() { printf '[%s] %s\n' "$1" "$2"; }
+
+build_support() {
+  [[ -x "$VAL" && -x "$CORE" && -x "$DNS" ]] || swift build --configuration release >/dev/null || die "Swift release build failed";
+}
+
+snapshot() {
+  local dir="$SNAPSHOTS/$1" path project
+  mkdir -p "$dir" "$LOG"
+  printf 'root=%s\ncommit=%s\n' "$ROOT" "$(git -C "$ROOT" rev-parse HEAD)" > "$dir/manifest.txt"
+  ps -axo pid=,ppid=,user=,command= | grep -E 'Vaelen|vaelend|vaelendns|php-fpm|mysqld|caddy' | grep -v grep > "$dir/processes.txt" || true
+  : > "$dir/durable-sha256.txt"
+  : > "$dir/durable-files.txt"
+  : > "$dir/project-git.txt"
+  for path in config instances packages state tls; do
+    [[ -e "$SUPPORT/$path" ]] || continue
+    (cd "$SUPPORT" && tar -cf - "$path") | gzip -c > "$dir/$path.tar.gz" || die "could not snapshot $path"
+    find "$SUPPORT/$path" -type f -print0 | xargs -0 shasum -a 256 >> "$dir/durable-sha256.txt"
+    find "$SUPPORT/$path" -type f -print >> "$dir/durable-files.txt"
+  done
+  if [[ -f "$SUPPORT/state/vaelen.sqlite" ]]; then
+    sqlite3 "$SUPPORT/state/vaelen.sqlite" 'select canonical_path from projects order by canonical_path;' > "$dir/projects.txt" || die "could not read project registry"
+  fi
+  while IFS= read -r project; do
+    [[ -d "$project" ]] || continue
+    printf '%s\t' "$project" >> "$dir/project-git.txt"
+    git -C "$project" rev-parse HEAD >> "$dir/project-git.txt" 2>/dev/null || printf 'not-a-git-worktree' >> "$dir/project-git.txt"
+    printf '\t' >> "$dir/project-git.txt"
+    git -C "$project" status --short 2>/dev/null | tr '\n' ' ' >> "$dir/project-git.txt" || true
+    printf '\n' >> "$dir/project-git.txt"
+  done < "${dir}/projects.txt" 2>/dev/null || true
+  printf '%s\n' "$dir"
+}
+
+env_value() {
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    { split($0, pair, "="); if (pair[1] == key) { value = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); if (value ~ /^\047.*\047$/ || value ~ /^".*"$/) value = substr(value, 2, length(value) - 2); print value; found++ } }
+    END { if (found != 1) exit 1 }
+  ' "$file"
+}
+
+syncproof_db_auth() {
+  local env_file="$HOME/Code/syncproof/.env" db_host db_port db_name db_user db_password
+  [[ -f "$env_file" ]] || { echo "  FAIL: Syncproof .env unavailable" >&2; return 1; }
+  db_host="$(env_value "$env_file" DB_HOST)" || { echo "  FAIL: malformed DB_HOST" >&2; return 1; }
+  db_port="$(env_value "$env_file" DB_PORT)" || { echo "  FAIL: malformed DB_PORT" >&2; return 1; }
+  db_name="$(env_value "$env_file" DB_DATABASE)" || { echo "  FAIL: malformed DB_DATABASE" >&2; return 1; }
+  db_user="$(env_value "$env_file" DB_USERNAME)" || { echo "  FAIL: malformed DB_USERNAME" >&2; return 1; }
+  db_password="$(env_value "$env_file" DB_PASSWORD)" || { echo "  FAIL: malformed DB_PASSWORD" >&2; return 1; }
+  [[ -n "$db_host" && "$db_port" =~ ^[0-9]+$ && -n "$db_name" && -n "$db_user" && -n "$db_password" ]] || { echo "  FAIL: incomplete Syncproof DB settings" >&2; return 1; }
+  MYSQL_PWD="$db_password" "$MYSQL" --protocol=tcp -h "$db_host" -P "$db_port" -u "$db_user" -e 'select 1' "$db_name" >/dev/null 2>&1
+}
+
+select_signing_identity() {
+  local run="$1" probe_root="$1/signing-probes" line hash name probe details team identifier selected=""
+  mkdir -p "$probe_root"
+  : > "$run/signing-probe-evidence.txt"
+  while IFS=$'\t' read -r hash name; do
+    [[ -n "$hash" ]] || continue
+    probe="$probe_root/$hash.app"
+    mkdir -p "$probe/Contents/MacOS"
+    cp /usr/bin/true "$probe/Contents/MacOS/probe"
+    cat > "$probe/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>$EXPECTED_PARENT</string><key>CFBundleExecutable</key><string>probe</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>
+PLIST
+    if codesign --force --sign "$hash" "$probe" >/dev/null 2>&1; then
+      details="$(codesign -dvv "$probe" 2>&1 || true)"
+      team="$(printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p')"
+      identifier="$(printf '%s\n' "$details" | sed -n 's/^Identifier=//p')"
+      printf 'hash=%s display=%s team=%s identifier=%s\n' "$hash" "$name" "${team:-<none>}" "${identifier:-<none>}" >> "$run/signing-probe-evidence.txt"
+      if [[ "$team" == "$EXPECTED_TEAM" && "$identifier" == "$EXPECTED_PARENT" ]]; then selected="$hash"; fi
+    else
+      printf 'hash=%s display=%s sign=failed\n' "$hash" "$name" >> "$run/signing-probe-evidence.txt"
+    fi
+    rm -rf "$probe"
+  done < <(security find-identity -v -p codesigning | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-F]*\) "\(.*\)"$/\1\t\2/p')
+  rm -rf "$probe_root"
+  [[ -n "$selected" ]] || die "no signing identity produced TeamIdentifier $EXPECTED_TEAM and bundle ID $EXPECTED_PARENT (see $run/signing-probe-evidence.txt)"
+  printf '%s\n' "$selected"
+}
+
+verify_preservation() {
+  local dir="$1" mode="${2:-clean}" file old current missing=0 changed=0 expected=0 unexpected=0 added=0 classification
+  local report="$dir/preservation-report.txt"
+  : > "$report"
+  : > "$dir/preservation-missing.txt"
+  : > "$dir/preservation-changed.txt"
+  : > "$dir/preservation-added.txt"
+  classification() {
+    case "$1" in
+      */instances/mysql/*|*/instances/php/*/process.json|*/instances/caddy/process.json|*/state/vaelen.sqlite*) printf 'expected-live-mutable' ;;
+      *) printf 'unexpected' ;;
+    esac
+  }
+  while IFS= read -r file; do
+    [[ -e "$file" ]] || {
+      if [[ "$mode" == reset && ( "$file" == */instances/php/*/process.json || "$file" == */instances/mysql/*/process.json || "$file" == */instances/caddy/process.json ) ]]; then
+        expected=$((expected + 1)); printf 'deleted classification=expected-ephemeral-metadata before=%s after=<missing> path=%s\n' "$(grep -F "  $file" "$dir/durable-sha256.txt" | awk '{print $1}')" "$file" >> "$dir/preservation-missing.txt"
+      else
+        missing=$((missing + 1)); printf 'deleted classification=unexpected before=%s after=<missing> path=%s\n' "$(grep -F "  $file" "$dir/durable-sha256.txt" | awk '{print $1}')" "$file" >> "$dir/preservation-missing.txt"
+      fi
+    }
+  done < "$dir/durable-files.txt"
+  while read -r old file; do
+    [[ -f "$file" ]] || continue
+    current="$(shasum -a 256 "$file" | awk '{print $1}')"
+    [[ "$old" == "$current" ]] && continue
+    changed=$((changed + 1))
+    classification="$(classification "$file")"
+    [[ "$classification" == expected-* ]] && expected=$((expected + 1)) || unexpected=$((unexpected + 1))
+    printf 'changed classification=%s before=%s after=%s path=%s\n' "$classification" "$old" "$current" "$file" >> "$dir/preservation-changed.txt"
+  done < <(grep -E '^[0-9a-f]{64}  ' "$dir/durable-sha256.txt")
+  while IFS= read -r file; do
+    grep -Fqx "$file" "$dir/durable-files.txt" && continue
+    added=$((added + 1)); classification="$(classification "$file")"
+    [[ "$classification" == expected-* ]] && expected=$((expected + 1)) || unexpected=$((unexpected + 1))
+    printf 'added classification=%s before=<absent> after=%s path=%s\n' "$classification" "$(shasum -a 256 "$file" | awk '{print $1}')" "$file" >> "$dir/preservation-added.txt"
+  done < <(for path in config instances packages state tls; do find "$SUPPORT/$path" -type f -print 2>/dev/null; done)
+  printf 'missing=%s changed=%s added=%s expected=%s unexpected=%s\n' "$missing" "$changed" "$added" "$expected" "$unexpected" > "$report"
+  cat "$dir/preservation-missing.txt" "$dir/preservation-changed.txt" "$dir/preservation-added.txt" >> "$report"
+  [[ "$missing" == 0 && "$unexpected" == 0 ]] || { echo "preservation: FAIL (report: $report)" >&2; return 1; }
+  echo "preservation: PASS (missing=$missing changed=$changed added=$added expected-mutable=$expected unexpected=$unexpected report=$report)"
+}
+
+smoke() {
+  need curl; need nc; need dig; need osascript; need sqlite3
+  build_support
+  local failures=0 version="8.4.23" response menu
+  stage registration "Core IPC registration"
+  "$VAL" status >/dev/null 2>&1 || { echo "  FAIL: Core status registration" >&2; failures=1; }
+  stage process "actual Core/DNS/GUI processes"
+  ps -axo command= | grep -Fq "$CORE" || { echo "  FAIL: canonical Core process" >&2; failures=1; }
+  ps -axo command= | grep -Fq "$DNS --port 53535" || { echo "  FAIL: canonical DNS process" >&2; failures=1; }
+  pgrep -f '/Vaelen\.app/Contents/MacOS/Vaelen$' >/dev/null || { echo "  FAIL: actual GUI process" >&2; failures=1; }
+  local gui_app="$CANONICAL_APP"
+  [[ "${VAELEN_DEV_INTERNAL:-0}" == 1 ]] && gui_app="$GUI"
+  stage gui "MenuBarExtra popover ($([[ "$gui_app" == "$CANONICAL_APP" ]] && echo canonical || echo noncanonical-dev): $gui_app)"
+  local ui_dump="$ARTIFACTS/smoke-$STAMP-ui.txt" ui_error="$ARTIFACTS/smoke-$STAMP-ui.err" screenshot="$ARTIFACTS/smoke-$STAMP.png"
+  mkdir -p "$ARTIFACTS"
+  [[ -d "$gui_app" ]] || { echo "  FAIL: GUI app absent: $gui_app" >&2; failures=1; }
+  if [[ -d "$gui_app" ]] && ! pgrep -f "$gui_app/Contents/MacOS/Vaelen$" >/dev/null; then open "$gui_app" >/dev/null 2>&1 || { echo "  FAIL: could not launch GUI artifact" >&2; failures=1; }; fi
+  for _ in {1..30}; do pgrep -f "$gui_app/Contents/MacOS/Vaelen$" >/dev/null && break; sleep .25; done
+  pgrep -f "$gui_app/Contents/MacOS/Vaelen$" >/dev/null || { echo "  FAIL: GUI artifact is not running: $gui_app" >&2; failures=1; }
+  osascript -e 'tell application "Vaelen" to activate' >/dev/null 2>&1 || true
+  local status_item=""
+  for _ in {1..30}; do
+    status_item="$(osascript <<'APPLESCRIPT' 2>/dev/null || true
+tell application "System Events"
+  tell process "Vaelen"
+    try
+      return (name of menu bar item 1 of menu bar 2)
+    on error
+      return ""
+    end try
+  end tell
+end tell
+APPLESCRIPT
+)"
+    [[ -n "$status_item" ]] && break
+    sleep .25
+  done
+  if [[ -z "$status_item" ]]; then
+    echo "  FAIL: actual MenuBarExtra status item did not appear (System Events/Accessibility permission may be required)" >&2; failures=1
+  else
+    osascript <<'APPLESCRIPT' >/dev/null 2>"$ui_error" || { echo "  FAIL: MenuBarExtra AXPress failed: $(cat "$ui_error")" >&2; failures=1; }
+tell application "System Events"
+  tell process "Vaelen"
+    perform action "AXPress" of menu bar item 1 of menu bar 2
+  end tell
+end tell
+APPLESCRIPT
+    sleep 2
+    pgrep -f "$gui_app/Contents/MacOS/Vaelen$" >/dev/null || { echo "  FAIL: GUI artifact exited after MenuBarExtra AXPress" >&2; failures=1; }
+    echo "  GUI status item exposed and AXPress accepted: $status_item"
+  fi
+  screencapture -x "$screenshot" >/dev/null 2>&1 || { echo "  FAIL: GUI screenshot unavailable" >&2; failures=1; }
+  if ! osascript <<'APPLESCRIPT' >"$ui_dump" 2>"$ui_error"; then
+tell application "System Events"
+  tell process "Vaelen"
+    return (entire contents of front window) as text
+  end tell
+end tell
+APPLESCRIPT
+    echo "  NOTE: optional GUI text unavailable (native MenuBarExtra popover is not exposed as a window; screenshot: $screenshot; detail: $(cat "$ui_error"))"
+  elif [[ ! -s "$ui_dump" ]]; then
+    echo "  NOTE: optional GUI text unavailable (native MenuBarExtra popover returned no window text; screenshot: $screenshot)"
+  else
+    echo "  Optional GUI accessibility text captured: $ui_dump"
+    grep -Eiq 'Core Running' "$ui_dump" && echo "  Optional GUI text: Core Running" || true
+    grep -Eiq 'syncproof' "$ui_dump" && echo "  Optional GUI text: syncproof" || true
+  fi
+  stage cli "CLI command path"
+  "$VAL" status >/dev/null 2>&1 || { echo "  FAIL: val status" >&2; failures=1; }
+  stage core "Core socket and IPC readiness"
+  [[ -S "$RUNTIME/sockets/core.sock" ]] || { echo "  FAIL: Core socket readiness" >&2; failures=1; }
+  "$VAL" status 2>&1 | grep -Eq 'Core[[:space:]]+Running' || { echo "  FAIL: Core IPC status is not running" >&2; failures=1; }
+  stage php "PHP 8.4.23/FPM readiness"
+  "$VAL" php status "$version" 2>&1 | grep -Eq 'FPM[[:space:]]+running|Health[[:space:]]+healthy' || { echo "  FAIL: PHP/FPM" >&2; failures=1; }
+  stage mysql "MySQL 8.4.11 and app DB authentication"
+  "$VAL" mysql status 2>&1 | grep -Eq 'State[[:space:]]+running|Health[[:space:]]+healthy' || { echo "  FAIL: MySQL readiness" >&2; failures=1; }
+  [[ -x "$MYSQL" ]] && syncproof_db_auth || { echo "  FAIL: app DB authentication" >&2; failures=1; }
+  stage route "routing/Caddy readiness"
+  "$VAL" routing status 2>&1 | grep -Eq 'State[[:space:]]+running|Health[[:space:]]+healthy' || { echo "  FAIL: Caddy routing" >&2; failures=1; }
+  stage dns "syncproof.test DNS endpoint"
+  dig +short @127.0.0.1 -p 53535 syncproof.test | grep -qx '127\.0\.0\.1' || { echo "  FAIL: syncproof.test DNS" >&2; failures=1; }
+  stage endpoints "public 80/443 registration"
+  nc -z 127.0.0.1 80 || { echo "  FAIL: public port 80" >&2; failures=1; }
+  nc -z 127.0.0.1 443 || { echo "  FAIL: public port 443" >&2; failures=1; }
+  stage https "trusted HTTPS Syncproof response"
+  response="$(curl --fail --silent --show-error --resolve syncproof.test:443:127.0.0.1 https://syncproof.test/login 2>/dev/null || true)"
+  [[ "$response" == *"<!DOCTYPE html"* || "$response" == *"<html"* ]] || { echo "  FAIL: trusted HTTPS Syncproof response" >&2; failures=1; }
+  [[ "$failures" == 0 ]] || die "smoke failed"
+  echo "smoke: PASS"
+}
+
+smoke_dev() { VAELEN_DEV_INTERNAL=1 smoke; }
+
+owned_pids() {
+  ps -axo pid=,command= | while read -r pid command; do
+    case "$command" in
+      "$CORE"|"$DNS --port 53535") echo "$pid";;
+      */Vaelen.app/Contents/MacOS/Vaelen) echo "$pid";;
+    esac
+  done
+}
+
+stop_owned() {
+  local pids; pids="$(owned_pids)"
+  [[ -z "$pids" ]] || kill $pids 2>/dev/null || true
+  for _ in {1..40}; do pids="$(owned_pids)"; [[ -z "$pids" ]] && return 0; sleep .25; done
+  pids="$(owned_pids)"; [[ -z "$pids" ]] || { echo "$pids" | xargs -n1 kill -KILL; }
+}
+
+stop_exact_managed() {
+  local file pid command expected
+  for file in "$SUPPORT/instances/php/8.4.23/process.json" "$SUPPORT/instances/mysql/default/process.json" "$SUPPORT/instances/caddy/process.json"; do
+    [[ -f "$file" ]] || continue
+    pid="$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$file")"
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$file" in
+      */php/*) expected="php-fpm: master process ($SUPPORT/instances/php/8.4.23/config/php-fpm.conf)";;
+      */mysql/*) expected="$SUPPORT/packages/mysql/8.4.11/bin/mysqld";;
+      */caddy/*) expected="$SUPPORT/packages/caddy/2.11.4/caddy";;
+    esac
+    [[ "$command" == "$expected"* ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  stop_owned
+  for _ in {1..40}; do
+    local live=0
+    for file in "$SUPPORT/instances/php/8.4.23/process.json" "$SUPPORT/instances/mysql/default/process.json" "$SUPPORT/instances/caddy/process.json"; do
+      [[ -f "$file" ]] || continue
+      pid="$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$file")"
+      [[ -n "$(ps -p "$pid" -o pid= 2>/dev/null)" ]] && live=1
+    done
+    [[ "$live" == 0 ]] && return 0
+    sleep .25
+  done
+  return 1
+}
+
+clear_process_metadata() {
+  local file owners
+  for file in "$SUPPORT/instances/php/8.4.23/process.json" "$SUPPORT/instances/mysql/default/process.json" "$SUPPORT/instances/caddy/process.json"; do
+    [[ -f "$file" ]] || continue
+    owners="$(lsof -t -- "$file" 2>/dev/null || true)"
+    [[ -z "$owners" ]] || { echo "process metadata still held: $file ($owners)" >&2; return 1; }
+    rm -f -- "$file"
+  done
+}
+
+clear_ephemeral() {
+  local file owners
+  while IFS= read -r -d '' file; do
+    owners="$(lsof -t -- "$file" 2>/dev/null || true)"
+    [[ -z "$owners" ]] || { echo "ephemeral file still owned: $file ($owners)" >&2; return 1; }
+    rm -f -- "$file"
+  done < <(find "$RUNTIME/pids" "$RUNTIME/sockets" "$RUNTIME/locks" \( -type f -o -type s \) -print0 2>/dev/null)
+  mkdir -p "$RUNTIME/pids" "$RUNTIME/sockets" "$RUNTIME/locks"
+}
+
+tree_hash() {
+  local path="$1"
+  find "$path" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | awk '{print $1}'
+}
+
+verify_canonical_install() {
+  local installed gui_count canonical_count
+  installed="$(find /Applications -maxdepth 1 -type d -name 'Vaelen.app' -print 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$installed" == 1 ]] || { echo "installed Vaelen.app count=$installed (expected 1)" >&2; return 1; }
+  gui_count="$(ps -axo command= | awk '/\/Vaelen\.app\/Contents\/MacOS\/Vaelen$/ {count++} END {print count+0}')"
+  canonical_count="$(ps -axo command= | awk '$0 == "/Applications/Vaelen.app/Contents/MacOS/Vaelen" {count++} END {print count+0}')"
+  [[ "$gui_count" == 1 && "$canonical_count" == 1 ]] || { echo "running GUI count=$gui_count canonical=$canonical_count (expected one canonical)" >&2; return 1; }
+}
+
+cleanup_disposable_residue() {
+  local run="$1" path hash workspace="$ROOT/App/Vaelen/Vaelen.xcodeproj/project.xcworkspace"
+  local record="$run/disposable-artifacts.txt"
+  : > "$record"
+  while IFS= read -r path; do
+    [[ -d "$path" ]] || continue
+    hash="$(tree_hash "$path")"
+    printf 'path=%s tree-sha256=%s\n' "$path" "$hash" >> "$record"
+    rm -rf -- "$path"
+  done < <(find "$ARTIFACTS" -type d -path '*/deriveddata/Build/Products/*/Vaelen.app' -print 2>/dev/null | sort)
+  if [[ -d "$ROOT/.build/app" ]]; then
+    hash="$(tree_hash "$ROOT/.build/app")"
+    printf 'path=%s tree-sha256=%s\n' "$ROOT/.build/app" "$hash" >> "$record"
+    rm -rf -- "$ROOT/.build/app"
+  fi
+  if [[ -d "$workspace" ]]; then
+    hash="$(tree_hash "$workspace")"
+    printf 'path=%s tree-sha256=%s\n' "$workspace" "$hash" >> "$record"
+    rm -rf -- "$workspace"
+  fi
+  echo "disposable residue recorded: $record"
+}
+
+start_runtime() {
+  local gui="${1:-$CANONICAL_APP}"
+  [[ -z "$(owned_pids)" ]] || return 1
+  mkdir -p "$RUNTIME/pids" "$LOG"
+  "$CORE" >>"$LOG/vaelend-dev.log" 2>&1 & echo $! > "$RUNTIME/pids/harness-vaelend.pid"
+  "$DNS" --port 53535 >>"$LOG/vaelendns-dev.log" 2>&1 & echo $! > "$RUNTIME/pids/harness-vaelendns.pid"
+  for _ in {1..60}; do [[ -S "$RUNTIME/sockets/core.sock" ]] && break; sleep .25; done
+  [[ -S "$RUNTIME/sockets/core.sock" ]] || return 1
+  "$VAL" php start 8.4.23 >/dev/null || return 1
+  "$VAL" mysql start >/dev/null || return 1
+  "$VAL" routing start >/dev/null || return 1
+  open "$gui" >/dev/null 2>&1 || return 1
+}
+
+recover_runtime() {
+  stop_exact_managed || true
+  "$VAL" routing stop >/dev/null 2>&1 || true
+  "$VAL" php stop 8.4.23 >/dev/null 2>&1 || true
+  "$VAL" mysql stop >/dev/null 2>&1 || true
+  stop_owned || true
+  clear_ephemeral || true
+  start_runtime "$CANONICAL_APP"
+}
+
+CLEAN_RUN=""; CLEAN_MOVED=0; CLEAN_APP_MOVED=0; CLEAN_SUCCEEDED=0
+clean_rollback() {
+  [[ "$CLEAN_SUCCEEDED" == 1 || -z "$CLEAN_RUN" ]] && return 0
+  echo "vaelen-dev: clean-install rollback (registration is not restored)" >&2
+  if [[ "$CLEAN_APP_MOVED" == 1 && -d "$CLEAN_RUN/app-before" && ! -e "$CANONICAL_APP" ]]; then mv "$CLEAN_RUN/app-before" "$CANONICAL_APP" || true; fi
+  if [[ "$CLEAN_MOVED" == 1 && -d "$CLEAN_RUN/support-before" ]]; then
+    [[ ! -e "$SUPPORT" ]] || mv "$SUPPORT" "$CLEAN_RUN/support-failed" || true
+    mv "$CLEAN_RUN/support-before" "$SUPPORT" || true
+  fi
+  CORE="$ROOT/.build/release/vaelend"; DNS="$ROOT/.build/release/vaelendns"; VAL="$ROOT/.build/release/val"; MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
+  recover_runtime || true
+}
+
+clean_preflight() {
+  local run="$1" btm
+  stage preflight "clean-install identities and preservation"
+  [[ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" == "restored-m13-product" ]] || die "wrong branch"
+  [[ "$(git -C "$ROOT" rev-parse HEAD)" == "328e2f1efc74dab9c41f411e914afe015a22d009" ]] || die "wrong golden HEAD"
+  [[ -d "$SUPPORT" && -d "$SUPPORT/config" && -d "$SUPPORT/instances" && -d "$SUPPORT/packages" && -d "$SUPPORT/state" && -d "$SUPPORT/tls" ]] || die "durable Vaelen support root incomplete"
+  [[ -f "$SUPPORT/state/vaelen.sqlite" ]] || die "registry database missing"
+  btm="$run/btm-before.txt"
+  sfltool dumpbtm > "$btm" 2>&1 || die "could not capture BTM evidence"
+  grep -q "Identifier: 8.$EXPECTED_LABEL" "$btm" || die "exact BTM agent registration missing"
+  grep -q "Parent Identifier: 2.$EXPECTED_PARENT" "$btm" || die "BTM parent mismatch"
+  grep -q "Team Identifier: $EXPECTED_TEAM" "$btm" || die "BTM team mismatch"
+  grep -q "UUID: $EXPECTED_BTM_UUID" "$btm" || die "BTM UUID mismatch"
+  if launchctl print "gui/$(id -u)/$EXPECTED_LABEL" > "$run/launchctl-before.txt" 2>&1; then
+    grep -q "BTM uuid = $EXPECTED_BTM_UUID" "$run/launchctl-before.txt" || die "launchd BTM UUID mismatch"
+    grep -Eq "Executable.*$CANONICAL_APP/Contents/Resources/vaelend|program = $CANONICAL_APP/Contents/Resources/vaelend|$CANONICAL_APP/Contents/Resources/vaelend" "$run/launchctl-before.txt" || die "launchd executable mismatch"
+  else
+    printf 'historical/inactive launchd job already absent\n' > "$run/launchctl-before.txt"
+  fi
+  select_signing_identity "$run" > "$run/signing-identity.txt"
+  [[ ! -e "$CANONICAL_APP" ]] || { codesign --verify --deep --strict "$CANONICAL_APP" || die "existing app failed signature validation"; }
+  syncproof_db_auth || die "Syncproof DB preflight authentication failed"
+  mkdir -p "$run/system-before"
+  for path in /etc/resolver/test /etc/pf.conf /etc/pf.anchors/dev.vaelen.standard-ports; do [[ -e "$path" ]] && cp -p "$path" "$run/system-before/$(basename "$path")"; done
+}
+
+unregister_exact_agent() {
+  local run="$1" identity="$2" bundle="$run/unregister.app" source="$run/unregister.swift"
+  mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Library/LaunchAgents" "$bundle/Contents/Resources"
+  cat > "$bundle/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>$EXPECTED_PARENT</string><key>CFBundleExecutable</key><string>unregister</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>
+PLIST
+  cat > "$bundle/Contents/Library/LaunchAgents/dev.vaelen.vaelend.agent.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>$EXPECTED_LABEL</string><key>ProgramArguments</key><array><string>$CANONICAL_APP/Contents/Resources/vaelend</string></array></dict></plist>
+PLIST
+  cat > "$source" <<'SWIFT'
+import Foundation
+import ServiceManagement
+let service = SMAppService.agent(plistName: "dev.vaelen.vaelend.agent.plist")
+if service.status == .notRegistered {
+    print("unregister idempotent; status=notRegistered")
+    exit(0)
+}
+try service.unregister()
+guard service.status == .notRegistered else { throw NSError(domain: "VaelenCleanup", code: 1) }
+print("unregister returned successfully; status=notRegistered")
+SWIFT
+  swiftc "$source" -framework ServiceManagement -o "$bundle/Contents/MacOS/unregister" || die "cleanup utility build failed"
+  cp "$CORE" "$bundle/Contents/Resources/vaelend"
+  codesign --force --deep --sign "$identity" "$bundle" >/dev/null || die "cleanup utility signing failed"
+  codesign --verify --deep --strict "$bundle" || die "cleanup utility signature invalid"
+  "$bundle/Contents/MacOS/unregister" > "$run/unregister-result.txt" || die "exact SMAppService unregister failed"
+  grep -q 'status=notRegistered' "$run/unregister-result.txt" || die "fresh helper did not observe notRegistered"
+  launchctl print "gui/$(id -u)/$EXPECTED_LABEL" >/dev/null 2>&1 && die "exact launchd registration remains after unregister"
+  pgrep -f "$CANONICAL_APP/Contents/Resources/vaelend$" >/dev/null && die "installed canonical Core process remains after unregister"
+  lsof -nP -iTCP:80 -iTCP:443 2>/dev/null | grep -F "$CANONICAL_APP/Contents/Resources/vaelend" && die "canonical endpoint remains after unregister" || true
+  find "$RUNTIME/locks" -type f -print -quit 2>/dev/null | grep -q . && die "runtime lock remains held after unregister" || true
+  sfltool dumpbtm > "$run/btm-after.txt" 2>&1 || die "could not capture post-unregister BTM evidence"
+  grep -q "UUID: $EXPECTED_BTM_UUID" "$run/btm-after.txt" && echo "historical BTM record retained; launchd/API state is inactive" > "$run/btm-historical.txt" || true
+}
+
+clean_install() {
+  local run="$ARTIFACTS/clean-install-$STAMP" snapshot_dir app identity
+  mkdir -p "$run"
+  clean_preflight "$run"
+  snapshot_dir="$(snapshot "clean-install-$STAMP")"
+  CLEAN_RUN="$run"; trap clean_rollback EXIT
+  cp -R "$snapshot_dir" "$run/preservation-snapshot"
+  identity="$(cat "$run/signing-identity.txt")"
+  "$VAL" routing stop >/dev/null || true; "$VAL" php stop 8.4.23 >/dev/null || true; "$VAL" mysql stop >/dev/null || true
+  stop_owned || die "could not stop exact owned runtime"
+  clear_ephemeral || die "could not clear verified ephemeral runtime"
+  unregister_exact_agent "$run" "$identity"
+  if [[ -e "$CANONICAL_APP" ]]; then mv "$CANONICAL_APP" "$run/app-before" || die "could not preserve existing canonical app"; CLEAN_APP_MOVED=1; fi
+  mv "$SUPPORT" "$run/support-before"
+  CLEAN_MOVED=1
+  mkdir -p "$SUPPORT"
+  for path in config instances packages state tls; do gzip -dc "$snapshot_dir/$path.tar.gz" | tar -xf - -C "$SUPPORT"; done
+  swift build --configuration release >/dev/null || die "release runtime build failed"
+  xcodebuild -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release -derivedDataPath "$run/deriveddata" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$identity" DEVELOPMENT_TEAM="$EXPECTED_TEAM" build 2>&1 | tee "$run/release-build.log"
+  [[ "${PIPESTATUS[0]}" == 0 ]] || die "release GUI build failed"
+  app="$run/deriveddata/Build/Products/Release/Vaelen.app"
+  codesign --verify --deep --strict "$app" || die "release GUI signature invalid"
+  codesign -dvv --verbose=4 "$app" > "$run/app-provenance.txt" 2>&1 || die "release GUI provenance capture failed"
+  printf 'source-tree-sha256=%s\n' "$(tree_hash "$app")" >> "$run/app-provenance.txt"
+  [[ "$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$EXPECTED_TEAM" ]] || die "release GUI Team ID mismatch"
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" == "$EXPECTED_PARENT" ]] || die "release GUI bundle ID mismatch"
+  osascript - "$app" "$CANONICAL_APP" <<'APPLESCRIPT' || die "canonical app install authorization/install failed"
+on run argv
+  set sourceApp to item 1 of argv
+  set destinationApp to item 2 of argv
+  do shell script "/usr/bin/ditto " & quoted form of sourceApp & " " & quoted form of destinationApp with administrator privileges
+end run
+APPLESCRIPT
+  diff -qr "$app" "$CANONICAL_APP" >/dev/null || die "installed canonical app differs byte-for-byte from verified source"
+  codesign --verify --deep --strict "$CANONICAL_APP" || die "installed canonical app signature invalid"
+  [[ "$(codesign -dv --verbose=4 "$CANONICAL_APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$EXPECTED_TEAM" ]] || die "installed canonical app Team ID mismatch"
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CANONICAL_APP/Contents/Info.plist")" == "$EXPECTED_PARENT" ]] || die "installed canonical app bundle ID mismatch"
+  CORE="$ROOT/.build/release/vaelend"; DNS="$ROOT/.build/release/vaelendns"; VAL="$ROOT/.build/release/val"; MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
+  start_runtime || die "fresh M13 runtime start failed"
+  smoke || die "clean-install smoke failed"
+  verify_canonical_install || die "canonical install/process verification failed"
+  cleanup_disposable_residue "$run"
+  verify_canonical_install || die "canonical install/process verification failed after residue cleanup"
+  CLEAN_SUCCEEDED=1; trap - EXIT
+  echo "clean-install: PASS"
+  echo "preserved: $snapshot_dir"
+  echo "registration-before: $run/btm-before.txt"
+  echo "registration-after: $run/btm-after.txt"
+}
+
+RESET_RUN=""; RESET_SUCCEEDED=0
+reset_rollback() {
+  [[ "$RESET_SUCCEEDED" == 1 || -z "$RESET_RUN" ]] && return 0
+  echo "vaelen-dev: reset-runtime rollback; restoring manual Release runtime" >&2
+  CORE="$ROOT/.build/release/vaelend"; DNS="$ROOT/.build/release/vaelendns"; VAL="$ROOT/.build/release/val"; MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
+  recover_runtime || true
+}
+
+reset_runtime() {
+  local run="$ARTIFACTS/reset-runtime-$STAMP" snapshot_dir app_details_before app_details_after
+  mkdir -p "$run"
+  clean_preflight "$run"
+  [[ -d "$CANONICAL_APP" ]] || die "canonical installed app missing"
+  codesign --verify --deep --strict "$CANONICAL_APP" || die "canonical installed app signature invalid"
+  codesign -dv --verbose=4 "$CANONICAL_APP" > "$run/app-before.txt" 2>&1
+  snapshot_dir="$(snapshot "reset-runtime-$STAMP")"
+  RESET_RUN="$run"; trap reset_rollback EXIT
+  "$VAL" routing stop >/dev/null 2>&1 || true
+  "$VAL" php stop 8.4.23 >/dev/null 2>&1 || true
+  "$VAL" mysql stop >/dev/null 2>&1 || true
+  stop_exact_managed || die "exact managed package cleanup failed"
+  stop_owned || die "exact Vaelen process cleanup failed"
+  clear_ephemeral || die "ephemeral runtime cleanup failed"
+  clear_process_metadata || die "process metadata cleanup failed"
+  unregister_exact_agent "$run" "$(cat "$run/signing-identity.txt")"
+  mkdir -p "$RUNTIME/pids" "$RUNTIME/sockets" "$RUNTIME/locks"
+  CORE="$ROOT/.build/release/vaelend"; DNS="$ROOT/.build/release/vaelendns"; VAL="$ROOT/.build/release/val"; MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
+  start_runtime "$CANONICAL_APP" || die "Release runtime restart failed"
+  verify_preservation "$snapshot_dir" reset || die "reset-runtime preservation failed"
+  app_details_after="$run/app-after.txt"; codesign -dv --verbose=4 "$CANONICAL_APP" > "$app_details_after" 2>&1
+  diff -u "$run/app-before.txt" "$app_details_after" >/dev/null || die "installed app identity changed during reset-runtime"
+  smoke || die "reset-runtime internal smoke failed"
+  RESET_SUCCEEDED=1; trap - EXIT
+  echo "reset-runtime: PASS"
+  echo "preserved: $snapshot_dir"
+  echo "registration-before: $run/btm-before.txt"
+  echo "registration-after: $run/btm-after.txt"
+}
+
+restart() {
+  local snapshot_dir="$(snapshot "restart-$STAMP")" failure=0
+  smoke || { echo "vaelen-dev: pre-restart smoke failed; recovering runtime" >&2; recover_runtime || true; return 1; }
+  "$VAL" routing stop >/dev/null || failure=1
+  "$VAL" php stop 8.4.23 >/dev/null || failure=1
+  "$VAL" mysql stop >/dev/null || failure=1
+  stop_owned || failure=1
+  clear_ephemeral || failure=1
+  [[ "$failure" == 0 ]] && start_runtime || failure=1
+  if [[ "$failure" != 0 ]]; then
+    echo "vaelen-dev: restart failed; attempting runtime recovery" >&2
+    recover_runtime || true
+    die "restart failed (preservation snapshot: $snapshot_dir)"
+  fi
+  verify_preservation "$snapshot_dir" || { echo "vaelen-dev: preservation check failed; recovering runtime" >&2; recover_runtime || true; return 1; }
+  smoke || { echo "vaelen-dev: post-restart smoke failed; recovering runtime" >&2; recover_runtime || true; return 1; }
+  echo "restart: PASS"
+  echo "preserved: $snapshot_dir"
+}
+
+case "${1:-}" in
+  restart) restart;;
+  reset-runtime) reset_runtime;;
+  clean-install) clean_install;;
+  smoke) smoke;;
+  *) echo "Usage: $0 {restart|reset-runtime|clean-install|smoke}" >&2; exit 2;;
+esac
