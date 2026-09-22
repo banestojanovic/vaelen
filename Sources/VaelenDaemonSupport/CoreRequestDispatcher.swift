@@ -101,8 +101,10 @@ public actor CoreRequestDispatcher {
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); try module.remove(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpOperation:
                 let module = try phpModule(); return (.init(id: request.id, result: .phpOperation(.init(operation: module.operationState()))), true)
+            case .phpDefaultSet:
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpCatalog(.init(catalog: try module.selectDefault(requestedVersion: params.version)))), true)
             case .phpUse:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.setDefault(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.selectDefault(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpExec:
                 let module = try phpModule(); let params = try request.params?.decode(PHPExecRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP execution parameters are required.") }(); let result = try module.exec(requestedVersion: params.version, workingDirectory: params.workingDirectory, arguments: params.arguments); return (.init(id: request.id, result: .phpExec(.init(exitStatus: result.status, output: result.output))), true)
             case .phpStart:
@@ -215,10 +217,7 @@ public actor CoreRequestDispatcher {
                 fatalError("handled above")
             }
         } catch let error as PHPModuleError {
-            switch error {
-            case .invalidWorkingDirectory(let path): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "PHP working directory is unavailable: \(path)")), true)
-            default: return (.init(id: request.id, error: .init(code: .internalError, message: "PHP operation failed: \(error)")), true)
-            }
+            return (.init(id: request.id, error: map(error)), true)
         } catch let error as MySQLModuleError {
             return (.init(id: request.id, error: map(error)), true)
         } catch let error as MailpitModuleError {
@@ -250,6 +249,29 @@ public actor CoreRequestDispatcher {
     }
 
     private func phpModule() throws -> PHPModule { guard let php else { throw IPCErrorPayload(code: .internalError, message: "PHP distribution manifest is not configured.") }; return php }
+
+    private func map(_ error: PHPModuleError) -> IPCErrorPayload {
+        switch error {
+        case .invalidWorkingDirectory(let path):
+            return .init(code: .invalidRequest, message: "PHP working directory is unavailable: \(path)")
+        case .packageMissing(let version):
+            return .init(code: .invalidRequest, message: "PHP \(version) is not an installed managed runtime.")
+        case .unsupportedVersion(let version):
+            return .init(code: .invalidRequest, message: "PHP version \(version) is not supported.")
+        case .operationInProgress(let version):
+            return .init(code: .invalidRequest, message: "Another PHP operation is in progress for \(version). Please wait and try again.")
+        case .cannotRemoveDefaultRuntime(let version):
+            return .init(code: .invalidRequest, message: "PHP \(version) is the current default runtime and cannot be removed.")
+        case .cannotRemoveActiveRuntime(let version):
+            return .init(code: .invalidRequest, message: "PHP \(version) is running and cannot be removed.")
+        case .processIdentityMismatch:
+            return .init(code: .invalidRequest, message: "PHP-FPM could not be verified safely; no process was changed.")
+        case .validationFailed, .processFailed:
+            return .init(code: .internalError, message: "PHP runtime could not be made healthy. The previous default remains selected.")
+        default:
+            return .init(code: .internalError, message: "PHP operation could not be completed.")
+        }
+    }
     private func mysqlModule() throws -> MySQLModule { guard let mysql else { throw IPCErrorPayload(code: .internalError, message: "MySQL module is not configured.") }; return mysql }
     private func mailpitModule() throws -> MailpitModule { guard let mailpit else { throw IPCErrorPayload(code: .internalError, message: "Mailpit module is not configured.") }; return mailpit }
 

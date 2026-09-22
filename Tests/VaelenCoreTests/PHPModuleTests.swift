@@ -88,6 +88,23 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertEqual(try module.runtimeCatalog().installedVersions.first { $0.version == "8.4.23" }?.running, true)
     }
 
+    func testRealDefaultSelectionIsIdempotentAndDurable() throws {
+        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
+        let catalog = try module.selectDefault(requestedVersion: "8.4.23")
+        XCTAssertEqual(catalog.defaultVersion, "8.4.23")
+        XCTAssertTrue(catalog.installedVersions.first { $0.version == "8.4.23" }?.running == true)
+        let reloaded = try XCTUnwrap(PHPModule.development())
+        XCTAssertEqual(try reloaded.runtimeCatalog().defaultVersion, "8.4.23")
+    }
+
+    func testDefaultSelectionRejectsUnavailableExactVersion() throws {
+        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
+        XCTAssertThrowsError(try module.selectDefault(requestedVersion: "8.5.0")) { error in
+            XCTAssertEqual(error as? PHPModuleError, .packageMissing("8.5.0"))
+        }
+        XCTAssertEqual(try module.runtimeCatalog().defaultVersion, "8.4.23")
+    }
+
     func testNumericPHPVersionResolutionUsesHighestStablePatch() {
         XCTAssertEqual(PHPVersionResolver.resolve("8.4", versionStrings: ["8.4.9", "8.4.23", "8.3.99"]), "8.4.23")
         XCTAssertEqual(PHPVersionResolver.resolve("8.4.9", versionStrings: ["8.4.9", "8.4.23"]), "8.4.9")

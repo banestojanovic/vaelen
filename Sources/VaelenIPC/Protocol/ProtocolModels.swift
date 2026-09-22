@@ -62,6 +62,7 @@ public enum CoreMethod: String, Sendable {
     case phpUpdate = "php.update"
     case phpRemove = "php.remove"
     case phpOperation = "php.operation"
+    case phpDefaultSet = "php.default.set"
     case phpUse = "php.use"
     case phpExec = "php.exec"
     case phpStart = "php.start"
@@ -144,6 +145,9 @@ public enum RequestParams: Codable, Equatable, Sendable {
         if case .object(let fields) = value {
             if fields["client"] != nil, let params = try? IPCCodec.decode(HandshakeParams.self, from: IPCCodec.encode(value)) {
                 self = .handshake(params); return
+            }
+            if fields["version"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPVersionRequest.self, from: IPCCodec.encode(value)) {
+                self = .phpVersion(params); return
             }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }

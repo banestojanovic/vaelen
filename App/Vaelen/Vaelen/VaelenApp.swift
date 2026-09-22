@@ -22,6 +22,11 @@ struct VaelenApp: App {
         Settings {
             SettingsView(model: model)
         }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                SettingsMenuCommand()
+            }
+        }
     }
 }
 
@@ -220,6 +225,12 @@ final class AppModel {
     func removePHP(_ version: String) async {
         guard beginPHPRequest(version: version), let client else { return }
         do { _ = try await client.phpRemove(version); await finishPHPRequest() }
+        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+    }
+
+    func setDefaultPHP(_ version: String) async {
+        guard beginPHPRequest(version: version), let client else { return }
+        do { _ = try await client.phpDefaultSet(version); await finishPHPRequest() }
         catch { await finishPHPRequest(error: phpErrorMessage(error)) }
     }
 
@@ -451,6 +462,7 @@ private struct VaelenEmptyState: View {
 struct StatusView: View {
     let model: AppModel
     @State private var selectedSection = Section.projects
+    @Environment(\.openSettings) private var openSettings
 
     private enum Section: Hashable {
         case projects
@@ -499,7 +511,7 @@ struct StatusView: View {
                     .controlSize(.small)
                     .accessibilityHint("Refresh Vaelen state")
                 Spacer()
-                SettingsLink { Text("Settings…") }
+                Button("Settings…") { presentSettings() }
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
         }
@@ -516,6 +528,21 @@ struct StatusView: View {
         return max(usefulMinimum, preferred)
     }
 
+    private func presentSettings() {
+        // Settings is an explicit user action from a menu-bar popover. Activate
+        // Vaelen first, then make the SwiftUI-created window key once the scene
+        // has had a chance to materialize. The window remains a normal window;
+        // it is not made floating or repeatedly forced to the front.
+        SettingsWindowActivation.activateApplication()
+        openSettings()
+        DispatchQueue.main.async {
+            SettingsWindowActivation.bringForward()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            SettingsWindowActivation.bringForward()
+        }
+    }
+
     @ViewBuilder
     private var coreStatus: some View {
         switch model.state {
@@ -527,6 +554,63 @@ struct StatusView: View {
             VaelenStatusLabel("Core Unavailable", systemImage: "circle", tint: .secondary)
         case .incompatible:
             VaelenStatusLabel("Core Incompatible", systemImage: "exclamationmark.circle", tint: .orange)
+        }
+    }
+}
+
+@MainActor
+private enum SettingsWindowActivation {
+    private static var closeObserver: NSObjectProtocol?
+
+    static func activateApplication() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    static func bringForward() {
+        guard let window = NSApplication.shared.windows.first(where: {
+            $0.isVisible && $0.title.localizedCaseInsensitiveContains("Settings")
+        }) else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        // A menu-bar-only application has accessory activation policy, which
+        // permits the window to order above another app but does not make it
+        // the active application. Temporarily use normal application
+        // activation while the user-owned Settings window is open, restoring
+        // the menu-bar-only policy when that window closes.
+        NSApplication.shared.setActivationPolicy(.regular)
+        if closeObserver == nil {
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: window,
+                queue: .main
+            ) { _ in
+                NSApplication.shared.setActivationPolicy(.accessory)
+                if let observer = closeObserver {
+                    NotificationCenter.default.removeObserver(observer)
+                    closeObserver = nil
+                }
+            }
+        }
+        window.orderFrontRegardless()
+        activateApplication()
+        window.makeKeyAndOrderFront(nil)
+        activateApplication()
+    }
+}
+
+private struct SettingsMenuCommand: View {
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Button("Settings…") {
+            SettingsWindowActivation.activateApplication()
+            openSettings()
+            DispatchQueue.main.async {
+                SettingsWindowActivation.bringForward()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                SettingsWindowActivation.bringForward()
+            }
         }
     }
 }
@@ -881,7 +965,12 @@ struct SettingsView: View {
             }
         }
         .frame(width: 760, height: 520)
-        .onAppear { model.startMonitoring() }
+        .onAppear {
+            model.startMonitoring()
+            DispatchQueue.main.async {
+                SettingsWindowActivation.bringForward()
+            }
+        }
     }
 }
 
@@ -925,10 +1014,10 @@ struct PHPSettingsView: View {
     var body: some View {
         SettingsContent(title: "PHP", subtitle: "Manage Vaelen’s installed PHP runtimes without changing project configuration.") {
             if let catalog = model.phpCatalog {
-                SettingsGroup(title: "Default Runtime", footer: "The default runtime is observed here. Changing it will be available in a later PHP release.") {
+                SettingsGroup(title: "Default Runtime", footer: "Used when a project does not select another PHP runtime.") {
                     if let version = catalog.defaultVersion {
                         HStack(spacing: VaelenUI.spacing8) {
-                            VaelenStatusLabel("PHP \(version)", systemImage: "checkmark.circle", tint: .secondary)
+                            PHPDefaultMenu(catalog: catalog, model: model)
                             Spacer()
                             Text(PHPSeriesLabel.series(for: version))
                                 .font(.caption)
@@ -1011,6 +1100,35 @@ struct PHPSettingsView: View {
     }
 }
 
+private struct PHPDefaultMenu: View {
+    let catalog: PHPRuntimeCatalog
+    let model: AppModel
+
+    var body: some View {
+        Menu {
+            ForEach(catalog.installedVersions, id: \.version) { runtime in
+                Button {
+                    guard runtime.version != catalog.defaultVersion else { return }
+                    Task { await model.setDefaultPHP(runtime.version) }
+                } label: {
+                    if runtime.version == catalog.defaultVersion {
+                        Label("PHP \(runtime.version)", systemImage: "checkmark")
+                    } else {
+                        Text("PHP \(runtime.version)")
+                    }
+                }
+                .disabled(model.phpRequestInFlight || runtime.running == nil)
+            }
+        } label: {
+            Label("PHP \(catalog.defaultVersion ?? "Unavailable")", systemImage: "checkmark.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("Default PHP runtime")
+        .accessibilityValue(catalog.defaultVersion.map { "PHP \($0)" } ?? "Unavailable")
+        .disabled(model.phpRequestInFlight)
+    }
+}
+
 private struct PHPVersionRow: View {
     let runtime: PHPRuntimeVersion
     let model: AppModel
@@ -1031,10 +1149,6 @@ private struct PHPVersionRow: View {
                     Text("Update available: \(latest)")
                         .font(.caption)
                         .foregroundStyle(.orange)
-                } else if runtime.updateAvailable == nil {
-                    Text("Update status unavailable")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: VaelenUI.spacing8)

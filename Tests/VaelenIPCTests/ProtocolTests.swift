@@ -75,6 +75,14 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(emptyOperation)), emptyOperation)
     }
 
+    func testPHPDefaultSetMethodAndCatalogResponseRoundTripThroughJSON() throws {
+        let request = IPCRequest(method: .phpDefaultSet, params: .phpVersion(.init(version: "8.4.23")))
+        XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)), request)
+        let catalog = PHPRuntimeCatalog(availableVersions: ["8.4.23"], installedVersions: [.init(version: "8.4.23", running: true, isDefault: true)], defaultVersion: "8.4.23", runningVersions: ["8.4.23"])
+        let response = IPCResponse(id: request.id, result: .phpCatalog(.init(catalog: catalog)))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
+    }
+
     func testPortsMethodsAndResponseRoundTripThroughJSON() throws {
         for method in [CoreMethod.portsStatus, .portsInstall, .portsRemove] {
             let request = IPCRequest(method: method)

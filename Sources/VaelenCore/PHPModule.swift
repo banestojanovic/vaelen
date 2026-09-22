@@ -284,7 +284,7 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
     }
 }
 
-public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove }
+public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove, defaultSelection }
 public enum PHPOperationPhase: String, Codable, Sendable { case starting, downloading, verifying, installing, ready, removing, removed, failed }
 public struct PHPOperationState: Codable, Equatable, Sendable {
     public let kind: PHPOperationKind
@@ -389,9 +389,24 @@ public final class PHPModule: @unchecked Sendable {
             let currentDefault = self.defaultVersion()
             let package = try self.installUnlocked(requestedVersion: target)
             if let currentDefault, PHPVersion(currentDefault)?.family == PHPVersion(target)?.family, currentDefault != target {
-                _ = try self.setDefault(requestedVersion: target)
+                _ = try self.setDefaultUnlocked(requestedVersion: target)
             }
             return package
+        }
+    }
+
+    public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog {
+        try executeOperation(kind: .defaultSelection, targetVersion: requestedVersion) {
+            let package = try self.resolveExactEligible(requestedVersion)
+            var status = try self.status(requestedVersion: package.version)
+            if status.state != .running || status.health != "healthy" {
+                status = try self.start(requestedVersion: package.version)
+            }
+            guard status.state == .running, status.health == "healthy" else {
+                throw PHPModuleError.processFailed("PHP-FPM did not become healthy for PHP \(package.version)")
+            }
+            _ = try self.setDefaultUnlocked(requestedVersion: package.version)
+            return try self.runtimeCatalog()
         }
     }
 
@@ -442,6 +457,14 @@ public final class PHPModule: @unchecked Sendable {
         return package
     }
 
+    private func resolveExactEligible(_ requestedVersion: String) throws -> PHPPackage {
+        guard let version = PHPVersion(requestedVersion), version.isStable,
+              let package = eligibleInstalledVersions().first(where: { $0.version == version.description }) else {
+            throw PHPModuleError.packageMissing(requestedVersion)
+        }
+        return package
+    }
+
     private func manifest(for requestedVersion: String) throws -> PHPManifest {
         let manifests = try location.manifests()
         guard let exact = PHPVersion(requestedVersion), exact.isStable,
@@ -486,13 +509,24 @@ public final class PHPModule: @unchecked Sendable {
     }
 
     public func setDefault(requestedVersion: String) throws -> PHPPackage {
+        try executeOperation(kind: .defaultSelection, targetVersion: requestedVersion) {
+            try self.setDefaultUnlocked(requestedVersion: requestedVersion)
+        }
+    }
+
+    private func setDefaultUnlocked(requestedVersion: String) throws -> PHPPackage {
         let package = try resolveEligible(requestedVersion)
         try makeDirectories([layout.configurationDirectoryURL])
         try atomicWrite(package.version, to: layout.configurationDirectoryURL.appendingPathComponent("php-default.json"))
         return package
     }
 
-    public func defaultVersion() -> String? { try? String(contentsOf: layout.configurationDirectoryURL.appendingPathComponent("php-default.json"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) }
+    public func defaultVersion() -> String? {
+        guard let persisted = try? String(contentsOf: layout.configurationDirectoryURL.appendingPathComponent("php-default.json"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              !persisted.isEmpty,
+              eligibleInstalledVersions().contains(where: { $0.version == persisted }) else { return nil }
+        return persisted
+    }
 
     public func executable(requestedVersion: String? = nil) throws -> String { try resolveInstalled(requestedVersion ?? defaultVersion() ?? "latest").cliPath }
 

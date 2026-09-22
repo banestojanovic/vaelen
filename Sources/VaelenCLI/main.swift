@@ -22,6 +22,8 @@ enum CLICommand {
     case phpUpdate(String)
     case phpRemove(String)
     case phpOperation(json: Bool)
+    case phpDefault(json: Bool)
+    case phpDefaultSet(String)
     case phpUse(String)
     case phpExec(version: String?, arguments: [String])
     case phpStart(String)
@@ -89,7 +91,7 @@ struct VaelenCLIMain {
       val project status|inspect|doctor|plan|activate [project] [--json]
       val routing status|start|stop
       val route list|add|remove|associate
-      val php versions|install|update|remove|operation ...
+      val php versions|default|install|update|remove|operation ...
       val mysql ...
       val mailpit versions|install|start|stop|status|open
     """
@@ -150,6 +152,11 @@ struct VaelenCLIMain {
             case "update": guard args.count == 3 else { throw CLIError.usage }; return .phpUpdate(args[2])
             case "remove": guard args.count == 3 else { throw CLIError.usage }; return .phpRemove(args[2])
             case "operation": return .phpOperation(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "default":
+                if args.count == 2 || (args.count == 3 && args[2] == "--json") { return .phpDefault(json: args.count == 3) }
+                if args.count == 3, args[2] != "set" { return .phpDefaultSet(args[2]) }
+                guard args.count == 4, args[2] == "set" else { throw CLIError.usage }
+                return .phpDefaultSet(args[3])
             case "use": guard args.count == 3 else { throw CLIError.usage }; return .phpUse(args[2])
             case "start": guard args.count == 3 else { throw CLIError.usage }; return .phpStart(args[2])
             case "stop": guard args.count == 3 else { throw CLIError.usage }; return .phpStop(args[2])
@@ -323,6 +330,10 @@ struct VaelenCLIMain {
         case .phpRemove(let version): _ = try await client.phpRemove(version); print("Removed PHP \(version)")
         case .phpOperation(let json):
             let operation = try await client.phpOperation(); if json { print(String(decoding: try IPCCodec.encode(PHPOperationResult(operation: operation)), as: UTF8.self)) } else if let operation { print("PHP \(operation.kind.rawValue) \(operation.targetVersion): \(operation.phase.rawValue)\(operation.message.map { " — \($0)" } ?? "")") } else { print("No PHP operation recorded") }
+        case .phpDefault(let json):
+            let catalog = try await client.phpCatalog(); if json { print(String(decoding: try IPCCodec.encode(PHPRuntimeCatalogResult(catalog: catalog)), as: UTF8.self)) } else { print("Default PHP \(catalog.defaultVersion ?? "none")") }
+        case .phpDefaultSet(let version):
+            let catalog = try await client.phpDefaultSet(version); print("Default PHP \(catalog.defaultVersion ?? version)")
         case .phpUse(let version): let result = try await client.phpUse(version); print("Using PHP \(result.version) for CLI")
         case .phpExec(let version, let arguments): let result = try await client.phpExec(version: version, workingDirectory: FileManager.default.currentDirectoryPath, arguments: arguments); print(result.output, terminator: ""); if result.exitStatus != 0 { exit(result.exitStatus) }
         case .phpStart(let version): let result = try await client.phpStart(version); print("PHP \(result.version) FPM \(result.state.rawValue) \(result.health)")

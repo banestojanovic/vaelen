@@ -151,6 +151,9 @@ public actor VaelenCoreClient {
     public func phpOperation() async throws -> PHPOperationState? {
         guard case .phpOperation(let result) = try result(from: await send(IPCRequest(method: .phpOperation))) else { throw CoreClientError.invalidResponse }; return result.operation
     }
+    public func phpDefaultSet(_ version: String) async throws -> PHPRuntimeCatalog {
+        guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpDefaultSet, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.catalog
+    }
     public func phpUse(_ version: String) async throws -> PHPPackageWire {
         guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpUse, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let resolved = PHPVersionResolver.resolve(version, versionStrings: result.installed.map(\.version)), let package = result.installed.first(where: { $0.version == resolved }) else { throw CoreClientError.invalidResponse }; return package
     }
