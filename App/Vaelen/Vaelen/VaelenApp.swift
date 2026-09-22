@@ -60,6 +60,11 @@ final class AppModel {
 
     private(set) var state: State = .connecting
     private(set) var projectReports: [ProjectEnvironmentReport] = []
+    private(set) var phpCatalog: PHPRuntimeCatalog?
+    private(set) var phpOperation: PHPOperationState?
+    private(set) var phpError: String?
+    private(set) var phpRequestInFlight = false
+    private(set) var phpRequestTarget: String?
     private(set) var parkedFolders: [ParkedPathWire] = []
     private(set) var linkedProjects: [ProjectWire] = []
     private(set) var trustError: String?
@@ -124,10 +129,14 @@ final class AppModel {
             let ports = try? await client.portsStatus()
             let mysql = try? await client.mysqlStatus()
             let mailpit = try? await client.mailpitStatus()
+            let phpCatalog = try? await client.phpCatalog()
+            let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
             projectReports = reports
             self.linkedProjects = linkedProjects
             self.parkedFolders = parkedFolders
+            self.phpCatalog = phpCatalog
+            self.phpOperation = phpOperation
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
             refreshError = nil
         } catch let error as CoreClientError {
@@ -195,6 +204,28 @@ final class AppModel {
     func openMailpit() async { guard beginServiceOperation("Opening Mailpit…"), let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
     func startRouting() async { guard beginServiceOperation("Starting Caddy…"), let client else { return }; do { _ = try await client.routingStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
     func stopRouting() async { guard beginServiceOperation("Stopping Caddy…"), let client else { return }; do { _ = try await client.routingStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+
+    func installPHP(_ version: String) async {
+        guard beginPHPRequest(version: version), let client else { return }
+        do { _ = try await client.phpInstall(version); await finishPHPRequest() }
+        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+    }
+
+    func updatePHP(_ version: String) async {
+        guard beginPHPRequest(version: version), let client else { return }
+        do { _ = try await client.phpUpdate(version); await finishPHPRequest() }
+        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+    }
+
+    func removePHP(_ version: String) async {
+        guard beginPHPRequest(version: version), let client else { return }
+        do { _ = try await client.phpRemove(version); await finishPHPRequest() }
+        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+    }
+
+    func phpOperationIs(for version: String) -> Bool {
+        phpRequestInFlight && phpOperation?.targetVersion == version
+    }
 
     func serviceOperationIs(for title: String) -> Bool {
         guard let operation = serviceOperation else { return false }
@@ -324,6 +355,32 @@ final class AppModel {
         trustError = nil
         serviceOperation = operation
         return true
+    }
+
+    private func beginPHPRequest(version: String) -> Bool {
+        guard !phpRequestInFlight else { return false }
+        guard client != nil else { phpError = "Vaelen Core is unavailable."; return false }
+        phpError = nil
+        phpRequestInFlight = true
+        phpRequestTarget = version
+        return true
+    }
+
+    private func finishPHPRequest(error: String? = nil) async {
+        phpRequestInFlight = false
+        phpRequestTarget = nil
+        phpError = error
+        await refresh()
+    }
+
+    private func phpErrorMessage(_ error: Error) -> String {
+        if case CoreClientError.remote(let payload) = error {
+            switch payload.code {
+            case .invalidRequest: return payload.message
+            default: return payload.message
+            }
+        }
+        return error.localizedDescription
     }
 
     private func finishServiceOperation(error: String? = nil) {
@@ -801,7 +858,7 @@ struct SettingsView: View {
     let model: AppModel
     @State private var selection = SettingsPage.general
 
-    private enum SettingsPage: Hashable { case general, projects }
+    private enum SettingsPage: Hashable { case general, projects, php }
 
     var body: some View {
         NavigationSplitView {
@@ -810,6 +867,9 @@ struct SettingsView: View {
                     Label("General", systemImage: "gearshape").tag(SettingsPage.general)
                     Label("Projects", systemImage: "folder").tag(SettingsPage.projects)
                 }
+                Section("DEVELOPMENT") {
+                    Label("PHP", systemImage: "server.rack").tag(SettingsPage.php)
+                }
             }
             .listStyle(.sidebar)
             .navigationTitle("Settings")
@@ -817,6 +877,7 @@ struct SettingsView: View {
             switch selection {
             case .general: GeneralSettingsView(model: model)
             case .projects: ProjectSettingsView(model: model)
+            case .php: PHPSettingsView(model: model)
             }
         }
         .frame(width: 760, height: 520)
@@ -855,6 +916,173 @@ struct GeneralSettingsView: View {
                 }
             }
         }
+    }
+}
+
+struct PHPSettingsView: View {
+    let model: AppModel
+
+    var body: some View {
+        SettingsContent(title: "PHP", subtitle: "Manage Vaelen’s installed PHP runtimes without changing project configuration.") {
+            if let catalog = model.phpCatalog {
+                SettingsGroup(title: "Default Runtime", footer: "The default runtime is observed here. Changing it will be available in a later PHP release.") {
+                    if let version = catalog.defaultVersion {
+                        HStack(spacing: VaelenUI.spacing8) {
+                            VaelenStatusLabel("PHP \(version)", systemImage: "checkmark.circle", tint: .secondary)
+                            Spacer()
+                            Text(PHPSeriesLabel.series(for: version))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        VaelenStatusLabel("Default runtime unavailable", systemImage: "questionmark.circle", tint: .secondary)
+                    }
+                }
+
+                SettingsGroup(title: "Installed Versions") {
+                    if catalog.installedVersions.isEmpty {
+                        VaelenEmptyState(title: "No Installed PHP", systemImage: "shippingbox", message: "Vaelen has no managed PHP runtimes to show.")
+                            .padding(.vertical, VaelenUI.spacing8)
+                    } else {
+                        ForEach(catalog.installedVersions, id: \.version) { runtime in
+                            PHPVersionRow(runtime: runtime, model: model)
+                        }
+                    }
+                }
+
+                SettingsGroup(title: "Available Versions") {
+                    let installed = Set(catalog.installedVersions.map(\.version))
+                    let available = catalog.availableVersions.filter { !installed.contains($0) }
+                    if available.isEmpty {
+                        Text("No additional PHP versions are currently available.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, VaelenUI.spacing8)
+                    } else {
+                        ForEach(available, id: \.self) { version in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("PHP \(version)")
+                                    Text(PHPSeriesLabel.series(for: version))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Install", systemImage: "arrow.down.circle") {
+                                    Task { await model.installPHP(version) }
+                                }
+                                .labelStyle(.titleAndIcon)
+                                .accessibilityLabel("Install PHP \(version)")
+                                .disabled(model.phpRequestInFlight)
+                            }
+                            .padding(.vertical, VaelenUI.spacing8)
+                            .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+                        }
+                    }
+                }
+            } else {
+                HStack(spacing: VaelenUI.spacing8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading PHP runtime state…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, VaelenUI.spacing12)
+            }
+
+            if let target = model.phpRequestTarget {
+                HStack(spacing: VaelenUI.spacing8) {
+                    ProgressView().controlSize(.small)
+                    Text("Working on PHP \(target)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, VaelenUI.spacing6)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("PHP operation in progress for \(target)")
+            }
+            if let error = model.phpError {
+                VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red)
+                    .font(.caption)
+                    .padding(.top, VaelenUI.spacing6)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+private struct PHPVersionRow: View {
+    let runtime: PHPRuntimeVersion
+    let model: AppModel
+
+    private var isWorking: Bool { model.phpRequestTarget == runtime.version }
+    private var canRemove: Bool { runtime.running == false && !runtime.isDefault }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: VaelenUI.spacing8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("PHP \(runtime.version)").font(.body)
+                if let series = runtime.series {
+                    Text("\(series) series")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if runtime.updateAvailable == true, let latest = runtime.latestVersion {
+                    Text("Update available: \(latest)")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if runtime.updateAvailable == nil {
+                    Text("Update status unavailable")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: VaelenUI.spacing8)
+            if runtime.isDefault {
+                VaelenStatusLabel("Default", systemImage: "checkmark.circle", tint: .secondary)
+                    .font(.caption)
+            }
+            if runtime.running == true {
+                VaelenStatusLabel("Running", systemImage: "circle.fill", tint: .secondary)
+                    .font(.caption)
+            }
+            if isWorking {
+                ProgressView().controlSize(.small)
+            } else if runtime.updateAvailable == true, let latest = runtime.latestVersion {
+                Button("Update", systemImage: "arrow.triangle.2.circlepath") {
+                    Task { await model.updatePHP(latest) }
+                }
+                .labelStyle(.titleAndIcon)
+                .accessibilityLabel("Update PHP \(runtime.version) to \(latest)")
+                .disabled(model.phpRequestInFlight)
+            }
+            if canRemove {
+                Menu {
+                    Button("Remove PHP \(runtime.version)", systemImage: "trash", role: .destructive) {
+                        Task { await model.removePHP(runtime.version) }
+                    }
+                    .accessibilityLabel("Remove PHP \(runtime.version)")
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .accessibilityLabel("Actions for PHP \(runtime.version)")
+                .disabled(model.phpRequestInFlight)
+            }
+        }
+        .padding(.vertical, VaelenUI.spacing8)
+        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("PHP \(runtime.version)")
+    }
+}
+
+private enum PHPSeriesLabel {
+    static func series(for version: String) -> String {
+        if let parsed = PHPVersion(version) { return "PHP \(parsed.family) series" }
+        return "PHP series unavailable"
     }
 }
 
