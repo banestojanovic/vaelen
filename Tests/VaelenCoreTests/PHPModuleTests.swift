@@ -2,6 +2,92 @@ import XCTest
 @testable import VaelenCore
 
 final class PHPModuleTests: XCTestCase {
+    func testRuntimeCatalogKeepsInstalledDefaultAndRunningIndependent() {
+        let first = PHPPackage(version: "8.4.23", architecture: "arm64", packagePath: "/php/8.4.23", cliPath: "/php/8.4.23/php", fpmPath: "/php/8.4.23/php-fpm", source: "fixture", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())
+        let second = PHPPackage(version: "8.3.30", architecture: "arm64", packagePath: "/php/8.3.30", cliPath: "/php/8.3.30/php", fpmPath: "/php/8.3.30/php-fpm", source: "fixture", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())
+        let running = PHPStatus(version: "8.4.23", package: first, state: .running, pid: 42, socket: "/tmp/php.sock", health: "healthy", isDefault: true)
+        let stopped = PHPStatus(version: "8.3.30", package: second, state: .stopped, pid: nil, socket: "/tmp/php-old.sock", health: "stopped", isDefault: false)
+
+        let catalog = PHPRuntimeCatalog(availableVersions: ["8.5.0", "8.4.23", "8.4.23"], packages: [second, first, first], statuses: [stopped, running], defaultVersion: "8.4.23", updates: [PHPUpdateObservation(installedVersion: "8.4.23", latestVersion: "8.4.25")])
+
+        XCTAssertEqual(catalog.availableVersions, ["8.4.23", "8.5.0"])
+        XCTAssertEqual(catalog.installedVersions.map(\.version), ["8.3.30", "8.4.23"])
+        XCTAssertEqual(catalog.defaultVersion, "8.4.23")
+        XCTAssertEqual(catalog.runningVersions, ["8.4.23"])
+        XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.3.30" }?.running, false)
+        XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.4.23" }?.updateAvailable, true)
+    }
+
+    func testPHPUpdateObservationDistinguishesSameSeriesPatchAndUnknownMetadata() {
+        XCTAssertEqual(PHPUpdateObservation(installedVersion: "8.4.23", latestVersion: "8.4.25").updateAvailable, true)
+        XCTAssertEqual(PHPUpdateObservation(installedVersion: "8.4.23", latestVersion: "8.5.0").updateAvailable, false)
+        XCTAssertNil(PHPUpdateObservation(installedVersion: "8.4.23").updateAvailable)
+    }
+
+    func testCurrentManagedPHPIsReportedWithExactIdentityWhenAvailable() throws {
+        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
+        let catalog = try module.runtimeCatalog()
+        XCTAssertTrue(catalog.installedVersions.contains { $0.version == "8.4.23" })
+        XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.4.23" }?.series, "8.4")
+    }
+
+    func testCatalogFixtureCanDescribeMultipleAvailableReleasesWithoutNetwork() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let verification = PHPVerification(algorithm: "sha256", authenticity: "fixture")
+        let manifests = [
+            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: verification),
+            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.25", platform: "macos", architecture: "arm64", artifacts: [:], verification: verification),
+            PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.5.0", platform: "macos", architecture: "arm64", artifacts: [:], verification: verification)
+        ]
+        let manifestURL = root.appendingPathComponent("php-distribution.json")
+        try JSONEncoder().encode(manifests[0]).write(to: manifestURL)
+        try JSONEncoder().encode(PHPManifestCatalog(manifests: manifests)).write(to: root.appendingPathComponent("php-catalog.json"))
+        let module = PHPModule(layout: VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support")), location: FilePHPManifestLocation(manifestURL: manifestURL))
+        XCTAssertEqual(try module.availableVersions(), ["8.4.23", "8.4.25", "8.5.0"])
+        XCTAssertThrowsError(try module.install(requestedVersion: "8.4.25"))
+        XCTAssertEqual(module.operationState()?.phase, .failed)
+        XCTAssertTrue(module.installedVersions().isEmpty)
+    }
+
+    func testUnknownPHPInstallDoesNotCreateRuntimeOrClaimInstalledState() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: .init(algorithm: "sha256", authenticity: "fixture"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"))
+        let module = PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: manifestURL))
+        XCTAssertThrowsError(try module.install(requestedVersion: "8.5.0")) { error in
+            XCTAssertEqual(error as? PHPModuleError, .unsupportedVersion("8.5.0"))
+        }
+        XCTAssertTrue(module.installedVersions().isEmpty)
+        XCTAssertEqual(module.operationState()?.phase, .failed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.phpPackagesDirectoryURL.appendingPathComponent("8.5.0").path))
+    }
+
+    func testRemovalOfMissingVersionIsIdempotentInIsolatedRoot() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: .init(algorithm: "sha256", authenticity: "fixture"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let module = PHPModule(layout: VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support")), location: FilePHPManifestLocation(manifestURL: manifestURL))
+        XCTAssertNoThrow(try module.remove(requestedVersion: "8.4.23"))
+        XCTAssertEqual(module.operationState()?.phase, .removed)
+    }
+
+    func testRealDefaultRunningPHPCannotBeRemoved() throws {
+        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
+        XCTAssertThrowsError(try module.remove(requestedVersion: "8.4.23")) { error in
+            XCTAssertEqual(error as? PHPModuleError, .cannotRemoveActiveRuntime("8.4.23"))
+        }
+        XCTAssertEqual(try module.runtimeCatalog().installedVersions.first { $0.version == "8.4.23" }?.running, true)
+    }
+
     func testNumericPHPVersionResolutionUsesHighestStablePatch() {
         XCTAssertEqual(PHPVersionResolver.resolve("8.4", versionStrings: ["8.4.9", "8.4.23", "8.3.99"]), "8.4.23")
         XCTAssertEqual(PHPVersionResolver.resolve("8.4.9", versionStrings: ["8.4.9", "8.4.23"]), "8.4.9")

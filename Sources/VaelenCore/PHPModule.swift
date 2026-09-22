@@ -134,6 +134,16 @@ public struct PHPVerification: Codable, Equatable, Sendable {
 public protocol PHPManifestLocation: Sendable {
     func manifest() throws -> PHPManifest
     func artifactBaseURL() -> URL?
+    func manifests() throws -> [PHPManifest]
+}
+
+public extension PHPManifestLocation {
+    func manifests() throws -> [PHPManifest] { [try manifest()] }
+}
+
+public struct PHPManifestCatalog: Codable, Equatable, Sendable {
+    public let manifests: [PHPManifest]
+    public init(manifests: [PHPManifest]) { self.manifests = manifests }
 }
 
 public struct FilePHPManifestLocation: PHPManifestLocation {
@@ -144,6 +154,11 @@ public struct FilePHPManifestLocation: PHPManifestLocation {
         try JSONDecoder().decode(PHPManifest.self, from: Data(contentsOf: manifestURL))
     }
     public func artifactBaseURL() -> URL? { baseURL ?? manifestURL.deletingLastPathComponent() }
+    public func manifests() throws -> [PHPManifest] {
+        let catalogURL = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog.json")
+        guard let data = try? Data(contentsOf: catalogURL) else { return [try manifest()] }
+        return try JSONDecoder().decode(PHPManifestCatalog.self, from: data).manifests
+    }
 }
 
 public enum PHPModuleError: Error, Equatable, Sendable {
@@ -158,6 +173,9 @@ public enum PHPModuleError: Error, Equatable, Sendable {
     case processIdentityMismatch
     case processFailed(String)
     case invalidWorkingDirectory(String)
+    case operationInProgress(String)
+    case cannotRemoveActiveRuntime(String)
+    case cannotRemoveDefaultRuntime(String)
 }
 
 public struct PHPPackage: Codable, Equatable, Sendable {
@@ -184,6 +202,101 @@ public struct PHPStatus: Codable, Equatable, Sendable {
     public let isDefault: Bool
 }
 
+/// Core-authoritative, read-only PHP inventory. Installation, default
+/// selection, and process state are deliberately represented independently.
+public struct PHPUpdateObservation: Codable, Equatable, Sendable {
+    public let installedVersion: String
+    public let latestVersion: String?
+
+    public init(installedVersion: String, latestVersion: String? = nil) {
+        self.installedVersion = installedVersion
+        self.latestVersion = latestVersion
+    }
+
+    public var updateAvailable: Bool? {
+        guard let latestVersion,
+              let installed = PHPVersion(installedVersion),
+              let latest = PHPVersion(latestVersion) else { return nil }
+        guard installed.isStable, latest.isStable, installed.family == latest.family else { return false }
+        return latest > installed
+    }
+}
+
+public struct PHPRuntimeVersion: Codable, Equatable, Sendable {
+    public let version: String
+    public let series: String?
+    public let running: Bool?
+    public let isDefault: Bool
+    public let updateAvailable: Bool?
+    public let latestVersion: String?
+
+    public init(version: String, series: String? = nil, running: Bool? = nil, isDefault: Bool = false, updateAvailable: Bool? = nil, latestVersion: String? = nil) {
+        self.version = version
+        self.series = series ?? PHPVersion(version)?.family
+        self.running = running
+        self.isDefault = isDefault
+        self.updateAvailable = updateAvailable
+        self.latestVersion = latestVersion
+    }
+}
+
+public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
+    public let availableVersions: [String]
+    public let installedVersions: [PHPRuntimeVersion]
+    public let defaultVersion: String?
+    public let runningVersions: [String]
+
+    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String]) {
+        self.availableVersions = Self.sortedUnique(availableVersions)
+        self.installedVersions = installedVersions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
+            guard result[value.version] == nil else { return }
+            result[value.version] = value
+        }.values.sorted { Self.versionSort($0.version, $1.version) }
+        self.defaultVersion = defaultVersion
+        self.runningVersions = Self.sortedUnique(runningVersions)
+    }
+
+    public init(availableVersions: [String], packages: [PHPPackage], statuses: [PHPStatus], defaultVersion: String?, updates: [PHPUpdateObservation] = []) {
+        let statusByVersion = Dictionary(uniqueKeysWithValues: statuses.map { ($0.version, $0) })
+        let updateByVersion = Dictionary(uniqueKeysWithValues: updates.map { ($0.installedVersion, $0) })
+        let versions = packages.map { package in
+            let status = statusByVersion[package.version]
+            let update = updateByVersion[package.version]
+            return PHPRuntimeVersion(version: package.version,
+                                     running: status.map { $0.state == .running },
+                                     isDefault: defaultVersion == package.version,
+                                     updateAvailable: update?.updateAvailable,
+                                     latestVersion: update?.latestVersion)
+        }
+        self.init(availableVersions: availableVersions,
+                  installedVersions: versions,
+                  defaultVersion: defaultVersion,
+                  runningVersions: statuses.filter { $0.state == .running }.map(\.version))
+    }
+
+    private static func sortedUnique(_ values: [String]) -> [String] {
+        Array(Set(values)).sorted(by: versionSort)
+    }
+
+    private static func versionSort(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = PHPVersion(lhs), let right = PHPVersion(rhs) else { return lhs < rhs }
+        return left < right
+    }
+}
+
+public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove }
+public enum PHPOperationPhase: String, Codable, Sendable { case starting, downloading, verifying, installing, ready, removing, removed, failed }
+public struct PHPOperationState: Codable, Equatable, Sendable {
+    public let kind: PHPOperationKind
+    public let targetVersion: String
+    public let phase: PHPOperationPhase
+    public let message: String?
+
+    public init(kind: PHPOperationKind, targetVersion: String, phase: PHPOperationPhase, message: String? = nil) {
+        self.kind = kind; self.targetVersion = targetVersion; self.phase = phase; self.message = message
+    }
+}
+
 private struct PHPProcessRecord: Codable, Sendable {
     let pid: Int32
     let version: String
@@ -204,6 +317,8 @@ public final class PHPModule: @unchecked Sendable {
     private let location: any PHPManifestLocation
     private let manager = FileManager.default
     private let lock = NSLock()
+    private var activeOperation: PHPOperationState?
+    private var lastOperation: PHPOperationState?
 
     public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation) {
         self.layout = layout; self.location = location
@@ -219,7 +334,17 @@ public final class PHPModule: @unchecked Sendable {
         return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base))
     }
 
-    public func availableVersions() throws -> [String] { [try location.manifest().phpVersion] }
+    public func availableVersions() throws -> [String] { try location.manifests().map(\.phpVersion).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) } }
+
+    public func runtimeCatalog(updates: [PHPUpdateObservation] = []) throws -> PHPRuntimeCatalog {
+        let packages = eligibleInstalledVersions()
+        let statuses = packages.compactMap { try? status(requestedVersion: $0.version) }
+        return PHPRuntimeCatalog(availableVersions: try availableVersions(), packages: packages, statuses: statuses, defaultVersion: defaultVersion(), updates: updates)
+    }
+
+    public func operationState() -> PHPOperationState? {
+        lock.lock(); defer { lock.unlock() }; return activeOperation ?? lastOperation
+    }
 
     public func installedVersions() -> [PHPPackage] {
         packageObservations().compactMap(\.package).sorted { lhs, rhs in
@@ -255,8 +380,38 @@ public final class PHPModule: @unchecked Sendable {
     }
 
     public func install(requestedVersion: String) throws -> PHPPackage {
-        lock.lock(); defer { lock.unlock() }
-        let manifest = try location.manifest()
+        try executeOperation(kind: .install, targetVersion: requestedVersion) { try self.installUnlocked(requestedVersion: requestedVersion) }
+    }
+
+    public func update(requestedVersion: String) throws -> PHPPackage {
+        try executeOperation(kind: .update, targetVersion: requestedVersion) {
+            let target = try self.manifest(for: requestedVersion).phpVersion
+            let currentDefault = self.defaultVersion()
+            let package = try self.installUnlocked(requestedVersion: target)
+            if let currentDefault, PHPVersion(currentDefault)?.family == PHPVersion(target)?.family, currentDefault != target {
+                _ = try self.setDefault(requestedVersion: target)
+            }
+            return package
+        }
+    }
+
+    public func remove(requestedVersion: String) throws {
+        try executeOperation(kind: .remove, targetVersion: requestedVersion) {
+            self.setOperationPhase(.removing)
+            guard let requested = PHPVersion(requestedVersion), requested.isStable else { throw PHPModuleError.unsupportedVersion(requestedVersion) }
+            guard let package = self.eligibleInstalledVersions().first(where: { $0.version == requested.description }) else { return }
+            let status = try self.status(requestedVersion: package.version)
+            if status.state != .stopped { throw PHPModuleError.cannotRemoveActiveRuntime(package.version) }
+            if self.defaultVersion() == package.version { throw PHPModuleError.cannotRemoveDefaultRuntime(package.version) }
+            let packageRoot = URL(fileURLWithPath: package.packagePath).standardizedFileURL
+            let managedRoot = self.layout.phpPackagesDirectoryURL.standardizedFileURL
+            guard packageRoot.path.hasPrefix(managedRoot.path + "/") else { throw PHPModuleError.validationFailed("PHP package is outside Vaelen's managed package directory") }
+            try self.manager.removeItem(at: packageRoot)
+        }
+    }
+
+    private func installUnlocked(requestedVersion: String) throws -> PHPPackage {
+        let manifest = try manifest(for: requestedVersion)
         guard manifest.module == "php", manifest.schemaVersion == 1, manifest.platform == "macos" else { throw PHPModuleError.invalidManifest("unsupported manifest") }
         guard manifest.architecture == "arm64" else { throw PHPModuleError.unsupportedArchitecture(manifest.architecture) }
         guard manifest.verification.algorithm.lowercased() == "sha256" else { throw PHPModuleError.invalidManifest("SHA-256 verification is required") }
@@ -265,12 +420,15 @@ public final class PHPModule: @unchecked Sendable {
         let version = manifest.phpVersion
         let final = layout.phpPackagesDirectoryURL.appendingPathComponent(version, isDirectory: true)
         if let existing = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: final.appendingPathComponent(".vaelen-package.json"))) { return existing }
+        setOperationPhase(.downloading)
         let operation = UUID().uuidString
         let staging = layout.stagingDirectoryURL.appendingPathComponent("php-\(version)-\(operation)", isDirectory: true)
         try makeDirectories([layout.downloadsDirectoryURL, layout.stagingDirectoryURL, layout.phpPackagesDirectoryURL, staging])
         defer { try? manager.removeItem(at: staging) }
+        setOperationPhase(.verifying)
         let cliURL = try acquire(cli, base: location.artifactBaseURL())
         let fpmURL = try acquire(fpm, base: location.artifactBaseURL())
+        setOperationPhase(.installing)
         try extract(cliURL, to: staging); try extract(fpmURL, to: staging)
         let cliPath = staging.appendingPathComponent("php").path
         let fpmPath = staging.appendingPathComponent("php-fpm").path
@@ -282,6 +440,49 @@ public final class PHPModule: @unchecked Sendable {
         let package = PHPPackage(version: version, architecture: manifest.architecture, packagePath: final.path, cliPath: final.appendingPathComponent("php").path, fpmPath: final.appendingPathComponent("php-fpm").path, source: cli.url, cliSHA256: cli.sha256, fpmSHA256: fpm.sha256, installedAt: Date())
         try atomicWrite(package, to: final.appendingPathComponent(".vaelen-package.json"))
         return package
+    }
+
+    private func manifest(for requestedVersion: String) throws -> PHPManifest {
+        let manifests = try location.manifests()
+        guard let exact = PHPVersion(requestedVersion), exact.isStable,
+              let manifest = manifests.first(where: { $0.phpVersion == exact.description }) else {
+            guard let family = PHPFamily(requestedVersion), let manifest = manifests.filter({ PHPVersion($0.phpVersion)?.family == family.description }).max(by: { (PHPVersion($0.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1.phpVersion) ?? .init(major: 0, minor: 0, patch: 0) ) }) else {
+                throw PHPModuleError.unsupportedVersion(requestedVersion)
+            }
+            return manifest
+        }
+        return manifest
+    }
+
+    private func executeOperation<T>(kind: PHPOperationKind, targetVersion: String, body: () throws -> T) throws -> T {
+        lock.lock()
+        guard activeOperation == nil else {
+            let current = activeOperation?.targetVersion ?? "unknown"
+            lock.unlock()
+            throw PHPModuleError.operationInProgress(current)
+        }
+        activeOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: .starting)
+        lock.unlock()
+        do {
+            let result = try body()
+            lock.lock()
+            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: kind == .remove ? .removed : .ready)
+            activeOperation = nil
+            lock.unlock()
+            return result
+        } catch {
+            lock.lock()
+            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: .failed, message: String(describing: error))
+            activeOperation = nil
+            lock.unlock()
+            throw error
+        }
+    }
+
+    private func setOperationPhase(_ phase: PHPOperationPhase) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = activeOperation else { return }
+        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: phase, message: current.message)
     }
 
     public func setDefault(requestedVersion: String) throws -> PHPPackage {

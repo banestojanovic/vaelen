@@ -57,7 +57,11 @@ public enum CoreMethod: String, Sendable {
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
     case phpVersions = "php.versions"
+    case phpCatalog = "php.catalog"
     case phpInstall = "php.install"
+    case phpUpdate = "php.update"
+    case phpRemove = "php.remove"
+    case phpOperation = "php.operation"
     case phpUse = "php.use"
     case phpExec = "php.exec"
     case phpStart = "php.start"
@@ -303,6 +307,20 @@ public struct PHPVersionRequest: Codable, Equatable, Sendable { public let versi
 public struct PHPExecRequest: Codable, Equatable, Sendable { public let version: String?; public let workingDirectory: String; public let arguments: [String]; public init(version: String? = nil, workingDirectory: String, arguments: [String]) { self.version = version; self.workingDirectory = workingDirectory; self.arguments = arguments } }
 public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
 public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
+public struct PHPRuntimeCatalogResult: Codable, Equatable, Sendable { public let catalog: PHPRuntimeCatalog; public init(catalog: PHPRuntimeCatalog) { self.catalog = catalog } }
+public struct PHPOperationResult: Codable, Equatable, Sendable {
+    public let operation: PHPOperationState?
+    public init(operation: PHPOperationState?) { self.operation = operation }
+    private enum CodingKeys: String, CodingKey { case operation }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let operation { try container.encode(operation, forKey: .operation) } else { try container.encodeNil(forKey: .operation) }
+    }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        operation = try container.decodeIfPresent(PHPOperationState.self, forKey: .operation)
+    }
+}
 public struct PHPStatusResult: Codable, Equatable, Sendable { public let status: PHPStatus; public init(status: PHPStatus) { self.status = status } }
 public struct MySQLPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: MySQLPackage) { version = package.version; architecture = package.architecture } }
 public struct MySQLVersionsPayload: Codable, Equatable, Sendable { public let available: [String]; public let installed: [MySQLPackageWire]; public let `default`: String?; public init(available: [String], installed: [MySQLPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
@@ -339,6 +357,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
+    case phpCatalog(PHPRuntimeCatalogResult)
+    case phpOperation(PHPOperationResult)
     case phpStatus(PHPStatusResult)
     case mysqlVersions(MySQLVersionsResult)
     case mysqlStatus(MySQLStatusResult)
@@ -368,6 +388,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
+        case .phpCatalog(let value): try value.encode(to: encoder)
+        case .phpOperation(let value): try value.encode(to: encoder)
         case .phpStatus(let value): try value.encode(to: encoder)
         case .mysqlVersions(let value): try value.encode(to: encoder)
         case .mysqlStatus(let value): try value.encode(to: encoder)
@@ -404,6 +426,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["mysql"] != nil, let result = try? IPCCodec.decode(MySQLStatusResult.self, from: data) { self = .mysqlStatus(result) }
         else if fields["mailpit"] != nil, let result = try? IPCCodec.decode(MailpitVersionsResult.self, from: data) { self = .mailpitVersions(result) }
         else if fields["mailpit"] != nil, let result = try? IPCCodec.decode(MailpitStatusResult.self, from: data) { self = .mailpitStatus(result) }
+        else if fields["catalog"] != nil, let result = try? IPCCodec.decode(PHPRuntimeCatalogResult.self, from: data) { self = .phpCatalog(result) }
+        else if fields["operation"] != nil, let result = try? IPCCodec.decode(PHPOperationResult.self, from: data) { self = .phpOperation(result) }
         else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }
         else if fields["status"] != nil, let result = try? IPCCodec.decode(PHPStatusResult.self, from: data) { self = .phpStatus(result) }
         else if fields["exitStatus"] != nil, let result = try? IPCCodec.decode(PHPExecResult.self, from: data) { self = .phpExec(result) }

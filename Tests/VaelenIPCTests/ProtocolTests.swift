@@ -65,6 +65,16 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(params?.arguments, ["test.php", "--flag", "value with spaces"])
     }
 
+    func testPHPCatalogMethodAndResponseRoundTripThroughJSON() throws {
+        let request = IPCRequest(method: .phpCatalog)
+        XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)).knownMethod, .phpCatalog)
+        let catalog = PHPRuntimeCatalog(availableVersions: ["8.4.23"], installedVersions: [.init(version: "8.4.23", running: true, isDefault: true)], defaultVersion: "8.4.23", runningVersions: ["8.4.23"])
+        let response = IPCResponse(id: request.id, result: .phpCatalog(.init(catalog: catalog)))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
+        let emptyOperation = IPCResponse(id: request.id, result: .phpOperation(.init(operation: nil)))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(emptyOperation)), emptyOperation)
+    }
+
     func testPortsMethodsAndResponseRoundTripThroughJSON() throws {
         for method in [CoreMethod.portsStatus, .portsInstall, .portsRemove] {
             let request = IPCRequest(method: method)
