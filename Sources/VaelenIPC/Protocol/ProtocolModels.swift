@@ -204,8 +204,10 @@ public struct ProjectWire: Codable, Equatable, Sendable {
     public let path: String
     public let registration: String
     public let availability: String
-    public init(id: UUID?, name: String, path: String, registration: String, availability: String) { self.id = id; self.name = name; self.path = path; self.registration = registration; self.availability = availability }
-    public init(_ project: Project) { self.init(id: project.id?.rawValue, name: project.name, path: project.rootPath.string, registration: project.registrationKind.rawValue, availability: project.availability.rawValue) }
+    public let detectedFramework: String?
+    public let sources: [String]?
+    public init(id: UUID?, name: String, path: String, registration: String, availability: String, detectedFramework: String? = nil, sources: [String]? = nil) { self.id = id; self.name = name; self.path = path; self.registration = registration; self.availability = availability; self.detectedFramework = detectedFramework; self.sources = sources }
+    public init(_ project: Project) { self.init(id: project.id?.rawValue, name: project.name, path: project.rootPath.string, registration: project.registrationKind.rawValue, availability: project.availability.rawValue, detectedFramework: project.detectedFramework, sources: project.visibilitySources?.map(\.rawValue)) }
 }
 
 public struct ParkedPathWire: Codable, Equatable, Sendable {

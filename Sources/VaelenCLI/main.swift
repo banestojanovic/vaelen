@@ -3,14 +3,15 @@ import Foundation
 import VaelenCore
 import VaelenIPC
 
-private enum CLICommand {
+enum CLICommand {
+    case help
     case status(json: Bool)
-    case link(path: String?, name: String?)
-    case unlink(path: String?, name: String?)
+    case link(path: String)
+    case unlink(path: String)
     case links(json: Bool)
-    case park(path: String?)
-    case unpark(path: String?)
-    case paths(json: Bool)
+    case park(path: String)
+    case unpark(path: String)
+    case parks(json: Bool)
     case projectStatus(selector: String?, json: Bool)
     case projectInspect(selector: String?, json: Bool)
     case projectDoctor(selector: String?, json: Bool)
@@ -71,9 +72,32 @@ private struct StatusPayload: Encodable {
 
 @main
 struct VaelenCLIMain {
+    static let usage = """
+    Usage:
+      val park <directory>
+      val parks [--json]
+      val unpark <directory>
+
+      val link <project-directory>
+      val links [--json]
+      val unlink <project-directory>
+
+      val status [--json]
+      val project status|inspect|doctor|plan|activate [project] [--json]
+      val routing status|start|stop
+      val route list|add|remove|associate
+      val php ...
+      val mysql ...
+      val mailpit versions|install|start|stop|status|open
+    """
+
     static func main() async {
         do {
             let command = try parse(Array(CommandLine.arguments.dropFirst()))
+            if case .help = command {
+                print(usage)
+                exit(0)
+            }
             let paths = CoreEndpointPaths()
             let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
             try await client.connect()
@@ -91,12 +115,15 @@ struct VaelenCLIMain {
         }
     }
 
-    private static func parse(_ args: [String]) throws -> CLICommand {
+    static func parse(_ args: [String]) throws -> CLICommand {
         guard let first = args.first else { throw CLIError.usage }
         switch first {
+        case "help", "--help", "-h":
+            guard args.count == 1 else { throw CLIError.usage }
+            return .help
         case "status": return .status(json: args.dropFirst().elementsEqual(["--json"]))
-        case "links": return .links(json: args.dropFirst().elementsEqual(["--json"]))
-        case "paths": return .paths(json: args.dropFirst().elementsEqual(["--json"]))
+        case "links": return .links(json: try listJSONOption(args))
+        case "parks", "paths": return .parks(json: try listJSONOption(args))
         case "project":
             guard args.count >= 2 else { throw CLIError.usage }
             let parsed = try projectEnvironmentArguments(Array(args.dropFirst(2)))
@@ -108,27 +135,10 @@ struct VaelenCLIMain {
             case "activate": return .projectActivate(selector: parsed.selector, json: parsed.json)
             default: throw CLIError.usage
             }
-        case "link":
-            var path: String?; var name: String?
-            var index = 1
-            while index < args.count {
-                if args[index] == "--name", index + 1 < args.count { name = args[index + 1]; index += 2 }
-                else if args[index].hasPrefix("--") { throw CLIError.usage }
-                else if path == nil { path = args[index]; index += 1 }
-                else { throw CLIError.usage }
-            }
-            return .link(path: path, name: name)
-        case "unlink":
-            var path: String?; var name: String?; var index = 1
-            while index < args.count {
-                if args[index] == "--path", index + 1 < args.count { path = args[index + 1]; index += 2 }
-                else if args[index] == "--name", index + 1 < args.count { name = args[index + 1]; index += 2 }
-                else { throw CLIError.usage }
-            }
-            guard !(path != nil && name != nil) else { throw CLIError.usage }
-            return .unlink(path: path, name: name)
-        case "park": return .park(path: try optionalPath(args, command: "park"))
-        case "unpark": return .unpark(path: try optionalPath(args, command: "unpark"))
+        case "link": return .link(path: try requiredPath(args))
+        case "unlink": return .unlink(path: try requiredPath(args))
+        case "park": return .park(path: try requiredPath(args))
+        case "unpark": return .unpark(path: try requiredPath(args))
         case "php":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
@@ -230,10 +240,14 @@ struct VaelenCLIMain {
         }
     }
 
-    private static func optionalPath(_ args: [String], command: String) throws -> String? {
-        let rest = Array(args.dropFirst())
-        guard rest.count <= 1 else { throw CLIError.usage }
-        return rest.first
+    private static func requiredPath(_ args: [String]) throws -> String {
+        guard args.count == 2 else { throw CLIError.usage }
+        return args[1]
+    }
+
+    private static func listJSONOption(_ args: [String]) throws -> Bool {
+        guard args.count == 1 || args.dropFirst().elementsEqual(["--json"]) else { throw CLIError.usage }
+        return args.count == 2
     }
 
     private static func projectEnvironmentArguments(_ args: [String]) throws -> (selector: String?, json: Bool) {
@@ -249,6 +263,8 @@ struct VaelenCLIMain {
 
     private static func execute(_ command: CLICommand, client: VaelenCoreClient, workingDirectory: String) async throws {
         switch command {
+        case .help:
+            print(usage)
         case .status(let json):
             let status = try await client.status()
             if json {
@@ -257,17 +273,17 @@ struct VaelenCLIMain {
             } else {
                 print("Vaelen\nCore       \(status.core.state == .running ? "Running" : "Unavailable")\nVersion    \(status.core.version)\nPID        \(status.core.pid)\nProtocol   \(status.protocolVersion)")
             }
-        case .link(let path, let name):
-            let result = try await client.link(path: path, workingDirectory: workingDirectory, name: name)
+        case .link(let path):
+            let result = try await client.link(path: path, workingDirectory: workingDirectory, name: nil)
             guard let project = result.project else { throw CLIError.message("Core returned no linked project.") }
             print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(displayPath(project.path))")
-        case .unlink(let path, let name):
-            try await client.unlink(path: path, name: name, workingDirectory: workingDirectory)
+        case .unlink(let path):
+            try await client.unlink(path: path, name: nil, workingDirectory: workingDirectory)
             print("Unlinked project")
         case .links(let json):
             let projects = try await client.linkedProjects()
             if json { print(String(decoding: try IPCCodec.encode(ProjectListEnvelope(projects: projects)), as: UTF8.self)) }
-            else { projects.forEach { print("\($0.name)\t\(displayPath($0.path))\t\($0.availability)") } }
+            else { print(linkedProjectsOutput(projects)) }
         case .park(let path):
             let result = try await client.park(path: path, workingDirectory: workingDirectory)
             guard let parked = result.path else { throw CLIError.message("Core returned no parked path.") }
@@ -275,10 +291,10 @@ struct VaelenCLIMain {
         case .unpark(let path):
             try await client.unpark(path: path, workingDirectory: workingDirectory)
             print("Unparked path")
-        case .paths(let json):
+        case .parks(let json):
             let paths = try await client.parkedPaths()
             if json { print(String(decoding: try IPCCodec.encode(ParkedPathListEnvelope(paths: paths)), as: UTF8.self)) }
-            else { paths.forEach { print("\(displayPath($0.path))\t\($0.availability)") } }
+            else { print(parkedPathsOutput(paths)) }
         case .projectStatus(let selector, let json):
             let report = try await client.projectStatus(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectSummary(report)) }
@@ -383,6 +399,16 @@ struct VaelenCLIMain {
         return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
     }
 
+    static func linkedProjectsOutput(_ projects: [ProjectWire]) -> String {
+        guard !projects.isEmpty else { return "No linked projects." }
+        return projects.map { "\($0.name)\t\(displayPath($0.path))\t\($0.availability)" }.joined(separator: "\n")
+    }
+
+    static func parkedPathsOutput(_ paths: [ParkedPathWire]) -> String {
+        guard !paths.isEmpty else { return "No parked folders." }
+        return paths.map { "\(displayPath($0.path))\t\($0.availability)" }.joined(separator: "\n")
+    }
+
     private static func targetDescription(_ target: RouteTarget) -> String {
         switch target {
         case .staticFiles(let root): return "static \(root)"
@@ -441,8 +467,8 @@ struct VaelenCLIMain {
     private static func fail(_ text: String, code: Int32) -> Never { FileHandle.standardError.write(Data((text + "\n").utf8)); exit(code) }
 }
 
-private enum CLIError: Error, CustomStringConvertible {
+enum CLIError: Error, CustomStringConvertible {
     case usage
     case message(String)
-    var description: String { switch self { case .usage: return "Usage: val status | val project status|inspect|doctor|plan|activate [project] [--json] | val routing status|start|stop | val route list|add|remove|associate | val php ... | val mysql ... | val mailpit versions|install|start|stop|status|open"; case .message(let text): return text } }
+    var description: String { switch self { case .usage: return VaelenCLIMain.usage; case .message(let text): return text } }
 }

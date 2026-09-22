@@ -108,14 +108,28 @@ public actor ProjectRegistry {
 
     public func projectsList() throws -> [Project] {
         let linked = try linkedProjects()
+        let discovered = discovery.discover(under: try parkedPaths())
+        let discoveredByPath = Dictionary(uniqueKeysWithValues: discovered.map { ($0.rootPath, $0) })
         let linkedPaths = Set(linked.map(\.rootPath))
-        let discovered = discovery.discover(under: try parkedPaths()).filter { !linkedPaths.contains($0.rootPath) }
-        return (linked + discovered).sorted { $0.rootPath.string < $1.rootPath.string }
+        let presentedLinks = linked.map { project in
+            guard let observation = discoveredByPath[project.rootPath] else { return project }
+            return Project(
+                id: project.id,
+                name: project.name,
+                rootPath: project.rootPath,
+                registrationKind: .linked,
+                availability: project.availability,
+                detectedFramework: observation.detectedFramework,
+                visibilitySources: [.explicitLink, .parkedFolder]
+            )
+        }
+        return (presentedLinks + discovered.filter { !linkedPaths.contains($0.rootPath) })
+            .sorted { $0.rootPath.string < $1.rootPath.string }
     }
 
     private func makeProject(_ record: LinkedProjectRecord) -> Project {
         let path = paths.canonicalize(record.canonicalPath)
-        return Project(id: record.id, name: record.name, rootPath: path, registrationKind: .linked, availability: paths.availability(of: path))
+        return Project(id: record.id, name: record.name, rootPath: path, registrationKind: .linked, availability: paths.availability(of: path), visibilitySources: [.explicitLink])
     }
 
     private func makeParked(_ record: ParkedPathRecord) -> ParkedPath {

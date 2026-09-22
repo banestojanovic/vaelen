@@ -50,13 +50,15 @@ final class ProjectRegistryTests: XCTestCase {
         XCTAssertEqual(restoredPaths.count, 1)
     }
 
-    func testDiscoveryIsImmediateChildOnlyAndExplicitLinkWins() async throws {
+    func testRecognizedDiscoveryAndExplicitLinkWins() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        for name in ["alpha", "nested", ".hidden"] {
-            try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+        for path in ["alpha/bootstrap", "alpha/config", "alpha/public", "nested/child/wp-admin", "nested/child/wp-includes", ".hidden/bootstrap", ".hidden/config", ".hidden/public"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true)
         }
-        try FileManager.default.createDirectory(at: root.appendingPathComponent("nested/child"), withIntermediateDirectories: true)
+        for path in ["alpha/artisan", "alpha/public/index.php", "nested/child/wp-config.php", ".hidden/artisan", ".hidden/public/index.php"] {
+            try Data("marker".utf8).write(to: root.appendingPathComponent(path))
+        }
         try Data("not a project".utf8).write(to: root.appendingPathComponent("file.txt"))
         let symlink = root.appendingPathComponent("linked-child")
         try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: root.appendingPathComponent("alpha"))
@@ -64,7 +66,7 @@ final class ProjectRegistryTests: XCTestCase {
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("db.sqlite")))
         _ = try await registry.park(path: root)
         let discovered = try await registry.projectsList()
-        XCTAssertEqual(Set(discovered.map(\.name)), Set(["alpha", "nested"]))
+        XCTAssertEqual(Set(discovered.map(\.name)), Set(["alpha", "child"]))
         XCTAssertTrue(discovered.allSatisfy { $0.id == nil })
 
         let explicit = try await registry.link(path: root.appendingPathComponent("alpha"), name: "custom")

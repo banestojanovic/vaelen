@@ -331,11 +331,15 @@ public enum ProjectEnvironmentInspectionError: Error, Equatable, Sendable {
 }
 
 public struct ProjectEnvironmentInspector: Sendable {
-    public init() {}
+    private let frameworkDetector: ProjectFrameworkDetector
+
+    public init(frameworkDetector: ProjectFrameworkDetector = .init()) {
+        self.frameworkDetector = frameworkDetector
+    }
 
     public func inspect(project: Project, routes: [RouteIntent], phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, mysql: MySQLStatus?, mailpit: MailpitStatus?, router: RouterStatus, dns: DNSStatus, tls: TLSStatus, standardPorts: StandardPortsStatus, invalidPHPVersions: [String] = [], registeredProjects: [Project] = [], runtimeRoutes: [Route]? = nil, pendingTransitions: [RouteTargetTransition] = []) -> ProjectEnvironmentReport {
         let root = URL(fileURLWithPath: project.rootPath.string, isDirectory: true)
-        let framework = inspectFramework(root: root)
+        let framework = frameworkDetector.inspect(root: root)
         let desiredResult = readDesiredState(root: root)
         let env = readDotenv(root: root)
         let cache = inspectConfigCache(root: root, envPath: root.appendingPathComponent(".env"))
@@ -426,21 +430,6 @@ public struct ProjectEnvironmentInspector: Sendable {
         guard let cacheDate = try? FileManager.default.attributesOfItem(atPath: cache.path)[.modificationDate] as? Date else { return .init(state: "absent", cachePath: cache.path, envModifiedAt: envDate) }
         let newer = envDate.map { $0 > cacheDate }
         return .init(state: newer == true ? "present, .env is newer" : "present, appears current", cachePath: cache.path, cacheModifiedAt: cacheDate, envModifiedAt: envDate, envNewerThanCache: newer)
-    }
-
-    private func inspectFramework(root: URL) -> ProjectFrameworkInspection {
-        let fm = FileManager.default
-        let markers = ["artisan": fm.fileExists(atPath: root.appendingPathComponent("artisan").path), "composer.json": fm.fileExists(atPath: root.appendingPathComponent("composer.json").path), "bootstrap/": fm.fileExists(atPath: root.appendingPathComponent("bootstrap", isDirectory: true).path), "config/": fm.fileExists(atPath: root.appendingPathComponent("config", isDirectory: true).path), "public/index.php": fm.fileExists(atPath: root.appendingPathComponent("public/index.php").path)]
-        var evidence = markers.filter { $0.value }.map(\.key).sorted()
-        var composerPHP: String?
-        if let data = try? Data(contentsOf: root.appendingPathComponent("composer.json")), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let requirements = object["require"] as? [String: Any] {
-            if let php = requirements["php"] as? String { composerPHP = php; evidence.append("composer.json require.php") }
-            if (requirements["laravel/framework"] as? String) != nil { evidence.append("composer.json laravel/framework") }
-        }
-        let laravel = markers["artisan"] == true && markers["bootstrap/"] == true && markers["config/"] == true && markers["public/index.php"] == true
-        if laravel { return .init(framework: "Laravel", confidence: .high, evidence: Array(Set(evidence)).sorted(), suggestedDocumentRoot: "public/", composerPHPRequirement: composerPHP) }
-        if markers.values.filter({ $0 }).count >= 2 { return .init(framework: "Generic PHP", confidence: .medium, evidence: Array(Set(evidence)).sorted(), suggestedDocumentRoot: fm.fileExists(atPath: root.appendingPathComponent("public", isDirectory: true).path) ? "public/" : nil, composerPHPRequirement: composerPHP) }
-        return .init(framework: "Generic/Unknown", confidence: .low, evidence: evidence, composerPHPRequirement: composerPHP)
     }
 
     private func routeObservation(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], router: RouterStatus, registeredProjects: [Project]) -> ProjectObservedRoute {

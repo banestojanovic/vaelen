@@ -14,6 +14,74 @@ private final class DispatcherTrustFake: @unchecked Sendable, TLSTrustBoundary {
 }
 
 final class DispatcherTests: XCTestCase {
+    func testProjectRelationshipsTraverseCoreAndRemainIndependentlyDurable() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        let project = workspace.appendingPathComponent("project", isDirectory: true)
+        for path in ["bootstrap", "config", "public"] {
+            try FileManager.default.createDirectory(at: project.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        try Data("marker".utf8).write(to: project.appendingPathComponent("artisan"))
+        try Data("<?php".utf8).write(to: project.appendingPathComponent("public/index.php"))
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = root.appendingPathComponent("state/state.sqlite")
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1),
+            registry: ProjectRegistry(store: try SQLiteStateStore(databaseURL: database))
+        )
+
+        let emptyParks = await dispatcher.dispatch(IPCRequest(method: .pathList, params: .listProjects(.init())), handshaken: true)
+        guard case .parkedPathList(let emptyParkList) = emptyParks.response.result else { return XCTFail("missing parked-root list") }
+        XCTAssertTrue(emptyParkList.paths.isEmpty)
+        let emptyLinks = await dispatcher.dispatch(IPCRequest(method: .projectLinks, params: .listProjects(.init())), handshaken: true)
+        guard case .projectList(let emptyLinkList) = emptyLinks.response.result else { return XCTFail("missing explicit-link list") }
+        XCTAssertTrue(emptyLinkList.projects.isEmpty)
+
+        let parked = await dispatcher.dispatch(IPCRequest(method: .pathPark, params: .park(.init(path: workspace.path, workingDirectory: root.path))), handshaken: true)
+        guard case .parkedPathMutation(let parkedResult) = parked.response.result else { return XCTFail("park did not return a typed result") }
+        XCTAssertTrue(parkedResult.created)
+        let repeatedPark = await dispatcher.dispatch(IPCRequest(method: .pathPark, params: .park(.init(path: workspace.appendingPathComponent(".").path, workingDirectory: root.path))), handshaken: true)
+        guard case .parkedPathMutation(let repeatedParkResult) = repeatedPark.response.result else { return XCTFail("repeated park did not return a typed result") }
+        XCTAssertFalse(repeatedParkResult.created)
+        XCTAssertEqual(repeatedParkResult.path?.id, parkedResult.path?.id)
+
+        let linked = await dispatcher.dispatch(IPCRequest(method: .projectLink, params: .link(.init(path: project.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectMutation(let linkedResult) = linked.response.result else { return XCTFail("link did not return a typed result") }
+        XCTAssertTrue(linkedResult.created)
+        let repeatedLink = await dispatcher.dispatch(IPCRequest(method: .projectLink, params: .link(.init(path: project.appendingPathComponent(".").path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectMutation(let repeatedLinkResult) = repeatedLink.response.result else { return XCTFail("repeated link did not return a typed result") }
+        XCTAssertFalse(repeatedLinkResult.created)
+        XCTAssertEqual(repeatedLinkResult.project?.id, linkedResult.project?.id)
+
+        let recreated = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 2),
+            registry: ProjectRegistry(store: try SQLiteStateStore(databaseURL: database))
+        )
+        let persistedParks = await recreated.dispatch(IPCRequest(method: .pathList, params: .listProjects(.init())), handshaken: true)
+        guard case .parkedPathList(let persistedParkList) = persistedParks.response.result else { return XCTFail("recreated Core lost parked roots") }
+        XCTAssertEqual(persistedParkList.paths.map(\.path), [workspace.standardizedFileURL.path])
+        let persistedLinks = await recreated.dispatch(IPCRequest(method: .projectLinks, params: .listProjects(.init())), handshaken: true)
+        guard case .projectList(let persistedLinkList) = persistedLinks.response.result else { return XCTFail("recreated Core lost explicit links") }
+        XCTAssertEqual(persistedLinkList.projects.map(\.path), [project.standardizedFileURL.path])
+        let presented = await recreated.dispatch(IPCRequest(method: .projectList, params: .listProjects(.init())), handshaken: true)
+        guard case .projectList(let presentedList) = presented.response.result else { return XCTFail("combined project list unavailable") }
+        XCTAssertEqual(presentedList.projects.count, 1)
+        XCTAssertEqual(presentedList.projects.first?.detectedFramework, "Laravel")
+        XCTAssertEqual(presentedList.projects.first?.sources, ["explicitLink", "parkedFolder"])
+
+        _ = await recreated.dispatch(IPCRequest(method: .pathUnpark, params: .unpark(.init(path: workspace.path, workingDirectory: root.path))), handshaken: true)
+        let linksAfterUnpark = await recreated.dispatch(IPCRequest(method: .projectLinks, params: .listProjects(.init())), handshaken: true)
+        guard case .projectList(let linksAfterUnparkResult) = linksAfterUnpark.response.result else { return XCTFail("explicit links unavailable after unpark") }
+        XCTAssertEqual(linksAfterUnparkResult.projects.map(\.path), [project.standardizedFileURL.path])
+
+        _ = await recreated.dispatch(IPCRequest(method: .pathPark, params: .park(.init(path: workspace.path, workingDirectory: root.path))), handshaken: true)
+        _ = await recreated.dispatch(IPCRequest(method: .projectUnlink, params: .unlink(.init(path: project.path, workingDirectory: root.path))), handshaken: true)
+        let parksAfterUnlink = await recreated.dispatch(IPCRequest(method: .pathList, params: .listProjects(.init())), handshaken: true)
+        guard case .parkedPathList(let parksAfterUnlinkResult) = parksAfterUnlink.response.result else { return XCTFail("parked roots unavailable after unlink") }
+        XCTAssertEqual(parksAfterUnlinkResult.paths.map(\.path), [workspace.standardizedFileURL.path])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: project.path))
+    }
+
     func testM13TrustAndUntrustTraverseDispatcherWithParameterlessRequests() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -218,16 +286,34 @@ final class DispatcherTests: XCTestCase {
     func testProjectReconciliationRejectsDiscoveredProjects() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let projectRoot = root.appendingPathComponent("discovered")
-        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        for path in ["bootstrap", "config", "public"] {
+            try FileManager.default.createDirectory(at: projectRoot.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        try Data("marker".utf8).write(to: projectRoot.appendingPathComponent("artisan"))
+        try Data("<?php".utf8).write(to: projectRoot.appendingPathComponent("public/index.php"))
         defer { try? FileManager.default.removeItem(at: root) }
         let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
         _ = try await registry.park(path: root)
         let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry)
 
+        // Precondition: Slice 4 discovery recognizes the parked folder as a discovered (unlinked) project.
+        let listed = await dispatcher.dispatch(IPCRequest(method: .projectList, params: .listProjects(.init())), handshaken: true)
+        guard case .projectList(let listedResult) = listed.response.result else { return XCTFail("combined project list unavailable") }
+        XCTAssertEqual(listedResult.projects.first(where: { $0.name == "discovered" })?.registration, "discovered")
+
+        // Read-only environment remains observable for discovered projects.
+        let status = await dispatcher.dispatch(IPCRequest(method: .projectStatus, params: .projectEnvironment(.init(selector: "discovered", workingDirectory: root.path))), handshaken: true)
+        XCTAssertNil(status.response.error)
+
+        // Reconciliation stays gated to explicitly linked projects.
         let result = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: "discovered", workingDirectory: root.path))), handshaken: true)
 
         XCTAssertEqual(result.response.error?.code, .invalidRequest)
         XCTAssertEqual(result.response.error?.message, "Project reconciliation requires a registered linked project.")
+
+        let plan = await dispatcher.dispatch(IPCRequest(method: .projectPlan, params: .projectEnvironment(.init(selector: "discovered", workingDirectory: root.path))), handshaken: true)
+        XCTAssertEqual(plan.response.error?.code, .invalidRequest)
+        XCTAssertEqual(plan.response.error?.message, "Project reconciliation requires a registered linked project.")
     }
 
     func testProjectActivationStartsAndThenReusesAnIsolatedMailpit() async throws {

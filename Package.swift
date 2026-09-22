@@ -26,7 +26,8 @@ let package = Package(
         .executableTarget(name: "VaelenCLI", dependencies: ["VaelenIPC"]),
         .executableTarget(name: "VaelenPrivilegedHelper", dependencies: ["VaelenCore"]),
         .testTarget(name: "VaelenCoreTests", dependencies: ["VaelenCore"]),
-        .testTarget(name: "VaelenIPCTests", dependencies: ["VaelenCore", "VaelenIPC", "VaelenDaemonSupport"])
-        ,.testTarget(name: "VaelenDNSTests", dependencies: ["VaelenDNSCore"])
+        .testTarget(name: "VaelenIPCTests", dependencies: ["VaelenCore", "VaelenIPC", "VaelenDaemonSupport"]),
+        .testTarget(name: "VaelenCLITests", dependencies: ["VaelenCLI"]),
+        .testTarget(name: "VaelenDNSTests", dependencies: ["VaelenDNSCore"])
     ]
 )

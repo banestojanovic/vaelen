@@ -15,6 +15,7 @@ public struct ParkedPathID: Hashable, Codable, Sendable, CustomStringConvertible
 }
 
 public enum ProjectRegistrationKind: String, Codable, Sendable { case linked, discovered }
+public enum ProjectVisibilitySource: String, Codable, Sendable { case explicitLink, parkedFolder }
 
 public struct Project: Identifiable, Codable, Equatable, Sendable {
     public let id: ProjectID?
@@ -22,11 +23,15 @@ public struct Project: Identifiable, Codable, Equatable, Sendable {
     public let rootPath: CanonicalPath
     public let registrationKind: ProjectRegistrationKind
     public let availability: PathAvailability
+    public let detectedFramework: String?
+    public let visibilitySources: [ProjectVisibilitySource]?
 
     public init(id: ProjectID?, name: String, rootPath: CanonicalPath,
-                registrationKind: ProjectRegistrationKind, availability: PathAvailability) {
+                registrationKind: ProjectRegistrationKind, availability: PathAvailability,
+                detectedFramework: String? = nil, visibilitySources: [ProjectVisibilitySource]? = nil) {
         self.id = id; self.name = name; self.rootPath = rootPath
         self.registrationKind = registrationKind; self.availability = availability
+        self.detectedFramework = detectedFramework; self.visibilitySources = visibilitySources
     }
 }
 
