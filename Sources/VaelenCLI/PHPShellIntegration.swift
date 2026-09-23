@@ -5,11 +5,28 @@ enum PHPShellIntegration {
     private static let begin = "# >>> Vaelen PHP runtime resolution >>>"
     private static let end = "# <<< Vaelen PHP runtime resolution <<<"
     private static var fileManager: FileManager { .default }
-    private static let shellBlock = #"""
+    static let shellBlock = #"""
     # >>> Vaelen PHP runtime resolution >>>
     function php() {
-      local _vaelen_php_path
-      _vaelen_php_path="$("$HOME/Library/Application Support/Vaelen/bin/vaelen-php-resolver" php resolve --path)" || return $?
+      local _vaelen_php_path _vaelen_php_result _vaelen_php_status _vaelen_activity
+      _vaelen_php_result="$("$HOME/Library/Application Support/Vaelen/bin/vaelen-php-resolver" php resolve --path 2>&1)"
+      _vaelen_php_status=$?
+      if (( _vaelen_php_status != 0 )); then
+        if (( _vaelen_php_status == 3 )); then
+          _vaelen_activity="$HOME/Library/Application Support/Vaelen/state/activity"
+          if [[ -r "$_vaelen_activity" ]] && [[ "$(<"$_vaelen_activity")" == inactive ]]; then
+            command php "$@"
+            return $?
+          fi
+          if [[ ! -r "$_vaelen_activity" ]]; then
+            print -u2 "Vaelen activity is unknown; refusing to switch PHP runtimes. Start Vaelen or retry after a clean Quit."
+            return 3
+          fi
+        fi
+        [[ -n "$_vaelen_php_result" ]] && print -u2 -- "$_vaelen_php_result"
+        return $_vaelen_php_status
+      fi
+      _vaelen_php_path="$_vaelen_php_result"
       if [[ ! -x "$_vaelen_php_path" ]]; then
         print -u2 "Vaelen could not resolve an executable PHP runtime. Check that Vaelen Core is running and a PHP version is installed."
         return 127

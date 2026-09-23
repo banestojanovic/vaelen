@@ -14,17 +14,53 @@ public actor CoreRequestDispatcher {
     private let dns: DNSCapability
     private let tls: TLSCapability
     private let ports: StandardPortsCapability
+    private let serviceIntents: ServiceIntentStore
+    private var restorationStarted = false
+    private var restorationTask: Task<Void, Never>?
     private var routeIntents: [RouteID: RouteIntent]
+    private var shutdownBegun = false
+    private var shutdownTask: Task<CoreShutdownResponse, Never>?
+    private var shutdownRunInFlight = false
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability()) throws {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil) throws {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
         let persistedRoutes = try routeRepository?.all() ?? []
         _ = try routeRepository?.pendingTransitions()
         self.routeIntents = Dictionary(uniqueKeysWithValues: persistedRoutes.map { ($0.route.id, $0) })
     }
 
     public func dispatch(_ request: IPCRequest, handshaken: Bool) async -> (response: IPCResponse, handshaken: Bool) {
+        if request.knownMethod == .shutdown {
+            guard handshaken else {
+                return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Handshake is required before shutdown.")), false)
+            }
+            shutdownBegun = true
+            return (.init(id: request.id, result: .shutdown(await performShutdownOnce())), true)
+        }
+        if shutdownBegun && request.knownMethod != .status && request.knownMethod != .handshake {
+            return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Core shutdown is in progress. Retry after cleanup completes.")), handshaken)
+        }
+        return await dispatchRequest(request, handshaken: handshaken)
+    }
+
+    /// Used by the Core's parent-liveness monitor when the GUI disappears
+    /// without completing its normal IPC Quit handshake.
+    public func shutdownForParentExit() async -> CoreShutdownResponse {
+        shutdownBegun = true
+        return await performShutdownOnce()
+    }
+
+    private func performShutdownOnce() async -> CoreShutdownResponse {
+        if shutdownTask == nil || (!shutdownRunInFlight && lastShutdownResponse?.completed == false) {
+            shutdownRunInFlight = true
+            shutdownTask = Task { await self.performShutdown() }
+        }
+        let task = shutdownTask!
+        return await task.value
+    }
+
+    private func dispatchRequest(_ request: IPCRequest, handshaken: Bool) async -> (response: IPCResponse, handshaken: Bool) {
         guard request.protocolVersion == ProtocolVersion.v1.rawValue else {
             return (.init(id: request.id, error: .init(code: .protocolIncompatible, message: "Client and Core protocol versions are incompatible.", details: ["clientProtocolVersion": "\(request.protocolVersion)", "coreProtocolVersion": "1"])), handshaken)
         }
@@ -46,7 +82,9 @@ public actor CoreRequestDispatcher {
         do {
             switch method {
             case .status:
-                return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1))), true)
+                return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1, serviceIssues: serviceIntents.failures()))), true)
+            case .shutdown:
+                fatalError("shutdown is handled before provider dispatch")
             case .projectLink:
                 let params = try request.params?.decode(LinkProjectRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Link parameters are required.") }()
                 let mutation = try await registry.linkWithCreation(path: params.path, workingDirectory: params.workingDirectory, name: params.name)
@@ -126,7 +164,7 @@ public actor CoreRequestDispatcher {
                 var dependencies = [String]()
                 for project in try await registry.linkedProjects() { if let id = project.id, try await registry.phpOverride(for: id) == params.version { dependencies.append(project.name) } }
                 if !dependencies.isEmpty { throw IPCErrorPayload(code: .invalidRequest, message: "PHP \(params.version) is required by linked project(s): \(dependencies.joined(separator: ", ")). Clear those project overrides first.") }
-                try module.remove(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                try serviceIntents.set("php:\(params.version)", enabled: false); try module.remove(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpOperation:
                 let module = try phpModule(); return (.init(id: request.id, result: .phpOperation(.init(operation: module.operationState()))), true)
             case .phpDefaultSet:
@@ -139,9 +177,9 @@ public actor CoreRequestDispatcher {
                 let params = try request.params?.decode(PHPResolveRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP resolution requires the current working directory.") }()
                 return (.init(id: request.id, result: .phpResolve(try await phpExecutableResolution(workingDirectory: params.workingDirectory))), true)
             case .phpStart:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.start(requestedVersion: params.version)))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); try serviceIntents.set("php:\(params.version)", enabled: true); return (.init(id: request.id, result: .phpStatus(.init(status: try module.start(requestedVersion: params.version)))), true)
             case .phpStop:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.stop(requestedVersion: params.version)))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); try serviceIntents.set("php:\(params.version)", enabled: false); return (.init(id: request.id, result: .phpStatus(.init(status: try module.stop(requestedVersion: params.version)))), true)
             case .phpStatus:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.status(requestedVersion: params.version)))), true)
             case .mysqlVersions:
@@ -153,9 +191,9 @@ public actor CoreRequestDispatcher {
             case .mysqlInitialize:
                 let module = try mysqlModule(); try module.initialize(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: module.status()))), true)
             case .mysqlStart:
-                let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.start()))), true)
+                let module = try mysqlModule(); try serviceIntents.set("mysql", enabled: true); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.start()))), true)
             case .mysqlStop:
-                let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.stop()))), true)
+                let module = try mysqlModule(); try serviceIntents.set("mysql", enabled: false); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: try module.stop()))), true)
             case .mysqlStatus:
                 let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: module.status()))), true)
             case .mailpitVersions:
@@ -163,17 +201,17 @@ public actor CoreRequestDispatcher {
             case .mailpitInstall:
                 let module = try mailpitModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Mailpit version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: module.installedVersions().map(MailpitPackageWire.init))))), true)
             case .mailpitStart:
-                let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.start()))), true)
+                let module = try mailpitModule(); try serviceIntents.set("mailpit", enabled: true); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.start()))), true)
             case .mailpitStop:
-                let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.stop()))), true)
+                let module = try mailpitModule(); try serviceIntents.set("mailpit", enabled: false); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.stop()))), true)
             case .mailpitStatus:
                 let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: module.status()))), true)
             case .routingStatus:
                 return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routingStart:
-                try await router.start(); try await router.reconcile(routes: routeIntents.values.map(\.route)); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
+                try serviceIntents.set("caddy", enabled: true); try await router.start(); try await router.reconcile(routes: routeIntents.values.map(\.route)); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routingStop:
-                try await router.stop(); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
+                try serviceIntents.set("caddy", enabled: false); try await router.stop(); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routeList:
                 return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
             case .routeAdd:
@@ -225,9 +263,9 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .dnsStatus(.init(dns: await dns.status()))), true)
             case .dnsInstall:
                 let params = try request.params?.decode(DNSInstallRequest.self) ?? .init()
-                return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.install(takeover: params.takeover)))), true)
+                try serviceIntents.set("dns", enabled: true); return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.install(takeover: params.takeover)))), true)
             case .dnsRemove:
-                return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.remove()))), true)
+                try serviceIntents.set("dns", enabled: false); return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.remove()))), true)
             case .tlsStatus:
                 return (.init(id: request.id, result: .tlsStatus(.init(tls: await tls.status()))), true)
             case .tlsInstall:
@@ -241,9 +279,9 @@ public actor CoreRequestDispatcher {
             case .portsStatus:
                 return (.init(id: request.id, result: .portsStatus(.init(ports: await ports.status()))), true)
             case .portsInstall:
-                return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.install()))), true)
+                try serviceIntents.set("standard-ports", enabled: true); return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.install()))), true)
             case .portsRemove:
-                return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.remove()))), true)
+                try serviceIntents.set("standard-ports", enabled: false); return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.remove()))), true)
             case .handshake:
                 fatalError("handled above")
             }
@@ -278,6 +316,146 @@ public actor CoreRequestDispatcher {
         guard (await router.status()).state == .running else { return }
         try await router.reconcile(routes: routeIntents.values.map(\.route))
     }
+
+    /// Kick off one restoration pass without holding up the Core IPC actor.
+    /// Providers continue to report observed state; saved choices are never
+    /// treated as proof that a service is running.
+    public func restoreServicesOnStartup() {
+        guard !restorationStarted else { return }
+        restorationStarted = true
+        let intents = serviceIntents
+        let php = self.php, mysql = self.mysql, mailpit = self.mailpit
+        let router = self.router, dns = self.dns, ports = self.ports
+        let routes = routeIntents.values.map(\.route)
+        restorationTask = Task.detached {
+            let enabled: Set<String>
+            do { enabled = try intents.enabledServices() }
+            catch { return }
+            func note(_ service: String, _ operation: () async throws -> Void) async {
+                do {
+                    try await operation()
+                    try? intents.clearFailure(service)
+                } catch {
+                    let detail: String
+                    if let error = error as? DNSCapabilityError {
+                        switch error {
+                        case .externalConflict: detail = "An external /etc/resolver/test file exists; it was left unchanged."
+                        case .ownershipMismatch: detail = "The resolver no longer matches Vaelen's saved preimage; it was left unchanged."
+                        case .privilegeUnavailable: detail = "macOS authorization for resolver changes is unavailable."
+                        case .authorizationRequired(let message): detail = "Resolver authorization failed: \(message)"
+                        case .responderUnverified(let message), .responderShutdownFailed(let message), .ownershipUncertain(let message), .resolverConflict(let message), .processFailed(let message): detail = message
+                        case .invalidPort(let port): detail = "DNS port \(port) is invalid."
+                        }
+                    } else if let error = error as? StandardPortsError {
+                        switch error {
+                        case .helperUnavailable: detail = "Standard Ports require approval in Vaelen.app."
+                        case .authorizationRequired(let message): detail = "PF authorization failed: \(message)"
+                        case .externalConflict(let message): detail = "External PF/port conflict: \(message)"
+                        case .ownershipMismatch: detail = "PF ownership no longer matches Vaelen's saved record; external rules were left unchanged."
+                        case .backendUnavailable: detail = "Caddy must be healthy before Standard Ports can be enabled."
+                        case .unavailable(let message): detail = message
+                        }
+                    } else { detail = String(describing: error) }
+                    try? intents.setFailure(service, detail: detail)
+                    Logger(subsystem: "dev.vaelen.daemon", category: "service-restoration").error("Saved \(service, privacy: .public) service could not start: \(detail, privacy: .public)")
+                }
+            }
+            // Restore local services before the router; PF forwarding is last
+            // because it requires a healthy Caddy backend.
+            for item in enabled.sorted() where item.hasPrefix("php:") {
+                guard !Task.isCancelled else { return }
+                let version = String(item.dropFirst(4))
+                if let php { await note(item) { _ = try php.start(requestedVersion: version) } }
+            }
+            guard !Task.isCancelled else { return }
+            if enabled.contains("mysql"), let mysql { await note("mysql") { _ = try mysql.start() } }
+            guard !Task.isCancelled else { return }
+            if enabled.contains("mailpit"), let mailpit { await note("mailpit") { _ = try mailpit.start() } }
+            guard !Task.isCancelled else { return }
+            if enabled.contains("caddy") {
+                await note("caddy") { try await router.start(); try await router.reconcile(routes: routes) }
+            }
+            guard !Task.isCancelled else { return }
+            if enabled.contains("dns") { await note("dns") { _ = try await dns.install() } }
+            guard !Task.isCancelled else { return }
+            if enabled.contains("standard-ports") { await note("standard-ports") { _ = try await ports.install() } }
+        }
+    }
+
+    public func shouldExitAfterShutdownResponse() -> Bool {
+        shutdownTask != nil && shutdownBegun && lastShutdownResponse?.completed == true
+    }
+
+    public func isShutdownInProgress() -> Bool { shutdownBegun }
+
+    private var lastShutdownResponse: CoreShutdownResponse?
+
+    private func performShutdown() async -> CoreShutdownResponse {
+        restorationTask?.cancel()
+        if let restorationTask { await restorationTask.value }
+        var outcomes = [CoreShutdownComponentResult]()
+        func result(_ name: String, _ body: () throws -> String) {
+            do { outcomes.append(.init(component: name, succeeded: true, detail: try body())) }
+            catch { outcomes.append(.init(component: name, succeeded: false, detail: String(describing: error))) }
+        }
+
+        // Keep every subsystem available until each exact provider stop has
+        // returned. Continue after failures so one resistant service does not
+        // leave other owned resources running unnecessarily.
+        if let php {
+            let packages = php.installedVersions()
+            if packages.isEmpty { outcomes.append(.init(component: "php-fpm", succeeded: true, detail: "No installed managed PHP runtimes.")) }
+            for package in packages {
+                result("php-fpm \(package.version)") {
+                    let status = try php.stop(requestedVersion: package.version)
+                    guard status.state == .stopped else { throw NSError(domain: "VaelenShutdown", code: 1, userInfo: [NSLocalizedDescriptionKey: "PHP-FPM reports \(status.health)"]) }
+                    return status.health == "stopped" ? "Stopped or already stopped." : "Stopped."
+                }
+            }
+        } else { outcomes.append(.init(component: "php-fpm", succeeded: true, detail: "PHP provider is not configured.")) }
+
+        if let mysql {
+            result("mysql") {
+                let status = try mysql.stop()
+                guard status.state == .stopped || status.state == .notInstalled else { throw NSError(domain: "VaelenShutdown", code: 2, userInfo: [NSLocalizedDescriptionKey: "MySQL reports \(status.health)"]) }
+                return "Stopped or already stopped."
+            }
+        } else { outcomes.append(.init(component: "mysql", succeeded: true, detail: "MySQL provider is not configured.")) }
+
+        if let mailpit {
+            result("mailpit") {
+                let status = try mailpit.stop()
+                guard status.state == .stopped || status.state == .installed || status.state == .notInstalled else { throw NSError(domain: "VaelenShutdown", code: 3, userInfo: [NSLocalizedDescriptionKey: "Mailpit reports \(status.health)"]) }
+                return "Stopped or already stopped."
+            }
+        } else { outcomes.append(.init(component: "mailpit", succeeded: true, detail: "Mailpit provider is not configured.")) }
+
+        do {
+            try await router.stop()
+            let status = await router.status()
+            guard status.state == .stopped else { throw NSError(domain: "VaelenShutdown", code: 4, userInfo: [NSLocalizedDescriptionKey: "Caddy reports \(status.health)"]) }
+            outcomes.append(.init(component: "caddy", succeeded: true, detail: "Stopped or already stopped."))
+        } catch { outcomes.append(.init(component: "caddy", succeeded: false, detail: String(describing: error))) }
+
+        do {
+            let status = try await dns.shutdownForQuit()
+            let responderState = status.responderState
+            let respondersStopped = responderState == .stopped || responderState == .exited
+            guard respondersStopped else { throw NSError(domain: "VaelenShutdown", code: 5, userInfo: [NSLocalizedDescriptionKey: "DNS responder remains \(responderState.rawValue); resolver state is \(status.health)"]) }
+            outcomes.append(.init(component: "dns", succeeded: true, detail: "Resolver ownership restored where recorded; owned responder is stopped."))
+        } catch { outcomes.append(.init(component: "dns", succeeded: false, detail: String(describing: error))) }
+
+        do {
+            let status = try await ports.shutdownCleanup()
+            outcomes.append(.init(component: "standard-ports-pf", succeeded: true, detail: status.detail ?? (status.state == .absent ? "No Vaelen PF forwarding remains." : "Existing PF state was left unchanged.")))
+        } catch { outcomes.append(.init(component: "standard-ports-pf", succeeded: false, detail: String(describing: error))) }
+
+        let response = CoreShutdownResponse(components: outcomes)
+        lastShutdownResponse = response
+        shutdownRunInFlight = false
+        return response
+    }
+
 
     private func phpModule() throws -> PHPModule { guard let php else { throw IPCErrorPayload(code: .internalError, message: "PHP distribution manifest is not configured.") }; return php }
 

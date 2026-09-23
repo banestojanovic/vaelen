@@ -3,6 +3,27 @@ import Darwin
 @testable import VaelenCore
 
 final class CaddyRuntimeTests: XCTestCase {
+    func testStopRefusesLiveOwnedHandleWhenStoredIdentityDoesNotMatch() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-caddy-mismatch-\(UUID().uuidString)")
+        defer { CaddyTestSupport.removeIfPresent(root) }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        try FileManager.default.createDirectory(at: layout.caddyInstancesDirectoryURL, withIntermediateDirectories: true)
+        let process = try OwnedChildProcess.launch(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["30"], label: "Caddy mismatch fixture")
+        defer { _ = process.terminateAndWait(timeout: 2) }
+        let supervisor = CaddyProcessSupervisor(layout: layout)
+        await supervisor.retainOwnedChild(process)
+        let record = CaddyProcessRecord(pid: process.processIdentifier, version: "fixture", executablePath: "/not/the/owned/executable", arguments: ["not-the-launched-arguments"], configPath: "/fixture/config", adminEndpoint: "unix//fixture", httpPort: 0, httpsPort: 0, startedAt: "not-the-start-time")
+        try JSONEncoder().encode(record).write(to: layout.caddyInstancesDirectoryURL.appendingPathComponent("process.json"))
+
+        do {
+            _ = try await supervisor.stop()
+            XCTFail("expected identity mismatch")
+        } catch let error as CaddyRuntimeError {
+            XCTAssertEqual(error, .processIdentityMismatch)
+        }
+        XCTAssertTrue(process.isRunningAndReapedIfExited(), "mismatched live process must remain untouched")
+    }
+
     func testOfficialCaddyLifecycleIsOwnedAndIdempotent() async throws {
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }

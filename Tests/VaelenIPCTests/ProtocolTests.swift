@@ -143,6 +143,20 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(decoded, response)
     }
 
+    func testTypedCoreShutdownRequestAndComponentOutcomesRoundTrip() throws {
+        let request = IPCRequest(method: .shutdown)
+        let restored = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(restored.knownMethod, .shutdown)
+        let value = CoreShutdownResponse(components: [
+            .init(component: "mailpit", succeeded: true, detail: "Stopped."),
+            .init(component: "standard-ports-pf", succeeded: false, detail: "No safe provenance.")
+        ])
+        XCTAssertFalse(value.completed)
+        let response = IPCResponse(id: UUID(), result: .shutdown(value))
+        guard case .shutdown(let decoded) = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)).result else { return XCTFail("shutdown result did not decode as typed response") }
+        XCTAssertEqual(decoded, value)
+    }
+
     func testProjectReconciliationMethodsAndResponsesRoundTripThroughJSON() throws {
         for method in [CoreMethod.projectPlan, .projectActivate] {
             let request = IPCRequest(method: method, params: .projectEnvironment(.init(selector: "syncproof", workingDirectory: "/tmp")))

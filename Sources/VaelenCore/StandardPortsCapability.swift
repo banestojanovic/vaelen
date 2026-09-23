@@ -238,6 +238,31 @@ public actor StandardPortsCapability {
         return await status()
     }
 
+    /// Quit-time cleanup removes PF integration only when the durable ledger
+    /// proves that Vaelen installed this exact fixed anchor. Without active
+    /// provenance it returns a successful no-op and leaves PF untouched.
+    public func shutdownCleanup() async throws -> StandardPortsStatus {
+        let record: StandardPortsLedgerRecord?
+        do { record = try ledger?.standardPortsRecord() }
+        catch { throw StandardPortsError.unavailable("PF provenance could not be read; forwarding was left untouched") }
+        let observed = await status()
+        guard let record, record.active else {
+            // Old installs may leave the policy files in place without an
+            // ownership record. They are not authorization to mutate PF and
+            // must not prevent an otherwise clean Quit.
+            return StandardPortsStatus(state: observed.state, detail: "No active Vaelen PF ownership record; existing PF state was left unchanged.")
+        }
+        guard record.anchorRules == StandardPortsForwardingPolicy.anchorRules() else {
+            throw StandardPortsError.ownershipMismatch
+        }
+        guard observed.state == .healthy || observed.state == .installed || observed.state == .unhealthy else {
+            throw StandardPortsError.unavailable("Active Vaelen PF provenance exists, but current forwarding state is \(observed.state.rawValue); it was left untouched")
+        }
+        let removed = try await remove()
+        guard removed.state == .absent else { throw StandardPortsError.unavailable("Vaelen PF removal was requested but state remains \(removed.state.rawValue)") }
+        return removed
+    }
+
     private static func describeOccupied(httpOccupied: Bool, httpsOccupied: Bool) -> String {
         switch (httpOccupied, httpsOccupied) {
         case (true, true): return "External processes own TCP 80 and 443"

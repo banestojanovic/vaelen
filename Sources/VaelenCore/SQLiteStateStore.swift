@@ -115,10 +115,8 @@ public final class SQLiteStateStore: @unchecked Sendable {
                 try execute("DROP TABLE tls_capability_legacy")
                 try execute("PRAGMA user_version = 6")
             }
-            if version <= 6 {
-                if try !tableHasColumn("projects", column: "php_override_version") {
-                    try execute("ALTER TABLE projects ADD COLUMN php_override_version TEXT NULL")
-                }
+            if version <= 6, try !tableHasColumn("projects", column: "php_override_version") {
+                try execute("ALTER TABLE projects ADD COLUMN php_override_version TEXT NULL")
             }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

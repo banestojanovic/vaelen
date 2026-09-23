@@ -100,29 +100,48 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertEqual(module.operationState()?.phase, .removed)
     }
 
-    func testRealDefaultRunningPHPCannotBeRemoved() throws {
-        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
-        XCTAssertThrowsError(try module.remove(requestedVersion: "8.4.23")) { error in
-            XCTAssertEqual(error as? PHPModuleError, .cannotRemoveActiveRuntime("8.4.23"))
+    func testActivePHPFPMRuntimeCannotBeRemovedInIsolatedState() throws {
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+        XCTAssertEqual(try fixture.module.status(requestedVersion: fixture.package.version).state, .stopped)
+        let started = try fixture.module.start(requestedVersion: fixture.package.version)
+        XCTAssertEqual(started.state, .running)
+        XCTAssertThrowsError(try fixture.module.remove(requestedVersion: fixture.package.version)) { error in
+            XCTAssertEqual(error as? PHPModuleError, .cannotRemoveActiveRuntime(fixture.package.version))
         }
-        XCTAssertEqual(try module.runtimeCatalog().installedVersions.first { $0.version == "8.4.23" }?.running, true)
+        XCTAssertEqual(try fixture.module.runtimeCatalog().installedVersions.first { $0.version == fixture.package.version }?.running, true)
     }
 
-    func testRealDefaultSelectionIsIdempotentAndDurable() throws {
-        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
-        let catalog = try module.selectDefault(requestedVersion: "8.4.23")
-        XCTAssertEqual(catalog.defaultVersion, "8.4.23")
-        XCTAssertTrue(catalog.installedVersions.first { $0.version == "8.4.23" }?.running == true)
-        let reloaded = try XCTUnwrap(PHPModule.development())
-        XCTAssertEqual(try reloaded.runtimeCatalog().defaultVersion, "8.4.23")
+    func testDefaultSelectionStartsFPMAndPersistsInIsolatedState() throws {
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+        XCTAssertEqual(try fixture.module.status(requestedVersion: fixture.package.version).state, .stopped)
+        let catalog = try fixture.module.selectDefault(requestedVersion: fixture.package.version)
+        XCTAssertEqual(catalog.defaultVersion, fixture.package.version)
+        XCTAssertTrue(catalog.installedVersions.first { $0.version == fixture.package.version }?.running == true)
+        let reloaded = PHPModule(layout: fixture.layout, location: FilePHPManifestLocation(manifestURL: fixture.root.appendingPathComponent("fixture-manifest.json")))
+        XCTAssertEqual(try reloaded.runtimeCatalog().defaultVersion, fixture.package.version)
+        XCTAssertTrue(try reloaded.runtimeCatalog().installedVersions.first { $0.version == fixture.package.version }?.running == true)
+    }
+
+    private func isolatedFixture() throws -> IsolatedPHPFixture {
+        let layout = VaelenFilesystemLayout()
+        let metadata = layout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
+        guard let package = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: metadata)) else {
+            throw XCTSkip("installed PHP 8.4.23 package metadata unavailable")
+        }
+        return try IsolatedPHPFixture(installedPackage: package)
     }
 
     func testDefaultSelectionRejectsUnavailableExactVersion() throws {
-        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
-        XCTAssertThrowsError(try module.selectDefault(requestedVersion: "8.5.0")) { error in
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+        try Data(fixture.package.version.utf8).write(to: fixture.layout.configurationDirectoryURL.appendingPathComponent("php-default.json"), options: .atomic)
+        XCTAssertThrowsError(try fixture.module.selectDefault(requestedVersion: "8.5.0")) { error in
             XCTAssertEqual(error as? PHPModuleError, .packageMissing("8.5.0"))
         }
-        XCTAssertEqual(try module.runtimeCatalog().defaultVersion, "8.4.23")
+        XCTAssertEqual(try fixture.module.runtimeCatalog().defaultVersion, fixture.package.version)
+        XCTAssertEqual(try fixture.module.status(requestedVersion: fixture.package.version).state, .stopped)
     }
 
     func testNumericPHPVersionResolutionUsesHighestStablePatch() {

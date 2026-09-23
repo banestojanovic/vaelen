@@ -426,7 +426,7 @@ struct VaelenCLIMain {
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
             else {
                 let conflict = result.conflict.map { "\nConflict   \($0)" } ?? ""
-                print("DNS\nState      \(result.state.rawValue)\nOwnership  \(result.ownership.rawValue)\nResolver   \(result.resolverPath)\nAddress    \(result.address):\(result.port)\nPID        \(result.pid.map(String.init) ?? "none")\nHealth     \(result.health)\(conflict)")
+                print("DNS\nState      \(result.state.rawValue)\nOwnership  \(result.ownership.rawValue)\nResponder  \(result.responderState.rawValue)\nResolver   \(result.resolverPath)\nAddress    \(result.address):\(result.port)\nPID        \(result.pid.map(String.init) ?? "none")\nHealth     \(result.health)\(conflict)")
             }
         case .dnsInstall(let takeover):
             let result = try await client.dnsInstall(takeover: takeover); print("DNS \(result.state.rawValue) \(result.health)")

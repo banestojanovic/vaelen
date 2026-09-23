@@ -23,6 +23,25 @@ public struct StandardPortsLedgerRecord: Equatable, Sendable {
 public final class SystemModificationLedger: @unchecked Sendable {
     private let store: SQLiteStateStore
     public init(store: SQLiteStateStore) { self.store = store }
+    public func resolverOwnershipRecord() throws -> DNSResolverOwnershipRecord? {
+        try store.execute("CREATE TABLE IF NOT EXISTS dns_resolver_ownership (id INTEGER PRIMARY KEY CHECK (id = 1), record_json TEXT NOT NULL)")
+        var encoded: String?
+        try store.query("SELECT record_json FROM dns_resolver_ownership WHERE id = 1") { encoded = store.columnString($0, 0) }
+        guard let encoded else { return nil }
+        guard let record = try? JSONDecoder().decode(DNSResolverOwnershipRecord.self, from: Data(encoded.utf8)) else {
+            throw DNSCapabilityError.ownershipUncertain("The durable resolver ownership record is unreadable")
+        }
+        return record
+    }
+    public func saveResolverOwnershipRecord(_ record: DNSResolverOwnershipRecord) throws {
+        try store.execute("CREATE TABLE IF NOT EXISTS dns_resolver_ownership (id INTEGER PRIMARY KEY CHECK (id = 1), record_json TEXT NOT NULL)")
+        let json = try String(decoding: JSONEncoder().encode(record), as: UTF8.self).replacingOccurrences(of: "'", with: "''")
+        try store.execute("INSERT OR REPLACE INTO dns_resolver_ownership(id, record_json) VALUES(1, '\(json)')")
+    }
+    public func clearResolverOwnershipRecord() throws {
+        try store.execute("CREATE TABLE IF NOT EXISTS dns_resolver_ownership (id INTEGER PRIMARY KEY CHECK (id = 1), record_json TEXT NOT NULL)")
+        try store.execute("DELETE FROM dns_resolver_ownership WHERE id = 1")
+    }
     public func dnsRecord() throws -> DNSLedgerRecord? {
         var result: DNSLedgerRecord?
         try store.query("SELECT installed_content, previous_content, active FROM system_modifications WHERE capability = 'test-resolver'") { statement in

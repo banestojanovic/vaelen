@@ -6,12 +6,14 @@ import VaelenIPC
 public final class DaemonServer: @unchecked Sendable {
     private let paths: CoreEndpointPaths
     private let dispatcher: CoreRequestDispatcher
+    private let parentPID: Int32?
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "server")
     private var listener: Int32 = -1
 
-    public init(paths: CoreEndpointPaths, dispatcher: CoreRequestDispatcher) {
+    public init(paths: CoreEndpointPaths, dispatcher: CoreRequestDispatcher, parentPID: Int32? = nil) {
         self.paths = paths
         self.dispatcher = dispatcher
+        self.parentPID = parentPID
     }
 
     public func run() throws {
@@ -38,19 +40,53 @@ public final class DaemonServer: @unchecked Sendable {
             source.setEventHandler { [weak self] in self?.stop() }; source.resume(); return source
         }
         defer { signals.forEach { $0.cancel() } }
+        let parentMonitor = startParentMonitor()
+        defer { parentMonitor?.cancel() }
         while true {
             let client = accept(listener, nil, nil)
             if client < 0 { if errno == EINTR { continue }; if listener < 0 { return }; throw CoreTransportError.systemCallFailed("accept", errno) }
             setNoSigPipe(client)
-            Task.detached { [dispatcher, logger] in
-                await Self.handle(client, dispatcher: dispatcher, logger: logger)
+            let server = self
+            Task.detached { [dispatcher, logger, server] in
+                await Self.handle(client, dispatcher: dispatcher, logger: logger) {
+                    guard await dispatcher.shouldExitAfterShutdownResponse() else { return }
+                    server.stop()
+                }
+            }
+        }
+    }
+
+    private func startParentMonitor() -> Task<Void, Never>? {
+        guard let parentPID, parentPID > 1 else { return nil }
+        let endpointPaths = paths
+        let logger = logger
+        return Task.detached { [weak self, dispatcher, endpointPaths, logger] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard getppid() != parentPID else { continue }
+                let result = await dispatcher.shutdownForParentExit()
+                if result.completed {
+                    let supportRoot = endpointPaths.root.deletingLastPathComponent()
+                    let activityURL = supportRoot.appendingPathComponent("state/activity")
+                    do {
+                        try FileManager.default.createDirectory(at: activityURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try Data("inactive\n".utf8).write(to: activityURL, options: .atomic)
+                    } catch {
+                        logger.error("Core cleaned up after its GUI exited, but could not mark shell PHP inactive: \(String(describing: error), privacy: .public)")
+                    }
+                    self?.stop()
+                    return
+                }
+                // A resistant owned child must not turn a vanished GUI into
+                // a permanently wedged Core; retry through the same routine.
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
 
     private func stop() { let fd = listener; listener = -1; if fd >= 0 { close(fd) } }
 
-    private static func handle(_ client: Int32, dispatcher: CoreRequestDispatcher, logger: Logger) async {
+    private static func handle(_ client: Int32, dispatcher: CoreRequestDispatcher, logger: Logger, afterResponse: @escaping @Sendable () async -> Void) async {
         defer { close(client) }
         do {
             try validatePeer(client)
@@ -65,6 +101,7 @@ public final class DaemonServer: @unchecked Sendable {
                     let result = await dispatcher.dispatch(request, handshaken: handshaken)
                     handshaken = result.handshaken
                     try writeAll(client, data: FrameEncoder().encode(IPCCodec.encode(result.response)))
+                    await afterResponse()
                 }
             }
         } catch { logger.error("Client connection ended: \(String(describing: error), privacy: .public)") }

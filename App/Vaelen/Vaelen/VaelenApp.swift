@@ -8,6 +8,7 @@ import VaelenCore
 @main
 struct VaelenApp: App {
     @State private var model = AppModel()
+    @NSApplicationDelegateAdaptor(VaelenAppDelegate.self) private var appDelegate
 
     var body: some Scene {
         MenuBarExtra {
@@ -15,7 +16,10 @@ struct VaelenApp: App {
         } label: {
             Image(nsImage: VaelenBrand.menuBarImage)
                 .accessibilityLabel("Vaelen")
-                .onAppear { model.startMonitoring() }
+                .onAppear {
+                    model.startMonitoring()
+                    appDelegate.requestQuit = { Task { await model.quitVaelen() } }
+                }
         }
         .menuBarExtraStyle(.window)
 
@@ -25,6 +29,10 @@ struct VaelenApp: App {
         .commands {
             CommandGroup(replacing: .appSettings) {
                 SettingsMenuCommand()
+            }
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit Vaelen") { Task { await model.quitVaelen() } }
+                    .keyboardShortcut("q")
             }
         }
     }
@@ -75,7 +83,10 @@ final class AppModel {
     private(set) var trustError: String?
     private(set) var serviceOperation: String?
     private(set) var serviceError: String?
+    private(set) var startupServiceIssues: [String: String] = [:]
+    private(set) var isQuitting = false
     private(set) var refreshError: String?
+    private(set) var coreLaunchError: String?
     private(set) var relationshipError: String?
     private(set) var relationshipOperation: String?
     private(set) var relationshipMutationInFlight = false
@@ -116,11 +127,38 @@ final class AppModel {
         self.client = client
         if !hasRunningSnapshot { state = .connecting }
         do {
-            try await client.connect()
+            do {
+                try await client.connect()
+            } catch let error as CoreClientError {
+                guard case .coreUnavailable = error else { throw error }
+                try CoreProcessManager.shared.start()
+                var connected = false
+                for _ in 0..<20 {
+                    try await Task.sleep(for: .milliseconds(100))
+                    do {
+                        try await client.connect()
+                        connected = true
+                        break
+                    } catch let retryError as CoreClientError {
+                        guard case .coreUnavailable = retryError else { throw retryError }
+                    }
+                }
+                guard connected else { throw CoreClientError.coreUnavailable }
+            }
             let status = try await client.status()
+            startupServiceIssues = status.serviceIssues ?? [:]
+            if !VaelenActivitySignal.markActive() {
+                serviceError = "Vaelen is running, but its shell activity signal could not be saved. PHP will refuse to fall back until this is repaired."
+            }
+            coreLaunchError = nil
+            // Make Core readiness visible as soon as its lightweight status
+            // request succeeds; project diagnostics and provider checks can
+            // continue without keeping the whole popover in a connecting state.
+            state = .running(status, [], nil, nil, nil, nil, nil, nil, nil)
             let projects = try await client.projectList()
             let linkedProjects = try await client.linkedProjects()
             let parkedFolders = try await client.parkedPaths()
+            state = .running(status, projects, nil, nil, nil, nil, nil, nil, nil)
             var reports = [ProjectEnvironmentReport]()
             for project in projects {
                 if let report = try? await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path) {
@@ -147,9 +185,12 @@ final class AppModel {
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
-            if hasRunningSnapshot {
+            if hasRunningSnapshot || isShowingRunningSnapshot {
                 refreshError = refreshMessage(for: error)
                 return
+            }
+            if case .coreUnavailable = error {
+                coreLaunchError = "Vaelen Core did not become ready within 2 seconds. Try Refresh or relaunch Vaelen."
             }
             switch error {
             case .coreUnavailable: state = .unavailable
@@ -164,6 +205,7 @@ final class AppModel {
                 refreshError = error.localizedDescription
                 return
             }
+            coreLaunchError = error.localizedDescription
             state = .unavailable
         }
     }
@@ -198,6 +240,18 @@ final class AppModel {
     func removeStandardPorts() async {
         guard beginServiceOperation("Disabling standard ports…"), let client else { return }
         do { _ = try await client.portsRemove(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) }
+    }
+
+    func startDNS() async {
+        guard beginServiceOperation("Starting DNS…"), let client else { return }
+        do { _ = try await client.dnsInstall(takeover: false); await refresh(); finishServiceOperation() }
+        catch { finishServiceOperation(error: error.localizedDescription) }
+    }
+
+    func stopDNS() async {
+        guard beginServiceOperation("Stopping DNS…"), let client else { return }
+        do { _ = try await client.dnsRemove(); await refresh(); finishServiceOperation() }
+        catch { finishServiceOperation(error: error.localizedDescription) }
     }
 
     func installMySQL() async { guard beginServiceOperation("Installing MySQL…"), let client else { return }; do { _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
@@ -331,6 +385,75 @@ final class AppModel {
         monitorTask = Task { [weak self] in await self?.monitor() }
     }
 
+    func quitVaelen() async {
+        guard !isQuitting else { return }
+        guard !serviceOperationIsBusy, !phpRequestInFlight, !relationshipMutationInFlight else {
+            serviceError = "Wait for the current Vaelen operation to finish, then try Quit again."
+            return
+        }
+        guard client != nil else { serviceError = "Vaelen Core is unavailable. Refresh and retry Quit."; return }
+        isQuitting = true
+        serviceError = nil
+        refreshGeneration += 1
+        monitorTask?.cancel(); monitorTask = nil
+        // Use a private IPC connection so an in-flight background refresh
+        // cannot serialize or disconnect the user's explicit Quit request.
+        let shutdownClient = VaelenCoreClient(
+            transport: UnixSocketTransport(path: CoreEndpointPaths().socketPath),
+            identity: ClientIdentity(name: "Vaelen.app", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)
+        )
+        do {
+            try await shutdownClient.connect()
+            let coreStatus = try await shutdownClient.status()
+            guard CoreProcessManager.shared.ownsCore(pid: coreStatus.core.pid) else {
+                serviceError = "This Core process was not launched and retained by this Vaelen app, so Quit cannot safely stop it. Keep the app open or restart Vaelen, then retry."
+                await shutdownClient.disconnect()
+                isQuitting = false
+                startMonitoring()
+                return
+            }
+            let result = try await shutdownClient.shutdown()
+            guard result.completed else {
+                let details = result.components.filter { !$0.succeeded }.map { "\($0.component): \($0.detail)" }.joined(separator: "\n")
+                serviceError = "Vaelen could not finish cleanup. Vaelen remains open and Core remains available. Retry Quit after addressing:\n\(details)"
+                await shutdownClient.disconnect()
+                isQuitting = false
+                startMonitoring()
+                return
+            }
+            let socketPath = CoreEndpointPaths().socketPath
+            guard await CoreProcessManager.shared.confirmCleanExit(pid: coreStatus.core.pid, socketPath: socketPath) else {
+                serviceError = "Core reported cleanup complete, but Vaelen could not verify its app-owned Core process and socket exited. The app remains open; relaunch Core and retry if necessary."
+                await shutdownClient.disconnect()
+                isQuitting = false
+                startMonitoring()
+                return
+            }
+            guard VaelenActivitySignal.markInactive() else {
+                serviceError = "Services stopped, but Vaelen could not record intentional inactivity for shell PHP. The app remains open; repair the activity signal and retry Quit."
+                await shutdownClient.disconnect()
+                isQuitting = false
+                startMonitoring()
+                return
+            }
+            await shutdownClient.disconnect()
+            VaelenAppDelegate.shared?.terminateAfterCleanQuit()
+        } catch {
+            serviceError = "Vaelen could not confirm coordinated cleanup. The app remains open; retry Quit. \(error.localizedDescription)"
+            await shutdownClient.disconnect()
+            isQuitting = false
+            startMonitoring()
+        }
+    }
+
+    private var serviceOperationIsBusy: Bool { serviceOperation != nil }
+
+    var startupServiceIssueMessage: String? {
+        guard !startupServiceIssues.isEmpty else { return nil }
+        let details = startupServiceIssues.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
+        return "Saved services are blocked from starting. Resolve the issue and retry Start:\n\(details)"
+    }
+
     private func monitor() async {
         while !Task.isCancelled {
             await refresh()
@@ -345,6 +468,11 @@ final class AppModel {
         case .coreIncompatible(let reason): return reason
         default: return "Core refresh failed."
         }
+    }
+
+    private var isShowingRunningSnapshot: Bool {
+        if case .running = state { return true }
+        return false
     }
 
     private func beginRelationshipMutation(_ operation: String) -> Bool {
@@ -488,7 +616,9 @@ struct StatusView: View {
             case .connecting:
                 Text("Connecting to Core…").foregroundStyle(.secondary)
             case .unavailable:
-                Text("Vaelen Core is unavailable.").foregroundStyle(.secondary)
+                Text(model.coreLaunchError ?? "Vaelen Core is unavailable. Start Vaelen and retry.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             case .incompatible(let reason):
                 Text(reason).font(.caption)
             case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit):
@@ -513,6 +643,13 @@ struct StatusView: View {
                 }
             }
             Divider().opacity(0.65)
+            if let error = model.serviceError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
             HStack {
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
                     .labelStyle(.titleAndIcon)
@@ -520,13 +657,19 @@ struct StatusView: View {
                     .accessibilityHint("Refresh Vaelen state")
                 Spacer()
                 Button("Settings…") { presentSettings() }
-                Button("Quit") { NSApplication.shared.terminate(nil) }
+                Button(model.isQuitting ? "Quitting Vaelen…" : "Quit Vaelen") {
+                    Task { await model.quitVaelen() }
+                }
+                .disabled(model.isQuitting)
             }
         }
         .padding(VaelenUI.popoverPadding)
         .frame(width: 400)
         .frame(height: popoverHeight)
-        .onAppear { model.startMonitoring() }
+        .onAppear {
+            model.startMonitoring()
+            VaelenAppDelegate.shared?.requestQuit = { Task { await model.quitVaelen() } }
+        }
     }
 
     private var popoverHeight: CGFloat {
@@ -865,7 +1008,10 @@ struct ServicesView: View {
                     .padding(.top, VaelenUI.spacing12)
                     .padding(.bottom, VaelenUI.spacing6)
                 if let dns {
-                    ServiceRow(title: "DNS", subtitle: nil, state: dnsState(dns).title, stateSymbol: dnsState(dns).symbol, stateTint: dnsState(dns).tint) { EmptyView() }
+                    ServiceRow(title: "DNS", subtitle: dns.conflict, state: dnsState(dns).title, stateSymbol: dnsState(dns).symbol, stateTint: dnsState(dns).tint, busy: model.serviceOperationIs(for: "DNS")) {
+                        if dns.health == "healthy" && dns.responderState == .ownedRunning { Button("Stop DNS") { Task { await model.stopDNS() } } }
+                        else { Button("Retry DNS Start") { Task { await model.startDNS() } } }
+                    }
                 }
                 if let tls {
                     ServiceRow(title: "Local HTTPS", subtitle: nil, state: tls.trustObserved ? "Trusted" : "Needs attention", stateSymbol: tls.trustObserved ? "checkmark" : "exclamationmark.triangle", stateTint: tls.trustObserved ? .secondary : .orange, busy: model.serviceOperationIs(for: "Local HTTPS")) {
@@ -875,7 +1021,9 @@ struct ServicesView: View {
                 }
                 if let ports {
                     ServiceRow(title: "Standard Ports", subtitle: nil, state: ports.state == .healthy ? "Enabled" : "Needs attention", stateSymbol: ports.state == .healthy ? "checkmark" : "exclamationmark.triangle", stateTint: ports.state == .healthy ? .secondary : .orange, busy: model.serviceOperationIs(for: "standard ports")) {
-                        if ports.state == .absent || ports.state == .unhealthy { Button("Enable Standard Ports") { Task { await model.installStandardPorts() } } }
+                        if ports.state != .healthy && ports.state != .installed {
+                            Button(ports.state == .absent ? "Enable Standard Ports" : "Retry Standard Ports") { Task { await model.installStandardPorts() } }
+                        }
                         if ports.state == .healthy || ports.state == .installed { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
                     }
                 }
@@ -884,7 +1032,7 @@ struct ServicesView: View {
                         .font(.caption)
                         .padding(.top, VaelenUI.spacing8)
                 }
-                if let error = model.serviceError ?? model.trustError {
+                if let error = model.serviceError ?? model.trustError ?? model.startupServiceIssueMessage {
                     VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red)
                         .font(.caption)
                         .padding(.top, VaelenUI.spacing8)

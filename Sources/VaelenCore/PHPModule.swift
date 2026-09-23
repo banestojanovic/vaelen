@@ -361,6 +361,8 @@ private struct PHPProcessRecord: Codable, Sendable {
     let configPath: String
     let socketPath: String
     let startedAt: String?
+    let socketDevice: Int64?
+    let socketInode: Int64?
 }
 
 private struct PHPDevelopmentConfiguration: Codable, Sendable {
@@ -384,6 +386,7 @@ public final class PHPModule: @unchecked Sendable {
     private let lock = NSLock()
     private var activeOperation: PHPOperationState?
     private var lastOperation: PHPOperationState?
+    private var ownedFPMProcesses: [String: OwnedChildProcess] = [:]
 
     public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false) {
         self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog
@@ -651,15 +654,30 @@ public final class PHPModule: @unchecked Sendable {
         let package = try? resolveInstalled(requestedVersion); let version = package?.version ?? requestedVersion
         let socket = socketPath(version); let record = processRecord(version)
         guard let record else { return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version) }
+        if let child = ownedFPMProcesses[version], child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
+            if child.hasLiveOwnedDescendants {
+                return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "master-exited-workers-running", isDefault: defaultVersion() == version)
+            }
+            clearExitedFPMRecord(record, version: version)
+            ownedFPMProcesses.removeValue(forKey: version)
+            return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version)
+        }
         guard processMatches(record) else {
             if !processExists(record.pid) {
-                try? manager.removeItem(at: processRecordURL(version))
-                try? manager.removeItem(atPath: socket)
+                clearExitedFPMRecord(record, version: version)
                 return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version)
             }
             return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "identity-unverified", isDefault: defaultVersion() == version)
         }
         let healthy = manager.fileExists(atPath: socket) && isSocket(socket) && isSocketReady(socket)
+        if let child = ownedFPMProcesses[version] { _ = child.isRunningAndReapedIfExited() }
+        if healthy, record.socketDevice == nil || record.socketInode == nil {
+            var info = stat()
+            if lstat(socket, &info) == 0, var updated = processRecord(version) {
+                updated = PHPProcessRecord(pid: updated.pid, version: updated.version, executable: updated.executable, arguments: updated.arguments, configPath: updated.configPath, socketPath: updated.socketPath, startedAt: updated.startedAt, socketDevice: Int64(info.st_dev), socketInode: Int64(info.st_ino))
+                try? atomicWrite(updated, to: processRecordURL(version))
+            }
+        }
         return PHPStatus(version: version, package: package, state: healthy ? .running : .degraded, pid: record.pid, socket: socket, health: healthy ? "healthy" : "not-ready", isDefault: defaultVersion() == version)
     }
 
@@ -681,21 +699,44 @@ public final class PHPModule: @unchecked Sendable {
         if !manager.fileExists(atPath: log.path) { manager.createFile(atPath: log.path, contents: nil) }
         let process = Process(); process.executableURL = URL(fileURLWithPath: package.fpmPath); process.arguments = ["-y", config.path, "-F"]; process.standardOutput = try FileHandle(forWritingTo: log); process.standardError = process.standardOutput
         try process.run()
-        let record = PHPProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.fpmPath, arguments: process.arguments ?? [], configPath: config.path, socketPath: socket, startedAt: processStartIdentity(process.processIdentifier))
+        let child = OwnedChildProcess(process: process, label: "PHP-FPM \(package.version)")
+        ownedFPMProcesses[package.version] = child
+        let record = PHPProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.fpmPath, arguments: process.arguments ?? [], configPath: config.path, socketPath: socket, startedAt: processStartIdentity(process.processIdentifier), socketDevice: nil, socketInode: nil)
         try atomicWrite(record, to: processRecordURL(package.version));
-        for _ in 0..<40 { if let result = try? status(requestedVersion: package.version), result.state == .running, result.health == "healthy" { return result }; usleep(50_000) }
-        if processMatches(record) { _ = kill(record.pid, SIGQUIT) }
+        var lastObservation: PHPStatus?
+        for _ in 0..<40 {
+            lastObservation = try? status(requestedVersion: package.version)
+            if lastObservation?.state == .running, lastObservation?.health == "healthy" { return lastObservation! }
+            if !child.process.isRunning { break }
+            usleep(50_000)
+        }
+        guard child.terminateAndWait(timeout: 3, signal: SIGQUIT, waitForDescendants: true) else {
+            throw PHPModuleError.processFailed("PHP-FPM \(package.version) PID \(record.pid) did not stop cleanly after startup timeout; process record retained")
+        }
+        ownedFPMProcesses.removeValue(forKey: package.version)
         try? manager.removeItem(at: processRecordURL(package.version))
-        try? manager.removeItem(atPath: socket)
-        throw PHPModuleError.processFailed("PHP-FPM did not become ready")
+        removeOwnedSocket(record)
+        let detail = (try? String(contentsOf: log, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        throw PHPModuleError.processFailed("PHP-FPM did not become ready (last health: \(lastObservation?.health ?? "unavailable"))\(detail.isEmpty ? "" : ": \(detail)")")
     }
 
     public func stop(requestedVersion: String) throws -> PHPStatus {
-        let version = try resolveInstalled(requestedVersion).version; guard let record = processRecord(version) else { return try status(requestedVersion: version) }
-        guard processMatches(record) else { throw PHPModuleError.processIdentityMismatch }
-        _ = kill(record.pid, SIGQUIT)
-        for _ in 0..<40 { if !processExists(record.pid) { try? manager.removeItem(at: processRecordURL(version)); try? manager.removeItem(atPath: record.socketPath); return try status(requestedVersion: version) }; usleep(50_000) }
-        _ = kill(record.pid, SIGKILL); try? manager.removeItem(at: processRecordURL(version)); try? manager.removeItem(atPath: record.socketPath); return try status(requestedVersion: version)
+        let version = try resolveInstalled(requestedVersion).version
+        let observed = try status(requestedVersion: version)
+        guard let record = processRecord(version) else { return observed }
+        guard let child = ownedFPMProcesses[version], child.processIdentifier == record.pid,
+              (!child.process.isRunning || processMatches(record)) else {
+            throw PHPModuleError.processIdentityMismatch
+        }
+        guard child.terminateAndWait(timeout: 3, signal: SIGQUIT, waitForDescendants: true) else {
+            throw PHPModuleError.processFailed("PHP-FPM \(version) PID \(record.pid) or one of its workers remains after the graceful shutdown timeout; process record retained")
+        }
+        ownedFPMProcesses.removeValue(forKey: version)
+        removeOwnedSocket(record)
+        try manager.removeItem(at: processRecordURL(version))
+        let final = try status(requestedVersion: version)
+        guard final.state == .stopped else { throw PHPModuleError.processFailed("PHP-FPM \(version) remains observable after shutdown; process record retained") }
+        return final
     }
 
     private func resolveInstalled(_ requested: String) throws -> PHPPackage {
@@ -772,15 +813,36 @@ public final class PHPModule: @unchecked Sendable {
     private func socketPath(_ version: String) -> String { layout.rootURL.appendingPathComponent("runtime/sockets/php/php-\(version).sock").path }
     private func processRecordURL(_ version: String) -> URL { layout.phpInstancesDirectoryURL.appendingPathComponent(version).appendingPathComponent("process.json") }
     private func processRecord(_ version: String) -> PHPProcessRecord? { try? JSONDecoder().decode(PHPProcessRecord.self, from: Data(contentsOf: processRecordURL(version))) }
+    private func clearExitedFPMRecord(_ record: PHPProcessRecord, version: String) {
+        try? manager.removeItem(at: processRecordURL(version))
+        removeOwnedSocket(record)
+    }
+    private func removeOwnedSocket(_ record: PHPProcessRecord) {
+        guard let device = record.socketDevice, let inode = record.socketInode else { return }
+        var info = stat()
+        guard lstat(record.socketPath, &info) == 0, Int64(info.st_dev) == device, Int64(info.st_ino) == inode,
+              (info.st_mode & S_IFMT) == S_IFSOCK, info.st_uid == getuid() else { return }
+        try? manager.removeItem(atPath: record.socketPath)
+    }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
     private func processMatches(_ record: PHPProcessRecord) -> Bool {
+        if let child = ownedFPMProcesses[record.version], child.processIdentifier == record.pid {
+            return child.isRunningAndReapedIfExited()
+                && child.executablePath == URL(fileURLWithPath: record.executable).standardizedFileURL.path
+                && child.arguments == record.arguments
+                && manager.fileExists(atPath: record.configPath)
+        }
         guard processExists(record.pid) else { return false }
         let user = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "user="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let startedAt = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines)
         let openExecutable = (try? command("/usr/sbin/lsof", ["-p", "\(record.pid)", "-a", "-d", "txt", "-Fn"])) ?? ""
         let executableMatches = openExecutable.split(separator: "\n").contains { $0 == Substring("n\(record.executable)") }
+        let commandLine = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // FPM rewrites argv to "php-fpm: master process (config-path)";
+        // requiring its original -F/-y tokens would reject the genuine master.
+        let configArgumentMatches = commandLine.contains(record.configPath)
         let configMatches = manager.fileExists(atPath: record.configPath)
-        return executableMatches && configMatches && user == NSUserName() && (record.startedAt == nil || record.startedAt == startedAt)
+        return executableMatches && configArgumentMatches && configMatches && user == NSUserName() && (record.startedAt == nil || record.startedAt == startedAt)
     }
     private func isSocket(_ path: String) -> Bool { var info = stat(); return lstat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFSOCK && info.st_uid == getuid() }
     private func isSocketReady(_ path: String) -> Bool {

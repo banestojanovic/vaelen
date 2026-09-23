@@ -32,7 +32,7 @@ public enum CaddyRuntimeError: Error, Equatable, Sendable {
     case invalidConfiguration(String)
 }
 
-private struct CaddyProcessRecord: Codable, Sendable {
+struct CaddyProcessRecord: Codable, Sendable {
     let pid: Int32
     let version: String
     let executablePath: String
@@ -68,6 +68,7 @@ public actor CaddyProcessSupervisor {
     public let configuration: CaddyRuntimeConfiguration
     private let manager = FileManager.default
     private var package: CaddyPackage?
+    private var ownedChild: OwnedChildProcess?
 
     public init(layout: VaelenFilesystemLayout, configuration: CaddyRuntimeConfiguration = .init()) {
         self.layout = layout; self.configuration = configuration
@@ -82,8 +83,17 @@ public actor CaddyProcessSupervisor {
         let record = processRecord()
         let admin = adminEndpoint()
         guard let record else { return CaddyProcessStatus(state: .stopped, health: .unknown, version: version, pid: nil, executablePath: executable, httpPort: configuration.httpPort, adminEndpoint: admin) }
-        guard processExists(record.pid) else {
+        if let child = ownedChild, child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
             try? manager.removeItem(at: processRecordURL())
+            ownedChild = nil
+            return CaddyProcessStatus(state: .stopped, health: .unknown, version: version, pid: nil, executablePath: executable, httpPort: configuration.httpPort, adminEndpoint: admin)
+        }
+        if !processHasCommand(record.pid) {
+            // kill(pid, 0) can still succeed briefly for an exited zombie.
+            // No command means no live process to own; dropping the stale
+            // record is safe and prevents reporting the child as degraded.
+            try? manager.removeItem(at: processRecordURL())
+            ownedChild = nil
             return CaddyProcessStatus(state: .stopped, health: .unknown, version: version, pid: nil, executablePath: executable, httpPort: configuration.httpPort, adminEndpoint: admin)
         }
         guard processMatches(record) else { return CaddyProcessStatus(state: .degraded, health: .unhealthy, version: record.version, pid: record.pid, executablePath: record.executablePath, httpPort: record.httpPort, adminEndpoint: record.adminEndpoint) }
@@ -118,6 +128,8 @@ public actor CaddyProcessSupervisor {
         let log = try FileHandle(forWritingTo: logURL)
         process.standardOutput = log; process.standardError = log
         try process.run()
+        let ownedChild = OwnedChildProcess(process: process, label: "Caddy")
+        self.ownedChild = ownedChild
         let record = CaddyProcessRecord(pid: process.processIdentifier, version: package.version, executablePath: package.executablePath, arguments: arguments, configPath: configURL.path, adminEndpoint: admin, httpPort: configuration.httpPort, httpsPort: configuration.httpsPort, startedAt: processStartIdentity(process.processIdentifier))
         try atomicWrite(record, to: processRecordURL())
 
@@ -126,35 +138,46 @@ public actor CaddyProcessSupervisor {
             if result.state == .running, result.health == .healthy, (try? CaddyAdminClient(endpoint: admin).getConfig()) != nil { return result }
             usleep(50_000)
         }
-        if processMatches(record) { _ = kill(record.pid, SIGTERM) }
+        guard ownedChild.terminateAndWait(timeout: 3) else {
+            throw CaddyRuntimeError.processFailed("Caddy PID \(record.pid) did not stop within the bounded startup cleanup interval")
+        }
+        self.ownedChild = nil
         try? manager.removeItem(at: processRecordURL())
         let output = (try? String(contentsOf: logURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         throw CaddyRuntimeError.processFailed(output.isEmpty ? "Caddy did not become ready" : output)
     }
 
     public func stop() throws -> CaddyProcessStatus {
+        let observed = status()
+        if observed.state == .stopped { return observed }
         guard let record = processRecord() else { return status() }
-        guard processMatches(record) else { throw CaddyRuntimeError.processIdentityMismatch }
-        _ = kill(record.pid, SIGTERM)
-        for _ in 0..<60 {
-            if !processExists(record.pid) {
-                try? manager.removeItem(at: processRecordURL())
-                return status()
-            }
-            usleep(50_000)
+        guard let child = ownedChild, child.processIdentifier == record.pid,
+              processMatches(record) else { throw CaddyRuntimeError.processIdentityMismatch }
+        guard child.terminateAndWait(timeout: 3) else {
+            throw CaddyRuntimeError.processFailed("Caddy PID \(record.pid) is still running after the graceful shutdown timeout")
         }
-        _ = kill(record.pid, SIGKILL)
+        ownedChild = nil
         try? manager.removeItem(at: processRecordURL())
-        return status()
+        let result = status()
+        guard result.state == .stopped else { throw CaddyRuntimeError.processFailed("Caddy remains observable after shutdown") }
+        return result
     }
 
     public func adminEndpoint() -> String { "unix//\(layout.routingRuntimeDirectoryURL.appendingPathComponent("admin.sock").path)" }
 
     private func installedPackage() -> CaddyPackage? { CaddyModule(layout: layout, verifier: nil).installedVersions().last }
     private func processRecordURL() -> URL { layout.caddyInstancesDirectoryURL.appendingPathComponent("process.json") }
+    func retainOwnedChild(_ child: OwnedChildProcess) { ownedChild = child }
     private func processRecord() -> CaddyProcessRecord? { try? JSONDecoder().decode(CaddyProcessRecord.self, from: Data(contentsOf: processRecordURL())) }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
+    private func processHasCommand(_ pid: Int32) -> Bool {
+        guard let output = try? command("/bin/ps", ["-p", "\(pid)", "-o", "command="]) else { return false }
+        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     private func processMatches(_ record: CaddyProcessRecord) -> Bool {
+        if let child = ownedChild, child.processIdentifier == record.pid {
+            guard child.isRunningAndReapedIfExited() else { return false }
+        }
         guard processExists(record.pid) else { return false }
         let commandOutput = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])) ?? ""
         let start = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

@@ -66,6 +66,12 @@ public actor VaelenCoreClient {
         return status
     }
 
+    public func shutdown() async throws -> CoreShutdownResponse {
+        guard connected else { throw CoreClientError.coreUnavailable }
+        guard case .shutdown(let response) = try result(from: await send(IPCRequest(method: .shutdown))) else { throw CoreClientError.invalidResponse }
+        return response
+    }
+
     public func link(path: String?, workingDirectory: String, name: String?) async throws -> ProjectMutationResult {
         let request = IPCRequest(method: .projectLink, params: .link(LinkProjectRequest(path: path, workingDirectory: workingDirectory, name: name)))
         guard case .projectMutation(let result) = try result(from: await send(request)) else { throw CoreClientError.invalidResponse }

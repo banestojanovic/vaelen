@@ -43,6 +43,8 @@ public final class MailpitModule: @unchecked Sendable {
     public static let smtpPort = VaelenNetworkPorts.mailpitSMTP
     public static let httpPort = VaelenNetworkPorts.mailpitHTTP
     private let layout: VaelenFilesystemLayout; private let manifest: MailpitManifest; private let downloader: any MailpitArtifactDownloader; private let configuration: MailpitRuntimeConfiguration; private let manager = FileManager.default; private let lock = NSLock()
+    private var ownedChild: OwnedChildProcess?
+    private var ownedRecord: MailpitProcessRecord?
     public init(layout: VaelenFilesystemLayout = .init(), manifest: MailpitManifest = .official1_31_1, downloader: any MailpitArtifactDownloader = SystemMailpitArtifactDownloader(), configuration: MailpitRuntimeConfiguration = .init()) { self.layout = layout; self.manifest = manifest; self.downloader = downloader; self.configuration = configuration }
     public func availableVersions() -> [String] { [manifest.version] }
     public func installedVersions() -> [MailpitPackage] { guard let entries = try? manager.contentsOfDirectory(at: layout.mailpitPackagesDirectoryURL, includingPropertiesForKeys: nil) else { return [] }; return entries.compactMap { url in guard let package = try? JSONDecoder().decode(MailpitPackage.self, from: Data(contentsOf: url.appendingPathComponent(".vaelen-package.json"))), isValid(package) else { return nil }; return package }.sorted { $0.version < $1.version } }
@@ -56,23 +58,68 @@ public final class MailpitModule: @unchecked Sendable {
 
     public func status() -> MailpitStatus {
         let package = installedVersions().first(where: { $0.version == manifest.version }); let paths = instancePaths()
-        guard let record = processRecord(paths) else { guard let package else { return makeStatus(state: .notInstalled, health: "not-installed", package: nil, pid: nil, paths: paths) }; let conflict = !isPortAvailable(configuration.smtpPort) ? configuration.smtpPort : !isPortAvailable(configuration.httpPort) ? configuration.httpPort : nil; let state: MailpitState = conflict == nil ? (manager.fileExists(atPath: paths.database.path) ? .stopped : .installed) : .conflict; return makeStatus(state: state, health: conflict.map { "port-conflict-\($0)" } ?? (state == .installed ? "installed" : "stopped"), package: package, pid: nil, paths: paths) }
-        guard processExists(record.pid) else { try? manager.removeItem(at: paths.process); return makeStatus(state: package == nil ? .notInstalled : .stopped, health: "stopped", package: package, pid: nil, paths: paths) }
-        guard processMatches(record) else { return makeStatus(state: .unhealthy, health: "identity-unverified", package: package, pid: record.pid, paths: paths) }
+        guard let record = processRecord(paths) ?? ownedRecord else { guard let package else { return makeStatus(state: .notInstalled, health: "not-installed", package: nil, pid: nil, paths: paths) }; let conflict = !isPortAvailable(configuration.smtpPort) ? configuration.smtpPort : !isPortAvailable(configuration.httpPort) ? configuration.httpPort : nil; let state: MailpitState = conflict == nil ? (manager.fileExists(atPath: paths.database.path) ? .stopped : .installed) : .conflict; return makeStatus(state: state, health: conflict.map { "port-conflict-\($0)" } ?? (state == .installed ? "installed" : "stopped"), package: package, pid: nil, paths: paths) }
+        if let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record, !child.isRunningAndReapedIfExited() {
+            guard isPortAvailable(record.smtpPort), isPortAvailable(record.httpPort) else {
+                return makeStatus(state: .unhealthy, health: "listener-release-incomplete", package: package, pid: nil, paths: paths, record: record)
+            }
+            ownedChild = nil; ownedRecord = nil
+            try? manager.removeItem(at: paths.process)
+            return makeStatus(state: package == nil ? .notInstalled : .stopped, health: "stopped", package: package, pid: nil, paths: paths)
+        }
+        guard processExists(record.pid) else {
+            if ownedChild?.processIdentifier == record.pid { _ = ownedChild?.isRunningAndReapedIfExited(); ownedChild = nil; ownedRecord = nil }
+            guard isPortAvailable(record.smtpPort), isPortAvailable(record.httpPort) else {
+                return makeStatus(state: .unhealthy, health: "listener-conflict-after-process-exit", package: package, pid: nil, paths: paths, record: record)
+            }
+            try? manager.removeItem(at: paths.process)
+            return makeStatus(state: package == nil ? .notInstalled : .stopped, health: "stopped", package: package, pid: nil, paths: paths)
+        }
+        guard let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record,
+              child.executablePath == record.executable, child.arguments == record.arguments,
+              processMatches(record) else { return makeStatus(state: .unhealthy, health: "identity-unverified", package: package, pid: record.pid, paths: paths, record: record) }
         guard httpReady(port: record.httpPort), smtpReady(port: record.smtpPort) else { return makeStatus(state: .unhealthy, health: "not-ready", package: package, pid: record.pid, paths: paths) }
         return makeStatus(state: .running, health: "healthy", package: package, pid: record.pid, paths: paths, record: record)
     }
 
     public func start() throws -> MailpitStatus {
         guard let package = installedVersions().first(where: { $0.version == manifest.version }) else { throw MailpitModuleError.packageMissing(manifest.version) }; let current = status(); if current.state == .running { return current }; if current.state == .unhealthy, let pid = current.pid, processExists(pid) { throw MailpitModuleError.processIdentityMismatch }; guard isPortAvailable(configuration.smtpPort) else { throw MailpitModuleError.portConflict(configuration.smtpPort) }; guard isPortAvailable(configuration.httpPort) else { throw MailpitModuleError.portConflict(configuration.httpPort) }
-        let paths = instancePaths(); try makeDirectories([layout.rootURL, paths.instance, layout.mailpitLogsDirectoryURL]); if !manager.fileExists(atPath: paths.log.path) { manager.createFile(atPath: paths.log.path, contents: nil) }; let arguments = ["--smtp", "127.0.0.1:\(configuration.smtpPort)", "--listen", "127.0.0.1:\(configuration.httpPort)", "--database", paths.database.path, "--log-file", paths.log.path, "--allowed-hosts", "127.0.0.1,localhost"]; let process = Process(); process.executableURL = URL(fileURLWithPath: package.executablePath); process.arguments = arguments; process.currentDirectoryURL = layout.rootURL; let logHandle = try FileHandle(forWritingTo: paths.log); process.standardOutput = logHandle; process.standardError = logHandle; try process.run(); let record = MailpitProcessRecord(pid: process.processIdentifier, user: NSUserName(), version: package.version, executable: package.executablePath, arguments: arguments, database: paths.database.path, log: paths.log.path, smtpPort: configuration.smtpPort, httpPort: configuration.httpPort, startedAt: processStartIdentity(process.processIdentifier)); try atomicWrite(record, to: paths.process)
-        for _ in 0..<100 { let result = status(); if result.state == .running { return result }; usleep(50_000) }; if processMatches(record) { _ = kill(record.pid, SIGTERM) }; try? manager.removeItem(at: paths.process); throw MailpitModuleError.processFailed(logText(paths.log))
+        let paths = instancePaths(); try makeDirectories([layout.rootURL, paths.instance, layout.mailpitLogsDirectoryURL]); if !manager.fileExists(atPath: paths.log.path) { manager.createFile(atPath: paths.log.path, contents: nil) }; let arguments = ["--smtp", "127.0.0.1:\(configuration.smtpPort)", "--listen", "127.0.0.1:\(configuration.httpPort)", "--database", paths.database.path, "--log-file", paths.log.path, "--allowed-hosts", "127.0.0.1,localhost"]; let process = Process(); process.executableURL = URL(fileURLWithPath: package.executablePath); process.arguments = arguments; process.currentDirectoryURL = layout.rootURL; let logHandle = try FileHandle(forWritingTo: paths.log); process.standardOutput = logHandle; process.standardError = logHandle; try process.run(); let child = OwnedChildProcess(process: process, label: "Mailpit"); let record = MailpitProcessRecord(pid: process.processIdentifier, user: NSUserName(), version: package.version, executable: package.executablePath, arguments: arguments, database: paths.database.path, log: paths.log.path, smtpPort: configuration.smtpPort, httpPort: configuration.httpPort, startedAt: processStartIdentity(process.processIdentifier)); ownedChild = child; ownedRecord = record
+        do { try atomicWrite(record, to: paths.process) } catch { throw MailpitModuleError.processFailed("Mailpit started but its process record could not be saved; retained Core ownership is available for safe stop: \(error)") }
+        for _ in 0..<100 { let result = status(); if result.state == .running { return result }; if !child.isRunningAndReapedIfExited() { ownedChild = nil; ownedRecord = nil; try? manager.removeItem(at: paths.process); throw MailpitModuleError.processFailed(logText(paths.log)) }; usleep(50_000) }
+        throw MailpitModuleError.unhealthy("Mailpit did not become healthy before the startup timeout; process ownership evidence was retained for retry or diagnosis")
     }
 
-    public func stop() throws -> MailpitStatus { let paths = instancePaths(); guard let record = processRecord(paths) else { return status() }; guard processMatches(record) else { throw MailpitModuleError.processIdentityMismatch }; _ = kill(record.pid, SIGTERM); for _ in 0..<60 { if !processExists(record.pid) { try? manager.removeItem(at: paths.process); waitForPortRelease(); return status() }; usleep(50_000) }; guard processMatches(record) else { throw MailpitModuleError.processIdentityMismatch }; _ = kill(record.pid, SIGKILL); for _ in 0..<20 where processExists(record.pid) { usleep(50_000) }; try? manager.removeItem(at: paths.process); waitForPortRelease(); return status() }
+    public func stop() throws -> MailpitStatus {
+        let paths = instancePaths()
+        guard let record = processRecord(paths) ?? ownedRecord else { return status() }
+        if let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record,
+           !child.isRunningAndReapedIfExited() {
+            guard isPortAvailable(record.smtpPort), isPortAvailable(record.httpPort) else {
+                throw MailpitModuleError.unhealthy("Owned Mailpit child exited, but SMTP/UI listener release is incomplete; process record retained")
+            }
+            ownedChild = nil; ownedRecord = nil
+            if manager.fileExists(atPath: paths.process.path) { try manager.removeItem(at: paths.process) }
+            return status()
+        }
+        guard let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record,
+              child.executablePath == record.executable, child.arguments == record.arguments,
+              processMatches(record) else { throw MailpitModuleError.processIdentityMismatch }
+        guard child.terminateAndWait(timeout: 3) else {
+            throw MailpitModuleError.unhealthy("Owned Mailpit PID \(record.pid) did not exit after graceful termination; process record retained for retry")
+        }
+        guard !processExists(record.pid), isPortAvailable(record.smtpPort), isPortAvailable(record.httpPort) else {
+            throw MailpitModuleError.unhealthy("Mailpit exited, but SMTP/UI listener release could not be confirmed; process record retained for diagnosis and retry")
+        }
+        ownedChild = nil; ownedRecord = nil
+        if manager.fileExists(atPath: paths.process.path) { try manager.removeItem(at: paths.process) }
+        let result = status()
+        guard result.state == .stopped || result.state == .installed else { throw MailpitModuleError.unhealthy("Mailpit stopped, but provider status is \(result.health)") }
+        return result
+    }
     public func instanceDatabasePath() -> String { instancePaths().database.path }
 
-    private struct MailpitProcessRecord: Codable { let pid: Int32; let user: String; let version: String; let executable: String; let arguments: [String]; let database: String; let log: String; let smtpPort: Int; let httpPort: Int; let startedAt: String }
+    private struct MailpitProcessRecord: Codable, Equatable { let pid: Int32; let user: String; let version: String; let executable: String; let arguments: [String]; let database: String; let log: String; let smtpPort: Int; let httpPort: Int; let startedAt: String }
     private struct InstancePaths { let instance: URL; let database: URL; let process: URL; let log: URL }
     private func instancePaths() -> InstancePaths { let instance = layout.mailpitInstancesDirectoryURL.appendingPathComponent("default", isDirectory: true); return .init(instance: instance, database: instance.appendingPathComponent("messages.db"), process: instance.appendingPathComponent("process.json"), log: layout.mailpitLogsDirectoryURL.appendingPathComponent("default.log")) }
     private func makeStatus(state: MailpitState, health: String, package: MailpitPackage?, pid: Int32?, paths: InstancePaths, record: MailpitProcessRecord? = nil) -> MailpitStatus { MailpitStatus(state: state, health: health, installedVersion: package?.version, pid: pid, smtpPort: record?.smtpPort ?? configuration.smtpPort, httpPort: record?.httpPort ?? configuration.httpPort, database: record?.database ?? paths.database.path, uiEndpoint: "http://127.0.0.1:\(record?.httpPort ?? configuration.httpPort)", executablePath: package?.executablePath ?? record?.executable ?? "", uptime: pid.flatMap(processUptime), memoryBytes: pid.flatMap(processMemory), cpuPercent: pid.flatMap(processCPU)) }
@@ -85,7 +132,6 @@ public final class MailpitModule: @unchecked Sendable {
     private func sendAll(_ descriptor: Int32, data: Data) -> Bool { data.withUnsafeBytes { buffer in var offset = 0; while offset < buffer.count { let sent = Darwin.send(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset, 0); if sent <= 0 { return false }; offset += sent }; return true } }
     private func isPortAvailable(_ port: Int) -> Bool { guard connect(port: port) == nil else { return false }; let descriptor = socket(AF_INET, SOCK_STREAM, 0); guard descriptor >= 0 else { return false }; defer { close(descriptor) }; var reuse: Int32 = 1; setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size)); var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(port).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1")); return withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 } }
     }
-    private func waitForPortRelease() { for _ in 0..<40 { if isPortAvailable(configuration.smtpPort) && isPortAvailable(configuration.httpPort) { return }; usleep(50_000) } }
     private func validateExecutable(_ url: URL, expected: String) throws { guard manager.isExecutableFile(atPath: url.path), try command("/usr/bin/file", [url.path]).contains("Mach-O 64-bit executable arm64"), try command(url.path, ["version"]).contains(expected), !(try command("/usr/bin/otool", ["-L", url.path])).contains("/opt/homebrew/") else { throw MailpitModuleError.validationFailed("unexpected Mailpit executable") } }
     private func extract(_ archive: URL, to directory: URL) throws { let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/tar"); process.arguments = ["-xzf", archive.path, "-C", directory.path]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw MailpitModuleError.validationFailed("archive extraction failed") } }
     private func setImmutable(_ url: URL) throws { let enumerator = manager.enumerator(at: url, includingPropertiesForKeys: [.isDirectoryKey]); while let item = enumerator?.nextObject() as? URL { let directory = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true; try manager.setAttributes([.posixPermissions: directory || item.lastPathComponent == "mailpit" ? 0o555 : 0o444], ofItemAtPath: item.path) }; try manager.setAttributes([.posixPermissions: 0o555], ofItemAtPath: url.path) }

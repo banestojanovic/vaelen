@@ -37,12 +37,13 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyServesControlledPHPFixtureThroughM2FPM() async throws {
-        guard let php = PHPModule.development(), let phpPackage = php.installedVersions().last else {
-            throw XCTSkip("M2 PHP-FPM package is not installed")
-        }
-        let phpWasRunning = (try? php.status(requestedVersion: phpPackage.version).state) == .running
+        let packageMetadata = VaelenFilesystemLayout().phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
+        guard let installedPackage = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageMetadata)) else { throw XCTSkip("M2 PHP-FPM package is not installed") }
         let root = URL(fileURLWithPath: "/tmp/vaelen-fastcgi-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let phpFixture = try IsolatedPHPFixture(installedPackage: installedPackage)
+        let php = phpFixture.module
+        let phpPackage = phpFixture.package
         try Data("<?php echo 'php response';".utf8).write(to: root.appendingPathComponent("index.php"))
         try Data("asset response".utf8).write(to: root.appendingPathComponent("asset.txt"))
 
@@ -53,9 +54,9 @@ final class CaddyRouterTests: XCTestCase {
         await supervisor.installPackage(package)
         let router = CaddyRouter(layout: layout, supervisor: supervisor)
         addTeardownBlock {
+            let phpClean = phpFixture.cleanup()
             try? await router.stop()
-            if !phpWasRunning { _ = try? php.stop(requestedVersion: phpPackage.version) }
-            try? FileManager.default.removeItem(at: root)
+            if phpClean, (await router.status()).state == .stopped { try? FileManager.default.removeItem(at: root) }
         }
 
         _ = try php.start(requestedVersion: phpPackage.version)
@@ -115,10 +116,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyReachesSyncproofLaravelFrontController() async throws {
-        guard let php = PHPModule.development(), let phpPackage = php.installedVersions().last else {
-            throw XCTSkip("M2 PHP-FPM package is not installed")
-        }
-        let phpWasRunning = (try? php.status(requestedVersion: phpPackage.version).state) == .running
+        let packageMetadata = VaelenFilesystemLayout().phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
+        guard let installedPackage = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageMetadata)) else { throw XCTSkip("M2 PHP-FPM package is not installed") }
         let project = URL(fileURLWithPath: "/Users/banes/Code/syncproof", isDirectory: true)
         guard FileManager.default.fileExists(atPath: project.appendingPathComponent("public/index.php").path) else {
             throw XCTSkip("syncproof project is not available")
@@ -128,15 +127,18 @@ final class CaddyRouterTests: XCTestCase {
             throw XCTSkip("syncproof MySQL is unavailable at \(database.host):\(database.port)")
         }
         let root = URL(fileURLWithPath: "/tmp/vaelen-syncproof-\(UUID().uuidString)", isDirectory: true)
+        let phpFixture = try IsolatedPHPFixture(installedPackage: installedPackage)
+        let php = phpFixture.module
+        let phpPackage = phpFixture.package
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
         await supervisor.installPackage(try resolveCaddyPackage())
         let router = CaddyRouter(layout: layout, supervisor: supervisor)
         addTeardownBlock {
+            let phpClean = phpFixture.cleanup()
             try? await router.stop()
-            if !phpWasRunning { _ = try? php.stop(requestedVersion: phpPackage.version) }
-            try? FileManager.default.removeItem(at: root)
+            if phpClean, (await router.status()).state == .stopped { try? FileManager.default.removeItem(at: root) }
         }
 
         _ = try php.start(requestedVersion: phpPackage.version)

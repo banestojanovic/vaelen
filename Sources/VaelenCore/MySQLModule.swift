@@ -98,16 +98,29 @@ public final class MySQLModule: @unchecked Sendable {
     private let manifest: MySQLManifest
     private let downloader: any MySQLArtifactDownloader
     private let port: Int
+    private let instanceName: String
+    private let tcpEnabled: Bool
+    private let packageOverride: MySQLPackage?
+    private let clientCommandTimeout: TimeInterval
+    var shutdownTimeout: TimeInterval
     private let manager = FileManager.default
     private let lock = NSLock()
+    private var ownedServer: OwnedChildProcess?
 
-    public init(layout: VaelenFilesystemLayout, manifest: MySQLManifest = .official8_4_11, downloader: any MySQLArtifactDownloader = SystemMySQLArtifactDownloader(), port: Int = MySQLModule.defaultPort) {
-        self.layout = layout; self.manifest = manifest; self.downloader = downloader; self.port = port
+    public convenience init(layout: VaelenFilesystemLayout, manifest: MySQLManifest = .official8_4_11, downloader: any MySQLArtifactDownloader = SystemMySQLArtifactDownloader(), port: Int = MySQLModule.defaultPort) {
+        self.init(layout: layout, manifest: manifest, downloader: downloader, port: port, instanceName: "default", tcpEnabled: true, packageOverride: nil, clientCommandTimeout: 10, shutdownTimeout: 5)
+    }
+
+    init(layout: VaelenFilesystemLayout, manifest: MySQLManifest = .official8_4_11, downloader: any MySQLArtifactDownloader = SystemMySQLArtifactDownloader(), port: Int = MySQLModule.defaultPort, instanceName: String, tcpEnabled: Bool, packageOverride: MySQLPackage? = nil, clientCommandTimeout: TimeInterval = 10, shutdownTimeout: TimeInterval = 8) {
+        self.layout = layout; self.manifest = manifest; self.downloader = downloader; self.port = port; self.instanceName = instanceName; self.tcpEnabled = tcpEnabled; self.packageOverride = packageOverride; self.clientCommandTimeout = clientCommandTimeout; self.shutdownTimeout = shutdownTimeout
     }
 
     public func availableVersions() -> [String] { [manifest.version] }
 
     public func installedVersions() -> [MySQLPackage] {
+        if let packageOverride {
+            return packageOverride.version == manifest.version && packageOverride.architecture == manifest.architecture && packageOverride.artifactSHA256 == manifest.artifactSHA256 && manager.isExecutableFile(atPath: packageOverride.serverPath) && manager.isExecutableFile(atPath: packageOverride.clientPath) && manager.isExecutableFile(atPath: packageOverride.adminPath) ? [packageOverride] : []
+        }
         guard let entries = try? manager.contentsOfDirectory(at: layout.mysqlPackagesDirectoryURL, includingPropertiesForKeys: nil) else { return [] }
         return entries.compactMap { url in
             guard let package = try? JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: url.appendingPathComponent(".vaelen-package.json"))), isValid(package) else { return nil }
@@ -178,7 +191,18 @@ public final class MySQLModule: @unchecked Sendable {
         let package = selectedPackage(); let paths = instancePaths(package: package); let record = processRecord(paths)
         let base = (package?.version, selectedVersion(), paths.socket.path, paths.data.path, package?.serverPath ?? "")
          guard let record else { return MySQLStatus(state: package == nil ? .notInstalled : (instanceMetadata()?.initialized == true ? .stopped : .installed), health: package == nil ? "not-installed" : (instanceMetadata()?.initialized == true ? "stopped" : "not-initialized"), installedVersion: base.0, selectedVersion: base.1, pid: nil, port: instanceMetadata()?.port ?? port, socket: base.2, datadir: base.3, executablePath: base.4) }
-        guard processExists(record.pid) else { try? manager.removeItem(at: paths.process); return MySQLStatus(state: .stopped, health: "stopped", installedVersion: base.0, selectedVersion: base.1, pid: nil, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable) }
+        if let child = ownedServer, child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
+            guard record.executable == child.executablePath, record.arguments == child.arguments, record.datadir == paths.data.path, record.socket == paths.socket.path else {
+                return MySQLStatus(state: .unhealthy, health: "identity-unverified", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable)
+            }
+            if child.hasLiveOwnedDescendants {
+                return MySQLStatus(state: .unhealthy, health: "server-exited-children-running", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable)
+            }
+            clearExitedRecord(record, paths: paths)
+            ownedServer = nil
+            return MySQLStatus(state: .stopped, health: "stopped", installedVersion: base.0, selectedVersion: base.1, pid: nil, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable)
+        }
+        guard processExists(record.pid) else { clearExitedRecord(record, paths: paths); return MySQLStatus(state: .stopped, health: "stopped", installedVersion: base.0, selectedVersion: base.1, pid: nil, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable) }
         guard processMatches(record) else { return MySQLStatus(state: .unhealthy, health: "identity-unverified", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable) }
         guard isPortOwnedByRecord(record) else { return MySQLStatus(state: .conflict, health: "port-conflict", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable) }
         let healthy = (try? ping(paths: paths)) == true
@@ -188,38 +212,137 @@ public final class MySQLModule: @unchecked Sendable {
     public func start() throws -> MySQLStatus {
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }; guard instanceMetadata()?.initialized == true else { throw MySQLModuleError.notInitialized }
         let paths = instancePaths(package: package); let current = status(); if current.state == .running { return current }; if current.state == .unhealthy || current.state == .conflict { if let record = processRecord(paths), processExists(record.pid) { throw MySQLModuleError.processIdentityMismatch }; try? manager.removeItem(at: paths.process) }
-        guard isPortAvailable(port) else { throw MySQLModuleError.portConflict(port) }
+        if tcpEnabled, !isPortAvailable(port) { throw MySQLModuleError.portConflict(port) }
         try writeConfig(package: package, paths: paths); try start(package: package, paths: paths, allowExpiredPassword: false); return status()
     }
 
     public func stop() throws -> MySQLStatus {
-        let paths = instancePaths(package: selectedPackage()); guard let record = processRecord(paths) else { return status() }; guard processMatches(record) else { throw MySQLModuleError.processIdentityMismatch }
-        if let package = selectedPackage(), FileManager.default.fileExists(atPath: paths.credentials.path) { _ = try? runClient(package.adminPath, paths: paths, arguments: ["--defaults-extra-file=\(paths.credentials.path)", "shutdown"]) }
-        for _ in 0..<60 { if !processExists(record.pid) { try? manager.removeItem(at: paths.process); waitForPortRelease(record.port); return status() }; usleep(50_000) }
-        guard processMatches(record) else { throw MySQLModuleError.processIdentityMismatch }; _ = kill(record.pid, SIGTERM)
-        for _ in 0..<40 { if !processExists(record.pid) { try? manager.removeItem(at: paths.process); waitForPortRelease(record.port); return status() }; usleep(50_000) }
-        guard processMatches(record) else { throw MySQLModuleError.processIdentityMismatch }; _ = kill(record.pid, SIGKILL); try? manager.removeItem(at: paths.process); waitForPortRelease(record.port); return status()
+        let paths = instancePaths(package: selectedPackage())
+        let observed = status()
+        guard let record = processRecord(paths) else { return observed }
+        guard let child = ownedServer, child.processIdentifier == record.pid, child.isRunningAndReapedIfExited(), processMatches(record), socketMatches(record) else {
+            throw MySQLModuleError.processIdentityMismatch
+        }
+        guard let package = selectedPackage(), FileManager.default.fileExists(atPath: paths.credentials.path) else { throw MySQLModuleError.credentialsUnavailable }
+        // mysqladmin contacts only the recorded, inode-verified Unix socket;
+        // no TCP port is used for a shutdown request.
+        try runClient(package.adminPath, paths: paths, arguments: ["--defaults-extra-file=\(paths.credentials.path)", "shutdown"], timeout: min(clientCommandTimeout, 3))
+        let deadline = Date().addingTimeInterval(shutdownTimeout)
+        while Date() < deadline {
+            if !child.isRunningAndReapedIfExited() {
+                guard !child.hasLiveOwnedDescendants else { usleep(50_000); continue }
+                removeOwnedFiles(record)
+                guard !socketMatches(record), !pidFileMatches(record, paths: paths) else { throw MySQLModuleError.processFailed("MySQL PID \(record.pid) exited but its owned socket or PID file remains; process record retained") }
+                ownedServer = nil
+                try manager.removeItem(at: paths.process)
+                return status()
+            }
+            usleep(50_000)
+        }
+        throw MySQLModuleError.processFailed("MySQL PID \(record.pid) did not stop within the graceful shutdown timeout; process record retained")
     }
 
     private let credentialsPassword = "vaelen-mysql-\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
     private struct MySQLInstanceMetadata: Codable { let version: String; let initializedVersion: String; let initialized: Bool; let port: Int; let socket: String; let datadir: String }
-    private struct MySQLProcessRecord: Codable { let pid: Int32; let version: String; let executable: String; let arguments: [String]; let port: Int; let socket: String; let datadir: String; let startedAt: String }
+    private struct MySQLProcessRecord: Codable { let pid: Int32; let version: String; let executable: String; let arguments: [String]; let port: Int; let socket: String; let datadir: String; let startedAt: String; let socketDevice: Int64?; let socketInode: Int64?; let pidFile: String?; let pidFileDevice: Int64?; let pidFileInode: Int64?; let tcpEnabled: Bool? }
     private struct InstancePaths { let instance: URL; let data: URL; let config: URL; let metadata: URL; let credentials: URL; let process: URL; let socket: URL; let log: URL }
 
     private func selectedPackage() -> MySQLPackage? { let version = selectedVersion() ?? manifest.version; return installedVersions().first { $0.version == version } }
-    private func instancePaths(package: MySQLPackage?) -> InstancePaths { let instance = layout.mysqlInstancesDirectoryURL.appendingPathComponent("default", isDirectory: true); let runtime = layout.rootURL.appendingPathComponent("runtime", isDirectory: true); let preferredSocket = runtime.appendingPathComponent("sockets/mysql/default.sock"); let socket = preferredSocket.path.utf8.count < 103 ? preferredSocket : URL(fileURLWithPath: "/tmp/vaelen-mysql-\(stableSocketSuffix()).sock"); return .init(instance: instance, data: instance.appendingPathComponent("data", isDirectory: true), config: instance.appendingPathComponent("my.cnf"), metadata: instance.appendingPathComponent("metadata.json"), credentials: instance.appendingPathComponent("client.cnf"), process: instance.appendingPathComponent("process.json"), socket: socket, log: layout.mysqlLogsDirectoryURL.appendingPathComponent("default.log")) }
+    private func instancePaths(package: MySQLPackage?) -> InstancePaths { let instance = layout.mysqlInstancesDirectoryURL.appendingPathComponent(instanceName, isDirectory: true); let runtime = layout.rootURL.appendingPathComponent("runtime", isDirectory: true); let preferredSocket = runtime.appendingPathComponent("sockets/mysql/\(instanceName).sock"); let socket = preferredSocket.path.utf8.count < 103 ? preferredSocket : URL(fileURLWithPath: "/tmp/vaelen-mysql-\(stableSocketSuffix())-\(instanceName).sock"); return .init(instance: instance, data: instance.appendingPathComponent("data", isDirectory: true), config: instance.appendingPathComponent("my.cnf"), metadata: instance.appendingPathComponent("metadata.json"), credentials: instance.appendingPathComponent("client.cnf"), process: instance.appendingPathComponent("process.json"), socket: socket, log: layout.mysqlLogsDirectoryURL.appendingPathComponent("\(instanceName).log")) }
     private func instanceMetadata() -> MySQLInstanceMetadata? { try? JSONDecoder().decode(MySQLInstanceMetadata.self, from: Data(contentsOf: instancePaths(package: selectedPackage()).metadata)) }
-     private func writeConfig(package: MySQLPackage, paths: InstancePaths) throws { var directories = [paths.instance, paths.config.deletingLastPathComponent(), layout.mysqlLogsDirectoryURL, paths.process.deletingLastPathComponent(), paths.instance.appendingPathComponent("tmp")]; let socketParent = paths.socket.deletingLastPathComponent(); if socketParent.path != "/tmp" { directories.append(socketParent) }; try makeDirectories(directories); let content = "[mysqld]\nbasedir=\(package.packagePath)\ndatadir=\(paths.data.path)\nsocket=\(paths.socket.path)\npid-file=\(paths.process.path.replacingOccurrences(of: "process.json", with: "mysqld.pid"))\nlog-error=\(paths.log.path)\nbind-address=127.0.0.1\nport=\(port)\ntmpdir=\(paths.instance.appendingPathComponent("tmp").path)\nmysqlx=OFF\n"; try atomicWrite(content, to: paths.config) }
-     private func start(package: MySQLPackage, paths: InstancePaths, allowExpiredPassword: Bool) throws { try? manager.removeItem(at: paths.socket); let logHandle = FileHandle(forWritingAtPath: paths.log.path) ?? { manager.createFile(atPath: paths.log.path, contents: nil); return try! FileHandle(forWritingTo: paths.log) }(); let process = Process(); process.executableURL = URL(fileURLWithPath: package.serverPath); process.arguments = ["--defaults-file=\(paths.config.path)"]; process.currentDirectoryURL = layout.rootURL; process.standardOutput = logHandle; process.standardError = logHandle; try process.run(); let record = MySQLProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.serverPath, arguments: process.arguments ?? [], port: port, socket: paths.socket.path, datadir: paths.data.path, startedAt: processStartIdentity(process.processIdentifier)); try atomicWrite(record, to: paths.process); for _ in 0..<100 { if (try? ping(paths: paths, allowExpiredPassword: allowExpiredPassword)) == true { return }; usleep(50_000) }; if processMatches(record) { _ = kill(record.pid, SIGTERM) }; throw MySQLModuleError.processFailed(logText(paths.log)) }
+       private func writeConfig(package: MySQLPackage, paths: InstancePaths) throws { var directories = [paths.instance, paths.config.deletingLastPathComponent(), layout.mysqlLogsDirectoryURL, paths.process.deletingLastPathComponent(), paths.instance.appendingPathComponent("tmp")]; let socketParent = paths.socket.deletingLastPathComponent(); if socketParent.path != "/tmp" { directories.append(socketParent) }; try makeDirectories(directories); let tcp = tcpEnabled ? "bind-address=127.0.0.1\nport=\(port)\n" : "skip-networking\n"; let content = "[mysqld]\nbasedir=\(package.packagePath)\ndatadir=\(paths.data.path)\nsocket=\(paths.socket.path)\npid-file=\(paths.instance.appendingPathComponent("mysqld.pid").path)\nlog-error=\(paths.log.path)\n\(tcp)tmpdir=\(paths.instance.appendingPathComponent("tmp").path)\nmysqlx=OFF\n"; try atomicWrite(content, to: paths.config) }
+      private func start(package: MySQLPackage, paths: InstancePaths, allowExpiredPassword: Bool) throws {
+          var directories = [paths.instance, layout.mysqlLogsDirectoryURL]
+          if paths.socket.deletingLastPathComponent().path != "/tmp" { directories.append(paths.socket.deletingLastPathComponent()) }
+          try makeDirectories(directories)
+          guard !manager.fileExists(atPath: paths.socket.path), !manager.fileExists(atPath: paths.instance.appendingPathComponent("mysqld.pid").path) else { throw MySQLModuleError.processFailed("MySQL socket or PID path already exists; refusing to replace it") }
+          let logHandle = FileHandle(forWritingAtPath: paths.log.path) ?? { manager.createFile(atPath: paths.log.path, contents: nil); return try! FileHandle(forWritingTo: paths.log) }()
+          let process = Process(); process.executableURL = URL(fileURLWithPath: package.serverPath); process.arguments = ["--defaults-file=\(paths.config.path)"] + (tcpEnabled ? [] : ["--skip-networking"]); process.currentDirectoryURL = layout.rootURL; process.standardOutput = logHandle; process.standardError = logHandle
+          try process.run()
+          let child = OwnedChildProcess(process: process, label: "MySQL \(package.version) \(instanceName)")
+          ownedServer = child
+          var record = MySQLProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.serverPath, arguments: process.arguments ?? [], port: tcpEnabled ? port : 0, socket: paths.socket.path, datadir: paths.data.path, startedAt: processStartIdentity(process.processIdentifier), socketDevice: nil, socketInode: nil, pidFile: paths.instance.appendingPathComponent("mysqld.pid").path, pidFileDevice: nil, pidFileInode: nil, tcpEnabled: tcpEnabled)
+          try atomicWrite(record, to: paths.process)
+          for _ in 0..<160 {
+              if (try? ping(paths: paths, allowExpiredPassword: allowExpiredPassword)) == true {
+                  record = recordWithFileIdentities(record, paths: paths)
+                  try atomicWrite(record, to: paths.process)
+                  return
+              }
+              if !child.isRunningAndReapedIfExited() { break }
+              usleep(50_000)
+          }
+          guard child.terminateAndWait(timeout: 8, signal: SIGTERM, waitForDescendants: true) else {
+              throw MySQLModuleError.processFailed("MySQL PID \(record.pid) failed readiness and remains live; process record retained")
+          }
+          ownedServer = nil
+          try? manager.removeItem(at: paths.process)
+          removeOwnedFiles(record)
+          throw MySQLModuleError.processFailed(logText(paths.log))
+      }
     private func writeCredentials(paths: InstancePaths, password: String) throws { try atomicWrite("[client]\nuser=root\npassword=\(password)\nprotocol=socket\nsocket=\(paths.socket.path)\n", to: paths.credentials); try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.credentials.path) }
-    private func runClient(_ executable: String, paths: InstancePaths, arguments: [String]) throws { let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = ["--socket=\(paths.socket.path)"] + arguments; let error = Pipe(); process.standardError = error; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "MySQL client failed") } }
-    private func ping(paths: InstancePaths, allowExpiredPassword: Bool = false) throws -> Bool { if allowExpiredPassword { return manager.fileExists(atPath: paths.socket.path) }; guard let package = selectedPackage() else { return false }; let process = Process(); process.executableURL = URL(fileURLWithPath: package.adminPath); process.arguments = ["--defaults-extra-file=\(paths.credentials.path)", "ping", "--socket=\(paths.socket.path)"]; try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 }
+     private func runClient(_ executable: String, paths: InstancePaths, arguments: [String], timeout: TimeInterval = 10) throws {
+         let process = Process(); process.executableURL = URL(fileURLWithPath: executable)
+         var clientArguments = arguments
+         let defaultsFile = clientArguments.first(where: { $0.hasPrefix("--defaults-extra-file=") })
+         clientArguments.removeAll(where: { $0.hasPrefix("--defaults-extra-file=") })
+         process.arguments = (defaultsFile.map { [$0] } ?? []) + ["--protocol=socket", "--socket=\(paths.socket.path)"] + clientArguments
+         let output = Pipe(); process.standardOutput = output; process.standardError = output
+         try process.run()
+         let deadline = Date().addingTimeInterval(timeout)
+         while process.isRunning && Date() < deadline { usleep(20_000) }
+         if process.isRunning {
+             process.terminate()
+             let terminateDeadline = Date().addingTimeInterval(1)
+             while process.isRunning && Date() < terminateDeadline { usleep(20_000) }
+             if !process.isRunning { process.waitUntilExit() }
+             throw MySQLModuleError.processFailed("MySQL client command timed out")
+         }
+         let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+         guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(String(data: data, encoding: .utf8) ?? "MySQL client failed") }
+     }
+    private func ping(paths: InstancePaths, allowExpiredPassword: Bool = false) throws -> Bool { if allowExpiredPassword { return manager.fileExists(atPath: paths.socket.path) }; guard let package = selectedPackage() else { return false }; let process = Process(); process.executableURL = URL(fileURLWithPath: package.adminPath); process.arguments = ["--defaults-extra-file=\(paths.credentials.path)", "--protocol=socket", "ping", "--socket=\(paths.socket.path)"]; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice; try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 }
     private func parseTemporaryPassword(_ text: String) -> String? { guard let range = text.range(of: "temporary password is generated for root@localhost: ") else { return nil }; return text[range.upperBound...].split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespaces) }
-    private func processRecord(_ paths: InstancePaths) -> MySQLProcessRecord? { try? JSONDecoder().decode(MySQLProcessRecord.self, from: Data(contentsOf: paths.process)) }
+     private func processRecord(_ paths: InstancePaths) -> MySQLProcessRecord? { try? JSONDecoder().decode(MySQLProcessRecord.self, from: Data(contentsOf: paths.process)) }
+     private func recordWithFileIdentities(_ record: MySQLProcessRecord, paths: InstancePaths) -> MySQLProcessRecord {
+         var socketInfo = stat(), pidInfo = stat()
+         let socketIdentity = lstat(record.socket, &socketInfo) == 0 && (socketInfo.st_mode & S_IFMT) == S_IFSOCK ? (Int64(socketInfo.st_dev), Int64(socketInfo.st_ino)) : (nil, nil)
+         let pidPath = paths.instance.appendingPathComponent("mysqld.pid").path
+         let pidIdentity = lstat(pidPath, &pidInfo) == 0 && (pidInfo.st_mode & S_IFMT) == S_IFREG ? (Int64(pidInfo.st_dev), Int64(pidInfo.st_ino)) : (nil, nil)
+         return MySQLProcessRecord(pid: record.pid, version: record.version, executable: record.executable, arguments: record.arguments, port: record.port, socket: record.socket, datadir: record.datadir, startedAt: record.startedAt, socketDevice: socketIdentity.0, socketInode: socketIdentity.1, pidFile: pidPath, pidFileDevice: pidIdentity.0, pidFileInode: pidIdentity.1, tcpEnabled: record.tcpEnabled)
+     }
+     private func socketMatches(_ record: MySQLProcessRecord) -> Bool {
+         guard record.socket == instancePaths(package: selectedPackage()).socket.path, let device = record.socketDevice, let inode = record.socketInode else { return false }
+         var info = stat()
+         return lstat(record.socket, &info) == 0 && (info.st_mode & S_IFMT) == S_IFSOCK && info.st_uid == getuid() && Int64(info.st_dev) == device && Int64(info.st_ino) == inode
+     }
+     private func pidFileMatches(_ record: MySQLProcessRecord, paths: InstancePaths) -> Bool {
+         guard let path = record.pidFile, path == paths.instance.appendingPathComponent("mysqld.pid").path, let device = record.pidFileDevice, let inode = record.pidFileInode else { return false }
+         var info = stat()
+         return lstat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == getuid() && Int64(info.st_dev) == device && Int64(info.st_ino) == inode
+     }
+     private func removeOwnedFiles(_ record: MySQLProcessRecord) {
+         if socketMatches(record) { try? manager.removeItem(atPath: record.socket) }
+         if let path = record.pidFile, let paths = Optional(instancePaths(package: selectedPackage())), pidFileMatches(record, paths: paths) { try? manager.removeItem(atPath: path) }
+     }
+     private func clearExitedRecord(_ record: MySQLProcessRecord, paths: InstancePaths) {
+         removeOwnedFiles(record)
+         try? manager.removeItem(at: paths.process)
+     }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
-    private func processMatches(_ record: MySQLProcessRecord) -> Bool { guard processExists(record.pid) else { return false }; let commandLine = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])) ?? ""; return commandLine.contains(record.executable) && record.arguments.allSatisfy { commandLine.contains($0) } && processStartIdentity(record.pid) == record.startedAt }
+    private func processMatches(_ record: MySQLProcessRecord) -> Bool {
+        if let child = ownedServer, child.processIdentifier == record.pid {
+            return child.isRunningAndReapedIfExited()
+                && child.executablePath == URL(fileURLWithPath: record.executable).standardizedFileURL.path
+                && child.arguments == record.arguments
+                && processStartIdentity(record.pid) == record.startedAt
+        }
+        guard processExists(record.pid) else { return false }
+        let commandLine = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])) ?? ""
+        return commandLine.contains(record.executable) && record.arguments.allSatisfy { commandLine.contains($0) } && processStartIdentity(record.pid) == record.startedAt
+    }
     private func processStartIdentity(_ pid: Int32) -> String { (try? command("/bin/ps", ["-p", "\(pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-    private func isPortOwnedByRecord(_ record: MySQLProcessRecord) -> Bool { isPortAvailable(record.port) == false }
+    private func isPortOwnedByRecord(_ record: MySQLProcessRecord) -> Bool { record.tcpEnabled == false || isPortAvailable(record.port) == false }
      private func isPortAvailable(_ port: Int) -> Bool {
          var address = sockaddr_in()
          address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)

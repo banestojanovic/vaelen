@@ -176,6 +176,49 @@ final class StandardPortsCapabilityTests: XCTestCase {
         XCTAssertEqual(repeated.state, .absent)
     }
 
+    func testQuitReleasesOwnedForwardingButPreservesSavedOnChoice() async throws {
+        let original = "# unrelated PF configuration\npass quick on lo0 all\n"
+        let fixture = try makeFixture(pfConf: original); defer { tearDown(fixture) }
+        let intentStore = ServiceIntentStore(url: fixture.dir.appendingPathComponent("state/service-intents.json"))
+        try intentStore.set("standard-ports", enabled: true)
+        let occupancy = Occupancy()
+        let capability = makeCapability(fixture, occupancy: occupancy, backendHealthy: true)
+        _ = try await capability.install()
+        XCTAssertEqual(try fixture.ledger.standardPortsRecord()?.active, true)
+
+        occupancy.ports = []
+        let released = try await capability.shutdownCleanup()
+        XCTAssertEqual(released.state, .absent)
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.pfConfPath, encoding: .utf8), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.anchorPath))
+        XCTAssertEqual(try fixture.ledger.standardPortsRecord()?.active, false)
+        XCTAssertEqual(try intentStore.enabledServices(), ["standard-ports"])
+
+        // With external PF content unchanged, the saved-on choice can safely
+        // re-install through the same ownership-checked path.
+        let relaunched = makeCapability(fixture, occupancy: occupancy, backendHealthy: true)
+        let running = try await relaunched.install()
+        XCTAssertNotEqual(running.state, .conflict)
+        XCTAssertEqual(try fixture.ledger.standardPortsRecord()?.active, true)
+        XCTAssertEqual(try intentStore.enabledServices(), ["standard-ports"])
+        occupancy.ports = []
+        _ = try await relaunched.shutdownCleanup()
+    }
+
+    func testSavedStandardPortsChoiceReportsForeignPFConflictWithoutMutation() async throws {
+        let fixture = try makeFixture(); defer { tearDown(fixture) }
+        let foreign = "# unrelated PF rules\nanchor \"foreign.example\"\n"
+        try foreign.write(toFile: fixture.paths.anchorPath, atomically: true, encoding: .utf8)
+        let intentStore = ServiceIntentStore(url: fixture.dir.appendingPathComponent("state/service-intents.json"))
+        try intentStore.set("standard-ports", enabled: true)
+        let status = await makeCapability(fixture, backendHealthy: true).status()
+        XCTAssertEqual(status.state, .conflict)
+        do { _ = try await makeCapability(fixture, backendHealthy: true).install(); XCTFail("foreign PF anchor must block auto-restoration") }
+        catch let error as StandardPortsError { XCTAssertEqual(error, .externalConflict("Foreign PF anchor claims \(StandardPortsForwardingPolicy.anchorName)")) }
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.anchorPath, encoding: .utf8), foreign)
+        XCTAssertEqual(try intentStore.enabledServices(), ["standard-ports"])
+    }
+
     func testReferencePrecedesFilterAnchorsAndHealsMisplacement() {
         let appleStyle = "# Default PF configuration file.\nscrub-anchor \"com.apple/*\"\nnat-anchor \"com.apple/*\"\nrdr-anchor \"com.apple/*\"\ndummynet-anchor \"com.apple/*\"\nanchor \"com.apple/*\"\nload anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n"
         let integrated = StandardPortsForwardingPolicy.addingReference(to: appleStyle)

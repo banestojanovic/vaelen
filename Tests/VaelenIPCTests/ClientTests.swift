@@ -40,6 +40,32 @@ final class ClientTests: XCTestCase {
         XCTAssertEqual(status.core.version, "0.0.1-dev")
     }
 
+    func testClientUsesTypedCoreShutdownOperation() async throws {
+        let pair = InMemoryTransport.pair()
+        let recorder = RequestRecorder()
+        let server = Task {
+            try await pair.server.connect()
+            var decoder = FrameDecoder()
+            while !Task.isCancelled {
+                let data = try await pair.server.read()
+                for frame in try decoder.append(data) {
+                    let request = try IPCCodec.decode(IPCRequest.self, from: frame)
+                    recorder.append(request.method)
+                    let result: ResponseResult = request.knownMethod == .handshake
+                        ? .handshake(.init(protocolVersion: 1, coreVersion: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))
+                        : .shutdown(.init(components: [.init(component: "all", succeeded: true, detail: "done")]))
+                    try await pair.server.write(FrameEncoder().encode(IPCCodec.encode(IPCResponse(id: request.id, result: result))))
+                }
+            }
+        }
+        let client = VaelenCoreClient(transport: pair.client, identity: ClientIdentity(name: "test", version: VaelenBuildInfo.version))
+        try await client.connect()
+        let result = try await client.shutdown()
+        await client.disconnect(); server.cancel()
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(recorder.methods, [CoreMethod.handshake.rawValue, CoreMethod.shutdown.rawValue])
+    }
+
     func testClientSendsParameterlessTrustOperationsAndDecodesTypedResults() async throws {
         let pair = InMemoryTransport.pair()
         let recorder = RequestRecorder()

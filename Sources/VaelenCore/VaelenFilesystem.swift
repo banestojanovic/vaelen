@@ -3,10 +3,12 @@ import Darwin
 
 public struct VaelenFilesystemLayout: Sendable {
     public let rootURL: URL
+    private let explicitLogsDirectoryURL: URL?
 
-    public init(rootURL: URL? = nil, fileManager: FileManager = .default) {
+    public init(rootURL: URL? = nil, fileManager: FileManager = .default, logsDirectoryURL: URL? = nil) {
         self.rootURL = (rootURL ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Vaelen", isDirectory: true)).standardizedFileURL
+        self.explicitLogsDirectoryURL = logsDirectoryURL?.standardizedFileURL
     }
 
     public var stateDirectoryURL: URL { rootURL.appendingPathComponent("state", isDirectory: true) }
@@ -27,7 +29,7 @@ public struct VaelenFilesystemLayout: Sendable {
     public var cacheDirectoryURL: URL { FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Vaelen", isDirectory: true) }
     public var downloadsDirectoryURL: URL { cacheDirectoryURL.appendingPathComponent("downloads", isDirectory: true) }
     public var stagingDirectoryURL: URL { cacheDirectoryURL.appendingPathComponent("staging", isDirectory: true) }
-    public var logsDirectoryURL: URL { FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true) }
+    public var logsDirectoryURL: URL { explicitLogsDirectoryURL ?? FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true) }
     public var phpLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/php", isDirectory: true) }
     public var caddyLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
     public var mysqlLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/mysql", isDirectory: true) }

@@ -38,12 +38,27 @@ public struct HandshakeResult: Codable, Equatable, Sendable {
 public struct CoreStatusResponse: Codable, Equatable, Sendable {
     public let core: CoreRuntimeStatus
     public let protocolVersion: Int
-    public init(core: CoreRuntimeStatus, protocolVersion: Int) { self.core = core; self.protocolVersion = protocolVersion }
+    public let serviceIssues: [String: String]?
+    public init(core: CoreRuntimeStatus, protocolVersion: Int, serviceIssues: [String: String]? = nil) { self.core = core; self.protocolVersion = protocolVersion; self.serviceIssues = serviceIssues }
+}
+
+public struct CoreShutdownComponentResult: Codable, Equatable, Sendable {
+    public let component: String
+    public let succeeded: Bool
+    public let detail: String
+    public init(component: String, succeeded: Bool, detail: String) { self.component = component; self.succeeded = succeeded; self.detail = detail }
+}
+
+public struct CoreShutdownResponse: Codable, Equatable, Sendable {
+    public let completed: Bool
+    public let components: [CoreShutdownComponentResult]
+    public init(components: [CoreShutdownComponentResult]) { self.components = components; self.completed = components.allSatisfy(\.succeeded) }
 }
 
 public enum CoreMethod: String, Sendable {
     case handshake = "core.handshake"
     case status = "core.status"
+    case shutdown = "core.shutdown"
     case projectLink = "project.link"
     case projectUnlink = "project.unlink"
     case projectLinks = "project.links"
@@ -381,6 +396,7 @@ public struct PortsStatusResult: Codable, Equatable, Sendable { public let ports
 public enum ResponseResult: Codable, Equatable, Sendable {
     case handshake(HandshakeResult)
     case status(CoreStatusResponse)
+    case shutdown(CoreShutdownResponse)
     case projectMutation(ProjectMutationResult)
     case projectList(ProjectListResult)
     case projectEnvironment(ProjectEnvironmentResult)
@@ -414,6 +430,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         switch self {
         case .handshake(let value): try value.encode(to: encoder)
         case .status(let value): try value.encode(to: encoder)
+        case .shutdown(let value): try value.encode(to: encoder)
         case .projectMutation(let value): try value.encode(to: encoder)
         case .projectList(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
@@ -449,7 +466,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         let value = try JSONValue(from: decoder)
         let data = try IPCCodec.encode(value)
         guard case .object(let fields) = value else { self = .raw(value); return }
-        if fields["core"] != nil, let result = try? IPCCodec.decode(CoreStatusResponse.self, from: data) { self = .status(result) }
+        if fields["components"] != nil, let result = try? IPCCodec.decode(CoreShutdownResponse.self, from: data) { self = .shutdown(result) }
+        else if fields["core"] != nil, let result = try? IPCCodec.decode(CoreStatusResponse.self, from: data) { self = .status(result) }
         else if fields["coreVersion"] != nil, let result = try? IPCCodec.decode(HandshakeResult.self, from: data) { self = .handshake(result) }
         else if fields["projects"] != nil, let result = try? IPCCodec.decode(ProjectListResult.self, from: data) { self = .projectList(result) }
         else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
