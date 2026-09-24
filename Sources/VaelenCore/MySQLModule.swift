@@ -222,6 +222,7 @@ public final class MySQLModule: @unchecked Sendable {
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }; guard instanceMetadata()?.initialized == true else { throw MySQLModuleError.notInitialized }
         let paths = instancePaths(package: package); let current = status(); if current.state == .running { return current }; if current.state == .unhealthy || current.state == .conflict { if let record = processRecord(paths), processExists(record.pid) { throw MySQLModuleError.processIdentityMismatch }; try? manager.removeItem(at: paths.process) }
         if tcpEnabled, !isPortAvailable(port) { throw MySQLModuleError.portConflict(port) }
+        if processRecord(paths) == nil { try reconcileExitedRuntimeArtifacts(paths: paths, package: package) }
         try writeConfig(package: package, paths: paths)
         try start(package: package, paths: paths, allowExpiredPassword: false)
         if let metadata = instanceMetadata(), metadata.rootPasswordMode != "empty" {
@@ -238,9 +239,14 @@ public final class MySQLModule: @unchecked Sendable {
         guard let record = processRecord(paths) else { return observed }
         let child = ownedServer
         guard processExists(record.pid), processMatches(record), socketMatches(record), isPortOwnedByRecord(record) else {
-            // A mismatched live PID is never signaled and its socket/data are
-            // left untouched. The stale Vaelen record must not block Quit.
-            if !processExists(record.pid) { removeOwnedFiles(record) }
+            // Never discard the only ownership evidence while a process with
+            // this PID is still alive. A later Core cannot safely adopt or
+            // stop it without a matching identity, but removing this record
+            // would make the live instance untraceable and block recovery.
+            if processExists(record.pid) {
+                throw MySQLModuleError.processIdentityMismatch
+            }
+            removeOwnedFiles(record)
             try? manager.removeItem(at: paths.process)
             ownedServer = nil
             return MySQLStatus(state: .stopped, health: "stopped", installedVersion: observed.installedVersion, selectedVersion: observed.selectedVersion, pid: nil, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable)
@@ -399,6 +405,43 @@ public final class MySQLModule: @unchecked Sendable {
           guard manager.fileExists(atPath: paths.process.path), let data = try? Data(contentsOf: paths.process) else { return nil }
           return try? JSONDecoder().decode(MySQLProcessRecord.self, from: data)
       }
+     private func reconcileExitedRuntimeArtifacts(paths: InstancePaths, package: MySQLPackage) throws {
+         let pidPath = paths.instance.appendingPathComponent("mysqld.pid")
+         let hasPID = manager.fileExists(atPath: pidPath.path)
+         let hasSocket = manager.fileExists(atPath: paths.socket.path)
+         guard hasPID || hasSocket else { return }
+         guard hasPID, hasSocket,
+               let pidText = try? String(contentsOf: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let pid = Int32(pidText), pid > 1, !processExists(pid),
+               let config = try? String(contentsOf: paths.config, encoding: .utf8),
+               config.contains("basedir=\(package.packagePath)\n"),
+               config.contains("datadir=\(paths.data.path)\n"),
+               config.contains("socket=\(paths.socket.path)\n"),
+               config.contains("pid-file=\(pidPath.path)\n"),
+               isOwnedSocketFile(paths.socket.path),
+               isUnopenedByAnyProcess(paths.socket.path),
+               !tcpEnabled || isPortAvailable(port)
+         else { throw MySQLModuleError.processFailed("MySQL has stale runtime paths that could not be proven safe to reconcile; no files were removed") }
+         // Only these two runtime artifacts are eligible. The data directory,
+         // credentials, and instance metadata are never touched here.
+         try manager.removeItem(at: paths.socket)
+         try manager.removeItem(at: pidPath)
+     }
+     private func isOwnedSocketFile(_ path: String) -> Bool {
+         var info = stat()
+         return lstat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFSOCK && info.st_uid == getuid()
+     }
+     private func isUnopenedByAnyProcess(_ path: String) -> Bool {
+         let process = Process(), output = Pipe()
+         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+         process.arguments = ["-t", "--", path]
+         process.standardOutput = output
+         process.standardError = FileHandle.nullDevice
+         guard (try? process.run()) != nil else { return false }
+         let data = output.fileHandleForReading.readDataToEndOfFile()
+         process.waitUntilExit()
+         return process.terminationStatus != 0 && data.isEmpty
+     }
      private func recordWithFileIdentities(_ record: MySQLProcessRecord, paths: InstancePaths) -> MySQLProcessRecord {
          var socketInfo = stat(), pidInfo = stat()
          let socketIdentity = lstat(record.socket, &socketInfo) == 0 && (socketInfo.st_mode & S_IFMT) == S_IFSOCK ? (Int64(socketInfo.st_dev), Int64(socketInfo.st_ino)) : (nil, nil)

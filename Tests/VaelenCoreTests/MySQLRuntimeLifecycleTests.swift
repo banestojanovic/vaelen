@@ -68,6 +68,40 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: started.socket))
     }
 
+    func testStartReconcilesOnlyProvenExitedRuntimeSocketAndPIDArtifacts() throws {
+        let installedLayout = VaelenFilesystemLayout()
+        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mysql-stale-runtime-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeModule(named: "stale", root: root, installed: installed)
+        let module = fixture.module
+        try module.initialize()
+
+        let instance = fixture.layout.mysqlInstancesDirectoryURL.appendingPathComponent("stale")
+        let pidFile = instance.appendingPathComponent("mysqld.pid")
+        let socketPath = module.status().socket
+        try Data("2147483647\n".utf8).write(to: pidFile)
+        let socketMaker = Process()
+        socketMaker.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        socketMaker.arguments = ["-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()", socketPath]
+        try socketMaker.run()
+        socketMaker.waitUntilExit()
+        XCTAssertEqual(socketMaker.terminationStatus, 0)
+        XCTAssertTrue(isSocket(socketPath))
+        let staleSocketIdentity = try fileIdentity(socketPath)
+
+        let started = try module.start()
+        XCTAssertEqual(started.state, .running)
+        let pid = try XCTUnwrap(started.pid)
+        XCTAssertEqual(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), "\(pid)")
+        XCTAssertTrue(isSocket(socketPath))
+        XCTAssertNotEqual(try fileIdentity(socketPath), staleSocketIdentity, "MySQL must bind a new socket after the proven stale socket is removed")
+        defer { if module.status().pid != nil { _ = try? module.stop() } }
+        XCTAssertEqual(try module.stop().state, .stopped)
+        XCTAssertProcessGone(pid)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: started.datadir).appendingPathComponent("mysql").path), "runtime recovery must preserve database files")
+    }
+
     func testStartReadinessIsBoundedWhenMysqlAdminHangs() throws {
         let installedLayout = VaelenFilesystemLayout()
         let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
@@ -257,9 +291,12 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
         let original = try Data(contentsOf: processRecord)
         var fields = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
         fields["executable"] = "/not/the/launched/mysqld"
-        try JSONSerialization.data(withJSONObject: fields).write(to: processRecord, options: .atomic)
-        XCTAssertEqual(try module.stop().state, .stopped)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: processRecord.path), "stale Vaelen bookkeeping should be reconciled")
+        let corrupted = try JSONSerialization.data(withJSONObject: fields, options: .sortedKeys)
+        try corrupted.write(to: processRecord, options: .atomic)
+        XCTAssertThrowsError(try module.stop(), "an unverifiable live PID must not be detached from its ownership record") { error in
+            guard case MySQLModuleError.processIdentityMismatch = error else { return XCTFail("unexpected error: \(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: processRecord), corrupted, "the live process identity evidence must be retained")
         XCTAssertTrue(moduleProcessIsLive(mismatchPID))
         XCTAssertTrue(isSocket(mismatchStatus.socket))
         try original.write(to: processRecord, options: .atomic)
