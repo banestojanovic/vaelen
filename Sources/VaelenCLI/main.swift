@@ -82,33 +82,179 @@ private struct StatusPayload: Encodable {
 
 @main
 struct VaelenCLIMain {
-    static let usage = """
-    Usage:
-      val park <directory>
-      val parks [--json]
-      val unpark <directory>
+    static let usage = helpText(for: [])
 
-      val link <project-directory>
-      val links [--json]
-      val unlink <project-directory>
+    static func helpText(for path: [String]) -> String {
+        if path.isEmpty {
+            let sections: [(String, [(String, String)])] = [
+                ("Projects", [("link", "Link a project"), ("links", "List linked projects"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
+                ("Overview", [("status", "Show Vaelen status")]),
+                ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
+                ("Networking", [("routing", "Manage router"), ("route", "Manage project routes"), ("dns", "Manage DNS"), ("tls", "Manage HTTPS"), ("ports", "Manage web ports")]),
+                ("Integration", [("shell", "PHP shell integration")])
+            ]
+            var lines = ["Vaelen — local development environments for your projects.", "", "Usage: val <command> [options]", ""]
+            for (title, commands) in sections {
+                lines.append(title)
+                lines += rootCommandRows(commands)
+                lines.append("")
+            }
+            lines += wrappedText("Run “val <command> --help” for command details.", indent: "").components(separatedBy: "\n")
+            return lines.joined(separator: "\n")
+        }
+        let name = path[0]
+        let body: String
+        switch name {
+        case "project": body = groupHelp("val project <command> [project] [options]", [
+                ("status [project] [--json]", "Show project environment summary"),
+                ("inspect [project] [--json]", "Show configuration and diagnostics"),
+                ("doctor [project] [--json]", "Report project diagnostic findings"),
+                ("plan [project] [--json]", "Preview project setup actions"),
+                ("activate [project] [--json]", "Apply actionable project setup"),
+                ("php [project] [options]", "Set a project PHP version")
+            ], examples: ["val project inspect", "val project php my-app --version 8.3"]) + "\n\n" + wrappedText("PHP options: --version <exact>, --use-default, --json", indent: "  ")
+        case "php": body = groupHelp("val php <command> [arguments]", [
+                ("versions [--json]", "List available and installed PHP"),
+                ("default [--json]", "Show the default PHP version"),
+                ("default set <version>", "Set the default PHP version"),
+                ("install <version>", "Install a PHP version"),
+                ("update <version>", "Update a PHP version"),
+                ("remove <version>", "Remove a PHP version"),
+                ("operation [--json]", "Show the current PHP operation"),
+                ("use <version>", "Select PHP for the shell"),
+                ("start <version>", "Start PHP-FPM"),
+                ("stop <version>", "Stop PHP-FPM"),
+                ("status <version> [--json]", "Show PHP runtime status"),
+                ("exec -- <arguments>", "Run PHP with the selected version"),
+                ("resolve --path", "Print the project PHP executable")
+            ], examples: ["val php install 8.3", "val php resolve --path"])
+        case "mysql": body = groupHelp("val mysql <command> [arguments]", [
+            ("versions [--json]", "List available and installed MySQL versions"), ("install <version>", "Install a MySQL version"), ("use <version>", "Select the MySQL version"), ("initialize", "Initialize the selected MySQL data"), ("start", "Start MySQL"), ("stop", "Stop MySQL"), ("status [--json]", "Show MySQL status")], examples: ["val mysql status"])
+        case "mailpit": body = groupHelp("val mailpit <command> [arguments]", [
+            ("versions [--json]", "List available and installed versions"), ("install <version>", "Install Mailpit"), ("start", "Start Mailpit"), ("stop", "Stop Mailpit"), ("status [--json]", "Show Mailpit status"), ("open", "Open the Mailpit web interface")], examples: ["val mailpit start"])
+        case "routing": body = groupHelp("val routing <status|start|stop>", [("status", "Show router status"), ("start", "Start routing"), ("stop", "Stop routing")], examples: ["val routing status"])
+        case "route": body = groupHelp("val route <command> [arguments]", [("list [--json]", "List configured routes"), ("add <hostname> <document-root> [options]", "Add a route"), ("remove <route-id>", "Remove a route"), ("associate <route-id> <project-id>", "Associate a route with a project")], examples: ["val route add app.test ./public --tls"]) + "\n\n" + wrappedText("Options: --php-socket <path>, --project-id <uuid>, --tls", indent: "  ")
+        case "dns": body = groupHelp("val dns <status|install|remove> [options]", [("status [--json]", "Show local DNS status"), ("install [--takeover]", "Install local DNS"), ("remove", "Remove Vaelen local DNS")], examples: ["val dns status --json"])
+        case "tls": body = groupHelp("val tls <command>", [("status [--json]", "Show local HTTPS status"), ("install", "Install the local certificate authority"), ("remove", "Remove local HTTPS"), ("trust", "Trust the local certificate authority"), ("untrust", "Remove local CA trust")], examples: ["val tls status"])
+        case "ports": body = groupHelp("val ports <status|install|remove>", [("status [--json]", "Show standard local port status"), ("install", "Enable standard local ports"), ("remove", "Remove standard local port forwarding")], examples: ["val ports status"])
+        case "shell": body = groupHelp("val shell <status|install|uninstall>", [("status", "Show PHP shell integration"), ("install", "Install PHP shell integration"), ("uninstall", "Remove PHP shell integration")], examples: ["val shell status"])
+        case "status": body = "Usage: val status [--json]\nShow whether Vaelen Core is running."
+        case "link": body = "Usage: val link <project-directory>\nLink a project folder to Vaelen.\nExample: val link ./my-app"
+        case "unlink": body = "Usage: val unlink <project-directory>\nUnlink a project without deleting its files.\nExample: val unlink ./my-app"
+        case "park": body = "Usage: val park <workspace-folder>\nPark a folder in your workspace.\nExample: val park ~/Code/old-project"
+        case "unpark": body = "Usage: val unpark <workspace-folder>\nUnpark a folder without deleting it.\nExample: val unpark ~/Code/old-project"
+        case "links": body = "Usage: val links [--json]\nList linked projects."
+        case "parks": body = "Usage: val parks [--json]\nList parked workspace folders."
+        default: return "Unknown command: \(name). Run ‘val --help’ to see available commands."
+        }
+        return "\(name)\n\n\(body)\n"
+    }
 
-      val status [--json]
-       val project status|inspect|doctor|plan|activate [project] [--json]
-       val project php [project] [--version <exact>] [--use-default] [--json]
-      val routing status|start|stop
-      val route list|add|remove|associate
-      val php versions|default|install|update|remove|operation ...
-      val php resolve --path
-      val shell status|install|uninstall
-      val mysql ...
-      val mailpit versions|install|start|stop|status|open
-    """
+    private static func groupHelp(_ usage: String, _ commands: [(String, String)], examples: [String]) -> String {
+        var lines = ["Usage: \(usage)", "", "Commands:"]
+        lines += commandRows(commands)
+        lines.append("")
+        lines.append(examples.count == 1 ? "Example:" : "Examples:")
+        lines += examples.map { "  \($0)" }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func commandRows(_ commands: [(String, String)]) -> [String] {
+        let width = max(40, min(120, Int(ProcessInfo.processInfo.environment["COLUMNS"] ?? "80") ?? 80))
+        if width < 60 {
+            return commands.flatMap { syntax, description in
+                wrappedText(syntax, indent: "  ").components(separatedBy: "\n")
+                    + wrappedText(description, indent: "    ").components(separatedBy: "\n")
+            }
+        }
+        let longest = commands.map { $0.0.count }.max() ?? 0
+        let nameWidth = min(longest, max(10, width / 2 - 2))
+        return commands.flatMap { syntax, description -> [String] in
+            let prefix = "  \(syntax)" + String(repeating: " ", count: max(2, nameWidth - syntax.count + 2))
+            let continuation = String(repeating: " ", count: prefix.count)
+            let descriptionWidth = max(8, width - prefix.count)
+            let words = description.split(whereSeparator: \.isWhitespace).map(String.init)
+            var result: [String] = []
+            var line = ""
+            for word in words {
+                if !line.isEmpty && line.count + 1 + word.count > descriptionWidth {
+                    result.append((result.isEmpty ? prefix : continuation) + line)
+                    line = word
+                } else {
+                    line += (line.isEmpty ? "" : " ") + word
+                }
+            }
+            if !line.isEmpty { result.append((result.isEmpty ? prefix : continuation) + line) }
+            return result
+        }
+    }
+
+    private static func rootCommandRows(_ commands: [(String, String)]) -> [String] {
+        commands.map { command, description in
+            "  \(command)" + String(repeating: " ", count: max(2, 9 - command.count)) + description
+        }
+    }
+
+    private static func wrappedText(_ text: String, indent: String) -> String {
+        let width = max(40, min(120, Int(ProcessInfo.processInfo.environment["COLUMNS"] ?? "80") ?? 80))
+        let words = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        var lines: [String] = []
+        var line = indent
+        for word in words {
+            if line.count > indent.count && line.count + 1 + word.count > width {
+                lines.append(line)
+                line = indent + word
+            } else {
+                line += (line == indent ? "" : " ") + word
+            }
+        }
+        if line != indent { lines.append(line) }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func groupTitle(for line: String) -> Bool {
+        ["Projects", "Overview", "Runtime", "Networking", "Integration", "Commands", "Examples", "Example:"].contains(line)
+    }
+
+    static func printHelp(_ text: String) {
+        guard ProcessInfo.processInfo.environment["NO_COLOR"] == nil,
+              ProcessInfo.processInfo.environment["TERM"] != "dumb",
+              isatty(STDOUT_FILENO) == 1 else { print(text); return }
+        let rendered = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+            let value = String(line)
+            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks"].contains(value)) {
+                return "\u{001B}[1;36m\(value)\u{001B}[0m"
+            }
+            if value.hasPrefix("  "), let gap = value.range(of: "  ", range: value.index(value.startIndex, offsetBy: 2)..<value.endIndex) {
+                let commandEnd = gap.lowerBound
+                let command = value[..<commandEnd]
+                if command.trimmingCharacters(in: .whitespaces).isEmpty == false {
+                    return "\u{001B}[36m\(command)\u{001B}[0m\(value[commandEnd...])"
+                }
+            }
+            return value
+        }.joined(separator: "\n")
+        print(rendered)
+    }
 
     static func main() async {
         do {
-            let command = try parse(Array(CommandLine.arguments.dropFirst()))
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments == ["--version"] || arguments == ["-V"] {
+                print("Vaelen \(VaelenBuildInfo.version)")
+                exit(0)
+            }
+            if arguments.isEmpty || arguments == ["--help"] || arguments == ["-h"] || arguments == ["help"] {
+                printHelp(usage)
+                exit(0)
+            }
+            if arguments.last == "--help" || arguments.last == "-h" {
+                printHelp(helpText(for: Array(arguments.dropLast()).filter { $0 != "help" }))
+                exit(0)
+            }
+            let command = try parse(arguments)
             if case .help = command {
-                print(usage)
+                printHelp(usage)
                 exit(0)
             }
             switch command {
@@ -284,7 +430,7 @@ struct VaelenCLIMain {
             case "remove": guard args.count == 2 else { throw CLIError.usage }; return .portsRemove
             default: throw CLIError.usage
             }
-        default: throw CLIError.usage
+        default: throw CLIError.message("Unknown command: \(first). Run ‘val --help’ to see available commands.")
         }
     }
 
