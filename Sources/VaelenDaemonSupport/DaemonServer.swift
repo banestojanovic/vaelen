@@ -101,6 +101,9 @@ public final class DaemonServer: @unchecked Sendable {
                     let result = await dispatcher.dispatch(request, handshaken: handshaken)
                     handshaken = result.handshaken
                     try writeAll(client, data: FrameEncoder().encode(IPCCodec.encode(result.response)))
+                    if request.knownMethod == .portsInstall {
+                        logger.info("IPC ports.install response frame written; error payload returned: \(result.response.error != nil, privacy: .public)")
+                    }
                     await afterResponse()
                 }
             }

@@ -23,6 +23,7 @@ public actor CoreRequestDispatcher {
     private var shutdownTask: Task<CoreShutdownResponse, Never>?
     private var shutdownRunInFlight = false
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
+    private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
     public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil) throws {
         self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
@@ -288,7 +289,11 @@ public actor CoreRequestDispatcher {
             case .portsStatus:
                 return (.init(id: request.id, result: .portsStatus(.init(ports: await ports.status()))), true)
             case .portsInstall:
-                try serviceIntents.set("standard-ports", enabled: true); return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.install()))), true)
+                standardPortsLogger.info("IPC ports.install entered; persisting desired Standard Ports state ON")
+                try serviceIntents.set("standard-ports", enabled: true)
+                let status = try await ports.install()
+                standardPortsLogger.info("IPC ports.install completed; status=\(status.state.rawValue, privacy: .public)")
+                return (.init(id: request.id, result: .portsStatus(.init(ports: status))), true)
             case .portsRemove:
                 try serviceIntents.set("standard-ports", enabled: false); return (.init(id: request.id, result: .portsStatus(.init(ports: try await ports.remove()))), true)
             case .handshake:
@@ -305,6 +310,7 @@ public actor CoreRequestDispatcher {
         } catch let error as IPCErrorPayload {
             return (.init(id: request.id, error: error), true)
         } catch let error as StandardPortsError {
+            standardPortsLogger.error("IPC Standard Ports request returned an error payload: \(String(describing: error), privacy: .public)")
             switch error {
             case .helperUnavailable: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Local Ports require approval in Vaelen.app.")), true)
             case .authorizationRequired(let detail): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports authorization failed: \(detail)")), true)

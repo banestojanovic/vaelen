@@ -86,6 +86,9 @@ public struct ServiceControlPresentation: Equatable, Sendable {
 
         if !savedOn {
             if status.ownership == .external {
+                if status.state == .installed || status.state == .unhealthy {
+                    return .init(title: "Off · Existing PF configuration", detail: "Exact compatible PF configuration pre-exists; Enable uses it without claiming or removing those files.", action: .enable)
+                }
                 return .init(title: "Off · External PF", detail: "Legacy PF rules have no Vaelen ownership record; left unchanged.")
             }
             if status.ownership == .unknown {

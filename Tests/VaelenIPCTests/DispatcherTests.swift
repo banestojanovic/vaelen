@@ -54,14 +54,14 @@ private struct ShutdownPortsFake: StandardPortsPrivileged {
     func inspectForwarding() async throws -> StandardPortsInspection {
         await removals.count() > 0 ? .init(anchorContent: nil, pfConfContent: "# original PF fixture\n") : inspection
     }
-    func installForwarding() async throws -> String? { nil }
-    func removeForwarding(pfToken: String?) async throws { await removals.increment() }
+    func installForwarding() async throws -> StandardPortsAcquisition { throw StandardPortsPrivilegeError.unavailable }
+    func removeForwarding(acquisition: StandardPortsAcquisition) async throws { await removals.increment() }
 }
 
 private struct BlockedShutdownPortsFake: StandardPortsPrivileged {
     func inspectForwarding() async throws -> StandardPortsInspection { .init(anchorContent: nil, pfConfContent: "# isolated PF fixture\n") }
-    func installForwarding() async throws -> String? { throw StandardPortsPrivilegeError.unavailable }
-    func removeForwarding(pfToken: String?) async throws {}
+    func installForwarding() async throws -> StandardPortsAcquisition { throw StandardPortsPrivilegeError.unavailable }
+    func removeForwarding(acquisition: StandardPortsAcquisition) async throws {}
 }
 
 private actor ShutdownRemovalCounter {
@@ -420,6 +420,35 @@ final class DispatcherTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.anchorPath))
     }
 
+    func testPortsInstallHelperFailureReturnsIPCErrorPayloadAndPreservesDesiredOn() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ports-install-ipc-error-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        let paths = StandardPortsPaths(anchorPath: root.appendingPathComponent("anchor").path, pfConfPath: root.appendingPathComponent("pf.conf").path)
+        try "# isolated PF fixture\n".write(toFile: paths.pfConfPath, atomically: true, encoding: .utf8)
+        let capability = StandardPortsCapability(
+            privileged: BlockedShutdownPortsFake(),
+            paths: paths,
+            ledger: SystemModificationLedger(store: store),
+            portOccupied: { _ in false },
+            backendHealthy: { true }
+        )
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test", pid: getpid()),
+            registry: ProjectRegistry(store: store),
+            ports: capability,
+            serviceIntents: intents
+        )
+
+        let result = await dispatcher.dispatch(IPCRequest(method: .portsInstall), handshaken: true)
+
+        XCTAssertEqual(result.response.error?.code, .invalidRequest)
+        XCTAssertNotNil(result.response.error?.message)
+        XCTAssertEqual(try intents.enabledServices(), ["standard-ports"])
+    }
+
     func testQuitReleasesProvenPFForwardingWithoutChangingSavedOnIntent() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("service-intent-pf-quit-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -429,7 +458,12 @@ final class DispatcherTests: XCTestCase {
         let references = StandardPortsForwardingPolicy.pfConfReferenceLines(anchorPath: paths.anchorPath).joined(separator: "\n") + "\n"
         let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
         let ledger = SystemModificationLedger(store: store)
-        try ledger.recordStandardPorts(anchorRules: anchor, pfConfPreimageSHA256: nil, pfToken: "fixture-authorization")
+        let preConf = StandardPortsFileSnapshot(exists: true, bytes: Data("# original PF fixture\n".utf8), owner: 501, group: 20, mode: 0o644)
+        let preAnchor = StandardPortsFileSnapshot(exists: false, bytes: nil, owner: nil, group: nil, mode: nil)
+        let writtenConf = StandardPortsFileSnapshot(exists: true, bytes: Data(references.utf8), owner: 501, group: 20, mode: 0o644)
+        let writtenAnchor = StandardPortsFileSnapshot(exists: true, bytes: Data(anchor.utf8), owner: 501, group: 20, mode: 0o644)
+        let acquisition = StandardPortsAcquisition(preimagePFConf: preConf, preimageAnchor: preAnchor, writtenPFConf: writtenConf, writtenAnchor: writtenAnchor, changedPFConf: true, changedAnchor: true, forwardingWasActive: false, pfToken: "fixture-authorization")
+        try ledger.recordStandardPorts(anchorRules: anchor, acquisition: acquisition)
         let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
         try intents.set("standard-ports", enabled: true)
         let removals = ShutdownRemovalCounter()

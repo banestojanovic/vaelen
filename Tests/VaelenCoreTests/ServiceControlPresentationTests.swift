@@ -87,12 +87,12 @@ final class ServiceControlPresentationTests: XCTestCase {
         XCTAssertEqual(ServiceControlPresentation.dnsStartFailure("Exact startup failure", authoritativeStatus: nil), "Exact startup failure")
     }
 
-    func testStandardPortsOffWithLegacyExternalRulesHasNoMutationControl() {
+    func testStandardPortsOffWithExactCompatibleExternalConfigurationOffersEnable() {
         let status = StandardPortsStatus(state: .installed, detail: "PF integration is present; backend router is not running", ownership: .external)
         let view = ServiceControlPresentation.standardPorts(status: status, savedOn: false)
 
-        XCTAssertEqual(view.title, "Off · External PF")
-        XCTAssertNil(view.action)
+        XCTAssertEqual(view.title, "Off · Existing PF configuration")
+        XCTAssertEqual(view.action, .enable)
         XCTAssertFalse(view.canDisable)
     }
 

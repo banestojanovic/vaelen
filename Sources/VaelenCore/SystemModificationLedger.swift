@@ -17,7 +17,8 @@ public struct StandardPortsLedgerRecord: Equatable, Sendable {
     public let pfConfPreimageSHA256: String?
     public let pfToken: String?
     public let active: Bool
-    public init(anchorRules: String, pfConfPreimageSHA256: String?, pfToken: String?, active: Bool) { self.anchorRules = anchorRules; self.pfConfPreimageSHA256 = pfConfPreimageSHA256; self.pfToken = pfToken; self.active = active }
+    public let acquisition: StandardPortsAcquisition?
+    public init(anchorRules: String, pfConfPreimageSHA256: String?, pfToken: String?, active: Bool, acquisition: StandardPortsAcquisition? = nil) { self.anchorRules = anchorRules; self.pfConfPreimageSHA256 = pfConfPreimageSHA256; self.pfToken = pfToken; self.active = active; self.acquisition = acquisition }
 }
 
 public final class SystemModificationLedger: @unchecked Sendable {
@@ -61,6 +62,12 @@ public final class SystemModificationLedger: @unchecked Sendable {
         try store.query("SELECT installed_content, previous_content, active FROM system_modifications WHERE capability = 'standard-ports'") { statement in
             guard let anchorRules = store.columnString(statement, 0) else { return }
             let previous = store.columnString(statement, 1)
+            if let previous, previous.hasPrefix("standard-ports-v2:") {
+                let encoded = String(previous.dropFirst("standard-ports-v2:".count))
+                guard let acquisition = try? JSONDecoder().decode(StandardPortsAcquisition.self, from: Data(base64Encoded: encoded) ?? Data()) else { throw StandardPortsError.unavailable("Standard Ports ownership record is unreadable") }
+                result = StandardPortsLedgerRecord(anchorRules: anchorRules, pfConfPreimageSHA256: nil, pfToken: acquisition.pfToken, active: sqlite3_column_int(statement, 2) != 0, acquisition: acquisition)
+                return
+            }
             var preimage: String?; var token: String?
             for part in (previous ?? "").split(separator: "|") {
                 if part.hasPrefix("pfconf-sha256:") { preimage = String(part.dropFirst("pfconf-sha256:".count)) }
@@ -73,6 +80,10 @@ public final class SystemModificationLedger: @unchecked Sendable {
     public func recordStandardPorts(anchorRules: String, pfConfPreimageSHA256: String?, pfToken: String?) throws {
         let previous = "pfconf-sha256:\(pfConfPreimageSHA256 ?? "")|pftoken:\(pfToken ?? "none")"
         try store.execute("INSERT OR REPLACE INTO system_modifications(capability, installed_content, previous_content, active) VALUES('standard-ports', '\(sql(anchorRules))', '\(sql(previous))', 1)")
+    }
+    public func recordStandardPorts(anchorRules: String, acquisition: StandardPortsAcquisition) throws {
+        let json = try JSONEncoder().encode(acquisition).base64EncodedString()
+        try store.execute("INSERT OR REPLACE INTO system_modifications(capability, installed_content, previous_content, active) VALUES('standard-ports', '\(sql(anchorRules))', 'standard-ports-v2:\(json)', 1)")
     }
     public func deactivateStandardPorts() throws { try store.execute("UPDATE system_modifications SET active = 0 WHERE capability = 'standard-ports'") }
     private func sql(_ value: String) -> String { value.replacingOccurrences(of: "'", with: "''") }

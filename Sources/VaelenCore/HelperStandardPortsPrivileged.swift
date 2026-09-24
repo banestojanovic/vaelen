@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Production DNS gateway. The privileged protocol exposes only the fixed
 /// resolver target; snapshots are data and never include caller-selected paths.
@@ -77,15 +78,16 @@ final class HelperRequestCompletion: @unchecked Sendable {
 
     init(_ continuation: CheckedContinuation<Data, Error>) { self.continuation = continuation }
 
-    func succeed(_ data: Data) { finish { $0.resume(returning: data) } }
-    func fail(_ error: Error) { finish { $0.resume(throwing: error) } }
+    @discardableResult func succeed(_ data: Data) -> Bool { finish { $0.resume(returning: data) } }
+    @discardableResult func fail(_ error: Error) -> Bool { finish { $0.resume(throwing: error) } }
 
-    private func finish(_ action: (CheckedContinuation<Data, Error>) -> Void) {
+    private func finish(_ action: (CheckedContinuation<Data, Error>) -> Void) -> Bool {
         lock.lock()
         let pending = continuation
         continuation = nil
         lock.unlock()
         if let pending { action(pending) }
+        return pending != nil
     }
 }
 
@@ -97,62 +99,135 @@ final class HelperRequestCompletion: @unchecked Sendable {
 /// standard ports require Vaelen.app approval.
 public struct HelperStandardPortsPrivileged: StandardPortsPrivileged {
     private let serviceName: String
-    public init(serviceName: String = "dev.vaelen.privileged-helper") { self.serviceName = serviceName }
+    private let requestTimeout: TimeInterval
+    private let connectionFactory: @Sendable (String) -> any StandardPortsHelperXPCConnection
+    private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports-helper-xpc")
+
+    public init(serviceName: String = "dev.vaelen.privileged-helper") {
+        self.init(serviceName: serviceName, requestTimeout: 10, connectionFactory: { SystemStandardPortsHelperXPCConnection(serviceName: $0) })
+    }
+
+    init(serviceName: String, requestTimeout: TimeInterval, connectionFactory: @escaping @Sendable (String) -> any StandardPortsHelperXPCConnection) {
+        self.serviceName = serviceName
+        self.requestTimeout = requestTimeout
+        self.connectionFactory = connectionFactory
+    }
 
     public func inspectForwarding() async throws -> StandardPortsInspection {
-        // World-readable; no privilege needed and no reason to round-trip XPC.
-        StandardPortsInspection(
-            anchorContent: try? String(contentsOfFile: StandardPortsForwardingPolicy.anchorPath, encoding: .utf8),
-            pfConfContent: try? String(contentsOfFile: StandardPortsForwardingPolicy.pfConfPath, encoding: .utf8),
-            pfEnabled: nil
-        )
+        logger.debug("PF inspection request started")
+        do {
+            let data = try await call { $0.inspectionData(with: $1) }
+            guard let value = try? JSONDecoder().decode(StandardPortsHelperInspection.self, from: data) else { throw StandardPortsPrivilegeError.unavailable }
+            logger.debug("PF inspection response decoded; PF enabled state and forwarding state were returned")
+            return StandardPortsInspection(anchorContent: value.anchorContent, pfConfContent: value.pfConfContent, pfEnabled: value.pfEnabled, forwardingActive: value.forwardingActive)
+        } catch {
+            logger.error("PF inspection request failed: \(String(describing: error), privacy: .public)")
+            throw StandardPortsPrivilegeError.unavailable
+        }
     }
 
-    public func installForwarding() async throws -> String? {
+    public func installForwarding() async throws -> StandardPortsAcquisition {
+        logger.info("PF helper install request started")
+        do {
+            let data = try await call { $0.installForwarding(with: $1) }
+            guard let acquisition = try? JSONDecoder().decode(StandardPortsAcquisition.self, from: data) else {
+                throw StandardPortsError.unavailable("PF helper returned an invalid acquisition response")
+            }
+            logger.info("PF helper install acquisition response received")
+            return acquisition
+        } catch let error as StandardPortsError {
+            throw error
+        } catch let error as NSError {
+            if error.domain == "dev.vaelen.privileged-helper", error.code == StandardPortsHelperError.ownershipMismatch.rawValue {
+                throw StandardPortsError.externalConflict(error.localizedDescription)
+            }
+            throw StandardPortsError.unavailable("PF helper could not verify or activate forwarding: \(error.localizedDescription)")
+        } catch {
+            throw StandardPortsError.unavailable("PF helper request failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func removeForwarding(acquisition: StandardPortsAcquisition) async throws {
+        let data = try JSONEncoder().encode(acquisition)
+        do {
+            _ = try await call { proxy, reply in
+                proxy.removeForwarding(acquisition: data) { error in reply(Data(), error) }
+            }
+        } catch let error as NSError where error.domain == "dev.vaelen.privileged-helper" && error.code == StandardPortsHelperError.ownershipMismatch.rawValue {
+            throw StandardPortsError.ownershipMismatch
+        } catch let error as StandardPortsError {
+            throw error
+        } catch {
+            throw StandardPortsPrivilegeError.unavailable
+        }
+    }
+
+    private func call(_ operation: @escaping (VaelenStandardPortsHelperProtocol, @escaping (Data?, NSError?) -> Void) -> Void) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
-            let connection = NSXPCConnection(machServiceName: serviceName, options: .privileged)
-            connection.exportedInterface = NSXPCInterface(with: VaelenStandardPortsHelperProtocol.self)
+            let completion = HelperRequestCompletion(continuation)
+            let connection = connectionFactory(serviceName)
+            connection.configureRemoteHelperInterface()
+            connection.setHandlers(
+                interruption: {
+                    self.logger.error("PF helper XPC connection interrupted")
+                    connection.invalidate()
+                    completion.fail(StandardPortsPrivilegeError.unavailable)
+                },
+                invalidation: {
+                    completion.fail(StandardPortsPrivilegeError.unavailable)
+                }
+            )
             connection.resume()
-            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ _ in
+            guard let proxy = connection.remoteProxy(errorHandler: { error in
+                self.logger.error("PF helper XPC proxy failed: \(String(describing: error), privacy: .public)")
                 connection.invalidate()
-                continuation.resume(throwing: StandardPortsPrivilegeError.unavailable)
-            }) as? VaelenStandardPortsHelperProtocol else {
+                completion.fail(error)
+            }) else {
                 connection.invalidate()
-                continuation.resume(throwing: StandardPortsPrivilegeError.unavailable)
+                completion.fail(StandardPortsPrivilegeError.unavailable)
                 return
             }
-            proxy.installForwarding { token, _ in
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + requestTimeout) {
+                guard completion.fail(StandardPortsPrivilegeError.unavailable) else { return }
+                self.logger.error("PF helper XPC request timed out after \(self.requestTimeout, privacy: .public) seconds")
                 connection.invalidate()
-                continuation.resume(returning: token as String?)
+            }
+            operation(proxy) { data, error in
+                if let error {
+                    completion.fail(error)
+                } else if let data {
+                    completion.succeed(data)
+                } else {
+                    completion.fail(StandardPortsPrivilegeError.unavailable)
+                }
+                connection.invalidate()
             }
         }
     }
+}
 
-    public func removeForwarding(pfToken: String?) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let connection = NSXPCConnection(machServiceName: serviceName, options: .privileged)
-            connection.exportedInterface = NSXPCInterface(with: VaelenStandardPortsHelperProtocol.self)
-            connection.resume()
-            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ _ in
-                connection.invalidate()
-                continuation.resume(throwing: StandardPortsPrivilegeError.unavailable)
-            }) as? VaelenStandardPortsHelperProtocol else {
-                connection.invalidate()
-                continuation.resume(throwing: StandardPortsPrivilegeError.unavailable)
-                return
-            }
-            proxy.removeForwarding(pfToken: pfToken as NSString?) { error in
-                connection.invalidate()
-                if let error {
-                    if error.domain == "dev.vaelen.privileged-helper", error.code == StandardPortsHelperError.ownershipMismatch.rawValue {
-                        continuation.resume(throwing: StandardPortsError.ownershipMismatch)
-                    } else {
-                        continuation.resume(throwing: StandardPortsPrivilegeError.unavailable)
-                    }
-                    return
-                }
-                continuation.resume()
-            }
-        }
+protocol StandardPortsHelperXPCConnection: AnyObject, Sendable {
+    func configureRemoteHelperInterface()
+    func setHandlers(interruption: @escaping @Sendable () -> Void, invalidation: @escaping @Sendable () -> Void)
+    func resume()
+    func invalidate()
+    func remoteProxy(errorHandler: @escaping @Sendable (Error) -> Void) -> VaelenStandardPortsHelperProtocol?
+}
+
+private final class SystemStandardPortsHelperXPCConnection: StandardPortsHelperXPCConnection, @unchecked Sendable {
+    private let connection: NSXPCConnection
+
+    init(serviceName: String) { connection = NSXPCConnection(machServiceName: serviceName, options: .privileged) }
+    func configureRemoteHelperInterface() {
+        connection.remoteObjectInterface = NSXPCInterface(with: VaelenStandardPortsHelperProtocol.self)
+    }
+    func setHandlers(interruption: @escaping @Sendable () -> Void, invalidation: @escaping @Sendable () -> Void) {
+        connection.interruptionHandler = interruption
+        connection.invalidationHandler = invalidation
+    }
+    func resume() { connection.resume() }
+    func invalidate() { connection.invalidate() }
+    func remoteProxy(errorHandler: @escaping @Sendable (Error) -> Void) -> VaelenStandardPortsHelperProtocol? {
+        connection.remoteObjectProxyWithErrorHandler(errorHandler) as? VaelenStandardPortsHelperProtocol
     }
 }

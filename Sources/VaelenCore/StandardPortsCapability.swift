@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import CryptoKit
+import OSLog
 
 /// Desired and observed state of Vaelen's Standard Local Ports capability.
 ///
@@ -72,6 +73,33 @@ public enum StandardPortsForwardingPolicy {
         ["# Vaelen standard local ports (managed by Vaelen; do not edit)", "rdr-anchor \"\(anchorName)\"", "load anchor \"\(anchorName)\" from \"\(anchorPath)\""]
     }
 
+    /// Strictly recognizes the fixed three-line integration block and rejects
+    /// any additional active PF anchor directive that targets this Vaelen
+    /// anchor. Comments and unrelated text are not counted as directives.
+    public static func hasExactReference(in content: String, anchorPath: String = anchorPath) -> Bool {
+        let expected = pfConfReferenceLines(anchorPath: anchorPath)
+        let lines = content.components(separatedBy: "\n")
+        guard expected.allSatisfy({ expectedLine in lines.filter { $0 == expectedLine }.count == 1 }),
+              let first = lines.firstIndex(of: expected[0]), first + expected.count <= lines.count,
+              Array(lines[first..<(first + expected.count)]) == expected else { return false }
+
+        let expectedDirectives = Array(expected.dropFirst())
+        let targetedDirectives = lines.compactMap { line -> String? in
+            let withoutComment = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
+            let directive = withoutComment.trimmingCharacters(in: .whitespaces)
+            guard containsPFAnchorDirective(directive), directive.contains(anchorName) else { return nil }
+            return directive
+        }
+        return targetedDirectives == expectedDirectives
+    }
+
+    private static func containsPFAnchorDirective(_ line: String) -> Bool {
+        let words = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard let first = words.first else { return false }
+        if ["anchor", "rdr-anchor", "nat-anchor", "binat-anchor"].contains(String(first)) { return true }
+        return first == "load" && words.dropFirst().first == "anchor"
+    }
+
     /// Writes the anchor file. Shared by the privileged helper and fixtures.
     public static func writeAnchor(to anchorPath: String, httpBackend: Int = VaelenNetworkPorts.httpBackend, httpsBackend: Int = VaelenNetworkPorts.httpsBackend) throws {
         try anchorRules(httpBackend: httpBackend, httpsBackend: httpsBackend).write(toFile: anchorPath, atomically: true, encoding: .utf8)
@@ -114,7 +142,33 @@ public struct StandardPortsInspection: Equatable, Sendable {
     public let anchorContent: String?
     public let pfConfContent: String?
     public let pfEnabled: Bool?
-    public init(anchorContent: String?, pfConfContent: String?, pfEnabled: Bool? = nil) { self.anchorContent = anchorContent; self.pfConfContent = pfConfContent; self.pfEnabled = pfEnabled }
+    public let forwardingActive: Bool?
+    public init(anchorContent: String?, pfConfContent: String?, pfEnabled: Bool? = nil, forwardingActive: Bool? = nil) { self.anchorContent = anchorContent; self.pfConfContent = pfConfContent; self.pfEnabled = pfEnabled; self.forwardingActive = forwardingActive }
+}
+
+/// Exact fixed-path file state used to distinguish pre-existing PF files from
+/// files written by this acquisition. Inode identity is intentionally omitted:
+/// restoration verifies bytes and metadata while atomic replacement naturally
+/// changes inode numbers.
+public struct StandardPortsFileSnapshot: Codable, Equatable, Sendable {
+    public let exists: Bool
+    public let bytes: Data?
+    public let owner: UInt32?
+    public let group: UInt32?
+    public let mode: UInt16?
+    public init(exists: Bool, bytes: Data?, owner: UInt32?, group: UInt32?, mode: UInt16?) { self.exists = exists; self.bytes = bytes; self.owner = owner; self.group = group; self.mode = mode }
+}
+
+public struct StandardPortsAcquisition: Codable, Equatable, Sendable {
+    public let preimagePFConf: StandardPortsFileSnapshot
+    public let preimageAnchor: StandardPortsFileSnapshot
+    public let writtenPFConf: StandardPortsFileSnapshot
+    public let writtenAnchor: StandardPortsFileSnapshot
+    public let changedPFConf: Bool
+    public let changedAnchor: Bool
+    public let forwardingWasActive: Bool
+    public let pfToken: String?
+    public init(preimagePFConf: StandardPortsFileSnapshot, preimageAnchor: StandardPortsFileSnapshot, writtenPFConf: StandardPortsFileSnapshot, writtenAnchor: StandardPortsFileSnapshot, changedPFConf: Bool, changedAnchor: Bool, forwardingWasActive: Bool, pfToken: String?) { self.preimagePFConf = preimagePFConf; self.preimageAnchor = preimageAnchor; self.writtenPFConf = writtenPFConf; self.writtenAnchor = writtenAnchor; self.changedPFConf = changedPFConf; self.changedAnchor = changedAnchor; self.forwardingWasActive = forwardingWasActive; self.pfToken = pfToken }
 }
 
 /// Privileged side of the Standard Ports capability. Implementations perform
@@ -124,11 +178,11 @@ public protocol StandardPortsPrivileged: Sendable {
     func inspectForwarding() async throws -> StandardPortsInspection
     /// Installs the fixed Vaelen forwarding policy. Returns the PF enable
     /// token when the implementation enabled PF, nil when PF was already on.
-    func installForwarding() async throws -> String?
+    func installForwarding() async throws -> StandardPortsAcquisition
     /// Removes the fixed policy. pfToken is the opaque token previously
     /// issued; nil/unknown tokens must leave PF enabled (bias to preserving
     /// shared infrastructure).
-    func removeForwarding(pfToken: String?) async throws
+    func removeForwarding(acquisition: StandardPortsAcquisition) async throws
 }
 
 public enum StandardPortsPrivilegeError: Error, Equatable, Sendable { case unavailable }
@@ -141,8 +195,8 @@ public struct UnavailableStandardPortsPrivileged: StandardPortsPrivileged {
     public func inspectForwarding() async throws -> StandardPortsInspection {
         StandardPortsInspection(anchorContent: try? String(contentsOfFile: paths.anchorPath), pfConfContent: try? String(contentsOfFile: paths.pfConfPath), pfEnabled: nil)
     }
-    public func installForwarding() async throws -> String? { throw StandardPortsPrivilegeError.unavailable }
-    public func removeForwarding(pfToken: String?) async throws { throw StandardPortsPrivilegeError.unavailable }
+    public func installForwarding() async throws -> StandardPortsAcquisition { throw StandardPortsPrivilegeError.unavailable }
+    public func removeForwarding(acquisition: StandardPortsAcquisition) async throws { throw StandardPortsPrivilegeError.unavailable }
 }
 
 public struct StandardPortsPaths: Equatable, Sendable {
@@ -153,6 +207,7 @@ public struct StandardPortsPaths: Equatable, Sendable {
 }
 
 public actor StandardPortsCapability {
+    private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
     private let privileged: any StandardPortsPrivileged
     private let paths: StandardPortsPaths
     private let ledger: SystemModificationLedger?
@@ -168,14 +223,17 @@ public actor StandardPortsCapability {
     }
 
     public func status() async -> StandardPortsStatus {
+        logger.debug("Standard Ports status inspection started")
         let expected = StandardPortsForwardingPolicy.anchorRules()
-        let reference = StandardPortsForwardingPolicy.pfConfReferenceLines(anchorPath: paths.anchorPath)
         let inspection: StandardPortsInspection
-        do { inspection = try await privileged.inspectForwarding() } catch { return StandardPortsStatus(state: .unavailable, detail: "Standard port observation is unavailable", ownership: .unknown) }
+        do { inspection = try await privileged.inspectForwarding() } catch {
+            logger.error("Standard Ports helper inspection failed: \(String(describing: error), privacy: .public)")
+            return StandardPortsStatus(state: .unavailable, detail: "Standard port observation is unavailable", ownership: .unknown)
+        }
         let anchorContent = inspection.anchorContent
         let pfConf = inspection.pfConfContent
         let anchorMatches = anchorContent == expected
-        let referencePresent = pfConf.map { reference.allSatisfy($0.contains) } ?? false
+        let referencePresent = pfConf.map { StandardPortsForwardingPolicy.hasExactReference(in: $0, anchorPath: paths.anchorPath) } ?? false
         let record: StandardPortsLedgerRecord?
         do { record = try ledger?.standardPortsRecord() }
         catch { return StandardPortsStatus(state: .unavailable, detail: "PF ownership record could not be read; existing rules were left unchanged", ownership: .unknown) }
@@ -195,7 +253,7 @@ public actor StandardPortsCapability {
         }
         if anchorContent == nil, !referencePresent {
             if httpOccupied || httpsOccupied {
-                return StandardPortsStatus(state: .conflict, conflict: StandardPortsCapability.describeOccupied(httpOccupied: httpOccupied, httpsOccupied: httpsOccupied), ownership: StandardPortsOwnership.none)
+                return StandardPortsStatus(state: .unavailable, detail: "\(StandardPortsCapability.describeOccupied(httpOccupied: httpOccupied, httpsOccupied: httpsOccupied)); no fixed Vaelen PF integration is present, so ownership cannot be established", ownership: .unknown)
             }
             return StandardPortsStatus(state: .absent, ownership: StandardPortsOwnership.none)
         }
@@ -204,48 +262,64 @@ public actor StandardPortsCapability {
             return StandardPortsStatus(state: .conflict, conflict: "Partial foreign PF integration for Vaelen anchor", ownership: .external)
         }
         let backend = await backendHealthy()
-        if (httpOccupied || httpsOccupied), backend {
+        if inspection.forwardingActive == true, httpOccupied, httpsOccupied, backend {
             return StandardPortsStatus(state: .healthy, ownership: ownership)
         }
         if backend {
-            // Integration present and backend ready, but standard ports refuse:
-            // PF rules are not loaded or PF is disabled.
-            return StandardPortsStatus(state: .unhealthy, detail: "PF integration is present but standard ports are unreachable", ownership: ownership)
+            // A successful TCP connect is not proof that an external process
+            // owns a port: active PF redirection makes Vaelen's backends
+            // reachable through 80/443 too. The helper's PF observation is
+            // authoritative for forwarding health.
+            logger.info("Standard Ports preflight completed; exact integration exists but helper has not verified active forwarding")
+            return StandardPortsStatus(state: .unhealthy, detail: "PF integration is present but active forwarding has not been verified", ownership: ownership)
         }
         return StandardPortsStatus(state: .installed, detail: "PF integration is present; backend router is not running", ownership: ownership)
     }
 
     public func install() async throws -> StandardPortsStatus {
+        logger.info("Standard Ports install operation entered")
         guard ledger != nil else { throw StandardPortsError.unavailable("Standard Ports require durable Core ownership state; no PF change was made") }
         let current = await status()
+        logger.info("Standard Ports preflight completed: state=\(current.state.rawValue, privacy: .public), ownership=\(current.ownership?.rawValue ?? "unknown", privacy: .public)")
         switch current.state {
-        case .healthy, .installed:
-            guard current.ownership == .vaelen else {
-                throw StandardPortsError.externalConflict("Existing PF integration has no active Vaelen ownership record; it was left unchanged")
-            }
-            return current
+        case .healthy:
+            if current.ownership == .vaelen { return current }
+            fallthrough
+        case .installed:
+            if current.ownership == .vaelen { return current }
         case .conflict: throw StandardPortsError.externalConflict(current.conflict ?? "Standard ports conflict with external state")
         case .ownershipMismatch: throw StandardPortsError.ownershipMismatch
         case .unavailable: throw StandardPortsError.unavailable("Standard port observation is unavailable")
         case .unhealthy:
-            guard current.ownership == .vaelen else {
-                throw StandardPortsError.externalConflict("Existing PF integration has no active Vaelen ownership record; it was left unchanged")
-            }
+            // With an exact compatible unowned pre-existing config, the helper
+            // may take a session PF reference and verify/load that fixed policy.
+            // It will reject partial or different on-disk state itself.
+            break
         case .absent: break
         }
         // Capture the pre-image before mutation: removal must be able to prove
         // what the system looked like before Vaelen touched it.
-        let preimage = sha256(ofFile: paths.pfConfPath)
-        let token: String?
+        let acquisition: StandardPortsAcquisition
+        logger.info("Standard Ports helper install request beginning")
         do {
-            token = try await privileged.installForwarding()
+            acquisition = try await privileged.installForwarding()
+            logger.info("Standard Ports helper acquisition returned")
         } catch is StandardPortsPrivilegeError {
+            logger.error("Standard Ports helper install request failed because helper was unavailable")
             throw StandardPortsError.helperUnavailable
         } catch let error as StandardPortsError {
+            logger.error("Standard Ports helper install request failed: \(String(describing: error), privacy: .public)")
             throw error
         }
-        let anchorRules = StandardPortsForwardingPolicy.anchorRules()
-        try ledger?.recordStandardPorts(anchorRules: anchorRules, pfConfPreimageSHA256: preimage, pfToken: token)
+        do {
+            logger.info("Standard Ports acquisition ledger persistence attempted")
+            try ledger?.recordStandardPorts(anchorRules: StandardPortsForwardingPolicy.anchorRules(), acquisition: acquisition)
+            logger.info("Standard Ports acquisition ledger persistence completed")
+        } catch {
+            logger.error("Standard Ports acquisition ledger persistence failed; best-effort helper rollback started: \(String(describing: error), privacy: .public)")
+            try? await privileged.removeForwarding(acquisition: acquisition)
+            throw error
+        }
         return await status()
     }
 
@@ -258,9 +332,9 @@ public actor StandardPortsCapability {
         }
         if current.state == .ownershipMismatch { throw StandardPortsError.ownershipMismatch }
         if current.state == .conflict { throw StandardPortsError.externalConflict(current.conflict ?? "Standard ports conflict with external state") }
-        guard current.ownership == .vaelen else { throw StandardPortsError.ownershipMismatch }
+        guard current.ownership == .vaelen, let acquisition = record?.acquisition else { throw StandardPortsError.ownershipMismatch }
         do {
-            try await privileged.removeForwarding(pfToken: record?.pfToken)
+            try await privileged.removeForwarding(acquisition: acquisition)
         } catch is StandardPortsPrivilegeError {
             throw StandardPortsError.helperUnavailable
         } catch let error as StandardPortsError {
@@ -291,15 +365,16 @@ public actor StandardPortsCapability {
             throw StandardPortsError.unavailable("Active Vaelen PF provenance exists, but current forwarding state is \(observed.state.rawValue); it was left untouched")
         }
         let removed = try await remove()
-        guard removed.state == .absent else { throw StandardPortsError.unavailable("Vaelen PF removal was requested but state remains \(removed.state.rawValue)") }
+        let keptPreexisting = record.acquisition.map { !$0.changedPFConf && !$0.changedAnchor } == true
+        guard removed.state == .absent || (keptPreexisting && removed.ownership == .external) else { throw StandardPortsError.unavailable("Vaelen PF removal was requested but state remains \(removed.state.rawValue)") }
         return removed
     }
 
     private static func describeOccupied(httpOccupied: Bool, httpsOccupied: Bool) -> String {
         switch (httpOccupied, httpsOccupied) {
-        case (true, true): return "External processes own TCP 80 and 443"
-        case (true, false): return "External process owns TCP 80"
-        case (false, true): return "External process owns TCP 443"
+        case (true, true): return "TCP connections to 80 and 443 succeed"
+        case (true, false): return "A TCP connection to 80 succeeds"
+        case (false, true): return "A TCP connection to 443 succeeds"
         case (false, false): return "Standard ports are unavailable"
         }
     }
@@ -313,8 +388,4 @@ public actor StandardPortsCapability {
         return withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 } }
     }
 
-    private func sha256(ofFile path: String) -> String? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
 }

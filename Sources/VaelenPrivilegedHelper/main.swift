@@ -1,6 +1,7 @@
 import Foundation
 import Security
 import Darwin
+import OSLog
 import VaelenCore
 
 /// Vaelen privileged helper daemon (production: installed via SMAppService).
@@ -17,6 +18,7 @@ final class StandardPortsHelper: NSObject, VaelenStandardPortsHelperProtocol {
     private let pfctl = "/sbin/pfctl"
     private let expectedAnchor = StandardPortsForwardingPolicy.anchorRules()
     private let resolverPath = "/etc/resolver/test"
+    private let portsLogger = Logger(subsystem: "dev.vaelen.privileged-helper", category: "standard-ports")
 
     func inspectTestResolver(with reply: @escaping (Data?, NSError?) -> Void) {
         do {
@@ -99,120 +101,223 @@ final class StandardPortsHelper: NSObject, VaelenStandardPortsHelperProtocol {
     }
 
     func inspectionData(with reply: @escaping (Data?, NSError?) -> Void) {
+        portsLogger.debug("PF inspection started")
         let inspection = StandardPortsHelperInspection(
             anchorContent: try? String(contentsOfFile: StandardPortsForwardingPolicy.anchorPath, encoding: .utf8),
             pfConfContent: try? String(contentsOfFile: StandardPortsForwardingPolicy.pfConfPath, encoding: .utf8),
-            pfEnabled: pfEnabled()
+            pfEnabled: pfEnabled(),
+            forwardingActive: forwardingActive()
         )
+        portsLogger.info("PF inspection completed; PF-enabled and forwarding-active observations collected")
         reply(try? JSONEncoder().encode(inspection), nil)
     }
 
-    func installForwarding(with reply: @escaping (NSString?, NSError?) -> Void) {
+    func installForwarding(with reply: @escaping (Data?, NSError?) -> Void) {
+        portsLogger.info("PF install request entered helper")
         do {
-            try install()
-            reply(pfEnableToken(), nil)
+            let acquisition = try install()
+            portsLogger.info("PF install acquisition produced; persistent file changes: \(acquisition.changedPFConf || acquisition.changedAnchor, privacy: .public)")
+            reply(try JSONEncoder().encode(acquisition), nil)
         } catch let error as NSError {
+            portsLogger.error("PF install failed: \(error.localizedDescription, privacy: .public)")
             reply(nil, error)
         }
     }
 
-    func removeForwarding(pfToken: NSString?, with reply: @escaping (NSError?) -> Void) {
+    func removeForwarding(acquisition: Data, with reply: @escaping (NSError?) -> Void) {
         do {
-            try remove(pfToken: pfToken as String?)
+            guard let record = try? JSONDecoder().decode(StandardPortsAcquisition.self, from: acquisition) else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+            try remove(acquisition: record)
             reply(nil)
         } catch let error as NSError {
             reply(error)
         }
     }
 
-    private func install() throws {
-        if FileManager.default.fileExists(atPath: StandardPortsForwardingPolicy.anchorPath) {
-            guard let existing = try? String(contentsOfFile: StandardPortsForwardingPolicy.anchorPath, encoding: .utf8) else {
-                throw StandardPortsHelperError.filesystemFailure.nsError
+    private func install() throws -> StandardPortsAcquisition {
+        portsLogger.debug("PF install preflight started")
+        let pfPre = try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath)
+        let anchorPre = try fileSnapshot(StandardPortsForwardingPolicy.anchorPath)
+        guard let confBytes = pfPre.bytes, let pfConf = String(data: confBytes, encoding: .utf8) else { throw StandardPortsHelperError.filesystemFailure.nsError }
+        let refLines = StandardPortsForwardingPolicy.pfConfReferenceLines()
+        let hasAnyReference = refLines.contains { pfConf.contains($0) } || pfConf.contains(StandardPortsForwardingPolicy.anchorName)
+        let exactExisting = anchorPre.exists && anchorPre.bytes == Data(expectedAnchor.utf8) && StandardPortsForwardingPolicy.hasExactReference(in: pfConf)
+        let absent = !anchorPre.exists && !hasAnyReference
+        guard exactExisting || absent else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+        let initiallyEnabled = pfEnabled() == true
+        let activeBefore = forwardingActive() == true
+        portsLogger.info("PF install preflight completed; exact compatible state: \(exactExisting, privacy: .public), PF initially enabled: \(initiallyEnabled, privacy: .public), forwarding active: \(activeBefore, privacy: .public)")
+        var token: String?
+        var vaelenPFConf: StandardPortsFileSnapshot?
+        var vaelenAnchor: StandardPortsFileSnapshot?
+        do {
+            if !initiallyEnabled {
+                portsLogger.info("PF enable-reference acquisition attempted")
+                token = try enablePF()
+                portsLogger.info("PF enable-reference acquisition completed; token returned: \(token != nil, privacy: .public)")
             }
-            guard existing == expectedAnchor else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+            if absent {
+                try atomicWrite(Data(expectedAnchor.utf8), to: StandardPortsForwardingPolicy.anchorPath, owner: 0, group: 0, mode: 0o644)
+                vaelenAnchor = try fileSnapshot(StandardPortsForwardingPolicy.anchorPath)
+                try atomicWrite(Data(StandardPortsForwardingPolicy.addingReference(to: pfConf).utf8), to: StandardPortsForwardingPolicy.pfConfPath, owner: pfPre.owner ?? 0, group: pfPre.group ?? 0, mode: pfPre.mode ?? 0o644)
+                vaelenPFConf = try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath)
+            }
+            if absent || !activeBefore {
+                portsLogger.info("PF main configuration reload attempted")
+                try runPfctl(["-f", StandardPortsForwardingPolicy.pfConfPath], stage: "reload-main-configuration")
+                portsLogger.info("PF main configuration reload completed")
+                portsLogger.info("PF fixed anchor load attempted")
+                try runPfctl(["-a", StandardPortsForwardingPolicy.anchorName, "-f", StandardPortsForwardingPolicy.anchorPath], stage: "load-fixed-anchor")
+                portsLogger.info("PF fixed anchor load completed")
+            }
+            portsLogger.info("PF forwarding verification attempted")
+            let enabledAfter = pfEnabled() == true
+            let activeAfter = forwardingActive() == true
+            portsLogger.info("PF forwarding verification completed; PF enabled: \(enabledAfter, privacy: .public), forwarding active: \(activeAfter, privacy: .public)")
+            guard enabledAfter, activeAfter else { throw StandardPortsHelperError.pfFailure.nsError }
+            return StandardPortsAcquisition(
+                preimagePFConf: pfPre, preimageAnchor: anchorPre,
+                writtenPFConf: try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath),
+                writtenAnchor: try fileSnapshot(StandardPortsForwardingPolicy.anchorPath),
+                changedPFConf: absent, changedAnchor: absent, forwardingWasActive: activeBefore, pfToken: token
+            )
+        } catch {
+            portsLogger.error("PF install stage failed; attempting best-effort rollback")
+            if absent {
+                if let vaelenPFConf { try? restoreIfMatches(StandardPortsForwardingPolicy.pfConfPath, expected: vaelenPFConf, preimage: pfPre) }
+                if let vaelenAnchor { try? restoreIfMatches(StandardPortsForwardingPolicy.anchorPath, expected: vaelenAnchor, preimage: anchorPre) }
+            }
+            if let token { _ = try? runPfctl(["-X", token], stage: "rollback-enable-reference") }
+            throw error
         }
-        guard let pfConf = try? String(contentsOfFile: StandardPortsForwardingPolicy.pfConfPath, encoding: .utf8) else {
-            throw StandardPortsHelperError.filesystemFailure.nsError
-        }
-        if pfConf.contains(StandardPortsForwardingPolicy.anchorName),
-           !StandardPortsForwardingPolicy.pfConfReferenceLines().allSatisfy(pfConf.contains) {
-            // Foreign use of our anchor name: never overwrite, never adopt.
-            throw StandardPortsHelperError.ownershipMismatch.nsError
-        }
-        // Fixed policy: the only anchor this helper will ever create.
-        try StandardPortsForwardingPolicy.writeAnchor(to: StandardPortsForwardingPolicy.anchorPath)
-        let updated = StandardPortsForwardingPolicy.addingReference(to: pfConf)
-        if updated != pfConf { try atomicWrite(updated, to: StandardPortsForwardingPolicy.pfConfPath) }
-        // The kernel only evaluates anchors referenced by its ACTIVE main
-        // ruleset. Editing pf.conf on disk is not enough: reload the main
-        // ruleset from disk (Apple anchors included) so the Vaelen
-        // rdr-anchor reference becomes live, then load the anchor itself.
-        try runPfctl(["-f", StandardPortsForwardingPolicy.pfConfPath])
-        try runPfctl(["-a", StandardPortsForwardingPolicy.anchorName, "-f", StandardPortsForwardingPolicy.anchorPath])
     }
 
-    private func remove(pfToken: String?) throws {
-        if FileManager.default.fileExists(atPath: StandardPortsForwardingPolicy.anchorPath) {
-            guard let existing = try? String(contentsOfFile: StandardPortsForwardingPolicy.anchorPath, encoding: .utf8) else {
-                throw StandardPortsHelperError.filesystemFailure.nsError
-            }
-            guard existing == expectedAnchor else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+    private func remove(acquisition: StandardPortsAcquisition) throws {
+        let currentConf = try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath)
+        let currentAnchor = try fileSnapshot(StandardPortsForwardingPolicy.anchorPath)
+        guard acquisition.preimagePFConf.bytes != nil,
+              acquisition.changedPFConf ? currentConf == acquisition.writtenPFConf : currentConf == acquisition.preimagePFConf,
+              acquisition.changedAnchor ? currentAnchor == acquisition.writtenAnchor : currentAnchor == acquisition.preimageAnchor else {
+            throw StandardPortsHelperError.ownershipMismatch.nsError
         }
-        guard let pfConf = try? String(contentsOfFile: StandardPortsForwardingPolicy.pfConfPath, encoding: .utf8) else {
+        if !acquisition.forwardingWasActive, forwardingActive() == true {
+            try runPfctl(["-a", StandardPortsForwardingPolicy.anchorName, "-F", "all"], stage: "clear-fixed-anchor")
+        }
+        if acquisition.changedPFConf { try restoreIfMatches(StandardPortsForwardingPolicy.pfConfPath, expected: acquisition.writtenPFConf, preimage: acquisition.preimagePFConf) }
+        if acquisition.changedAnchor { try restoreIfMatches(StandardPortsForwardingPolicy.anchorPath, expected: acquisition.writtenAnchor, preimage: acquisition.preimageAnchor) }
+        if acquisition.changedPFConf { try runPfctl(["-f", StandardPortsForwardingPolicy.pfConfPath], stage: "restore-main-configuration") }
+        if let token = acquisition.pfToken, Int(token) != nil { try runPfctl(["-X", token], stage: "release-enable-reference") }
+    }
+
+    private func fileSnapshot(_ path: String) throws -> StandardPortsFileSnapshot {
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            if errno == ENOENT { return StandardPortsFileSnapshot(exists: false, bytes: nil, owner: nil, group: nil, mode: nil) }
             throw StandardPortsHelperError.filesystemFailure.nsError
         }
-        if FileManager.default.fileExists(atPath: StandardPortsForwardingPolicy.anchorPath) {
-            do { try FileManager.default.removeItem(atPath: StandardPortsForwardingPolicy.anchorPath) }
-            catch { throw StandardPortsHelperError.filesystemFailure.nsError }
+        guard (info.st_mode & S_IFMT) == S_IFREG else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+        let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFREG, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino,
+              let bytes = try? FileHandle(fileDescriptor: fd, closeOnDealloc: false).readToEnd() else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+        return StandardPortsFileSnapshot(exists: true, bytes: bytes, owner: opened.st_uid, group: opened.st_gid, mode: UInt16(opened.st_mode & 0o7777))
+    }
+
+    private func restoreIfMatches(_ path: String, expected: StandardPortsFileSnapshot?, preimage: StandardPortsFileSnapshot) throws {
+        guard let expected, try fileSnapshot(path) == expected else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+        if preimage.exists {
+            guard let bytes = preimage.bytes else { throw StandardPortsHelperError.filesystemFailure.nsError }
+            try atomicWrite(bytes, to: path, owner: preimage.owner ?? 0, group: preimage.group ?? 0, mode: preimage.mode ?? 0o644)
+        } else { try FileManager.default.removeItem(atPath: path) }
+    }
+
+    private func forwardingActive() -> Bool? {
+        guard let enabled = pfEnabled() else { return nil }
+        guard enabled else { return false }
+        guard let rules = try? runPfctl(["-a", StandardPortsForwardingPolicy.anchorName, "-s", "nat"], stage: "inspect-fixed-anchor-rules") else { return nil }
+        let normalized = rules.lowercased().replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        // pfctl renders well-known source ports as service names (for example
+        // `port = http`) rather than decimal numbers. The anchor's on-disk
+        // rules are independently required to match Vaelen's exact fixed
+        // policy; here require both unique backend ports in the live NAT
+        // listing, which avoids treating a successful connection through the
+        // redirect as evidence of ownership.
+        let active = normalized.contains("port 8787") && normalized.contains("port 8743")
+        portsLogger.info("PF fixed anchor inspection completed; both Vaelen backend redirect ports observed: \(active, privacy: .public)")
+        return active
+    }
+
+    private func enablePF() throws -> String? {
+        let output = try runPfctl(["-E"], stage: "enable-reference")
+        if let token = StandardPortsPFEnableToken.parse(stdout: output, stderr: "") {
+            portsLogger.info("PF enable-reference command succeeded and returned a token")
+            return token
         }
-        let updated = StandardPortsForwardingPolicy.removingReference(from: pfConf)
-        if updated != pfConf { try atomicWrite(updated, to: StandardPortsForwardingPolicy.pfConfPath) }
-        // Reload the main ruleset so the removed reference leaves the
-        // active kernel state, then flush any residual anchor rules.
-        try runPfctl(["-f", StandardPortsForwardingPolicy.pfConfPath])
-        try runPfctl(["-a", StandardPortsForwardingPolicy.anchorName, "-F", "all"])
-        // Release our PF enable reference only with a token we issued.
-        // Unknown/nil tokens bias to leaving shared PF infrastructure enabled.
-        if let pfToken, Int(pfToken) != nil {
-            _ = try? runPfctl(["-X", pfToken])
-        }
+        let diagnostic = Self.safePFEnableDiagnostic(output)
+        portsLogger.error("pfctl stage parse-enable-reference-token completed with exit 0 but no numeric token was found; output: \(diagnostic, privacy: .public)")
+        throw StandardPortsHelperError.pfCommandFailure(stage: "parse-enable-reference-token", terminationStatus: 0, diagnostic: diagnostic)
     }
 
     private func pfEnabled() -> Bool? {
-        guard let output = try? runPfctl(["-s", "info"]) else { return nil }
+        guard let output = try? runPfctl(["-s", "info"], stage: "inspect-pf-state") else { return nil }
         return output.contains("Status: Enabled")
     }
 
     private func pfEnableToken() -> NSString? {
-        if (try? runPfctl(["-s", "info"]))?.contains("Status: Enabled") == true { return nil }
-        guard let output = try? runPfctl(["-E"]) else { return nil }
-        for line in output.components(separatedBy: .newlines) {
-            // pfctl -E prints "Token : <number>".
-            let parts = line.components(separatedBy: "Token :")
-            if parts.count == 2, let token = parts[1].trimmingCharacters(in: .whitespaces).nilIfEmpty, Int(token) != nil {
-                return token as NSString
-            }
-        }
-        return nil
+        if (try? runPfctl(["-s", "info"], stage: "inspect-pf-state"))?.contains("Status: Enabled") == true { return nil }
+        guard let output = try? runPfctl(["-E"], stage: "enable-reference") else { return nil }
+        return StandardPortsPFEnableToken.parse(stdout: output, stderr: "") as NSString?
     }
 
     @discardableResult
-    private func runPfctl(_ arguments: [String]) throws -> String {
+    private func runPfctl(_ arguments: [String], stage: String) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: pfctl)
         process.arguments = arguments
         let output = Pipe(); let error = Pipe()
         process.standardOutput = output; process.standardError = error
-        try process.run(); process.waitUntilExit()
-        guard process.terminationStatus == 0 else { throw StandardPortsHelperError.pfFailure.nsError }
-        return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            portsLogger.error("pfctl stage \(stage, privacy: .public) could not launch: \(error.localizedDescription, privacy: .public)")
+            throw StandardPortsHelperError.pfCommandFailure(stage: stage, terminationStatus: -1, diagnostic: error.localizedDescription)
+        }
+        let stdout = output.fileHandleForReading.readDataToEndOfFile()
+        let stderr = error.fileHandleForReading.readDataToEndOfFile()
+        let diagnostic = Self.safePFDiagnostic(stderr)
+        guard process.terminationStatus == 0 else {
+            portsLogger.error("pfctl stage \(stage, privacy: .public) exited \(process.terminationStatus, privacy: .public): \(diagnostic, privacy: .public)")
+            throw StandardPortsHelperError.pfCommandFailure(stage: stage, terminationStatus: process.terminationStatus, diagnostic: diagnostic)
+        }
+        portsLogger.debug("pfctl stage \(stage, privacy: .public) completed successfully")
+        let standardOutput = String(decoding: stdout, as: UTF8.self)
+        let standardError = String(decoding: stderr, as: UTF8.self)
+        return [standardOutput, standardError].filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    private static func safePFEnableDiagnostic(_ output: String) -> String {
+        let redacted = output.replacingOccurrences(of: #"(?im)Token\s*:\s*[^\s]+"#, with: "Token: <redacted>", options: .regularExpression)
+        return safePFDiagnostic(Data(redacted.utf8))
+    }
+
+    private static func safePFDiagnostic(_ data: Data) -> String {
+        let raw = String(decoding: data.prefix(1024), as: UTF8.self)
+        let oneLine = raw.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t" ? " " : String($0) }.joined()
+        return String(oneLine.prefix(512)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func atomicWrite(_ content: String, to path: String) throws {
+        try atomicWrite(Data(content.utf8), to: path, owner: 0, group: 0, mode: 0o644)
+    }
+
+    private func atomicWrite(_ content: Data, to path: String, owner: UInt32, group: UInt32, mode: UInt16) throws {
         let temporary = path + ".vaelen-tmp"
         do {
-            try content.write(toFile: temporary, atomically: true, encoding: .utf8)
+            try content.write(to: URL(fileURLWithPath: temporary), options: .atomic)
+            guard chown(temporary, uid_t(owner), gid_t(group)) == 0, chmod(temporary, mode_t(mode)) == 0 else { throw StandardPortsHelperError.filesystemFailure.nsError }
             if FileManager.default.fileExists(atPath: path) {
                 _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: temporary))
             } else {
