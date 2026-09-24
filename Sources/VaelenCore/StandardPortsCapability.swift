@@ -33,13 +33,16 @@ public struct StandardPortsStatus: Codable, Equatable, Sendable {
     public let anchor: String
     public let detail: String?
     public let conflict: String?
+    /// Whether the helper verified that the fixed forwarding rule is active.
+    /// Nil means the helper could not provide an authoritative observation.
+    public let forwardingActive: Bool?
     /// Ownership is reported by Core only when the active ledger and the
     /// currently observed fixed-policy integration agree. Nil is an
     /// unrecognized older Core response, never proof of ownership.
     public let ownership: StandardPortsOwnership?
 
-    public init(state: StandardPortsState, httpPort: Int = VaelenNetworkPorts.standardHTTP, httpsPort: Int = VaelenNetworkPorts.standardHTTPS, backendHTTPPort: Int = VaelenNetworkPorts.httpBackend, backendHTTPSPort: Int = VaelenNetworkPorts.httpsBackend, anchor: String = StandardPortsForwardingPolicy.anchorName, detail: String? = nil, conflict: String? = nil, ownership: StandardPortsOwnership? = nil) {
-        self.state = state; self.httpPort = httpPort; self.httpsPort = httpsPort; self.backendHTTPPort = backendHTTPPort; self.backendHTTPSPort = backendHTTPSPort; self.anchor = anchor; self.detail = detail; self.conflict = conflict; self.ownership = ownership
+    public init(state: StandardPortsState, httpPort: Int = VaelenNetworkPorts.standardHTTP, httpsPort: Int = VaelenNetworkPorts.standardHTTPS, backendHTTPPort: Int = VaelenNetworkPorts.httpBackend, backendHTTPSPort: Int = VaelenNetworkPorts.httpsBackend, anchor: String = StandardPortsForwardingPolicy.anchorName, detail: String? = nil, conflict: String? = nil, ownership: StandardPortsOwnership? = nil, forwardingActive: Bool? = nil) {
+        self.state = state; self.httpPort = httpPort; self.httpsPort = httpsPort; self.backendHTTPPort = backendHTTPPort; self.backendHTTPSPort = backendHTTPSPort; self.anchor = anchor; self.detail = detail; self.conflict = conflict; self.ownership = ownership; self.forwardingActive = forwardingActive
     }
 }
 
@@ -236,7 +239,7 @@ public actor StandardPortsCapability {
         let referencePresent = pfConf.map { StandardPortsForwardingPolicy.hasExactReference(in: $0, anchorPath: paths.anchorPath) } ?? false
         let record: StandardPortsLedgerRecord?
         do { record = try ledger?.standardPortsRecord() }
-        catch { return StandardPortsStatus(state: .unavailable, detail: "PF ownership record could not be read; existing rules were left unchanged", ownership: .unknown) }
+        catch { return StandardPortsStatus(state: .unavailable, detail: "PF ownership record could not be read; existing rules were left unchanged", ownership: .unknown, forwardingActive: inspection.forwardingActive) }
         let active = record?.active ?? false
         let hasIntegration = anchorContent != nil || referencePresent
         let ownership: StandardPortsOwnership = ledger == nil
@@ -248,22 +251,22 @@ public actor StandardPortsCapability {
         let httpsOccupied = portOccupied(VaelenNetworkPorts.standardHTTPS)
 
         if let anchorContent, anchorContent != expected {
-            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF anchor was modified externally", ownership: .unknown) }
-            return StandardPortsStatus(state: .conflict, conflict: "Foreign PF anchor claims \(StandardPortsForwardingPolicy.anchorName)", ownership: .external)
+            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF anchor was modified externally", ownership: .unknown, forwardingActive: inspection.forwardingActive) }
+            return StandardPortsStatus(state: .conflict, conflict: "Foreign PF anchor claims \(StandardPortsForwardingPolicy.anchorName)", ownership: .external, forwardingActive: inspection.forwardingActive)
         }
         if anchorContent == nil, !referencePresent {
             if httpOccupied || httpsOccupied {
-                return StandardPortsStatus(state: .unavailable, detail: "\(StandardPortsCapability.describeOccupied(httpOccupied: httpOccupied, httpsOccupied: httpsOccupied)); no fixed Vaelen PF integration is present, so ownership cannot be established", ownership: .unknown)
+                return StandardPortsStatus(state: .unavailable, detail: "\(StandardPortsCapability.describeOccupied(httpOccupied: httpOccupied, httpsOccupied: httpsOccupied)); no fixed Vaelen PF integration is present, so ownership cannot be established", ownership: .unknown, forwardingActive: inspection.forwardingActive)
             }
-            return StandardPortsStatus(state: .absent, ownership: StandardPortsOwnership.none)
+            return StandardPortsStatus(state: .absent, ownership: StandardPortsOwnership.none, forwardingActive: inspection.forwardingActive)
         }
         guard anchorMatches, referencePresent else {
-            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF integration is partially missing or was modified", ownership: .unknown) }
-            return StandardPortsStatus(state: .conflict, conflict: "Partial foreign PF integration for Vaelen anchor", ownership: .external)
+            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF integration is partially missing or was modified", ownership: .unknown, forwardingActive: inspection.forwardingActive) }
+            return StandardPortsStatus(state: .conflict, conflict: "Partial foreign PF integration for Vaelen anchor", ownership: .external, forwardingActive: inspection.forwardingActive)
         }
         let backend = await backendHealthy()
         if inspection.forwardingActive == true, httpOccupied, httpsOccupied, backend {
-            return StandardPortsStatus(state: .healthy, ownership: ownership)
+            return StandardPortsStatus(state: .healthy, ownership: ownership, forwardingActive: inspection.forwardingActive)
         }
         if backend {
             // A successful TCP connect is not proof that an external process
@@ -271,9 +274,9 @@ public actor StandardPortsCapability {
             // reachable through 80/443 too. The helper's PF observation is
             // authoritative for forwarding health.
             logger.info("Standard Ports preflight completed; exact integration exists but helper has not verified active forwarding")
-            return StandardPortsStatus(state: .unhealthy, detail: "PF integration is present but active forwarding has not been verified", ownership: ownership)
+            return StandardPortsStatus(state: .unhealthy, detail: "PF integration is present but active forwarding has not been verified", ownership: ownership, forwardingActive: inspection.forwardingActive)
         }
-        return StandardPortsStatus(state: .installed, detail: "PF integration is present; backend router is not running", ownership: ownership)
+        return StandardPortsStatus(state: .installed, detail: "PF integration is present; backend router is not running", ownership: ownership, forwardingActive: inspection.forwardingActive)
     }
 
     public func install() async throws -> StandardPortsStatus {

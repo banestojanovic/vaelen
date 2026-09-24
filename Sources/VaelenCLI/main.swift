@@ -6,6 +6,7 @@ import VaelenIPC
 enum CLICommand {
     case help
     case status(json: Bool)
+    case doctor(json: Bool)
     case link(path: String)
     case unlink(path: String)
     case links(json: Bool)
@@ -79,6 +80,24 @@ private struct StatusPayload: Encodable {
     let pid: Int32
     let protocolVersion: Int
 }
+private struct LegacyPortsStatusEnvelope: Encodable { let ports: LegacyPortsStatus }
+private struct LegacyPortsStatus: Encodable {
+    let state: StandardPortsState
+    let httpPort: Int
+    let httpsPort: Int
+    let backendHTTPPort: Int
+    let backendHTTPSPort: Int
+    let anchor: String
+    let detail: String?
+    let conflict: String?
+    let ownership: StandardPortsOwnership?
+
+    init(_ value: StandardPortsStatus) {
+        state = value.state; httpPort = value.httpPort; httpsPort = value.httpsPort
+        backendHTTPPort = value.backendHTTPPort; backendHTTPSPort = value.backendHTTPSPort
+        anchor = value.anchor; detail = value.detail; conflict = value.conflict; ownership = value.ownership
+    }
+}
 
 @main
 struct VaelenCLIMain {
@@ -88,7 +107,7 @@ struct VaelenCLIMain {
         if path.isEmpty {
             let sections: [(String, [(String, String)])] = [
                 ("Projects", [("link", "Link a project"), ("links", "List linked projects"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
-                ("Overview", [("status", "Show Vaelen status")]),
+                ("Overview", [("status", "Show Vaelen status"), ("doctor", "Check Vaelen services")]),
                 ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
                 ("Networking", [("routing", "Manage router"), ("route", "Manage project routes"), ("dns", "Manage DNS"), ("tls", "Manage HTTPS"), ("ports", "Manage web ports")]),
                 ("Integration", [("shell", "PHP shell integration")])
@@ -105,6 +124,7 @@ struct VaelenCLIMain {
         let name = path[0]
         let body: String
         switch name {
+        case "doctor": body = "Usage: val doctor [--json]\nCheck Vaelen Core and managed service health without starting or repairing services.\nExample: val doctor --json"
         case "project": body = groupHelp("val project <command> [project] [options]", [
                 ("status [project] [--json]", "Show project environment summary"),
                 ("inspect [project] [--json]", "Show configuration and diagnostics"),
@@ -253,6 +273,18 @@ struct VaelenCLIMain {
                 exit(0)
             }
             let command = try parse(arguments)
+            if case .doctor(let json) = command {
+                let paths = CoreEndpointPaths()
+                let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
+                let report = await runDoctor(client)
+                if json {
+                    do { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) }
+                    catch { fail("Unable to encode Vaelen Doctor report.", code: 1) }
+                } else {
+                    print(report.terminalOutput)
+                }
+                exit(report.exitCode)
+            }
             if case .help = command {
                 printHelp(usage)
                 exit(0)
@@ -292,6 +324,7 @@ struct VaelenCLIMain {
             guard args.count == 1 else { throw CLIError.usage }
             return .help
         case "status": return .status(json: args.dropFirst().elementsEqual(["--json"]))
+        case "doctor": return .doctor(json: try listJSONOption(args))
         case "links": return .links(json: try listJSONOption(args))
         case "parks", "paths": return .parks(json: try listJSONOption(args))
         case "project":
@@ -455,10 +488,74 @@ struct VaelenCLIMain {
         return (selector, json)
     }
 
+    private static func runDoctor(_ client: VaelenCoreClient) async -> DoctorReport {
+        do {
+            try await client.connect()
+        } catch let error as CoreClientError {
+            let code = errorCode(for: error)
+            let detail = error == .coreUnavailable ? "Not running; service checks unavailable." : error.localizedDescription
+            return DoctorEvaluator.evaluate(DoctorSnapshot(coreFailure: detail, coreFailureCode: code))
+        } catch {
+            return DoctorEvaluator.evaluate(DoctorSnapshot(coreFailure: "Core connection failed: \(error.localizedDescription)", coreFailureCode: 1))
+        }
+
+        var snapshot = DoctorSnapshot()
+        do {
+            snapshot.coreStatus = try await client.status()
+        } catch let error as CoreClientError {
+            snapshot.coreFailure = error == .coreUnavailable ? "Not running; service checks unavailable." : error.localizedDescription
+            snapshot.coreFailureCode = errorCode(for: error)
+            await client.disconnect()
+            return DoctorEvaluator.evaluate(snapshot)
+        } catch {
+            snapshot.coreFailure = "Core status could not be read: \(error.localizedDescription)"
+            snapshot.coreFailureCode = 1
+            await client.disconnect()
+            return DoctorEvaluator.evaluate(snapshot)
+        }
+
+        do {
+            let php = try await client.phpVersions()
+            snapshot.phpAvailable = php.available
+            snapshot.phpInstalled = php.installed.map(\.version)
+        } catch { snapshot.observationErrors["php-inventory"] = error.localizedDescription }
+        let requestedPHP = (snapshot.coreStatus?.serviceIntents ?? []).compactMap { value -> String? in
+            guard value.hasPrefix("php:") else { return nil }
+            let version = String(value.dropFirst(4))
+            return version.isEmpty ? nil : version
+        }
+        for version in Set((snapshot.phpInstalled ?? []) + requestedPHP).sorted() {
+            do { snapshot.phpStatuses[version] = try await client.phpStatus(version) }
+            catch { snapshot.observationErrors["php:\(version)"] = error.localizedDescription }
+        }
+        do { snapshot.mysql = try await client.mysqlStatus() }
+        catch { snapshot.observationErrors["mysql"] = error.localizedDescription }
+        do { snapshot.mailpit = try await client.mailpitStatus() }
+        catch { snapshot.observationErrors["mailpit"] = error.localizedDescription }
+        do { snapshot.routing = try await client.routingStatus() }
+        catch { snapshot.observationErrors["routing"] = error.localizedDescription }
+        do { snapshot.dns = try await client.dnsStatus() }
+        catch { snapshot.observationErrors["dns"] = error.localizedDescription }
+        do { snapshot.ports = try await client.portsStatus() }
+        catch { snapshot.observationErrors["standard-ports"] = error.localizedDescription }
+        await client.disconnect()
+        return DoctorEvaluator.evaluate(snapshot)
+    }
+
+    private static func errorCode(for error: CoreClientError) -> Int32 {
+        switch error {
+        case .coreUnavailable: return 3
+        case .protocolIncompatible, .coreIncompatible: return 4
+        case .invalidResponse, .remote: return 1
+        }
+    }
+
     private static func execute(_ command: CLICommand, client: VaelenCoreClient, workingDirectory: String) async throws {
         switch command {
         case .help:
             print(usage)
+        case .doctor:
+            break
         case .status(let json):
             let status = try await client.status()
             if json {
@@ -592,7 +689,7 @@ struct VaelenCLIMain {
             let result = try await client.tlsRemoveLocalCATrust(); print("Local TLS \(result.operation.rawValue): \(result.message)")
         case .portsStatus(let json):
             let result = try await client.portsStatus()
-            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            if json { print(String(decoding: try IPCCodec.encode(LegacyPortsStatusEnvelope(ports: LegacyPortsStatus(result))), as: UTF8.self)) }
             else {
                 let conflict = result.conflict.map { "\nConflict   \($0)" } ?? ""
                 let detail = result.detail.map { "\nDetail     \($0)" } ?? ""

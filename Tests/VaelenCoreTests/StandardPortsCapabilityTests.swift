@@ -392,6 +392,7 @@ final class StandardPortsCapabilityTests: XCTestCase {
         let status = await capability.status()
         XCTAssertEqual(status.state, .installed)
         XCTAssertEqual(status.ownership, .external)
+        XCTAssertEqual(status.forwardingActive, false)
         XCTAssertNil(try ledger.standardPortsRecord())
     }
 
