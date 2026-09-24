@@ -110,7 +110,134 @@ private struct MutableShutdownDNSHelper: PrivilegedDNSHelper {
     }
 }
 
+private actor StartupRaceDNSHelper: PrivilegedDNSHelper {
+    let path: String
+    private var inspections = 0
+    private var acquisitions = 0
+    init(path: String) { self.path = path }
+    func inspectCount() -> Int { inspections }
+    func acquisitionCount() -> Int { acquisitions }
+    func inspectTestResolver() async throws -> ResolverInspection {
+        inspections += 1
+        try await Task.sleep(for: .milliseconds(100))
+        let snapshot = try ResolverFileSnapshot.read(path)
+        return .init(exists: snapshot.exists, content: snapshot.bytes.map { String(decoding: $0, as: UTF8.self) }, ownership: snapshot.exists ? .unknown : .none, snapshot: snapshot)
+    }
+    func installTestResolver(port: Int, replacing: ResolverFileSnapshot?) async throws -> ResolverFileSnapshot {
+        acquisitions += 1
+        guard try ResolverFileSnapshot.read(path) == replacing else { throw DNSCapabilityError.ownershipMismatch }
+        try Data("nameserver 127.0.0.1\nport \(port)\n".utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
+        return try ResolverFileSnapshot.read(path)
+    }
+    func removeTestResolver(expected: ResolverFileSnapshot, restore: ResolverFileSnapshot) async throws {
+        guard try ResolverFileSnapshot.read(path) == expected else { throw DNSCapabilityError.ownershipMismatch }
+        if restore.exists, let bytes = restore.bytes { try bytes.write(to: URL(fileURLWithPath: path), options: .atomic) }
+        else { try FileManager.default.removeItem(atPath: path) }
+    }
+}
+
 final class DispatcherTests: XCTestCase {
+    func testCoreStatusWaitsForSavedDNSAutostartAndFirstSnapshotIsHealthy() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("status-after-dns-autostart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let resolver = root.appendingPathComponent("resolver/test")
+        try FileManager.default.createDirectory(at: resolver.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("nameserver 192.0.2.53\n".utf8).write(to: resolver)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        try intents.set("dns", enabled: true)
+        let responder = ShutdownTestResponder()
+        let dns = DNSCapability(helper: StartupRaceDNSHelper(path: resolver.path), responder: responder, port: 49173, ledger: SystemModificationLedger(store: store))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: getpid()), registry: ProjectRegistry(store: store), dns: dns, serviceIntents: intents)
+
+        await dispatcher.restoreServicesOnStartup()
+        let began = Date()
+        let coreReply = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
+        let elapsed = Date().timeIntervalSince(began)
+        guard case .status(let coreStatus) = coreReply.response.result else { return XCTFail("expected Core status") }
+        XCTAssertGreaterThanOrEqual(elapsed, 0.09, "bootstrap status must remain loading until the delayed saved DNS start settles")
+        XCTAssertEqual(coreStatus.serviceIntents, ["dns"])
+        XCTAssertNil(coreStatus.serviceIssues?["dns"])
+
+        let dnsReply = await dispatcher.dispatch(IPCRequest(method: .dnsStatus), handshaken: true)
+        guard case .dnsStatus(let dnsStatus) = dnsReply.response.result else { return XCTFail("expected authoritative DNS snapshot") }
+        XCTAssertEqual(dnsStatus.dns.state, .installed)
+        XCTAssertEqual(dnsStatus.dns.ownership, .vaelen)
+        XCTAssertEqual(dnsStatus.dns.responderState, .ownedRunning)
+        XCTAssertEqual(dnsStatus.dns.health, "healthy")
+        XCTAssertEqual(try intents.failures()["dns"], nil)
+    }
+
+    func testSavedDNSOffRemainsOffAndFailedAutostartRemainsRetryable() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dns-off-and-failure-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let offRoot = root.appendingPathComponent("off")
+        try FileManager.default.createDirectory(at: offRoot, withIntermediateDirectories: true)
+        let offStore = try SQLiteStateStore(databaseURL: offRoot.appendingPathComponent("state.sqlite"))
+        let offIntents = ServiceIntentStore(url: offRoot.appendingPathComponent("service-intents.json"))
+        let offResolver = offRoot.appendingPathComponent("resolver/test")
+        let offDNS = DNSCapability(helper: ShutdownTestDNSHelper(path: offResolver.path), responder: ShutdownTestResponder(), ledger: SystemModificationLedger(store: offStore))
+        let offDispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: getpid()), registry: ProjectRegistry(store: offStore), dns: offDNS, serviceIntents: offIntents)
+        await offDispatcher.restoreServicesOnStartup()
+        let offStatus = await offDispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status(let offCore) = offStatus.response.result else { return XCTFail("expected OFF Core status") }
+        XCTAssertFalse(offCore.serviceIntents?.contains("dns") ?? true)
+        let offDNSReply = await offDispatcher.dispatch(IPCRequest(method: .dnsStatus), handshaken: true)
+        guard case .dnsStatus(let offDNSStatus) = offDNSReply.response.result else { return XCTFail("expected OFF DNS status") }
+        XCTAssertEqual(offDNSStatus.dns.state, .notInstalled)
+        XCTAssertEqual(offDNSStatus.dns.responderState, .stopped)
+
+        let failedRoot = root.appendingPathComponent("failed")
+        try FileManager.default.createDirectory(at: failedRoot.appendingPathComponent("resolver"), withIntermediateDirectories: true)
+        let failedResolver = failedRoot.appendingPathComponent("resolver/test")
+        let failedStore = try SQLiteStateStore(databaseURL: failedRoot.appendingPathComponent("state.sqlite"))
+        let failedIntents = ServiceIntentStore(url: failedRoot.appendingPathComponent("service-intents.json"))
+        try failedIntents.set("dns", enabled: true)
+        let failedDNS = DNSCapability(helper: ShutdownTestDNSHelper(path: failedResolver.path), responder: ShutdownTestResponder(), port: 49174, ledger: SystemModificationLedger(store: failedStore))
+        let failedDispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: getpid()), registry: ProjectRegistry(store: failedStore), dns: failedDNS, serviceIntents: failedIntents)
+        await failedDispatcher.restoreServicesOnStartup()
+        let failedReply = await failedDispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status(let failedStatus) = failedReply.response.result else { return XCTFail("expected failed-start status") }
+        XCTAssertEqual(failedStatus.serviceIssues?["dns"], "macOS authorization for resolver changes is unavailable.")
+    }
+
+    func testSavedDNSAutostartAndConcurrentRetryAcquireOnceAndRecoverOnQuit() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("saved-dns-startup-race-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let resolver = root.appendingPathComponent("resolver/test")
+        try FileManager.default.createDirectory(at: resolver.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let preimage = Data("nameserver 192.0.2.53\nsearch local\n".utf8)
+        try preimage.write(to: resolver)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        try intents.set("dns", enabled: true)
+        let helper = StartupRaceDNSHelper(path: resolver.path)
+        let ledger = SystemModificationLedger(store: store)
+        let dns = DNSCapability(helper: helper, responder: ShutdownTestResponder(), port: 49173, ledger: ledger)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), dns: dns, serviceIntents: intents)
+
+        await dispatcher.restoreServicesOnStartup()
+        for _ in 0..<100 {
+            if await helper.inspectCount() > 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let retry = Task { await dispatcher.dispatch(IPCRequest(method: .dnsInstall), handshaken: true) }
+        let response = await retry.value
+        XCTAssertNil(response.response.error)
+        guard case .dnsStatus(let result) = response.response.result else { return XCTFail("saved startup/retry did not return DNS state") }
+        XCTAssertEqual(result.dns.health, "healthy")
+        let acquisitionCount = await helper.acquisitionCount()
+        XCTAssertEqual(acquisitionCount, 1)
+
+        let quit = await dispatcher.shutdownForParentExit()
+        XCTAssertTrue(quit.completed)
+        XCTAssertEqual(try Data(contentsOf: resolver), preimage)
+        XCTAssertEqual(try ledger.resolverOwnershipRecord()?.phase, .resolverRestored)
+        XCTAssertEqual(try ledger.dnsRecord()?.active, false)
+        XCTAssertEqual(try intents.enabledServices(), ["dns"])
+    }
+
     func testExplicitRouterIntentPersistsAcrossQuitAndStopClearsIt() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("service-intent-dispatcher-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -228,7 +355,7 @@ final class DispatcherTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(100))
         let response = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
         guard case .status(let status) = response.response.result else { return XCTFail("missing Core status") }
-        XCTAssertEqual(status.serviceIssues?["dns"], "An external /etc/resolver/test file exists; it was left unchanged.")
+        XCTAssertEqual(status.serviceIssues?["dns"], "DNS responder executable is unavailable")
         XCTAssertEqual(try Data(contentsOf: resolver), herd)
         XCTAssertEqual(try intents.enabledServices(), ["dns"])
 
@@ -362,7 +489,7 @@ final class DispatcherTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.socketPath), "Core socket must disappear after the successful response")
     }
 
-    func testShutdownFailureKeepsDispatcherReachableAndRetryCanComplete() async throws {
+    func testShutdownFailureIsReportedButDoesNotHoldCoreOpen() async throws {
         let router = ShutdownTestRouter(stopFailures: 1)
         let fixture = try makeShutdownDispatcher(router: router)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -370,18 +497,11 @@ final class DispatcherTests: XCTestCase {
         guard case .shutdown(let firstResult) = first.response.result else { return XCTFail("missing shutdown outcome") }
         XCTAssertFalse(firstResult.completed)
         XCTAssertFalse(firstResult.components.first { $0.component == "caddy" }?.succeeded ?? true)
+        XCTAssertTrue(firstResult.components.first { $0.component == "dns" }?.succeeded ?? false, "DNS cleanup still runs after Caddy cleanup fails")
         let mayExitAfterFailure = await fixture.dispatcher.shouldExitAfterShutdownResponse()
-        XCTAssertFalse(mayExitAfterFailure)
+        XCTAssertTrue(mayExitAfterFailure)
         let blockedStart = await fixture.dispatcher.dispatch(IPCRequest(method: .routingStart), handshaken: true)
         XCTAssertNotNil(blockedStart.response.error, "new service starts must be rejected once shutdown begins")
-        let reachable = await fixture.dispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
-        XCTAssertNotNil(reachable.response.result, "Core remains available for diagnosis and retry")
-
-        let retry = await fixture.dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
-        guard case .shutdown(let retryResult) = retry.response.result else { return XCTFail("missing retry outcome") }
-        XCTAssertTrue(retryResult.completed, "\(retryResult.components)")
-        let mayExitAfterRetry = await fixture.dispatcher.shouldExitAfterShutdownResponse()
-        XCTAssertTrue(mayExitAfterRetry)
     }
 
     func testCoreShutdownStopsOwnedMailpitAndLeavesUnrelatedSameExecutableAlive() async throws {
@@ -428,7 +548,7 @@ final class DispatcherTests: XCTestCase {
         XCTAssertTrue(mayExit)
     }
 
-    func testResistantMailpitMakesShutdownIncompleteThenRetrySucceeds() async throws {
+    func testResistantMailpitDoesNotKeepCoreAliveAfterBestEffortQuit() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("quit-mailpit-retry-\(UUID().uuidString)")
         defer { removeShutdownRoot(root) }
         let fixture = try makeMailpitFixture(root: root, resistant: true)
@@ -443,11 +563,10 @@ final class DispatcherTests: XCTestCase {
         XCTAssertTrue(waitForTCP(started.smtpPort)); XCTAssertTrue(waitForTCP(started.httpPort))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.processFile.path))
         let mayExit = await core.dispatcher.shouldExitAfterShutdownResponse()
-        XCTAssertFalse(mayExit)
+        XCTAssertTrue(mayExit)
+        XCTAssertTrue(processIsLive(pid), "a resistant process is not signaled beyond its provider's best effort")
         try FileManager.default.removeItem(at: fixture.resistFile)
-        let retry = await core.dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
-        guard case .shutdown(let completed) = retry.response.result else { return XCTFail("missing shutdown retry") }
-        XCTAssertTrue(completed.completed, "\(completed.components)")
+        _ = try fixture.module.stop()
         XCTAssertFalse(processIsLive(pid))
         XCTAssertFalse(waitForTCP(started.smtpPort)); XCTAssertFalse(waitForTCP(started.httpPort))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.processFile.path))
@@ -499,7 +618,7 @@ final class DispatcherTests: XCTestCase {
         XCTAssertTrue(mayExit)
     }
 
-    func testResolverEditMakesCoordinatedQuitIncompleteAndKeepsResponderRunning() async throws {
+    func testResolverEditPreservesExternalResolverAndQuitStopsVaelenResponder() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("quit-dns-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -513,16 +632,15 @@ final class DispatcherTests: XCTestCase {
         let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: ProjectRegistry(store: store), dns: dns)
         let reply = await dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
         guard case .shutdown(let result) = reply.response.result else { return XCTFail("missing shutdown result") }
-        XCTAssertFalse(result.completed)
+        XCTAssertTrue(result.completed, "external resolver drift is preserved while Vaelen releases its resources")
         let dnsResult = try XCTUnwrap(result.components.first { $0.component == "dns" })
-        XCTAssertFalse(dnsResult.succeeded)
+        XCTAssertTrue(dnsResult.succeeded)
         XCTAssertEqual(try Data(contentsOf: resolver), independent)
-        XCTAssertEqual(try SystemModificationLedger(store: store).resolverOwnershipRecord()?.phase, .owned)
+        XCTAssertNil(try SystemModificationLedger(store: store).resolverOwnershipRecord())
         let stops = await responder.stopCount()
-        XCTAssertEqual(stops, 0, "independent resolver edit must prevent responder shutdown")
+        XCTAssertEqual(stops, 1, "independent resolver edit must not prevent responder shutdown")
         let status = await dns.status()
-        XCTAssertEqual(status.health, "conflict")
-        XCTAssertEqual(status.responderState, .ownedRunning)
+        XCTAssertEqual(status.health, "stopped")
     }
 
     func testShutdownTreatsUnownedExternalResolverAsHarmlessAndLeavesItByteForByteAlone() async throws {
@@ -550,6 +668,58 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNil(try SystemModificationLedger(store: store).dnsRecord())
         let responderStops = await responder.stopCount()
         XCTAssertEqual(responderStops, 0)
+    }
+
+    func testCoreShutdownStopsCaddyThenContinuesThroughDNSRestore() async throws {
+        let root = URL(fileURLWithPath: "/tmp/vln-qcd-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let layout = VaelenFilesystemLayout(rootURL: support)
+        let package = try CaddyModule(layout: VaelenFilesystemLayout()).resolveInstalled(requestedVersion: "2.11.4")
+        let httpPort = try ephemeralTCPPort()
+        var httpsPort = try ephemeralTCPPort()
+        while httpsPort == httpPort { httpsPort = try ephemeralTCPPort() }
+        let supervisor = CaddyProcessSupervisor(layout: layout, configuration: CaddyRuntimeConfiguration(httpPort: httpPort, httpsPort: httpsPort))
+        await supervisor.installPackage(package)
+        let router = CaddyRouter(layout: layout, supervisor: supervisor)
+        try await router.start()
+
+        let resolver = root.appendingPathComponent("resolver/test")
+        try FileManager.default.createDirectory(at: resolver.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let preimage = Data("nameserver 192.0.2.53\n".utf8)
+        try preimage.write(to: resolver)
+        let responder = ShutdownTestResponder()
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let dns = DNSCapability(
+            layout: layout,
+            helper: MutableShutdownDNSHelper(path: resolver.path),
+            responder: responder,
+            port: 49174,
+            ledger: SystemModificationLedger(store: store)
+        )
+        _ = try await dns.install()
+        let ports = StandardPortsCapability(
+            privileged: ShutdownPortsFake(inspection: .init(anchorContent: nil, pfConfContent: nil), removals: ShutdownRemovalCounter()),
+            paths: .init(anchorPath: root.appendingPathComponent("anchor").path, pfConfPath: root.appendingPathComponent("pf.conf").path),
+            ledger: SystemModificationLedger(store: store),
+            portOccupied: { _ in false },
+            backendHealthy: { false }
+        )
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: getpid()), registry: ProjectRegistry(store: store), router: router, dns: dns, ports: ports)
+
+        let reply = await dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
+        guard case .shutdown(let result) = reply.response.result else { return XCTFail("missing typed shutdown result") }
+        XCTAssertTrue(result.completed, "all shutdown work, including DNS, must complete: \(result.components)")
+        let caddyIndex = try XCTUnwrap(result.components.firstIndex { $0.component == "caddy" })
+        let dnsIndex = try XCTUnwrap(result.components.firstIndex { $0.component == "dns" })
+        XCTAssertLessThan(caddyIndex, dnsIndex)
+        let caddyStatus = await supervisor.status()
+        let dnsStatus = await dns.status()
+        let responderStops = await responder.stopCount()
+        XCTAssertEqual(caddyStatus.state, .stopped)
+        XCTAssertEqual(dnsStatus.state, .notInstalled)
+        XCTAssertEqual(try Data(contentsOf: resolver), preimage)
+        XCTAssertEqual(responderStops, 1)
     }
 
     private struct ShutdownFixture {

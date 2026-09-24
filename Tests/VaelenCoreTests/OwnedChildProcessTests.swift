@@ -3,6 +3,13 @@ import Darwin
 @testable import VaelenCore
 
 final class OwnedChildProcessTests: XCTestCase {
+    private final class ConcurrentResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Bool] = []
+        func append(_ value: Bool) { lock.lock(); values.append(value); lock.unlock() }
+        var snapshot: [Bool] { lock.lock(); defer { lock.unlock() }; return values }
+    }
+
     func testOwnedLiveChildStopsAndSimilarUnrelatedChildSurvives() throws {
         let owned = try launchSleep()
         let unrelated = try launchSleep()
@@ -21,7 +28,40 @@ final class OwnedChildProcessTests: XCTestCase {
         for _ in 0..<100 where child.process.isRunning { usleep(10_000) }
         XCTAssertFalse(child.isRunningAndReapedIfExited())
         XCTAssertEqual(child.process.terminationStatus, 0)
+        XCTAssertTrue(child.terminateAndWait(timeout: 0.1), "stopping an already-exited child must not wait again")
         XCTAssertFalse(child.isRunningAndReapedIfExited())
+    }
+
+    func testStopWithTerminationHandlerAndPipedOutputCompletesOnceAcrossRepeatedReap() throws {
+        let output = Pipe()
+        let child = try OwnedChildProcess.launch(
+            executable: URL(fileURLWithPath: "/bin/sleep"),
+            arguments: ["30"],
+            label: "handler and pipe fixture",
+            output: output
+        )
+        let terminated = expectation(description: "Foundation termination handler")
+        terminated.expectedFulfillmentCount = 1
+        terminated.assertForOverFulfill = true
+        child.process.terminationHandler = { _ in terminated.fulfill() }
+
+        let group = DispatchGroup()
+        let results = ConcurrentResults()
+        for _ in 0..<4 {
+            group.enter()
+            DispatchQueue.global().async {
+                results.append(child.terminateAndWait(timeout: 2))
+                group.leave()
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 3), .success)
+        XCTAssertEqual(results.snapshot, [true, true, true, true])
+        wait(for: [terminated], timeout: 2)
+        XCTAssertEqual(child.process.terminationReason, .uncaughtSignal)
+        XCTAssertFalse(child.isRunningAndReapedIfExited())
+        XCTAssertTrue(child.terminateAndWait(timeout: 0.1))
+        XCTAssertFalse(child.process.isRunning)
+        output.fileHandleForReading.closeFile()
     }
 
     func testUnresponsiveOwnedChildReturnsBoundedFailureAndRemainsObservable() throws {

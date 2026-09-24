@@ -3,6 +3,106 @@ import Darwin
 @testable import VaelenCore
 
 final class DNSCapabilityTests: XCTestCase {
+    func testUnavailableResponderLeavesNoAcquisitionRecordAndRetryWorks() async throws {
+        let fixture = try makeFixture(contents: Data("external resolver\n".utf8))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let before = try ResolverFileSnapshot.read(fixture.file.path)
+        await fixture.responder.setExecutableAvailable(false)
+
+        do { _ = try await fixture.capability.install(); XCTFail("missing responder must fail before acquisition") }
+        catch { XCTAssertEqual(error as? DNSCapabilityError, .processFailed("DNS responder executable is unavailable")) }
+        XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
+        XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), before)
+
+        await fixture.responder.setExecutableAvailable(true)
+        _ = try await fixture.capability.install()
+        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .owned)
+        _ = try await fixture.capability.remove()
+        XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), before)
+    }
+
+    func testPreparedRecordWithUnchangedPreimageAndNoResponderRecoversForRetry() async throws {
+        let fixture = try makeFixture(contents: Data("external resolver\n".utf8))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let before = try ResolverFileSnapshot.read(fixture.file.path)
+        try fixture.ledger.saveResolverOwnershipRecord(.init(phase: .prepared, previous: before, intendedBytes: Data("nameserver 127.0.0.1\nport 53535\n".utf8), written: nil))
+
+        _ = try await fixture.capability.install()
+        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .owned)
+        _ = try await fixture.capability.remove()
+        XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), before)
+    }
+
+    func testConcurrentSavedStartupAndRetryJoinOneResolverAcquisition() async throws {
+        let fixture = try makeFixture(contents: Data("stable preimage\n".utf8))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.helper.delayInspections(by: .milliseconds(150))
+
+        async let automatic = fixture.capability.install()
+        try await Task.sleep(for: .milliseconds(20))
+        async let retry = fixture.capability.install()
+        let (automaticStatus, retryStatus) = try await (automatic, retry)
+
+        XCTAssertEqual(automaticStatus.health, "healthy")
+        XCTAssertEqual(retryStatus.health, "healthy")
+        let acquisitionCount = await fixture.helper.acquisitionCount()
+        XCTAssertEqual(acquisitionCount, 1, "a retry during saved-service startup must join, not repeat, resolver acquisition")
+        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .owned)
+        _ = try await fixture.capability.remove()
+        XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path).bytes, Data("stable preimage\n".utf8))
+    }
+
+    func testSavedQuitPreimageReacquisitionUsesFreshPostRestoreFileIdentity() async throws {
+        let originalBytes = Data("nameserver 127.0.0.1\n".utf8)
+        let fixture = try makeFixture(contents: originalBytes)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let savedBeforeQuit = try ResolverFileSnapshot.read(fixture.file.path)
+        try fixture.ledger.saveResolverOwnershipRecord(.init(
+            phase: .resolverRestored,
+            previous: savedBeforeQuit,
+            intendedBytes: Data("nameserver 127.0.0.1\nport 53535\n".utf8),
+            written: nil
+        ))
+
+        // The production helper restores an existing file with atomic replace;
+        // bytes/owner/group/mode remain the preimage but inode identity changes.
+        try originalBytes.write(to: fixture.file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o604], ofItemAtPath: fixture.file.path)
+        if let owner = savedBeforeQuit.owner, let group = savedBeforeQuit.group {
+            _ = chown(fixture.file.path, uid_t(owner), gid_t(group))
+        }
+        let preAcquisitionSnapshot = try ResolverFileSnapshot.read(fixture.file.path)
+        XCTAssertNotEqual(savedBeforeQuit.inode, preAcquisitionSnapshot.inode)
+        XCTAssertEqual(preAcquisitionSnapshot.bytes, savedBeforeQuit.bytes)
+        XCTAssertEqual(preAcquisitionSnapshot.owner, savedBeforeQuit.owner)
+        XCTAssertEqual(preAcquisitionSnapshot.group, savedBeforeQuit.group)
+        XCTAssertEqual(preAcquisitionSnapshot.mode, savedBeforeQuit.mode)
+
+        let relaunchedStatus = try await fixture.capability.install()
+
+        XCTAssertEqual(relaunchedStatus.health, "healthy")
+        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.previous, preAcquisitionSnapshot)
+        let acquisitionCount = await fixture.helper.acquisitionCount()
+        XCTAssertEqual(acquisitionCount, 1)
+        _ = try await fixture.capability.remove()
+        let restored = try ResolverFileSnapshot.read(fixture.file.path)
+        XCTAssertEqual(restored.bytes, originalBytes)
+        XCTAssertEqual(restored.owner, savedBeforeQuit.owner)
+        XCTAssertEqual(restored.group, savedBeforeQuit.group)
+        XCTAssertEqual(restored.mode, savedBeforeQuit.mode)
+    }
+
+    func testUnavailableProductionHelperHasDistinctRegistrationStatus() async {
+        let capability = DNSCapability(helper: UnregisteredDNSHelper(), responder: FixtureDNSResponder())
+
+        let status = await capability.status()
+
+        XCTAssertEqual(status.state, .unavailable)
+        XCTAssertEqual(status.ownership, .unknown)
+        XCTAssertEqual(status.health, "privilege-unavailable")
+        XCTAssertEqual(status.conflict, "Vaelen’s privileged helper is not registered or approved.")
+    }
+
     func testQuitRestoresHerdResolverAndRetainsDNSStartChoiceForReacquisition() async throws {
         let herd = Data("# Herd resolver\nnameserver 127.0.0.1\nsearch test\noptions timeout:1\n".utf8)
         let fixture = try makeRealFixture(contents: herd, ignoreTermination: false)
@@ -19,6 +119,7 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.file), herd)
         XCTAssertProcessGone(identity.pid)
         XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .resolverRestored)
+        XCTAssertEqual(try fixture.ledger.dnsRecord()?.active, false, "Quit finalizes active DNS ownership while retaining the exact-preimage authorization")
         XCTAssertEqual(try intents.enabledServices(), ["dns"])
 
         let relaunched = DNSCapability(helper: fixture.helper, responder: fixture.makeNewSupervisor(), port: fixture.port, ledger: fixture.ledger)
@@ -27,7 +128,27 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .owned)
         _ = try await relaunched.shutdownForQuit()
         XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), baseline)
+        XCTAssertEqual(try fixture.ledger.dnsRecord()?.active, false)
         XCTAssertEqual(try intents.enabledServices(), ["dns"])
+    }
+
+    func testExternalResolverDriftBetweenInspectionAndPrivilegedMutationFailsClosed() async throws {
+        let fixture = try makeFixture(contents: Data("resolver A\n".utf8))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let actualBytes = Data("resolver B changed externally\n".utf8)
+        await fixture.helper.changeResolverBeforeNextAcquisition(to: actualBytes)
+
+        do {
+            _ = try await fixture.capability.install()
+            XCTFail("external state change between inspection and write must fail closed")
+        } catch {
+            XCTAssertEqual(error as? DNSCapabilityError, .ownershipMismatch)
+        }
+
+        let actual = try ResolverFileSnapshot.read(fixture.file.path)
+        XCTAssertEqual(actual.bytes, actualBytes)
+        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .uncertain)
+        XCTAssertNotNil(try fixture.ledger.resolverOwnershipRecord()?.previous)
     }
 
     func testChangedResolverBlocksSavedDNSReacquisitionAndRemainsUntouched() async throws {
@@ -127,22 +248,17 @@ final class DNSCapabilityTests: XCTestCase {
         let edit = Data("nameserver 192.0.2.77\n# independent edit\n".utf8)
         try edit.write(to: fixture.file)
         let editedSnapshot = try ResolverFileSnapshot.read(fixture.file.path)
-        do { _ = try await fixture.capability.remove(); XCTFail("independent resolver edit must block disable") }
-        catch { XCTAssertEqual(error as? DNSCapabilityError, .ownershipMismatch) }
+        _ = try await fixture.capability.remove()
         XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), editedSnapshot)
         XCTAssertEqual(try Data(contentsOf: fixture.file), edit)
-        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .owned)
-        XCTAssertTrue(isProcessLive(identity.pid), "responder may still serve the independently edited resolver")
+        XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
+        XCTAssertFalse(isProcessLive(identity.pid), "Vaelen stops its responder while preserving newer external resolver state")
         let running = await fixture.responder.status()
-        XCTAssertEqual(running.state, .ownedRunning)
-        XCTAssertTrue(running.listenerResponding)
-        // The fixture owns its child handle; stop it explicitly after proving
-        // disable did not stop it. The independent file remains untouched.
-        _ = try await fixture.responder.stop(expected: identity, timeout: 1)
+        XCTAssertEqual(running.state, .exited)
         XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), editedSnapshot)
     }
 
-    func testCoreRestartHasNoPIDOnlyAuthorityAndUnrelatedListenerIsNotSignaled() async throws {
+    func testCoreRestartUsesRecordedResponderIdentityAndLeavesUnrelatedListenerAlone() async throws {
         let fixture = try makeRealFixture(contents: nil, ignoreTermination: false)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try await fixture.capability.install()
@@ -153,27 +269,30 @@ final class DNSCapabilityTests: XCTestCase {
         let restartedStatus = await restarted.status()
         XCTAssertEqual(restartedStatus.health, "responder-unverified")
         XCTAssertTrue(isProcessLive(identity.pid))
-        do { _ = try await restarted.remove(); XCTFail("new Core instance has no launch handle") }
-        catch { guard case DNSCapabilityError.responderShutdownFailed = error else { return XCTFail("unexpected error: \(error)") } }
+        _ = try await restarted.remove()
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.file.path))
-        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .resolverRestored)
-        XCTAssertTrue(isProcessLive(identity.pid), "persisted PID must not be used as signal authority")
-
-        XCTAssertEqual(kill(identity.pid, SIGTERM), 0)
+        XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
         XCTAssertProcessGone(identity.pid)
         let exited = await fixture.responder.status()
         XCTAssertEqual(exited.state, .exited)
         XCTAssertFalse(exited.listenerResponding)
         let exitedResolverStatus = await fixture.capability.status()
-        XCTAssertEqual(exitedResolverStatus.health, "responder-shutdown-pending")
+        XCTAssertEqual(exitedResolverStatus.state, .notInstalled)
+        _ = try await fixture.capability.install()
+        _ = try await fixture.capability.shutdownForQuit()
         let unrelated = try fixture.launchUnrelatedResponder()
         let endpointProbe = fixture.makeNewSupervisor()
         let endpointReady = await waitForListener(endpointProbe)
         XCTAssertTrue(endpointReady)
         let observed = await fixture.responder.status()
         XCTAssertEqual(observed.state, .unverified)
-        do { _ = try await fixture.capability.remove(); XCTFail("unrelated listener prevents success") }
-        catch { guard case DNSCapabilityError.responderShutdownFailed = error else { return XCTFail("unexpected error: \(error)") } }
+        do { _ = try await fixture.capability.remove(); XCTFail("unrelated listener prevents responder cleanup") }
+        catch {
+            guard case DNSCapabilityError.responderUnverified = error else {
+                if case DNSCapabilityError.responderShutdownFailed = error { return }
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
         XCTAssertTrue(unrelated.isRunning)
         XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .resolverRestored)
         unrelated.terminate(); unrelated.waitUntilExit()
@@ -181,13 +300,57 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
     }
 
-    func testExternalResolverConflictsWithoutMutation() async throws {
+    func testExternalResolverIsTemporarilyAcquiredAndRestoredExactly() async throws {
         let fixture = try makeFixture(contents: Data("nameserver 192.0.2.2\n".utf8))
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let before = try ResolverFileSnapshot.read(fixture.file.path)
-        do { _ = try await fixture.capability.install(); XCTFail("expected conflict") } catch { XCTAssertEqual(error as? DNSCapabilityError, .externalConflict) }
-        XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), before)
+        let observed = await fixture.capability.status()
+        XCTAssertEqual(observed.state, .notInstalled)
+        let acquired = try await fixture.capability.install()
+        XCTAssertEqual(acquired.health, "healthy")
+        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.previous, before)
+        _ = try await fixture.capability.remove()
+        let restored = try ResolverFileSnapshot.read(fixture.file.path)
+        XCTAssertEqual(restored.bytes, before.bytes)
+        XCTAssertEqual(restored.owner, before.owner)
+        XCTAssertEqual(restored.group, before.group)
+        XCTAssertEqual(restored.mode, before.mode)
         XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
+    }
+
+    func testExternalResolverMutationWhileActiveIsNeverOverwrittenOnQuit() async throws {
+        let fixture = try makeFixture(contents: Data("nameserver 192.0.2.7\noptions timeout:1\n".utf8))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try await fixture.capability.install()
+        let edited = Data("nameserver 203.0.113.9\n".utf8)
+        try edited.write(to: fixture.file)
+        _ = try await fixture.capability.shutdownForQuit()
+        XCTAssertEqual(try Data(contentsOf: fixture.file), edited)
+        XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
+    }
+
+    func testUncertainDNSRecordWithKnownWriteStillReleasesOnExternalDrift() async throws {
+        let fixture = try makeFixture(contents: Data("nameserver 192.0.2.7\n".utf8))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try await fixture.capability.install()
+        let active = try XCTUnwrap(fixture.ledger.resolverOwnershipRecord())
+        try fixture.ledger.saveResolverOwnershipRecord(.init(phase: .uncertain, previous: active.previous, intendedBytes: active.intendedBytes, written: active.written, responder: active.responder))
+        let external = Data("nameserver 203.0.113.27\n".utf8)
+        try external.write(to: fixture.file)
+
+        _ = try await fixture.capability.shutdownForQuit()
+
+        XCTAssertEqual(try Data(contentsOf: fixture.file), external)
+        XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
+        let responder = await fixture.responder.status()
+        XCTAssertEqual(responder.state, .exited)
+    }
+
+    func testPrivilegedDNSClientRejectsInvalidPortBeforeHelperRequest() async throws {
+        let helper = HelperPrivilegedDNS(serviceName: "dev.vaelen.no-such-test-helper")
+        let snapshot = ResolverFileSnapshot(exists: false, bytes: nil, owner: nil, group: nil, mode: nil, device: nil, inode: nil, fileType: nil)
+        do { _ = try await helper.installTestResolver(port: 53, replacing: snapshot); XCTFail("invalid resolver port must be rejected") }
+        catch { XCTAssertEqual(error as? DNSCapabilityError, .resolverConflict("Invalid fixed-target resolver acquisition request")) }
     }
 
     func testAbsentResolverRepeatedEnableDisableAndRestartRestoresExactAbsence() async throws {
@@ -232,20 +395,19 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
     }
 
-    func testIndependentEditIsPreservedAndOwnershipRecordRetained() async throws {
+    func testIndependentEditIsPreservedWhileVaelenReleasesItsDNSResources() async throws {
         let fixture = try makeFixture(contents: Data("nameserver 127.0.0.1\n".utf8))
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try await fixture.capability.install(takeover: true)
         let externalBytes = Data("nameserver 192.0.2.53\n# external edit\n".utf8)
         try await fixture.helper.externalWrite(externalBytes)
         let external = try ResolverFileSnapshot.read(fixture.file.path)
-        do { _ = try await fixture.capability.remove(); XCTFail("expected conflict") } catch { XCTAssertEqual(error as? DNSCapabilityError, .ownershipMismatch) }
+        _ = try await fixture.capability.remove()
         XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), external)
         XCTAssertEqual(try Data(contentsOf: fixture.file), externalBytes)
-        XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .owned)
+        XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
         let status = await fixture.capability.status()
-        XCTAssertEqual(status.state, .conflict)
-        XCTAssertNotNil(status.conflict)
+        XCTAssertEqual(status.state, .notInstalled)
     }
 
     func testRepeatedDisableIsIdempotentAfterSuccessfulRestore() async throws {
@@ -285,9 +447,8 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertEqual(try reopenedLedger.resolverOwnershipRecord()?.previous, before)
         let restartedStatus = await afterRestart.status()
         XCTAssertEqual(restartedStatus.health, "responder-unverified")
-        do { _ = try await afterRestart.remove(); XCTFail("new Core instance must not claim the old responder handle") }
-        catch { guard case DNSCapabilityError.responderShutdownFailed = error else { return XCTFail("unexpected error: \(error)") } }
-        XCTAssertEqual(try reopenedLedger.resolverOwnershipRecord()?.phase, .resolverRestored)
+        _ = try await afterRestart.remove()
+        XCTAssertNil(try reopenedLedger.resolverOwnershipRecord())
         XCTAssertEqual(try ResolverFileSnapshot.read(fixture.file.path), before)
         XCTAssertEqual(try Data(contentsOf: fixture.file), prior)
         _ = try await fixture.capability.remove()
@@ -327,9 +488,9 @@ final class DNSCapabilityTests: XCTestCase {
         let replacement = Data("independent replacement\n".utf8)
         try replacement.write(to: replacementFixture.file)
         let replacementState = try ResolverFileSnapshot.read(replacementFixture.file.path)
-        do { _ = try await replacementFixture.capability.remove(); XCTFail("expected replacement conflict") } catch { XCTAssertEqual(error as? DNSCapabilityError, .ownershipMismatch) }
+        _ = try await replacementFixture.capability.remove()
         XCTAssertEqual(try ResolverFileSnapshot.read(replacementFixture.file.path), replacementState)
-        XCTAssertEqual(try fixtureRecord(replacementFixture).phase, .owned)
+        XCTAssertNil(try replacementFixture.ledger.resolverOwnershipRecord())
 
         let symlinkFixture = try makeFixture(contents: nil)
         defer { try? FileManager.default.removeItem(at: symlinkFixture.root) }
@@ -441,21 +602,39 @@ final class DNSCapabilityTests: XCTestCase {
     private func awaitStatus(_ capability: DNSCapability) async -> DNSStatus { await capability.status() }
 }
 
+private struct UnregisteredDNSHelper: PrivilegedDNSHelper {
+    func inspectTestResolver() async throws -> ResolverInspection { throw DNSCapabilityError.privilegeUnavailable }
+    func installTestResolver(port: Int, replacing: ResolverFileSnapshot?) async throws -> ResolverFileSnapshot { throw DNSCapabilityError.privilegeUnavailable }
+    func removeTestResolver(expected: ResolverFileSnapshot, restore: ResolverFileSnapshot) async throws { throw DNSCapabilityError.privilegeUnavailable }
+}
+
 private actor FileDNSHelper: PrivilegedDNSHelper {
     private let path: String
     private var failInstall = false
     private var failRestore = false
+    private var inspectionDelay: Duration = .zero
+    private var installs = 0
+    private var nextAcquisitionDrift: Data?
     init(path: String) { self.path = path }
     func failNextInstall() { failInstall = true }
     func failNextRestore() { failRestore = true }
+    func delayInspections(by duration: Duration) { inspectionDelay = duration }
+    func acquisitionCount() -> Int { installs }
+    func changeResolverBeforeNextAcquisition(to bytes: Data) { nextAcquisitionDrift = bytes }
     func externalWrite(_ bytes: Data) throws { try bytes.write(to: URL(fileURLWithPath: path), options: .atomic) }
 
     func inspectTestResolver() async throws -> ResolverInspection {
+        if inspectionDelay > .zero { try await Task.sleep(for: inspectionDelay) }
         let snapshot = try ResolverFileSnapshot.read(path)
         return ResolverInspection(exists: snapshot.exists, content: snapshot.bytes.map { String(decoding: $0, as: UTF8.self) }, ownership: snapshot.exists ? .unknown : .none, snapshot: snapshot)
     }
 
     func installTestResolver(port: Int, replacing: ResolverFileSnapshot?) async throws -> ResolverFileSnapshot {
+        installs += 1
+        if let drift = nextAcquisitionDrift {
+            nextAcquisitionDrift = nil
+            try drift.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
         let before = try ResolverFileSnapshot.read(path)
         guard before == replacing else { throw DNSCapabilityError.ownershipMismatch }
         if failInstall {
@@ -506,20 +685,27 @@ private actor FileDNSHelper: PrivilegedDNSHelper {
 
 private actor FixtureDNSResponder: DNSResponderControlling {
     private var running = false
+    private var executableAvailable = true
+    private var stoppedAfterRestart = false
     private var shouldTimeout = false
     private let isRestarted: Bool
     private let identity = DNSResponderIdentity(pid: 42, executablePath: "/fixture/vaelendns", arguments: ["--port", "53535"], startedAt: "fixture")
     init(isRestarted: Bool = false) { self.isRestarted = isRestarted }
     func setTimeout(_ value: Bool) { shouldTimeout = value }
+    func setExecutableAvailable(_ value: Bool) { executableAvailable = value }
+    func validateExecutable() async throws {
+        guard executableAvailable else { throw DNSCapabilityError.processFailed("DNS responder executable is unavailable") }
+    }
     func status() async -> DNSResponderStatus {
+        if isRestarted && stoppedAfterRestart { return .init(state: .stopped) }
         if running { return .init(state: .ownedRunning, pid: identity.pid, listenerResponding: true, identity: identity) }
         if isRestarted { return .init(state: .unverified, listenerResponding: true) }
         return .init(state: .exited, pid: identity.pid, listenerResponding: false, identity: identity)
     }
     func start() async throws -> DNSResponderIdentity { running = true; return identity }
     func stop(expected: DNSResponderIdentity, timeout: TimeInterval) async throws -> DNSResponderStatus {
-        if isRestarted { throw DNSCapabilityError.responderUnverified("fixture has no retained launch handle") }
         guard expected == identity else { throw DNSCapabilityError.responderUnverified("fixture identity mismatch") }
+        if isRestarted { stoppedAfterRestart = true; return .init(state: .exited, pid: identity.pid, listenerResponding: false, identity: identity) }
         if shouldTimeout { throw DNSCapabilityError.responderShutdownFailed("injected fixture stop timeout") }
         running = false
         return .init(state: .exited, pid: identity.pid, listenerResponding: false, identity: identity)

@@ -3,6 +3,24 @@ import Darwin
 @testable import VaelenCore
 
 final class PHPFPMRuntimeLifecycleTests: XCTestCase {
+    func testRelaunchedCoreStopsRecordedFPMMasterWithoutKillingSiblingProcesses() throws {
+        let defaultLayout = VaelenFilesystemLayout()
+        let packageURL = defaultLayout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
+        let installed = try JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageURL))
+        let fixture = try IsolatedPHPFixture(installedPackage: installed)
+        defer { _ = fixture.cleanup() }
+
+        let started = try fixture.module.start(requestedVersion: installed.version)
+        let pid = try XCTUnwrap(started.pid)
+        let manifestURL = fixture.root.appendingPathComponent("fixture-manifest.json")
+        let relaunchedCore = PHPModule(layout: fixture.layout, location: FilePHPManifestLocation(manifestURL: manifestURL))
+
+        XCTAssertEqual(try relaunchedCore.stop(requestedVersion: installed.version).state, .stopped)
+        XCTAssertProcessGone(pid)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.socketURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.processRecordURL.path))
+    }
+
     func testPHPFPMIsolationRegressionLeavesNormalRuntimeStoppedAndUnrelatedProcessUntouched() throws {
         let defaultLayout = VaelenFilesystemLayout()
         let packageURL = defaultLayout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
@@ -128,10 +146,8 @@ final class PHPFPMRuntimeLifecycleTests: XCTestCase {
         var mismatchedRecord = try XCTUnwrap(JSONSerialization.jsonObject(with: originalRecord) as? [String: Any])
         mismatchedRecord["executable"] = "/not/the/launched/php-fpm"
         try JSONSerialization.data(withJSONObject: mismatchedRecord).write(to: recordURL, options: .atomic)
-        XCTAssertThrowsError(try module.stop(requestedVersion: "8.4.23")) { error in
-            XCTAssertEqual(error as? PHPModuleError, .processIdentityMismatch)
-        }
-        XCTAssertEqual(try module.status(requestedVersion: "8.4.23").state, .degraded)
+        XCTAssertEqual(try module.stop(requestedVersion: "8.4.23").state, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path), "stale Vaelen bookkeeping should not block cleanup")
         XCTAssertTrue(moduleProcessIsLive(mismatchPID), "identity mismatch must not signal the live FPM master")
         XCTAssertTrue(isUnixSocket(managedSocket.path), "identity mismatch must not remove the owned socket")
         recordToRestoreAfterIdentityTest = originalRecord
@@ -141,6 +157,14 @@ final class PHPFPMRuntimeLifecycleTests: XCTestCase {
         XCTAssertFalse(moduleProcessIsLive(mismatchPID))
         XCTAssertFalse(FileManager.default.fileExists(atPath: managedSocket.path))
         XCTAssertTrue(external.isRunning, "unrelated FPM must still be running after mismatch recovery")
+
+        let restartStart = try module.start(requestedVersion: "8.4.23")
+        let restartPID = try XCTUnwrap(restartStart.pid)
+        let relaunchedCore = PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: manifestURL))
+        XCTAssertEqual(try relaunchedCore.stop(requestedVersion: "8.4.23").state, .stopped)
+        XCTAssertProcessGone(restartPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: managedSocket.path))
+        XCTAssertTrue(external.isRunning, "Core restart cleanup must leave unrelated FPM untouched")
     }
 
     private func createFileIfNeeded(_ url: URL) -> URL {

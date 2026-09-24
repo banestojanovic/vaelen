@@ -50,6 +50,8 @@ public final class DaemonServer: @unchecked Sendable {
             Task.detached { [dispatcher, logger, server] in
                 await Self.handle(client, dispatcher: dispatcher, logger: logger) {
                     guard await dispatcher.shouldExitAfterShutdownResponse() else { return }
+                    let timestamp = String(format: "%.3f", Date().timeIntervalSince1970)
+                    logger.notice("SHUTDOWN_TIMING Core exit requested epoch=\(timestamp, privacy: .public)")
                     server.stop()
                 }
             }
@@ -65,21 +67,19 @@ public final class DaemonServer: @unchecked Sendable {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard getppid() != parentPID else { continue }
                 let result = await dispatcher.shutdownForParentExit()
-                if result.completed {
-                    let supportRoot = endpointPaths.root.deletingLastPathComponent()
-                    let activityURL = supportRoot.appendingPathComponent("state/activity")
-                    do {
-                        try FileManager.default.createDirectory(at: activityURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        try Data("inactive\n".utf8).write(to: activityURL, options: .atomic)
-                    } catch {
-                        logger.error("Core cleaned up after its GUI exited, but could not mark shell PHP inactive: \(String(describing: error), privacy: .public)")
-                    }
-                    self?.stop()
-                    return
+                let supportRoot = endpointPaths.root.deletingLastPathComponent()
+                let activityURL = supportRoot.appendingPathComponent("state/activity")
+                do {
+                    try FileManager.default.createDirectory(at: activityURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try Data("inactive\n".utf8).write(to: activityURL, options: .atomic)
+                } catch {
+                    logger.error("Core cleaned up after its GUI exited, but could not mark shell PHP inactive: \(String(describing: error), privacy: .public)")
                 }
-                // A resistant owned child must not turn a vanished GUI into
-                // a permanently wedged Core; retry through the same routine.
-                try? await Task.sleep(for: .seconds(2))
+                if !result.completed {
+                    logger.error("Best-effort parent-exit cleanup had incomplete components: \(result.components.filter { !$0.succeeded }.map(\.component).joined(separator: ", "), privacy: .public)")
+                }
+                self?.stop()
+                return
             }
         }
     }

@@ -15,6 +15,7 @@ public actor CoreRequestDispatcher {
     private let tls: TLSCapability
     private let ports: StandardPortsCapability
     private let serviceIntents: ServiceIntentStore
+    private let shutdownTimingLogger = Logger(subsystem: "dev.vaelen.daemon", category: "shutdown-timing")
     private var restorationStarted = false
     private var restorationTask: Task<Void, Never>?
     private var routeIntents: [RouteID: RouteIntent]
@@ -82,7 +83,14 @@ public actor CoreRequestDispatcher {
         do {
             switch method {
             case .status:
-                return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1, serviceIssues: serviceIntents.failures()))), true)
+                // The GUI uses this response to leave its bootstrap/loading
+                // presentation. Do not publish saved desired state before the
+                // one-shot autostart pass has settled, or the immediately
+                // following service probes can be cached as a false Retry.
+                if let restorationTask { await restorationTask.value }
+                let savedIntents = try? serviceIntents.enabledServices()
+                let issues = serviceIntents.failures()
+                return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1, serviceIssues: issues, serviceIntents: savedIntents))), true)
             case .shutdown:
                 fatalError("shutdown is handled before provider dispatch")
             case .projectLink:
@@ -260,7 +268,8 @@ public actor CoreRequestDispatcher {
                 let result = try await updatePHPTarget(projectID: params.projectID, routeID: params.routeID, expectedCurrentSocket: params.expectedCurrentSocket)
                 return (.init(id: request.id, result: .routePHPTargetUpdate(result)), true)
             case .dnsStatus:
-                return (.init(id: request.id, result: .dnsStatus(.init(dns: await dns.status()))), true)
+                let value = await dns.status()
+                return (.init(id: request.id, result: .dnsStatus(.init(dns: value))), true)
             case .dnsInstall:
                 let params = try request.params?.decode(DNSInstallRequest.self) ?? .init()
                 try serviceIntents.set("dns", enabled: true); return (.init(id: request.id, result: .dnsStatus(.init(dns: try await dns.install(takeover: params.takeover)))), true)
@@ -383,7 +392,7 @@ public actor CoreRequestDispatcher {
     }
 
     public func shouldExitAfterShutdownResponse() -> Bool {
-        shutdownTask != nil && shutdownBegun && lastShutdownResponse?.completed == true
+        shutdownTask != nil && shutdownBegun && !shutdownRunInFlight && lastShutdownResponse != nil
     }
 
     public func isShutdownInProgress() -> Bool { shutdownBegun }
@@ -391,6 +400,7 @@ public actor CoreRequestDispatcher {
     private var lastShutdownResponse: CoreShutdownResponse?
 
     private func performShutdown() async -> CoreShutdownResponse {
+        logShutdownTiming("shutdown begin")
         restorationTask?.cancel()
         if let restorationTask { await restorationTask.value }
         var outcomes = [CoreShutdownComponentResult]()
@@ -406,37 +416,46 @@ public actor CoreRequestDispatcher {
             let packages = php.installedVersions()
             if packages.isEmpty { outcomes.append(.init(component: "php-fpm", succeeded: true, detail: "No installed managed PHP runtimes.")) }
             for package in packages {
+                logShutdownTiming("PHP \(package.version) begin")
                 result("php-fpm \(package.version)") {
                     let status = try php.stop(requestedVersion: package.version)
                     guard status.state == .stopped else { throw NSError(domain: "VaelenShutdown", code: 1, userInfo: [NSLocalizedDescriptionKey: "PHP-FPM reports \(status.health)"]) }
                     return status.health == "stopped" ? "Stopped or already stopped." : "Stopped."
                 }
+                logShutdownTiming("PHP \(package.version) end")
             }
         } else { outcomes.append(.init(component: "php-fpm", succeeded: true, detail: "PHP provider is not configured.")) }
 
         if let mysql {
+            logShutdownTiming("MySQL begin")
             result("mysql") {
                 let status = try mysql.stop()
                 guard status.state == .stopped || status.state == .notInstalled else { throw NSError(domain: "VaelenShutdown", code: 2, userInfo: [NSLocalizedDescriptionKey: "MySQL reports \(status.health)"]) }
                 return "Stopped or already stopped."
             }
+            logShutdownTiming("MySQL end")
         } else { outcomes.append(.init(component: "mysql", succeeded: true, detail: "MySQL provider is not configured.")) }
 
         if let mailpit {
+            logShutdownTiming("Mailpit begin")
             result("mailpit") {
                 let status = try mailpit.stop()
                 guard status.state == .stopped || status.state == .installed || status.state == .notInstalled else { throw NSError(domain: "VaelenShutdown", code: 3, userInfo: [NSLocalizedDescriptionKey: "Mailpit reports \(status.health)"]) }
                 return "Stopped or already stopped."
             }
+            logShutdownTiming("Mailpit end")
         } else { outcomes.append(.init(component: "mailpit", succeeded: true, detail: "Mailpit provider is not configured.")) }
 
+        logShutdownTiming("Caddy begin")
         do {
             try await router.stop()
             let status = await router.status()
             guard status.state == .stopped else { throw NSError(domain: "VaelenShutdown", code: 4, userInfo: [NSLocalizedDescriptionKey: "Caddy reports \(status.health)"]) }
             outcomes.append(.init(component: "caddy", succeeded: true, detail: "Stopped or already stopped."))
         } catch { outcomes.append(.init(component: "caddy", succeeded: false, detail: String(describing: error))) }
+        logShutdownTiming("Caddy end")
 
+        logShutdownTiming("DNS begin")
         do {
             let status = try await dns.shutdownForQuit()
             let responderState = status.responderState
@@ -444,16 +463,25 @@ public actor CoreRequestDispatcher {
             guard respondersStopped else { throw NSError(domain: "VaelenShutdown", code: 5, userInfo: [NSLocalizedDescriptionKey: "DNS responder remains \(responderState.rawValue); resolver state is \(status.health)"]) }
             outcomes.append(.init(component: "dns", succeeded: true, detail: "Resolver ownership restored where recorded; owned responder is stopped."))
         } catch { outcomes.append(.init(component: "dns", succeeded: false, detail: String(describing: error))) }
+        logShutdownTiming("DNS end")
 
+        logShutdownTiming("post-DNS cleanup begin")
         do {
             let status = try await ports.shutdownCleanup()
             outcomes.append(.init(component: "standard-ports-pf", succeeded: true, detail: status.detail ?? (status.state == .absent ? "No Vaelen PF forwarding remains." : "Existing PF state was left unchanged.")))
         } catch { outcomes.append(.init(component: "standard-ports-pf", succeeded: false, detail: String(describing: error))) }
+        logShutdownTiming("post-DNS cleanup end")
 
         let response = CoreShutdownResponse(components: outcomes)
         lastShutdownResponse = response
         shutdownRunInFlight = false
+        logShutdownTiming("shutdown response ready")
         return response
+    }
+
+    private func logShutdownTiming(_ event: String) {
+        let timestamp = String(format: "%.3f", Date().timeIntervalSince1970)
+        shutdownTimingLogger.notice("SHUTDOWN_TIMING \(event, privacy: .public) epoch=\(timestamp, privacy: .public)")
     }
 
 

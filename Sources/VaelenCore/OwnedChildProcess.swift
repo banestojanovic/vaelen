@@ -6,8 +6,9 @@ import Darwin
 public final class OwnedChildProcess: @unchecked Sendable {
     public let process: Process
     public let label: String
-    private let lock = NSLock()
+    private let condition = NSCondition()
     private var reaped = false
+    private var stopping = false
     private var pendingDescendants: [Int32: String] = [:]
     private var observedDescendants: [Int32: String] = [:]
 
@@ -30,25 +31,42 @@ public final class OwnedChildProcess: @unchecked Sendable {
         return OwnedChildProcess(process: child, label: label)
     }
 
-    /// Returns true while the owned child is live. If it exited, waits for its
-    /// termination result to be collected before returning false.
+    /// Returns true while the owned child is live. Foundation publishes the
+    /// exit state and terminationStatus through Process; do not call
+    /// waitUntilExit here. In particular, waitUntilExit can wait on Foundation
+    /// bookkeeping even after isRunning has become false.
     public func isRunningAndReapedIfExited() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard !reaped else { return false }
-        if process.isRunning {
-            observedDescendants.merge(Self.descendantIdentities(of: process.processIdentifier)) { _, latest in latest }
-            return true
+        condition.lock()
+        guard !reaped else { condition.unlock(); return false }
+        guard process.isRunning else {
+            reaped = true
+            pendingDescendants.merge(observedDescendants) { _, latest in latest }
+            condition.unlock()
+            return false
         }
-        process.waitUntilExit()
-        reaped = true
-        pendingDescendants.merge(observedDescendants) { _, latest in latest }
-        return false
+        let pid = process.processIdentifier
+        condition.unlock()
+
+        let descendants = Self.descendantIdentities(of: pid)
+        condition.lock()
+        if !reaped && process.isRunning {
+            observedDescendants.merge(descendants) { _, latest in latest }
+        } else if !reaped {
+            reaped = true
+            pendingDescendants.merge(observedDescendants) { _, latest in latest }
+            pendingDescendants.merge(descendants) { _, latest in latest }
+        }
+        let running = !reaped && process.isRunning
+        condition.unlock()
+        return running
     }
 
     public var hasLiveOwnedDescendants: Bool {
-        lock.lock(); defer { lock.unlock() }
+        condition.lock()
         pendingDescendants.merge(observedDescendants) { _, latest in latest }
-        return !Self.descendantsAreGone(pendingDescendants)
+        let descendants = pendingDescendants
+        condition.unlock()
+        return !Self.descendantsAreGone(descendants)
     }
 
     /// Gracefully terminate this child only. Never escalates to SIGKILL; a
@@ -61,37 +79,65 @@ public final class OwnedChildProcess: @unchecked Sendable {
     /// requested, waits for the descendants that were children of its master
     /// when shutdown began (PHP-FPM workers).
     public func terminateAndWait(timeout: TimeInterval, signal: Int32, waitForDescendants: Bool) -> Bool {
-        lock.lock(); defer { lock.unlock() }
+        condition.lock()
+        while stopping { condition.wait() }
         if reaped {
+            let descendants = pendingDescendants
+            condition.unlock()
             guard waitForDescendants else { return true }
-            return Self.waitForDescendantsToExit(pendingDescendants, timeout: timeout)
+            return Self.waitForDescendantsToExit(descendants, timeout: timeout)
         }
-        guard process.processIdentifier > 0 else { process.waitUntilExit(); reaped = true; return true }
-        let descendants = waitForDescendants ? observedDescendants.merging(Self.descendantIdentities(of: process.processIdentifier)) { _, latest in latest } : [:]
+        let pid = process.processIdentifier
+        guard pid > 0 else { reaped = true; condition.unlock(); return true }
+        stopping = true
+        let priorDescendants = observedDescendants
+        condition.unlock()
+
+        let descendants = waitForDescendants
+            ? priorDescendants.merging(Self.descendantIdentities(of: pid)) { _, latest in latest }
+            : [:]
+        condition.lock()
         if waitForDescendants { pendingDescendants = descendants }
-        if !process.isRunning {
-            process.waitUntilExit(); reaped = true
+        let wasRunning = process.isRunning
+        condition.unlock()
+        if !wasRunning {
+            finishStop(descendants: descendants)
             return !waitForDescendants || Self.waitForDescendantsToExit(descendants, timeout: timeout)
         }
         // Foundation's Process handle proves the launched master identity.
         // SIGQUIT is PHP-FPM's graceful-stop signal (TERM is not equivalent).
         if signal == SIGTERM { process.terminate() }
-        else if kill(process.processIdentifier, signal) != 0 && errno != ESRCH { return false }
+        else if process.isRunning, kill(pid, signal) != 0 && errno != ESRCH {
+            finishStop(descendants: descendants, markReaped: false)
+            return false
+        }
         let deadline = Date().addingTimeInterval(timeout)
+        var childExited = false
         while Date() < deadline {
             if !process.isRunning {
-                process.waitUntilExit(); reaped = true
-                if !waitForDescendants || Self.waitForDescendantsToExit(descendants, timeout: max(0, deadline.timeIntervalSinceNow)) { pendingDescendants = [:]; return true }
+                childExited = true
+                break
             }
             usleep(20_000)
         }
-        if !process.isRunning {
-            process.waitUntilExit(); reaped = true
-            let gone = !waitForDescendants || Self.descendantsAreGone(descendants)
-            if gone { pendingDescendants = [:] }
-            return gone
+        if !childExited { childExited = !process.isRunning }
+        finishStop(descendants: descendants, markReaped: childExited)
+        guard childExited else { return false }
+        let descendantsGone = !waitForDescendants || Self.waitForDescendantsToExit(descendants, timeout: max(0, deadline.timeIntervalSinceNow))
+        if descendantsGone { condition.lock(); pendingDescendants = [:]; condition.unlock() }
+        return descendantsGone
+    }
+
+    private func finishStop(descendants: [Int32: String], markReaped: Bool = true) {
+        condition.lock()
+        if markReaped {
+            reaped = true
+            pendingDescendants.merge(descendants) { _, latest in latest }
+            pendingDescendants.merge(observedDescendants) { _, latest in latest }
         }
-        return false
+        stopping = false
+        condition.broadcast()
+        condition.unlock()
     }
 
     private static func descendantIdentities(of root: Int32) -> [Int32: String] {
@@ -100,7 +146,10 @@ public final class OwnedChildProcess: @unchecked Sendable {
         process.arguments = ["-axo", "pid=,ppid=,lstart="]
         process.standardOutput = output; process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return [:] }
-        let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        // EOF is sufficient for this one-shot `ps` probe. Avoid introducing
+        // another synchronous Process.waitUntilExit into child lifecycle
+        // observation; the kernel closes its pipe when ps exits.
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         guard let text = String(data: data, encoding: .utf8) else { return [:] }
         var parents = [Int32: Int32](), identities = [Int32: String]()
         for line in text.split(whereSeparator: \.isNewline) {
@@ -126,7 +175,7 @@ public final class OwnedChildProcess: @unchecked Sendable {
             probe.arguments = ["-p", "\(pid)", "-o", "lstart="]
             probe.standardOutput = output; probe.standardError = FileHandle.nullDevice
             guard (try? probe.run()) != nil else { return true }
-            let data = output.fileHandleForReading.readDataToEndOfFile(); probe.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
             let observed = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return observed.isEmpty || observed != startedAt
         }

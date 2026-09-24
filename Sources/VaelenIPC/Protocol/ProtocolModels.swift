@@ -39,7 +39,8 @@ public struct CoreStatusResponse: Codable, Equatable, Sendable {
     public let core: CoreRuntimeStatus
     public let protocolVersion: Int
     public let serviceIssues: [String: String]?
-    public init(core: CoreRuntimeStatus, protocolVersion: Int, serviceIssues: [String: String]? = nil) { self.core = core; self.protocolVersion = protocolVersion; self.serviceIssues = serviceIssues }
+    public let serviceIntents: Set<String>?
+    public init(core: CoreRuntimeStatus, protocolVersion: Int, serviceIssues: [String: String]? = nil, serviceIntents: Set<String>? = nil) { self.core = core; self.protocolVersion = protocolVersion; self.serviceIssues = serviceIssues; self.serviceIntents = serviceIntents }
 }
 
 public struct CoreShutdownComponentResult: Codable, Equatable, Sendable {

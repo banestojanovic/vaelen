@@ -96,14 +96,17 @@ same path. Missing registrations remain visible as unavailable metadata.
 Vaelen never owns or modifies project source directories. Link, unlink, park,
 and unpark change only Vaelen's registry metadata.
 
-Milestone 0 uses manual daemon startup. LaunchAgent installation and
-socket-activation are intentionally deferred.
+The package CLI remains usable with a manually started per-user daemon.
+LaunchAgent installation and socket activation remain deferred; the installed
+menu-bar app embeds and starts its matching Core when no compatible Core is
+available, and stops only the Core process it started when Vaelen quits.
 
 ## App
 
 Open the Xcode project under `App/Vaelen` when full Xcode is installed. The
-app is a first-class Core client and does not start or inspect the daemon
-directly.
+app bundles `vaelend`, starts it on demand when Core IPC is unavailable, and
+connects through the normal typed IPC client. An already-running Core is
+reused and is not stopped by the app when it did not start that process.
 
 ## Scope
 

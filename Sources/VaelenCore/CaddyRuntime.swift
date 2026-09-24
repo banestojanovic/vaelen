@@ -151,16 +151,43 @@ public actor CaddyProcessSupervisor {
         let observed = status()
         if observed.state == .stopped { return observed }
         guard let record = processRecord() else { return status() }
-        guard let child = ownedChild, child.processIdentifier == record.pid,
-              processMatches(record) else { throw CaddyRuntimeError.processIdentityMismatch }
-        guard child.terminateAndWait(timeout: 3) else {
+        let child = ownedChild
+        guard processExists(record.pid), processMatches(record) else {
+            // Forget stale Vaelen metadata, never signal a live PID whose
+            // executable/arguments/start time no longer match the record.
+            try? manager.removeItem(at: processRecordURL())
+            ownedChild = nil
+            return CaddyProcessStatus(state: .stopped, health: .unknown, version: record.version, pid: nil, executablePath: record.executablePath, httpPort: record.httpPort, adminEndpoint: record.adminEndpoint)
+        }
+        let stopped: Bool
+        if let child, child.processIdentifier == record.pid {
+            stopped = child.terminateAndWait(timeout: 3)
+        } else {
+            // The durable process identity survives a Core restart. Signal
+            // only the still-matching Caddy process; a mismatched PID is
+            // handled above without signaling.
+            guard kill(record.pid, SIGTERM) == 0 else { throw CaddyRuntimeError.processFailed("Caddy PID \(record.pid) could not be asked to stop") }
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline, processMatches(record) { usleep(20_000) }
+            stopped = !processMatches(record)
+        }
+        guard stopped else {
             throw CaddyRuntimeError.processFailed("Caddy PID \(record.pid) is still running after the graceful shutdown timeout")
         }
         ownedChild = nil
         try? manager.removeItem(at: processRecordURL())
+        removeStaleAdminSocket(record.adminEndpoint)
         let result = status()
         guard result.state == .stopped else { throw CaddyRuntimeError.processFailed("Caddy remains observable after shutdown") }
         return result
+    }
+
+    private func removeStaleAdminSocket(_ endpoint: String) {
+        let path = endpoint.replacingOccurrences(of: "unix//", with: "")
+        guard path == layout.routingRuntimeDirectoryURL.appendingPathComponent("admin.sock").path else { return }
+        var info = stat()
+        guard lstat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFSOCK, info.st_uid == getuid() else { return }
+        try? manager.removeItem(atPath: path)
     }
 
     public func adminEndpoint() -> String { "unix//\(layout.routingRuntimeDirectoryURL.appendingPathComponent("admin.sock").path)" }

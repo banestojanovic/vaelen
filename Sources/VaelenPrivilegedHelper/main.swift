@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import Darwin
 import VaelenCore
 
 /// Vaelen privileged helper daemon (production: installed via SMAppService).
@@ -9,16 +10,93 @@ import VaelenCore
 /// from callers: every privileged operation is validated against
 /// StandardPortsForwardingPolicy constants compiled into this binary.
 ///
-/// Production requirements (NOT satisfied by ad-hoc development builds):
-/// - Developer ID signature on both Vaelen.app and this tool
-/// - SMPrivilegedExecutables entry in Vaelen.app's Info.plist
-/// - SMAuthorizedClients in this tool's embedded Info.plist
-/// - Embedded launchd plist with MachServices dev.vaelen.privileged-helper
-/// - Placement in Vaelen.app/Contents/Library/LaunchServices
-/// - Registration through SMAppService.daemon by Vaelen.app
+/// The signed executable and its BundleProgram launchd plist are embedded in
+/// Vaelen.app and registered through SMAppService.daemon. Both development
+/// and distribution builds must carry meaningful Apple code signatures.
 final class StandardPortsHelper: NSObject, VaelenStandardPortsHelperProtocol {
     private let pfctl = "/sbin/pfctl"
     private let expectedAnchor = StandardPortsForwardingPolicy.anchorRules()
+    private let resolverPath = "/etc/resolver/test"
+
+    func inspectTestResolver(with reply: @escaping (Data?, NSError?) -> Void) {
+        do {
+            let snapshot = try ResolverFileSnapshot.read(resolverPath)
+            reply(try JSONEncoder().encode(snapshot), nil)
+        } catch { reply(nil, resolverError(1, "Unable to safely inspect /etc/resolver/test: \(error.localizedDescription)")) }
+    }
+
+    func installTestResolver(port: Int, replacing: Data, with reply: @escaping (Data?, NSError?) -> Void) {
+        do {
+            guard (1024...65535).contains(port) else { throw resolverError(2, "Invalid DNS responder port") }
+            let expected = try decodeSnapshot(replacing)
+            let actual = try ResolverFileSnapshot.read(resolverPath)
+            guard actual == expected else {
+                throw resolverError(3, "Resolver changed before acquisition; expected [\(describe(expected))], actual [\(describe(actual))]. No resolver change was made.")
+            }
+            let bytes = Data("nameserver 127.0.0.1\nport \(port)\n".utf8)
+            try writeResolver(bytes, owner: 0, group: 0, mode: 0o644)
+            let installed = try ResolverFileSnapshot.read(resolverPath)
+            guard installed.bytes == bytes else { throw resolverError(4, "Resolver install verification failed") }
+            reply(try JSONEncoder().encode(installed), nil)
+        } catch let error as NSError { reply(nil, error) }
+        catch { reply(nil, resolverError(1, "Unable to install /etc/resolver/test: \(error.localizedDescription)")) }
+    }
+
+    func restoreTestResolver(expected: Data, preimage: Data, with reply: @escaping (NSError?) -> Void) {
+        do {
+            let installed = try decodeSnapshot(expected)
+            let previous = try decodeSnapshot(preimage)
+            guard try ResolverFileSnapshot.read(resolverPath) == installed else { throw resolverError(3, "Resolver changed externally; it was not overwritten") }
+            if previous.exists {
+                guard let bytes = previous.bytes, bytes.count <= 1_048_576 else { throw resolverError(5, "Invalid resolver preimage") }
+                try writeResolver(bytes, owner: previous.owner ?? 0, group: previous.group ?? 0, mode: previous.mode ?? 0o644)
+            } else {
+                try FileManager.default.removeItem(atPath: resolverPath)
+            }
+            let restored = try ResolverFileSnapshot.read(resolverPath)
+            guard restored.exists == previous.exists, restored.bytes == previous.bytes,
+                  !previous.exists || (restored.owner == previous.owner && restored.group == previous.group && restored.mode == previous.mode) else {
+                throw resolverError(4, "Resolver restore verification failed")
+            }
+            reply(nil)
+        } catch let error as NSError { reply(error) }
+        catch { reply(resolverError(1, "Unable to restore /etc/resolver/test: \(error.localizedDescription)")) }
+    }
+
+    private func decodeSnapshot(_ data: Data) throws -> ResolverFileSnapshot {
+        guard data.count <= 1_100_000, let value = try? JSONDecoder().decode(ResolverFileSnapshot.self, from: data),
+              (!value.exists || (value.bytes != nil && (value.bytes?.count ?? 0) <= 1_048_576)) else {
+            throw resolverError(5, "Invalid resolver snapshot")
+        }
+        return value
+    }
+
+    private func describe(_ snapshot: ResolverFileSnapshot) -> String {
+        let bytes = snapshot.bytes?.base64EncodedString() ?? "nil"
+        let owner = snapshot.owner.map { String($0) } ?? "nil"
+        let group = snapshot.group.map { String($0) } ?? "nil"
+        let mode = snapshot.mode.map { String($0, radix: 8) } ?? "nil"
+        let device = snapshot.device.map { String($0) } ?? "nil"
+        let inode = snapshot.inode.map { String($0) } ?? "nil"
+        let fileType = snapshot.fileType.map { String($0) } ?? "nil"
+        return "exists=\(snapshot.exists), bytes.base64=\(bytes), owner=\(owner), group=\(group), mode=\(mode), device=\(device), inode=\(inode), fileType=\(fileType)"
+    }
+
+    private func writeResolver(_ bytes: Data, owner: UInt32, group: UInt32, mode: UInt16) throws {
+        // Atomic replacement is always confined to the one fixed regular-file
+        // target. Verify parent and target shape immediately before writing.
+        var parent = stat()
+        guard lstat("/etc/resolver", &parent) == 0, (parent.st_mode & S_IFMT) == S_IFDIR else { throw resolverError(1, "Resolver directory is not a real directory") }
+        var current = stat()
+        if lstat(resolverPath, &current) == 0, (current.st_mode & S_IFMT) != S_IFREG { throw resolverError(1, "Resolver target is not a regular file") }
+        try bytes.write(to: URL(fileURLWithPath: resolverPath), options: .atomic)
+        guard chown(resolverPath, uid_t(owner), gid_t(group)) == 0,
+              chmod(resolverPath, mode_t(mode)) == 0 else { throw resolverError(1, "Unable to restore resolver metadata") }
+    }
+
+    private func resolverError(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "dev.vaelen.privileged-helper.dns", code: code, userInfo: [NSLocalizedDescriptionKey: message])
+    }
 
     func inspectionData(with reply: @escaping (Data?, NSError?) -> Void) {
         let inspection = StandardPortsHelperInspection(
@@ -152,14 +230,57 @@ private extension String {
 }
 
 final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
-    private let clientRequirement = "anchor apple generic and identifier \"dev.vaelen.app\""
+    // Privileged requests originate from the bundled Core, not the GUI. The
+    // Core identifier is additionally constrained to the helper's signing team
+    // by VaelenPrivilegedClientTrust below.
+    private let clientRequirement = "anchor apple generic and identifier \"vaelend\""
+    private let lock = NSLock()
+    private var activeConnections = 0
+    private var idleExit: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        scheduleIdleExit()
+    }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard authorizedClient(connection) else { return false }
+        lock.lock()
+        activeConnections += 1
+        idleExit?.cancel()
+        idleExit = nil
+        lock.unlock()
         connection.exportedInterface = NSXPCInterface(with: VaelenStandardPortsHelperProtocol.self)
         connection.exportedObject = StandardPortsHelper()
+        connection.invalidationHandler = { [weak self] in self?.connectionDidClose() }
         connection.resume()
         return true
+    }
+
+    private func connectionDidClose() {
+        lock.lock()
+        activeConnections = max(0, activeConnections - 1)
+        let shouldSchedule = activeConnections == 0
+        lock.unlock()
+        if shouldSchedule { scheduleIdleExit() }
+    }
+
+    private func scheduleIdleExit() {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let idle = self.activeConnections == 0
+            self.lock.unlock()
+            if idle { exit(EXIT_SUCCESS) }
+        }
+        lock.lock()
+        idleExit?.cancel()
+        idleExit = work
+        lock.unlock()
+        // LaunchDaemons with MachServices are demand-started. Exit after an
+        // idle grace period so approval remains durable without a resident
+        // root process when Vaelen/Core is inactive.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(3), execute: work)
     }
 
     private func authorizedClient(_ connection: NSXPCConnection) -> Bool {
@@ -170,8 +291,36 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
               let code,
               SecRequirementCreateWithString(clientRequirement as CFString, [], &requirement) == errSecSuccess,
               let requirement,
-              SecCodeCheckValidity(code, [], requirement) == errSecSuccess else { return false }
-        return true
+              SecCodeCheckValidity(code, [], requirement) == errSecSuccess,
+              let clientIdentity = signingIdentity(code),
+              let helperIdentity = ownSigningIdentity() else { return false }
+        return VaelenPrivilegedClientTrust.permits(client: clientIdentity, helper: helperIdentity)
+    }
+
+    private func ownSigningIdentity() -> VaelenSigningIdentity? {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(
+            "anchor apple generic and identifier \"dev.vaelen.privileged-helper\"" as CFString,
+            [],
+            &requirement
+        ) == errSecSuccess,
+              let requirement,
+              SecCodeCheckValidity(code, [], requirement) == errSecSuccess else { return nil }
+        return signingIdentity(code)
+    }
+
+    private func signingIdentity(_ code: SecCode) -> VaelenSigningIdentity? {
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let values = information as? [String: Any],
+              let identifier = values[kSecCodeInfoIdentifier as String] as? String,
+              let team = values[kSecCodeInfoTeamIdentifier as String] as? String,
+              !team.isEmpty else { return nil }
+        return VaelenSigningIdentity(identifier: identifier, teamIdentifier: team)
     }
 }
 

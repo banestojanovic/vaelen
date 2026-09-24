@@ -3,6 +3,100 @@ import Darwin
 @testable import VaelenCore
 
 final class MySQLRuntimeLifecycleTests: XCTestCase {
+    func testConfiguredInstanceMigratesTo3306WithoutReinitializingData() throws {
+        guard !isPortListening(3306) else { throw XCTSkip("canonical MySQL port is occupied") }
+        let installedLayout = VaelenFilesystemLayout()
+        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vm-port-migration-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
+        try FileManager.default.createDirectory(at: layout.configurationDirectoryURL, withIntermediateDirectories: true)
+        try Data(installed.version.utf8).write(to: layout.configurationDirectoryURL.appendingPathComponent("mysql-default.json"))
+        let legacyPort = try availableLoopbackPort()
+        let legacy = MySQLModule(layout: layout, port: legacyPort, instanceName: "migration", tcpEnabled: true, packageOverride: installed)
+        try legacy.initialize()
+        XCTAssertEqual(legacy.status().state, MySQLState.stopped)
+        XCTAssertEqual(legacy.status().port, legacyPort)
+        let legacyInstance = layout.mysqlInstancesDirectoryURL.appendingPathComponent("migration")
+        let legacyStatus = try legacy.start()
+        _ = try command(installed.clientPath, ["--defaults-extra-file=\(legacyInstance.appendingPathComponent("client.cnf").path)", "--protocol=socket", "--socket=\(legacyStatus.socket)", "-e", "CREATE DATABASE syncproof; CREATE TABLE syncproof.vaelen_migration_probe (value VARCHAR(32)); INSERT INTO syncproof.vaelen_migration_probe VALUES ('preserved'); ALTER USER 'root'@'localhost' IDENTIFIED BY 'legacy-password';"])
+        try Data("[client]\nuser=root\npassword=legacy-password\nprotocol=socket\nsocket=\(legacyStatus.socket)\n".utf8).write(to: legacyInstance.appendingPathComponent("client.cnf"), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: legacyInstance.appendingPathComponent("client.cnf").path)
+        _ = try legacy.stop()
+        var legacyMetadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: legacyInstance.appendingPathComponent("metadata.json"))) as? [String: Any])
+        legacyMetadata.removeValue(forKey: "rootPasswordMode")
+        try JSONSerialization.data(withJSONObject: legacyMetadata, options: [.sortedKeys]).write(to: legacyInstance.appendingPathComponent("metadata.json"), options: .atomic)
+
+        let migrated = MySQLModule(layout: layout, port: 3306, instanceName: "migration", tcpEnabled: true, packageOverride: installed)
+        defer { if migrated.status().pid != nil { _ = try? migrated.stop() } }
+        let status = try migrated.start()
+        XCTAssertEqual(status.state, .running)
+        XCTAssertEqual(status.port, 3306)
+        let metadataURL = layout.mysqlInstancesDirectoryURL.appendingPathComponent("migration/metadata.json")
+        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any])
+        XCTAssertEqual(metadata["port"] as? Int, 3306)
+        let query = try command(installed.clientPath, ["--no-defaults", "--protocol=tcp", "--connect-timeout=2", "-h127.0.0.1", "-P3306", "-uroot", "--password=", "-Nse", "SELECT @@port, EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name='syncproof'), (SELECT value FROM syncproof.vaelen_migration_probe LIMIT 1)"])
+        XCTAssertTrue(query.hasSuffix("3306\t1\tpreserved"), "root/empty-password at 127.0.0.1:3306 must work while preserving schema data: \(query)")
+        let migratedMetadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any])
+        XCTAssertEqual(migratedMetadata["rootPasswordMode"] as? String, "empty")
+        XCTAssertEqual(try migrated.stop().state, .stopped)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: layout.mysqlInstancesDirectoryURL.appendingPathComponent("migration/data/mysql").path), "migration must preserve the initialized data directory")
+
+        let restarted = try migrated.start()
+        XCTAssertEqual(restarted.state, .running, "the normalization marker makes migration idempotent")
+        let repeated = try command(installed.clientPath, ["--no-defaults", "--protocol=tcp", "--connect-timeout=2", "-h127.0.0.1", "-P3306", "-uroot", "--password=", "-Nse", "SELECT value FROM syncproof.vaelen_migration_probe"])
+        XCTAssertTrue(repeated.hasSuffix("preserved"), repeated)
+        _ = try migrated.stop()
+    }
+
+    func testRelaunchedCoreStopsRecordedMySQLInstanceWithoutProcessHandle() throws {
+        let installedLayout = VaelenFilesystemLayout()
+        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mysql-core-restart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeModule(named: "restart", root: root, installed: installed)
+        let originalCore = fixture.module
+        defer { if originalCore.status().pid != nil { _ = try? originalCore.stop() } }
+
+        try originalCore.initialize()
+        let started = try originalCore.start()
+        let pid = try XCTUnwrap(started.pid)
+        let relaunchedCore = try makeModule(named: "restart", root: root, installed: installed).module
+
+        XCTAssertEqual(try relaunchedCore.stop().state, .stopped)
+        XCTAssertProcessGone(pid)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: started.socket))
+    }
+
+    func testStartReadinessIsBoundedWhenMysqlAdminHangs() throws {
+        let installedLayout = VaelenFilesystemLayout()
+        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vm-ping-timeout-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
+        try FileManager.default.createDirectory(at: layout.configurationDirectoryURL, withIntermediateDirectories: true)
+        try Data(installed.version.utf8).write(to: layout.configurationDirectoryURL.appendingPathComponent("mysql-default.json"))
+
+        let modeFile = root.appendingPathComponent("mysqladmin-mode")
+        let wrapper = root.appendingPathComponent("mysqladmin-wrapper.sh")
+        let script = "#!/bin/sh\nif [ \"$(cat '\(modeFile.path)' 2>/dev/null)\" = hang ]; then\n  for arg in \"$@\"; do [ \"$arg\" = ping ] && exec /bin/sleep 30; done\nfi\nexec '\(installed.adminPath)' \"$@\"\n"
+        try Data(script.utf8).write(to: wrapper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        let package = MySQLPackage(version: installed.version, architecture: installed.architecture, packagePath: installed.packagePath, serverPath: installed.serverPath, clientPath: installed.clientPath, adminPath: wrapper.path, source: installed.source, artifactSHA256: installed.artifactSHA256, signatureURL: installed.signatureURL, license: installed.license, installedAt: installed.installedAt)
+        let module = MySQLModule(layout: layout, port: 0, instanceName: "timeout", tcpEnabled: false, packageOverride: package, clientCommandTimeout: 1.5, shutdownTimeout: 2)
+        try module.initialize()
+        try Data("hang".utf8).write(to: modeFile)
+
+        let startedAt = Date()
+        XCTAssertThrowsError(try module.start()) { error in
+            guard case let MySQLModuleError.processFailed(message) = error else { return XCTFail("unexpected error: \(error)") }
+            XCTAssertFalse(message.contains("remains live"), message)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 18, "a wedged mysqladmin readiness probe must not leave Start pending")
+        XCTAssertEqual(module.status().state, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.mysqlInstancesDirectoryURL.appendingPathComponent("timeout/process.json").path))
+    }
+
     func testStopRetainsOwnershipAcrossClientAndServerShutdownTimeouts() throws {
         let installedLayout = VaelenFilesystemLayout()
         let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
@@ -82,9 +176,9 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
         print("MySQL acceptance executable: \(serverURL.path)\nSHA-256: \(hash)")
 
         let beforeListeners = try command("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"])
-        XCTAssertFalse(beforeListeners.contains(":3306 "), beforeListeners)
-        XCTAssertFalse(beforeListeners.contains(":13306 "), beforeListeners)
-        XCTAssertTrue(processIDs(named: "mysqld").isEmpty, "unexpected MySQL server existed before isolated test startup")
+        guard !beforeListeners.contains(":3306 "), !beforeListeners.contains(":13306 "), processIDs(named: "mysqld").isEmpty else {
+            throw XCTSkip("MySQL lifecycle acceptance requires canonical ports and mysqld to be inactive")
+        }
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vm-\(UUID().uuidString.prefix(8))", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -99,6 +193,10 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
         }
 
         try module.initialize()
+        let initializedStatus = try module.start()
+        let rootLogin = try command(installed.clientPath, ["--defaults-extra-file=\(moduleFixture.layout.mysqlInstancesDirectoryURL.appendingPathComponent("acceptance/client.cnf").path)", "--protocol=socket", "--socket=\(initializedStatus.socket)", "-Nse", "SELECT CURRENT_USER()"])
+        XCTAssertTrue(rootLogin.hasSuffix("root@localhost"), "Vaelen-managed MySQL should accept its generated local credentials")
+        _ = try module.stop()
         try unrelated.initialize()
         let unrelatedStatus = try unrelated.start()
         let unrelatedPID = try XCTUnwrap(unrelatedStatus.pid)
@@ -160,7 +258,8 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
         var fields = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
         fields["executable"] = "/not/the/launched/mysqld"
         try JSONSerialization.data(withJSONObject: fields).write(to: processRecord, options: .atomic)
-        XCTAssertThrowsError(try module.stop()) { error in XCTAssertEqual(error as? MySQLModuleError, .processIdentityMismatch) }
+        XCTAssertEqual(try module.stop().state, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: processRecord.path), "stale Vaelen bookkeeping should be reconciled")
         XCTAssertTrue(moduleProcessIsLive(mismatchPID))
         XCTAssertTrue(isSocket(mismatchStatus.socket))
         try original.write(to: processRecord, options: .atomic)
@@ -169,6 +268,14 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
         XCTAssertEqual(unrelated.status().pid, unrelatedPID)
         XCTAssertTrue(unrelatedStatus.socket.withCString { access($0, F_OK) == 0 })
+
+        let restartedServer = try module.start()
+        let restartedPID = try XCTUnwrap(restartedServer.pid)
+        let relaunchedCore = try makeModule(named: "acceptance", root: root.appendingPathComponent("managed"), installed: installed).module
+        XCTAssertEqual(try relaunchedCore.stop().state, .stopped)
+        XCTAssertProcessGone(restartedPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: restartedServer.socket))
+        XCTAssertEqual(unrelated.status().state, .running, "Core restart cleanup must leave the unrelated server running")
 
         // Exercise the retained Process handle observing a server that exits
         // outside the provider's normal shutdown path.
@@ -197,6 +304,25 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
     private func isPortListening(_ port: Int) -> Bool {
         let output = (try? command("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"])) ?? ""
         return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func availableLoopbackPort() throws -> Int {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw NSError(domain: "MySQLRuntimeLifecycleTests", code: 10) }
+        defer { close(descriptor) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard bound == 0 else { throw NSError(domain: "MySQLRuntimeLifecycleTests", code: 11) }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
+        }
+        guard named == 0 else { throw NSError(domain: "MySQLRuntimeLifecycleTests", code: 12) }
+        return Int(UInt16(bigEndian: address.sin_port))
     }
 
     private func isSocket(_ path: String) -> Bool {

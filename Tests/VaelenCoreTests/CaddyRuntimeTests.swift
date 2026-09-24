@@ -15,12 +15,9 @@ final class CaddyRuntimeTests: XCTestCase {
         let record = CaddyProcessRecord(pid: process.processIdentifier, version: "fixture", executablePath: "/not/the/owned/executable", arguments: ["not-the-launched-arguments"], configPath: "/fixture/config", adminEndpoint: "unix//fixture", httpPort: 0, httpsPort: 0, startedAt: "not-the-start-time")
         try JSONEncoder().encode(record).write(to: layout.caddyInstancesDirectoryURL.appendingPathComponent("process.json"))
 
-        do {
-            _ = try await supervisor.stop()
-            XCTFail("expected identity mismatch")
-        } catch let error as CaddyRuntimeError {
-            XCTAssertEqual(error, .processIdentityMismatch)
-        }
+        let stopped = try await supervisor.stop()
+        XCTAssertEqual(stopped.state, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.caddyInstancesDirectoryURL.appendingPathComponent("process.json").path))
         XCTAssertTrue(process.isRunningAndReapedIfExited(), "mismatched live process must remain untouched")
     }
 
@@ -46,6 +43,24 @@ final class CaddyRuntimeTests: XCTestCase {
         XCTAssertEqual(stopped.state, .stopped)
         let stoppedStatus = await supervisor.status()
         XCTAssertNil(stoppedStatus.pid)
+    }
+
+    func testNewCoreCanStopPreciselyRecordedCaddyProcess() async throws {
+        let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-core-restart-\(UUID().uuidString)", isDirectory: true)
+        defer { CaddyTestSupport.removeIfPresent(root) }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let package = try resolveCaddyPackage()
+        let configuration = try CaddyTestSupport.configuration()
+        let originalCore = CaddyProcessSupervisor(layout: layout, configuration: configuration)
+        await originalCore.installPackage(package)
+        let started = try await originalCore.start()
+        let pid = try XCTUnwrap(started.pid)
+
+        let relaunchedCore = CaddyProcessSupervisor(layout: layout, configuration: configuration)
+        let stopped = try await relaunchedCore.stop()
+        XCTAssertEqual(stopped.state, .stopped)
+        XCTAssertFalse(processIsLive(pid))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.caddyInstancesDirectoryURL.appendingPathComponent("process.json").path))
     }
 
     func testExternalCrashIsObservedAndPortCollisionDoesNotKillListener() async throws {
@@ -87,6 +102,8 @@ final class CaddyRuntimeTests: XCTestCase {
         guard result == 0, Darwin.listen(descriptor, 1) == 0 else { close(descriptor); throw CaddyRuntimeError.processFailed("bind") }
         return descriptor
     }
+
+    private func processIsLive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
 
     private func resolveCaddyPackage() throws -> CaddyPackage {
         let module = CaddyModule(layout: VaelenFilesystemLayout())

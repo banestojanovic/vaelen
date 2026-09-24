@@ -28,6 +28,10 @@ final class MySQLModuleTests: XCTestCase {
         XCTAssertTrue(layout.mysqlPackagesDirectoryURL.path.contains("packages/mysql"))
     }
 
+    func testCanonicalDefaultPortIsMySQLPort() {
+        XCTAssertEqual(MySQLModule.defaultPort, 3306)
+    }
+
     func testOfficialArchiveInitializesPersistsAndStopsCleanly() throws {
         let archive = URL(fileURLWithPath: "/var/folders/9b/1f1sf2v51_36ys9ngvlqzc8c0000gn/T/opencode/mysql-8.4.11-macos15-arm64.tar.gz")
         guard FileManager.default.fileExists(atPath: archive.path) else { throw XCTSkip("M5 artifact fixture is not available") }

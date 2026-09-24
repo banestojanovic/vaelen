@@ -57,13 +57,15 @@ prerequisites or explicitly development-only distribution tests.
 
 ## Privilege And Distribution Boundary
 
-The production standard-port helper exposes only parameterless fixed-policy
-operations and now validates the caller against the signed `dev.vaelen.app`
-code requirement. It validates the existing fixed anchor before mutation and
-uses atomic replacement. The current development package does not contain the
-signed SMAppService bundle metadata, Developer ID signatures, or notarization;
-runtime production registration therefore remains a distribution acceptance
-item, not a claim of completed public distribution.
+The standard-port helper exposes only parameterless fixed-policy operations,
+validates the caller's Apple code signature and requires the expected
+`dev.vaelen.app` identifier and the same nonempty signing team as the daemon.
+It validates the existing fixed anchor before mutation and uses atomic
+replacement. The app embeds the daemon and a `BundleProgram` LaunchDaemon plist
+for `SMAppService.daemon`. Local Apple Development signing exercises package
+structure and code-signing trust; LaunchDaemon registration/approval remains
+subject to macOS approval and Apple's notarization requirement for apps
+containing LaunchDaemons. This does not claim public distribution acceptance.
 
 The development DNS bridge remains explicitly environment-gated and uses
 non-interactive fixed `sudo` commands. Public PHP distribution remains blocked

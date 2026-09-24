@@ -93,7 +93,7 @@ public struct SystemMySQLArtifactDownloader: MySQLArtifactDownloader {
 
 public final class MySQLModule: @unchecked Sendable {
     public static let defaultVersion = MySQLManifest.official8_4_11.version
-    public static let defaultPort = 13306
+    public static let defaultPort = 3306
     private let layout: VaelenFilesystemLayout
     private let manifest: MySQLManifest
     private let downloader: any MySQLArtifactDownloader
@@ -175,15 +175,24 @@ public final class MySQLModule: @unchecked Sendable {
         let contents = (try? manager.contentsOfDirectory(atPath: paths.data.path)) ?? []
         guard contents.isEmpty else { throw MySQLModuleError.partialInitialization }
         let log = paths.log; manager.createFile(atPath: log.path, contents: nil)
-        let process = Process(); process.executableURL = URL(fileURLWithPath: package.serverPath); process.arguments = ["--no-defaults", "--initialize", "--basedir=\(package.packagePath)", "--datadir=\(paths.data.path)", "--log-error=\(log.path)"]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(logText(paths.log)) }
-        guard let temporary = parseTemporaryPassword(logText(log)) else { throw MySQLModuleError.credentialsUnavailable }
+        let process = Process(); process.executableURL = URL(fileURLWithPath: package.serverPath); process.arguments = ["--no-defaults", "--initialize-insecure", "--basedir=\(package.packagePath)", "--datadir=\(paths.data.path)", "--log-error=\(log.path)"]; try process.run()
+        let initializationDeadline = Date().addingTimeInterval(60)
+        while process.isRunning && Date() < initializationDeadline { usleep(50_000) }
+        if process.isRunning {
+            process.terminate()
+            let terminationDeadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < terminationDeadline { usleep(20_000) }
+            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+            process.waitUntilExit()
+            throw MySQLModuleError.processFailed("MySQL initialization timed out; existing data files were left intact for inspection")
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(logText(paths.log)) }
         try writeConfig(package: package, paths: paths)
-        let metadata = MySQLInstanceMetadata(version: package.version, initializedVersion: package.version, initialized: true, port: port, socket: paths.socket.path, datadir: paths.data.path)
+        let metadata = MySQLInstanceMetadata(version: package.version, initializedVersion: package.version, initialized: true, port: port, socket: paths.socket.path, datadir: paths.data.path, rootPasswordMode: "empty")
         try atomicWrite(metadata, to: paths.metadata)
-        try writeCredentials(paths: paths, password: temporary)
-        try start(package: package, paths: paths, allowExpiredPassword: true)
-        try runClient(package.clientPath, paths: paths, arguments: ["--connect-expired-password", "-uroot", "-p\(temporary)", "-e", "ALTER USER 'root'@'localhost' IDENTIFIED BY '\(credentialsPassword)';"])
-        try writeCredentials(paths: paths, password: credentialsPassword)
+        try writeCredentials(paths: paths, password: "")
+        try start(package: package, paths: paths, allowExpiredPassword: false)
         _ = try stop()
     }
 
@@ -213,15 +222,28 @@ public final class MySQLModule: @unchecked Sendable {
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }; guard instanceMetadata()?.initialized == true else { throw MySQLModuleError.notInitialized }
         let paths = instancePaths(package: package); let current = status(); if current.state == .running { return current }; if current.state == .unhealthy || current.state == .conflict { if let record = processRecord(paths), processExists(record.pid) { throw MySQLModuleError.processIdentityMismatch }; try? manager.removeItem(at: paths.process) }
         if tcpEnabled, !isPortAvailable(port) { throw MySQLModuleError.portConflict(port) }
-        try writeConfig(package: package, paths: paths); try start(package: package, paths: paths, allowExpiredPassword: false); return status()
+        try writeConfig(package: package, paths: paths)
+        try start(package: package, paths: paths, allowExpiredPassword: false)
+        if let metadata = instanceMetadata(), metadata.rootPasswordMode != "empty" {
+            try normalizeLegacyRootPassword(package: package, paths: paths, metadata: metadata)
+        } else if let metadata = instanceMetadata(), metadata.port != (tcpEnabled ? port : 0) {
+            try saveMetadata(metadata, paths: paths, port: tcpEnabled ? port : 0, rootPasswordMode: "empty")
+        }
+        return status()
     }
 
     public func stop() throws -> MySQLStatus {
         let paths = instancePaths(package: selectedPackage())
         let observed = status()
         guard let record = processRecord(paths) else { return observed }
-        guard let child = ownedServer, child.processIdentifier == record.pid, child.isRunningAndReapedIfExited(), processMatches(record), socketMatches(record) else {
-            throw MySQLModuleError.processIdentityMismatch
+        let child = ownedServer
+        guard processExists(record.pid), processMatches(record), socketMatches(record), isPortOwnedByRecord(record) else {
+            // A mismatched live PID is never signaled and its socket/data are
+            // left untouched. The stale Vaelen record must not block Quit.
+            if !processExists(record.pid) { removeOwnedFiles(record) }
+            try? manager.removeItem(at: paths.process)
+            ownedServer = nil
+            return MySQLStatus(state: .stopped, health: "stopped", installedVersion: observed.installedVersion, selectedVersion: observed.selectedVersion, pid: nil, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable)
         }
         guard let package = selectedPackage(), FileManager.default.fileExists(atPath: paths.credentials.path) else { throw MySQLModuleError.credentialsUnavailable }
         // mysqladmin contacts only the recorded, inode-verified Unix socket;
@@ -229,8 +251,11 @@ public final class MySQLModule: @unchecked Sendable {
         try runClient(package.adminPath, paths: paths, arguments: ["--defaults-extra-file=\(paths.credentials.path)", "shutdown"], timeout: min(clientCommandTimeout, 3))
         let deadline = Date().addingTimeInterval(shutdownTimeout)
         while Date() < deadline {
-            if !child.isRunningAndReapedIfExited() {
+            let masterRunning = processMatches(record)
+            if let child, child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
                 guard !child.hasLiveOwnedDescendants else { usleep(50_000); continue }
+            }
+            if !masterRunning {
                 removeOwnedFiles(record)
                 guard !socketMatches(record), !pidFileMatches(record, paths: paths) else { throw MySQLModuleError.processFailed("MySQL PID \(record.pid) exited but its owned socket or PID file remains; process record retained") }
                 ownedServer = nil
@@ -242,16 +267,37 @@ public final class MySQLModule: @unchecked Sendable {
         throw MySQLModuleError.processFailed("MySQL PID \(record.pid) did not stop within the graceful shutdown timeout; process record retained")
     }
 
-    private let credentialsPassword = "vaelen-mysql-\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
-    private struct MySQLInstanceMetadata: Codable { let version: String; let initializedVersion: String; let initialized: Bool; let port: Int; let socket: String; let datadir: String }
+    private struct MySQLInstanceMetadata: Codable {
+        let version: String
+        let initializedVersion: String
+        let initialized: Bool
+        let port: Int
+        let socket: String
+        let datadir: String
+        var rootPasswordMode: String?
+
+        init(version: String, initializedVersion: String, initialized: Bool, port: Int, socket: String, datadir: String, rootPasswordMode: String? = nil) {
+            self.version = version
+            self.initializedVersion = initializedVersion
+            self.initialized = initialized
+            self.port = port
+            self.socket = socket
+            self.datadir = datadir
+            self.rootPasswordMode = rootPasswordMode
+        }
+    }
     private struct MySQLProcessRecord: Codable { let pid: Int32; let version: String; let executable: String; let arguments: [String]; let port: Int; let socket: String; let datadir: String; let startedAt: String; let socketDevice: Int64?; let socketInode: Int64?; let pidFile: String?; let pidFileDevice: Int64?; let pidFileInode: Int64?; let tcpEnabled: Bool? }
     private struct InstancePaths { let instance: URL; let data: URL; let config: URL; let metadata: URL; let credentials: URL; let process: URL; let socket: URL; let log: URL }
 
     private func selectedPackage() -> MySQLPackage? { let version = selectedVersion() ?? manifest.version; return installedVersions().first { $0.version == version } }
     private func instancePaths(package: MySQLPackage?) -> InstancePaths { let instance = layout.mysqlInstancesDirectoryURL.appendingPathComponent(instanceName, isDirectory: true); let runtime = layout.rootURL.appendingPathComponent("runtime", isDirectory: true); let preferredSocket = runtime.appendingPathComponent("sockets/mysql/\(instanceName).sock"); let socket = preferredSocket.path.utf8.count < 103 ? preferredSocket : URL(fileURLWithPath: "/tmp/vaelen-mysql-\(stableSocketSuffix())-\(instanceName).sock"); return .init(instance: instance, data: instance.appendingPathComponent("data", isDirectory: true), config: instance.appendingPathComponent("my.cnf"), metadata: instance.appendingPathComponent("metadata.json"), credentials: instance.appendingPathComponent("client.cnf"), process: instance.appendingPathComponent("process.json"), socket: socket, log: layout.mysqlLogsDirectoryURL.appendingPathComponent("\(instanceName).log")) }
-    private func instanceMetadata() -> MySQLInstanceMetadata? { try? JSONDecoder().decode(MySQLInstanceMetadata.self, from: Data(contentsOf: instancePaths(package: selectedPackage()).metadata)) }
+    private func instanceMetadata() -> MySQLInstanceMetadata? {
+        let url = instancePaths(package: selectedPackage()).metadata
+        guard manager.fileExists(atPath: url.path), let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(MySQLInstanceMetadata.self, from: data)
+    }
        private func writeConfig(package: MySQLPackage, paths: InstancePaths) throws { var directories = [paths.instance, paths.config.deletingLastPathComponent(), layout.mysqlLogsDirectoryURL, paths.process.deletingLastPathComponent(), paths.instance.appendingPathComponent("tmp")]; let socketParent = paths.socket.deletingLastPathComponent(); if socketParent.path != "/tmp" { directories.append(socketParent) }; try makeDirectories(directories); let tcp = tcpEnabled ? "bind-address=127.0.0.1\nport=\(port)\n" : "skip-networking\n"; let content = "[mysqld]\nbasedir=\(package.packagePath)\ndatadir=\(paths.data.path)\nsocket=\(paths.socket.path)\npid-file=\(paths.instance.appendingPathComponent("mysqld.pid").path)\nlog-error=\(paths.log.path)\n\(tcp)tmpdir=\(paths.instance.appendingPathComponent("tmp").path)\nmysqlx=OFF\n"; try atomicWrite(content, to: paths.config) }
-      private func start(package: MySQLPackage, paths: InstancePaths, allowExpiredPassword: Bool) throws {
+       private func start(package: MySQLPackage, paths: InstancePaths, allowExpiredPassword: Bool) throws {
           var directories = [paths.instance, layout.mysqlLogsDirectoryURL]
           if paths.socket.deletingLastPathComponent().path != "/tmp" { directories.append(paths.socket.deletingLastPathComponent()) }
           try makeDirectories(directories)
@@ -263,11 +309,13 @@ public final class MySQLModule: @unchecked Sendable {
           ownedServer = child
           var record = MySQLProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.serverPath, arguments: process.arguments ?? [], port: tcpEnabled ? port : 0, socket: paths.socket.path, datadir: paths.data.path, startedAt: processStartIdentity(process.processIdentifier), socketDevice: nil, socketInode: nil, pidFile: paths.instance.appendingPathComponent("mysqld.pid").path, pidFileDevice: nil, pidFileInode: nil, tcpEnabled: tcpEnabled)
           try atomicWrite(record, to: paths.process)
-          for _ in 0..<160 {
-              if (try? ping(paths: paths, allowExpiredPassword: allowExpiredPassword)) == true {
-                  record = recordWithFileIdentities(record, paths: paths)
-                  try atomicWrite(record, to: paths.process)
-                  return
+           let readinessDeadline = Date().addingTimeInterval(8)
+           while Date() < readinessDeadline {
+               let remaining = readinessDeadline.timeIntervalSinceNow
+               if (try? ping(paths: paths, allowExpiredPassword: allowExpiredPassword, timeout: min(0.5, max(0.05, remaining)))) == true {
+                   record = recordWithFileIdentities(record, paths: paths)
+                   try atomicWrite(record, to: paths.process)
+                   return
               }
               if !child.isRunningAndReapedIfExited() { break }
               usleep(50_000)
@@ -301,9 +349,56 @@ public final class MySQLModule: @unchecked Sendable {
          let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
          guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(String(data: data, encoding: .utf8) ?? "MySQL client failed") }
      }
-    private func ping(paths: InstancePaths, allowExpiredPassword: Bool = false) throws -> Bool { if allowExpiredPassword { return manager.fileExists(atPath: paths.socket.path) }; guard let package = selectedPackage() else { return false }; let process = Process(); process.executableURL = URL(fileURLWithPath: package.adminPath); process.arguments = ["--defaults-extra-file=\(paths.credentials.path)", "--protocol=socket", "ping", "--socket=\(paths.socket.path)"]; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice; try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 }
-    private func parseTemporaryPassword(_ text: String) -> String? { guard let range = text.range(of: "temporary password is generated for root@localhost: ") else { return nil }; return text[range.upperBound...].split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespaces) }
-     private func processRecord(_ paths: InstancePaths) -> MySQLProcessRecord? { try? JSONDecoder().decode(MySQLProcessRecord.self, from: Data(contentsOf: paths.process)) }
+     private func ping(paths: InstancePaths, allowExpiredPassword: Bool = false, timeout: TimeInterval = 0.5) throws -> Bool {
+         if allowExpiredPassword { return manager.fileExists(atPath: paths.socket.path) }
+         guard let package = selectedPackage() else { return false }
+         let standardArguments = ["--defaults-extra-file=\(paths.credentials.path)", "--protocol=socket", "ping", "--socket=\(paths.socket.path)"]
+         if try runAdminProbe(package.adminPath, arguments: standardArguments, timeout: timeout) { return true }
+         guard instanceMetadata()?.rootPasswordMode == "normalizingEmpty" else { return false }
+         return try runAdminProbe(package.adminPath, arguments: ["--no-defaults", "--protocol=socket", "-uroot", "--password=", "ping", "--socket=\(paths.socket.path)"], timeout: timeout)
+     }
+     private func runAdminProbe(_ executable: String, arguments: [String], timeout: TimeInterval) throws -> Bool {
+         let process = Process()
+         process.executableURL = URL(fileURLWithPath: executable)
+         process.arguments = arguments
+         process.standardOutput = FileHandle.nullDevice
+         process.standardError = FileHandle.nullDevice
+         try process.run()
+         let deadline = Date().addingTimeInterval(max(0.05, timeout))
+         while process.isRunning && Date() < deadline { usleep(20_000) }
+         guard !process.isRunning else {
+             process.terminate()
+             let terminationDeadline = Date().addingTimeInterval(0.25)
+             while process.isRunning && Date() < terminationDeadline { usleep(20_000) }
+             if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+             process.waitUntilExit()
+             return false
+         }
+         process.waitUntilExit()
+         return process.terminationStatus == 0
+     }
+
+     private func normalizeLegacyRootPassword(package: MySQLPackage, paths: InstancePaths, metadata: MySQLInstanceMetadata) throws {
+         let transitioning = MySQLInstanceMetadata(version: metadata.version, initializedVersion: metadata.initializedVersion, initialized: metadata.initialized, port: metadata.port, socket: metadata.socket, datadir: metadata.datadir, rootPasswordMode: "normalizingEmpty")
+         try atomicWrite(transitioning, to: paths.metadata)
+
+         // Recover safely if the previous attempt changed authentication but
+         // stopped before updating Vaelen's client credentials/metadata.
+         let emptyCredentialWorks = (try? runClient(package.clientPath, paths: paths, arguments: ["--defaults-extra-file=\(paths.credentials.path)", "--password=", "-e", "SELECT CURRENT_USER()"])) != nil
+         if !emptyCredentialWorks {
+             try runClient(package.clientPath, paths: paths, arguments: ["--defaults-extra-file=\(paths.credentials.path)", "-e", "ALTER USER 'root'@'localhost' IDENTIFIED BY ''; "])
+         }
+         try writeCredentials(paths: paths, password: "")
+         try saveMetadata(metadata, paths: paths, port: tcpEnabled ? port : 0, rootPasswordMode: "empty")
+     }
+
+     private func saveMetadata(_ metadata: MySQLInstanceMetadata, paths: InstancePaths, port: Int, rootPasswordMode: String?) throws {
+         try atomicWrite(MySQLInstanceMetadata(version: metadata.version, initializedVersion: metadata.initializedVersion, initialized: metadata.initialized, port: port, socket: metadata.socket, datadir: metadata.datadir, rootPasswordMode: rootPasswordMode), to: paths.metadata)
+     }
+      private func processRecord(_ paths: InstancePaths) -> MySQLProcessRecord? {
+          guard manager.fileExists(atPath: paths.process.path), let data = try? Data(contentsOf: paths.process) else { return nil }
+          return try? JSONDecoder().decode(MySQLProcessRecord.self, from: data)
+      }
      private func recordWithFileIdentities(_ record: MySQLProcessRecord, paths: InstancePaths) -> MySQLProcessRecord {
          var socketInfo = stat(), pidInfo = stat()
          let socketIdentity = lstat(record.socket, &socketInfo) == 0 && (socketInfo.st_mode & S_IFMT) == S_IFSOCK ? (Int64(socketInfo.st_dev), Int64(socketInfo.st_ino)) : (nil, nil)

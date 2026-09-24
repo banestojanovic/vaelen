@@ -16,6 +16,11 @@ import Foundation
     /// Removes the fixed policy. pfToken is the opaque token previously
     /// issued by installForwarding; nil/unknown tokens leave PF enabled.
     func removeForwarding(pfToken: NSString?, with reply: @escaping (NSError?) -> Void)
+    /// DNS operations have a fixed target compiled into the helper. Snapshot
+    /// data contains file state only; it cannot select a path.
+    func inspectTestResolver(with reply: @escaping (Data?, NSError?) -> Void)
+    func installTestResolver(port: Int, replacing: Data, with reply: @escaping (Data?, NSError?) -> Void)
+    func restoreTestResolver(expected: Data, preimage: Data, with reply: @escaping (NSError?) -> Void)
 }
 
 public struct StandardPortsHelperInspection: Codable, Sendable {

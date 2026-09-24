@@ -16,6 +16,13 @@ public enum StandardPortsState: String, Codable, Sendable {
     case unavailable
 }
 
+public enum StandardPortsOwnership: String, Codable, Sendable {
+    case none
+    case vaelen
+    case external
+    case unknown
+}
+
 public struct StandardPortsStatus: Codable, Equatable, Sendable {
     public let state: StandardPortsState
     public let httpPort: Int
@@ -25,9 +32,13 @@ public struct StandardPortsStatus: Codable, Equatable, Sendable {
     public let anchor: String
     public let detail: String?
     public let conflict: String?
+    /// Ownership is reported by Core only when the active ledger and the
+    /// currently observed fixed-policy integration agree. Nil is an
+    /// unrecognized older Core response, never proof of ownership.
+    public let ownership: StandardPortsOwnership?
 
-    public init(state: StandardPortsState, httpPort: Int = VaelenNetworkPorts.standardHTTP, httpsPort: Int = VaelenNetworkPorts.standardHTTPS, backendHTTPPort: Int = VaelenNetworkPorts.httpBackend, backendHTTPSPort: Int = VaelenNetworkPorts.httpsBackend, anchor: String = StandardPortsForwardingPolicy.anchorName, detail: String? = nil, conflict: String? = nil) {
-        self.state = state; self.httpPort = httpPort; self.httpsPort = httpsPort; self.backendHTTPPort = backendHTTPPort; self.backendHTTPSPort = backendHTTPSPort; self.anchor = anchor; self.detail = detail; self.conflict = conflict
+    public init(state: StandardPortsState, httpPort: Int = VaelenNetworkPorts.standardHTTP, httpsPort: Int = VaelenNetworkPorts.standardHTTPS, backendHTTPPort: Int = VaelenNetworkPorts.httpBackend, backendHTTPSPort: Int = VaelenNetworkPorts.httpsBackend, anchor: String = StandardPortsForwardingPolicy.anchorName, detail: String? = nil, conflict: String? = nil, ownership: StandardPortsOwnership? = nil) {
+        self.state = state; self.httpPort = httpPort; self.httpsPort = httpsPort; self.backendHTTPPort = backendHTTPPort; self.backendHTTPSPort = backendHTTPSPort; self.anchor = anchor; self.detail = detail; self.conflict = conflict; self.ownership = ownership
     }
 }
 
@@ -160,50 +171,67 @@ public actor StandardPortsCapability {
         let expected = StandardPortsForwardingPolicy.anchorRules()
         let reference = StandardPortsForwardingPolicy.pfConfReferenceLines(anchorPath: paths.anchorPath)
         let inspection: StandardPortsInspection
-        do { inspection = try await privileged.inspectForwarding() } catch { return StandardPortsStatus(state: .unavailable, detail: "Standard port observation is unavailable") }
+        do { inspection = try await privileged.inspectForwarding() } catch { return StandardPortsStatus(state: .unavailable, detail: "Standard port observation is unavailable", ownership: .unknown) }
         let anchorContent = inspection.anchorContent
         let pfConf = inspection.pfConfContent
         let anchorMatches = anchorContent == expected
         let referencePresent = pfConf.map { reference.allSatisfy($0.contains) } ?? false
-        let record = try? ledger?.standardPortsRecord()
+        let record: StandardPortsLedgerRecord?
+        do { record = try ledger?.standardPortsRecord() }
+        catch { return StandardPortsStatus(state: .unavailable, detail: "PF ownership record could not be read; existing rules were left unchanged", ownership: .unknown) }
         let active = record?.active ?? false
+        let hasIntegration = anchorContent != nil || referencePresent
+        let ownership: StandardPortsOwnership = ledger == nil
+            ? .unknown
+            : active
+                ? (anchorMatches && referencePresent ? .vaelen : .unknown)
+                : (hasIntegration ? .external : .none)
         let httpOccupied = portOccupied(VaelenNetworkPorts.standardHTTP)
         let httpsOccupied = portOccupied(VaelenNetworkPorts.standardHTTPS)
 
         if let anchorContent, anchorContent != expected {
-            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF anchor was modified externally") }
-            return StandardPortsStatus(state: .conflict, conflict: "Foreign PF anchor claims \(StandardPortsForwardingPolicy.anchorName)")
+            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF anchor was modified externally", ownership: .unknown) }
+            return StandardPortsStatus(state: .conflict, conflict: "Foreign PF anchor claims \(StandardPortsForwardingPolicy.anchorName)", ownership: .external)
         }
         if anchorContent == nil, !referencePresent {
             if httpOccupied || httpsOccupied {
-                return StandardPortsStatus(state: .conflict, conflict: StandardPortsCapability.describeOccupied(httpOccupied: httpOccupied, httpsOccupied: httpsOccupied))
+                return StandardPortsStatus(state: .conflict, conflict: StandardPortsCapability.describeOccupied(httpOccupied: httpOccupied, httpsOccupied: httpsOccupied), ownership: StandardPortsOwnership.none)
             }
-            return StandardPortsStatus(state: .absent)
+            return StandardPortsStatus(state: .absent, ownership: StandardPortsOwnership.none)
         }
         guard anchorMatches, referencePresent else {
-            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF integration is partially missing or was modified") }
-            return StandardPortsStatus(state: .conflict, conflict: "Partial foreign PF integration for Vaelen anchor")
+            if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF integration is partially missing or was modified", ownership: .unknown) }
+            return StandardPortsStatus(state: .conflict, conflict: "Partial foreign PF integration for Vaelen anchor", ownership: .external)
         }
         let backend = await backendHealthy()
         if (httpOccupied || httpsOccupied), backend {
-            return StandardPortsStatus(state: .healthy)
+            return StandardPortsStatus(state: .healthy, ownership: ownership)
         }
         if backend {
             // Integration present and backend ready, but standard ports refuse:
             // PF rules are not loaded or PF is disabled.
-            return StandardPortsStatus(state: .unhealthy, detail: "PF integration is present but standard ports are unreachable")
+            return StandardPortsStatus(state: .unhealthy, detail: "PF integration is present but standard ports are unreachable", ownership: ownership)
         }
-        return StandardPortsStatus(state: .installed, detail: "PF integration is present; backend router is not running")
+        return StandardPortsStatus(state: .installed, detail: "PF integration is present; backend router is not running", ownership: ownership)
     }
 
     public func install() async throws -> StandardPortsStatus {
+        guard ledger != nil else { throw StandardPortsError.unavailable("Standard Ports require durable Core ownership state; no PF change was made") }
         let current = await status()
         switch current.state {
-        case .healthy, .installed: return current
+        case .healthy, .installed:
+            guard current.ownership == .vaelen else {
+                throw StandardPortsError.externalConflict("Existing PF integration has no active Vaelen ownership record; it was left unchanged")
+            }
+            return current
         case .conflict: throw StandardPortsError.externalConflict(current.conflict ?? "Standard ports conflict with external state")
         case .ownershipMismatch: throw StandardPortsError.ownershipMismatch
         case .unavailable: throw StandardPortsError.unavailable("Standard port observation is unavailable")
-        case .absent, .unhealthy: break
+        case .unhealthy:
+            guard current.ownership == .vaelen else {
+                throw StandardPortsError.externalConflict("Existing PF integration has no active Vaelen ownership record; it was left unchanged")
+            }
+        case .absent: break
         }
         // Capture the pre-image before mutation: removal must be able to prove
         // what the system looked like before Vaelen touched it.
@@ -225,8 +253,12 @@ public actor StandardPortsCapability {
         let record = try ledger?.standardPortsRecord()
         let current = await status()
         if record == nil || record?.active == false, current.state == .absent { return current }
+        guard record?.active == true else {
+            throw StandardPortsError.externalConflict("No active Vaelen PF ownership record; existing rules were left unchanged")
+        }
         if current.state == .ownershipMismatch { throw StandardPortsError.ownershipMismatch }
         if current.state == .conflict { throw StandardPortsError.externalConflict(current.conflict ?? "Standard ports conflict with external state") }
+        guard current.ownership == .vaelen else { throw StandardPortsError.ownershipMismatch }
         do {
             try await privileged.removeForwarding(pfToken: record?.pfToken)
         } catch is StandardPortsPrivilegeError {

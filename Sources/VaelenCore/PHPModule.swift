@@ -724,11 +724,26 @@ public final class PHPModule: @unchecked Sendable {
         let version = try resolveInstalled(requestedVersion).version
         let observed = try status(requestedVersion: version)
         guard let record = processRecord(version) else { return observed }
-        guard let child = ownedFPMProcesses[version], child.processIdentifier == record.pid,
-              (!child.process.isRunning || processMatches(record)) else {
-            throw PHPModuleError.processIdentityMismatch
+        let child = ownedFPMProcesses[version]
+        guard processExists(record.pid), processMatches(record) else {
+            // A dead PID or a live process that no longer matches this record
+            // is not authority to signal anything. Drop only Vaelen's stale
+            // bookkeeping; do not remove sockets that may now belong to others.
+            if !processExists(record.pid) { removeOwnedSocket(record) }
+            try? manager.removeItem(at: processRecordURL(version))
+            ownedFPMProcesses.removeValue(forKey: version)
+            return PHPStatus(version: version, package: observed.package, state: .stopped, pid: nil, socket: record.socketPath, health: "stopped", isDefault: defaultVersion() == version)
         }
-        guard child.terminateAndWait(timeout: 3, signal: SIGQUIT, waitForDescendants: true) else {
+        let stopped: Bool
+        if let child, child.processIdentifier == record.pid {
+            stopped = child.terminateAndWait(timeout: 3, signal: SIGQUIT, waitForDescendants: true)
+        } else {
+            // Core may have restarted while the exact recorded FPM master
+            // survived. Its executable, config argv and start time are enough
+            // to safely issue PHP-FPM's graceful master signal.
+            stopped = kill(record.pid, SIGQUIT) == 0 && waitForRecordedProcessToExit(record, timeout: 3)
+        }
+        guard stopped else {
             throw PHPModuleError.processFailed("PHP-FPM \(version) PID \(record.pid) or one of its workers remains after the graceful shutdown timeout; process record retained")
         }
         ownedFPMProcesses.removeValue(forKey: version)
@@ -737,6 +752,15 @@ public final class PHPModule: @unchecked Sendable {
         let final = try status(requestedVersion: version)
         guard final.state == .stopped else { throw PHPModuleError.processFailed("PHP-FPM \(version) remains observable after shutdown; process record retained") }
         return final
+    }
+
+    private func waitForRecordedProcessToExit(_ record: PHPProcessRecord, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !processMatches(record) { return true }
+            usleep(20_000)
+        }
+        return !processMatches(record)
     }
 
     private func resolveInstalled(_ requested: String) throws -> PHPPackage {

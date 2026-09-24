@@ -219,6 +219,32 @@ final class StandardPortsCapabilityTests: XCTestCase {
         XCTAssertEqual(try intentStore.enabledServices(), ["standard-ports"])
     }
 
+    func testLegacyMatchingPFFilesWithoutOwnershipCannotBeEnabledOrRemoved() async throws {
+        let fixture = try makeFixture(); defer { tearDown(fixture) }
+        let anchor = StandardPortsForwardingPolicy.anchorRules()
+        let references = StandardPortsForwardingPolicy.pfConfReferenceLines(anchorPath: fixture.paths.anchorPath).joined(separator: "\n") + "\n"
+        try anchor.write(toFile: fixture.paths.anchorPath, atomically: true, encoding: .utf8)
+        try references.write(toFile: fixture.paths.pfConfPath, atomically: true, encoding: .utf8)
+        let capability = makeCapability(fixture, backendHealthy: true)
+        let observed = await capability.status()
+        XCTAssertEqual(observed.state, .unhealthy)
+        XCTAssertEqual(observed.ownership, .external)
+        let anchorBefore = try Data(contentsOf: URL(fileURLWithPath: fixture.paths.anchorPath))
+        let pfConfBefore = try Data(contentsOf: URL(fileURLWithPath: fixture.paths.pfConfPath))
+
+        do { _ = try await capability.install(); XCTFail("saved start must not adopt matching legacy PF files") }
+        catch let error as StandardPortsError {
+            guard case .externalConflict = error else { return XCTFail("unexpected error: \(error)") }
+        }
+        do { _ = try await capability.remove(); XCTFail("unowned PF files must not be removed") }
+        catch let error as StandardPortsError {
+            guard case .externalConflict = error else { return XCTFail("unexpected error: \(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixture.paths.anchorPath)), anchorBefore)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixture.paths.pfConfPath)), pfConfBefore)
+        XCTAssertNil(try fixture.ledger.standardPortsRecord())
+    }
+
     func testReferencePrecedesFilterAnchorsAndHealsMisplacement() {
         let appleStyle = "# Default PF configuration file.\nscrub-anchor \"com.apple/*\"\nnat-anchor \"com.apple/*\"\nrdr-anchor \"com.apple/*\"\ndummynet-anchor \"com.apple/*\"\nanchor \"com.apple/*\"\nload anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n"
         let integrated = StandardPortsForwardingPolicy.addingReference(to: appleStyle)

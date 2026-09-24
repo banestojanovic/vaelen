@@ -133,7 +133,9 @@ final class ProtocolTests: XCTestCase {
             id: UUID(),
             result: .status(CoreStatusResponse(
                 core: .init(state: .running, version: "0.0.1-dev", pid: 42),
-                protocolVersion: 1
+                protocolVersion: 1,
+                serviceIssues: ["dns": "external resolver"],
+                serviceIntents: ["mysql"]
             ))
         )
 

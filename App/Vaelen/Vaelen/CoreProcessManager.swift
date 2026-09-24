@@ -11,7 +11,6 @@ final class CoreProcessManager {
 
     func start() throws {
         if let process, process.isRunning { return }
-        process?.waitUntilExit()
         process = nil
         executablePath = nil
         guard let executable = Bundle.main.url(forResource: "vaelend", withExtension: nil),
@@ -42,7 +41,6 @@ final class CoreProcessManager {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if !process.isRunning {
-                process.waitUntilExit()
                 while FileManager.default.fileExists(atPath: socketPath), Date() < deadline {
                     try? await Task.sleep(for: .milliseconds(50))
                 }
@@ -76,6 +74,18 @@ final class VaelenAppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         super.init()
         Self.shared = self
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let duplicates = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != getpid() }
+        // LaunchServices normally coalesces launches, but explicitly reject a
+        // second process with Vaelen's bundle identity before it can start a
+        // competing Core, including when a second copy was opened from a
+        // different installed/archive path.
+        if duplicates.contains(where: { $0.processIdentifier < getpid() }) {
+            terminateAfterCleanQuit()
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

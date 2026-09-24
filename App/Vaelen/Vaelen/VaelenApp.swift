@@ -83,6 +83,7 @@ final class AppModel {
     private(set) var trustError: String?
     private(set) var serviceOperation: String?
     private(set) var serviceError: String?
+    private var serviceErrorService: String?
     private(set) var startupServiceIssues: [String: String] = [:]
     private(set) var isQuitting = false
     private(set) var refreshError: String?
@@ -95,6 +96,13 @@ final class AppModel {
     private var refreshInFlight = false
     private var refreshRequested = false
     private var monitorTask: Task<Void, Never>?
+
+    var savedServiceIntents: Set<String>? {
+        guard case .running(let status, _, _, _, _, _, _, _, _) = state else { return nil }
+        return status.serviceIntents
+    }
+
+    func startupIssue(for service: String) -> String? { startupServiceIssues[service] }
 
     func refresh() async {
         guard !relationshipMutationInFlight else {
@@ -151,20 +159,31 @@ final class AppModel {
                 serviceError = "Vaelen is running, but its shell activity signal could not be saved. PHP will refuse to fall back until this is repaired."
             }
             coreLaunchError = nil
-            // Make Core readiness visible as soon as its lightweight status
-            // request succeeds; project diagnostics and provider checks can
-            // continue without keeping the whole popover in a connecting state.
-            state = .running(status, [], nil, nil, nil, nil, nil, nil, nil)
-            let projects = try await client.projectList()
-            let linkedProjects = try await client.linkedProjects()
-            let parkedFolders = try await client.parkedPaths()
-            state = .running(status, projects, nil, nil, nil, nil, nil, nil, nil)
-            var reports = [ProjectEnvironmentReport]()
-            for project in projects {
-                if let report = try? await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path) {
-                    reports.append(report)
-                }
+            let currentProjects: [ProjectWire]
+            let cachedPHP: PHPVersionsResult?
+            let cachedRouting: RouterStatus?
+            let cachedDNS: DNSStatus?
+            let cachedTLS: TLSStatus?
+            let cachedPorts: StandardPortsStatus?
+            let cachedMySQL: MySQLStatus?
+            let cachedMailpit: MailpitStatus?
+            if case .running(_, let projects, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state {
+                currentProjects = projects
+                cachedPHP = php; cachedRouting = routing; cachedDNS = dns; cachedTLS = tls
+                cachedPorts = ports; cachedMySQL = mysql; cachedMailpit = mailpit
+            } else {
+                currentProjects = []
+                cachedPHP = nil; cachedRouting = nil; cachedDNS = nil; cachedTLS = nil
+                cachedPorts = nil; cachedMySQL = nil; cachedMailpit = nil
             }
+            // Core connectivity itself is enough to leave Connecting. Service
+            // probes and all project/catalog work may finish afterward.
+            state = .running(status, currentProjects, cachedPHP, cachedRouting, cachedDNS, cachedTLS, cachedPorts, cachedMySQL, cachedMailpit)
+
+            // Publish a usable Services view before project diagnostics or
+            // remote catalog enrichment. Core connectivity is established by
+            // this point; those slower requests must never own the Connecting
+            // presentation.
             let php = try? await client.phpVersions()
             let routing = try? await client.routingStatus()
             let dns = try? await client.dnsStatus()
@@ -172,6 +191,21 @@ final class AppModel {
             let ports = try? await client.portsStatus()
             let mysql = try? await client.mysqlStatus()
             let mailpit = try? await client.mailpitStatus()
+            guard generation == refreshGeneration else { await client.disconnect(); return }
+            state = .running(status, currentProjects, php, routing, dns, tls, ports, mysql, mailpit)
+
+            // Project discovery, per-project reports, and catalog enrichment
+            // are secondary startup work. They can update the view later, but
+            // they no longer gate Core readiness or service controls.
+            let projects = try await client.projectList()
+            let linkedProjects = try await client.linkedProjects()
+            let parkedFolders = try await client.parkedPaths()
+            var reports = [ProjectEnvironmentReport]()
+            for project in projects {
+                if let report = try? await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path) {
+                    reports.append(report)
+                }
+            }
             let phpCatalog = try? await client.phpCatalog()
             let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
@@ -224,13 +258,19 @@ final class AppModel {
     func installStandardPorts() async {
         guard beginServiceOperation("Enabling standard ports…"), let client else { return }
         do {
-            // Production path: register the signed helper through macOS; the
-            // system owns authentication and Vaelen never sees credentials.
-            // Ad-hoc development builds cannot register (this is expected);
-            // use Scripts/dev-standard-ports-install.sh for development.
+            // Register the bundled LaunchDaemon through macOS. System Settings
+            // owns administrator approval; Vaelen never handles credentials.
             if #available(macOS 13, *) {
                 let service = SMAppService.daemon(plistName: "dev.vaelen.privileged-helper.plist")
+                if service.status == .requiresApproval {
+                    finishServiceOperation(error: "Approve Vaelen’s privileged daemon in System Settings → General → Login Items & Extensions → Allow in the Background, then retry.")
+                    return
+                }
                 if service.status != .enabled { try service.register() }
+                guard service.status == .enabled else {
+                    finishServiceOperation(error: "Approve Vaelen’s privileged daemon in System Settings → General → Login Items & Extensions → Allow in the Background, then retry.")
+                    return
+                }
             }
             _ = try await client.portsInstall(); await refresh()
         } catch { finishServiceOperation(error: error.localizedDescription); return }
@@ -243,49 +283,123 @@ final class AppModel {
     }
 
     func startDNS() async {
-        guard beginServiceOperation("Starting DNS…"), let client else { return }
-        do { _ = try await client.dnsInstall(takeover: false); await refresh(); finishServiceOperation() }
-        catch { finishServiceOperation(error: error.localizedDescription) }
+        await performServiceCommand("Starting DNS…", service: "dns") { [self] client in
+            guard try await registerCurrentPrivilegedHelper() else { throw HelperRegistrationError.failed(Self.helperApprovalGuidance) }
+            // DNS status performs a read-only resolver inspection through the
+            // Core's privileged XPC client. Record helper preparation after
+            // this succeeds, independently of the following DNS acquisition.
+            let helperProbe = try await client.dnsStatus()
+            guard helperProbe.health != "privilege-unavailable" else {
+                throw HelperRegistrationError.failed("The registered privileged helper did not respond to Core’s XPC inspection.")
+            }
+            let digest = try helperRegistrationDigest()
+            UserDefaults.standard.set(digest, forKey: Self.registeredHelperDigestKey)
+            UserDefaults.standard.removeObject(forKey: Self.pendingHelperDigestKey)
+            _ = try await client.dnsInstall(takeover: false)
+        }
+    }
+
+    private static let helperApprovalGuidance = "Approve Vaelen’s privileged daemon in System Settings → General → Login Items & Extensions → Allow in the Background, then retry."
+    private static let registeredHelperDigestKey = "registeredPrivilegedHelperSHA256"
+    private static let pendingHelperDigestKey = "pendingPrivilegedHelperSHA256"
+
+    /// SMAppService requires re-registration when the bundled helper or plist
+    /// changes. The build manifest hashes the helper payload before code
+    /// signing plus the packaged plist, so local re-signing does not look like
+    /// a functional update. A pending digest prevents a failed first XPC call
+    /// from repeating the unregister/register cycle on the user's next retry.
+    private func registerCurrentPrivilegedHelper() async throws -> Bool {
+        guard #available(macOS 13, *) else { return true }
+        let service = SMAppService.daemon(plistName: "dev.vaelen.privileged-helper.plist")
+        let digest = try helperRegistrationDigest()
+        let defaults = UserDefaults.standard
+        let registeredDigest = defaults.string(forKey: Self.registeredHelperDigestKey)
+        let pendingDigest = defaults.string(forKey: Self.pendingHelperDigestKey)
+
+        if service.status == .enabled, registeredDigest == digest || pendingDigest == digest {
+            // A normal launch must not churn a valid durable registration.
+            return true
+        }
+
+        if service.status == .requiresApproval, registeredDigest == digest || pendingDigest == digest {
+            return false
+        }
+
+        if (service.status == .enabled || service.status == .requiresApproval), registeredDigest != digest {
+            do {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    service.unregister { error in
+                        if let error { continuation.resume(throwing: error) }
+                        else {
+                            // SMAppService can transiently reject immediate
+                            // re-registration after unregister (Operation not
+                            // permitted). Defer to the next main run-loop turn
+                            // as recommended by Apple DTS:
+                            // https://developer.apple.com/forums/thread/783539
+                            DispatchQueue.main.async { continuation.resume() }
+                        }
+                    }
+                }
+            } catch {
+                throw HelperRegistrationError.failed("macOS could not replace the registered helper: \(error.localizedDescription)")
+            }
+        }
+
+        if service.status != .enabled && service.status != .requiresApproval {
+            do { try service.register() }
+            catch { throw HelperRegistrationError.failed(error.localizedDescription) }
+        }
+
+        switch service.status {
+        case .enabled:
+            defaults.set(digest, forKey: Self.pendingHelperDigestKey)
+            return true
+        case .requiresApproval:
+            defaults.set(digest, forKey: Self.pendingHelperDigestKey)
+            return false
+        case .notRegistered:
+            throw HelperRegistrationError.failed("macOS did not register Vaelen’s privileged daemon.")
+        case .notFound:
+            throw HelperRegistrationError.failed("macOS could not find Vaelen’s packaged privileged daemon.")
+        @unknown default:
+            throw HelperRegistrationError.failed("macOS could not find Vaelen’s packaged privileged daemon.")
+        }
+    }
+
+    private func helperRegistrationDigest() throws -> String {
+        let manifestURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources/vaelen-privileged-helper.manifest")
+        return try String(contentsOf: manifestURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func stopDNS() async {
-        guard beginServiceOperation("Stopping DNS…"), let client else { return }
-        do { _ = try await client.dnsRemove(); await refresh(); finishServiceOperation() }
-        catch { finishServiceOperation(error: error.localizedDescription) }
+        await performServiceCommand("Stopping DNS…", service: "dns") { client in _ = try await client.dnsRemove() }
     }
 
-    func installMySQL() async { guard beginServiceOperation("Installing MySQL…"), let client else { return }; do { _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func startMySQL() async { guard beginServiceOperation("Starting MySQL…"), let client else { return }; do { let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func stopMySQL() async { guard beginServiceOperation("Stopping MySQL…"), let client else { return }; do { _ = try await client.mysqlStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func installMailpit() async { guard beginServiceOperation("Installing Mailpit…"), let client else { return }; do { _ = try await client.mailpitInstall(MailpitModule.defaultVersion); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func startMailpit() async { guard beginServiceOperation("Starting Mailpit…"), let client else { return }; do { _ = try await client.mailpitStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func stopMailpit() async { guard beginServiceOperation("Stopping Mailpit…"), let client else { return }; do { _ = try await client.mailpitStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func installMySQL() async { await performServiceCommand("Installing MySQL…") { client in _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion) } }
+    func startMySQL() async { await performServiceCommand("Starting MySQL…") { client in let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart() } }
+    func stopMySQL() async { await performServiceCommand("Stopping MySQL…") { client in _ = try await client.mysqlStop() } }
+    func installMailpit() async { await performServiceCommand("Installing Mailpit…") { client in _ = try await client.mailpitInstall(MailpitModule.defaultVersion) } }
+    func startMailpit() async { await performServiceCommand("Starting Mailpit…") { client in _ = try await client.mailpitStart() } }
+    func stopMailpit() async { await performServiceCommand("Stopping Mailpit…") { client in _ = try await client.mailpitStop() } }
     func openMailpit() async { guard beginServiceOperation("Opening Mailpit…"), let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func startRouting() async { guard beginServiceOperation("Starting Caddy…"), let client else { return }; do { _ = try await client.routingStart(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
-    func stopRouting() async { guard beginServiceOperation("Stopping Caddy…"), let client else { return }; do { _ = try await client.routingStop(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
+    func startRouting() async { await performServiceCommand("Starting Caddy…") { client in _ = try await client.routingStart() } }
+    func stopRouting() async { await performServiceCommand("Stopping Caddy…") { client in _ = try await client.routingStop() } }
 
     func installPHP(_ version: String) async {
-        guard beginPHPRequest(version: version), let client else { return }
-        do { _ = try await client.phpInstall(version); await finishPHPRequest() }
-        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+        await performPHPCommand(version) { _ = try await $0.phpInstall(version) }
     }
 
     func updatePHP(_ version: String) async {
-        guard beginPHPRequest(version: version), let client else { return }
-        do { _ = try await client.phpUpdate(version); await finishPHPRequest() }
-        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+        await performPHPCommand(version) { _ = try await $0.phpUpdate(version) }
     }
 
     func removePHP(_ version: String) async {
-        guard beginPHPRequest(version: version), let client else { return }
-        do { _ = try await client.phpRemove(version); await finishPHPRequest() }
-        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+        await performPHPCommand(version) { _ = try await $0.phpRemove(version) }
     }
 
     func setDefaultPHP(_ version: String) async {
-        guard beginPHPRequest(version: version), let client else { return }
-        do { _ = try await client.phpDefaultSet(version); await finishPHPRequest() }
-        catch { await finishPHPRequest(error: phpErrorMessage(error)) }
+        await performPHPCommand(version) { _ = try await $0.phpDefaultSet(version) }
     }
 
     func phpOperationIs(for version: String) -> Bool {
@@ -387,12 +501,14 @@ final class AppModel {
 
     func quitVaelen() async {
         guard !isQuitting else { return }
+        // These flags cover only live request/reply operations now; the slow
+        // project/catalog reconciliation is not part of their lifetime.
         guard !serviceOperationIsBusy, !phpRequestInFlight, !relationshipMutationInFlight else {
-            serviceError = "Wait for the current Vaelen operation to finish, then try Quit again."
+            serviceError = "Vaelen is finishing the current operation. Try Quit again when it completes."
             return
         }
-        guard client != nil else { serviceError = "Vaelen Core is unavailable. Refresh and retry Quit."; return }
         isQuitting = true
+        NSLog("SHUTDOWN_TIMING GUI quit begin epoch=%.3f", Date().timeIntervalSince1970)
         serviceError = nil
         refreshGeneration += 1
         monitorTask?.cancel(); monitorTask = nil
@@ -404,46 +520,18 @@ final class AppModel {
         )
         do {
             try await shutdownClient.connect()
-            let coreStatus = try await shutdownClient.status()
-            guard CoreProcessManager.shared.ownsCore(pid: coreStatus.core.pid) else {
-                serviceError = "This Core process was not launched and retained by this Vaelen app, so Quit cannot safely stop it. Keep the app open or restart Vaelen, then retry."
-                await shutdownClient.disconnect()
-                isQuitting = false
-                startMonitoring()
-                return
-            }
             let result = try await shutdownClient.shutdown()
-            guard result.completed else {
+            if !result.completed {
                 let details = result.components.filter { !$0.succeeded }.map { "\($0.component): \($0.detail)" }.joined(separator: "\n")
-                serviceError = "Vaelen could not finish cleanup. Vaelen remains open and Core remains available. Retry Quit after addressing:\n\(details)"
-                await shutdownClient.disconnect()
-                isQuitting = false
-                startMonitoring()
-                return
+                NSLog("Vaelen is quitting after best-effort cleanup; remaining issues: %@", details)
             }
-            let socketPath = CoreEndpointPaths().socketPath
-            guard await CoreProcessManager.shared.confirmCleanExit(pid: coreStatus.core.pid, socketPath: socketPath) else {
-                serviceError = "Core reported cleanup complete, but Vaelen could not verify its app-owned Core process and socket exited. The app remains open; relaunch Core and retry if necessary."
-                await shutdownClient.disconnect()
-                isQuitting = false
-                startMonitoring()
-                return
-            }
-            guard VaelenActivitySignal.markInactive() else {
-                serviceError = "Services stopped, but Vaelen could not record intentional inactivity for shell PHP. The app remains open; repair the activity signal and retry Quit."
-                await shutdownClient.disconnect()
-                isQuitting = false
-                startMonitoring()
-                return
-            }
-            await shutdownClient.disconnect()
-            VaelenAppDelegate.shared?.terminateAfterCleanQuit()
         } catch {
-            serviceError = "Vaelen could not confirm coordinated cleanup. The app remains open; retry Quit. \(error.localizedDescription)"
-            await shutdownClient.disconnect()
-            isQuitting = false
-            startMonitoring()
+            NSLog("Vaelen Core shutdown request failed; exiting app and relying on Core parent-exit cleanup: %@", error.localizedDescription)
         }
+        _ = VaelenActivitySignal.markInactive()
+        await shutdownClient.disconnect()
+        NSLog("SHUTDOWN_TIMING GUI termination request epoch=%.3f", Date().timeIntervalSince1970)
+        VaelenAppDelegate.shared?.terminateAfterCleanQuit()
     }
 
     private var serviceOperationIsBusy: Bool { serviceOperation != nil }
@@ -455,9 +543,20 @@ final class AppModel {
     }
 
     private func monitor() async {
+        // Bootstrap must run the Core discovery/start path. A lightweight
+        // status refresh is only for an already-running Core; using it first
+        // would leave the UI in Connecting forever when no Core exists yet.
+        await refresh()
         while !Task.isCancelled {
-            await refresh()
-            try? await Task.sleep(for: .seconds(5))
+            try? await Task.sleep(for: .seconds(30))
+            guard !Task.isCancelled else { return }
+            if isShowingRunningSnapshot { await refreshAuthoritativeServiceState() }
+            else { await refresh() }
+            // Background reconciliation catches changes Vaelen did not
+            // initiate. Explicit commands use request/reply plus an immediate
+            // authoritative service snapshot and never wait for this timer.
+            // Keep projects and the remote PHP catalog out of the periodic
+            // path so those diagnostics cannot queue behind lifecycle calls.
         }
     }
 
@@ -499,9 +598,80 @@ final class AppModel {
             return false
         }
         serviceError = nil
+        serviceErrorService = nil
         trustError = nil
         serviceOperation = operation
         return true
+    }
+
+    /// Explicit commands own their request/reply and authoritative service
+    /// refresh. The slower project/catalog refresh remains background
+    /// reconciliation and never keeps a completed command's spinner alive.
+    private func performServiceCommand(_ operation: String, service: String? = nil, command: @MainActor (VaelenCoreClient) async throws -> Void) async {
+        guard beginServiceOperation(operation) else { return }
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            try await command(commandClient)
+            await commandClient.disconnect()
+            await refreshAuthoritativeServiceState()
+            finishServiceOperation()
+        } catch {
+            await commandClient.disconnect()
+            await refreshAuthoritativeServiceState()
+            let reconciledError = service == "dns" && operation == "Starting DNS…"
+                ? ServiceControlPresentation.dnsStartFailure(error.localizedDescription, authoritativeStatus: currentDNSStatus)
+                : error.localizedDescription
+            finishServiceOperation(error: reconciledError, service: service)
+        }
+    }
+
+    private func makeCoreClient() -> VaelenCoreClient {
+        VaelenCoreClient(
+            transport: UnixSocketTransport(path: CoreEndpointPaths().socketPath),
+            identity: ClientIdentity(name: "Vaelen.app", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)
+        )
+    }
+
+    private func refreshAuthoritativeServiceState() async {
+        refreshGeneration += 1 // invalidate any older, slower reconciliation snapshot
+        let generation = refreshGeneration
+        let refreshClient = makeCoreClient()
+        do {
+            try await refreshClient.connect()
+            let status = try await refreshClient.status()
+            let php = try? await refreshClient.phpVersions()
+            let routing = try? await refreshClient.routingStatus()
+            let dns = try? await refreshClient.dnsStatus()
+            let mysql = try? await refreshClient.mysqlStatus()
+            let mailpit = try? await refreshClient.mailpitStatus()
+            guard generation == refreshGeneration else {
+                await refreshClient.disconnect()
+                return
+            }
+
+            let projects: [ProjectWire]
+            let tls: TLSStatus?
+            let ports: StandardPortsStatus?
+            if case .running(_, let currentProjects, _, _, _, let currentTLS, let currentPorts, _, _) = state {
+                projects = currentProjects; tls = currentTLS; ports = currentPorts
+            } else {
+                projects = []; tls = nil; ports = nil
+            }
+            state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
+            startupServiceIssues = status.serviceIssues ?? [:]
+            if serviceErrorService == "dns", Self.isAuthoritativelyHealthyDNS(dns) {
+                let supersededError = serviceError
+                serviceError = nil
+                serviceErrorService = nil
+                if trustError == supersededError { trustError = nil }
+            }
+            refreshError = nil
+            await refreshClient.disconnect()
+        } catch {
+            await refreshClient.disconnect()
+            refreshError = error.localizedDescription
+        }
     }
 
     private func beginPHPRequest(version: String) -> Bool {
@@ -514,10 +684,24 @@ final class AppModel {
     }
 
     private func finishPHPRequest(error: String? = nil) async {
+        await refreshAuthoritativeServiceState()
         phpRequestInFlight = false
         phpRequestTarget = nil
         phpError = error
-        await refresh()
+    }
+
+    private func performPHPCommand(_ version: String, command: @MainActor (VaelenCoreClient) async throws -> Void) async {
+        guard beginPHPRequest(version: version) else { return }
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            try await command(commandClient)
+            await commandClient.disconnect()
+            await finishPHPRequest()
+        } catch {
+            await commandClient.disconnect()
+            await finishPHPRequest(error: phpErrorMessage(error))
+        }
     }
 
     private func phpErrorMessage(_ error: Error) -> String {
@@ -530,16 +714,37 @@ final class AppModel {
         return error.localizedDescription
     }
 
-    private func finishServiceOperation(error: String? = nil) {
+    private func finishServiceOperation(error: String? = nil, service: String? = nil) {
         serviceOperation = nil
         serviceError = error
         trustError = error
+        serviceErrorService = error == nil ? nil : service
+    }
+
+    private var currentDNSStatus: DNSStatus? {
+        guard case .running(_, _, _, _, let dns, _, _, _, _) = state else { return nil }
+        return dns
+    }
+
+    private static func isAuthoritativelyHealthyDNS(_ dns: DNSStatus?) -> Bool {
+        guard let dns else { return false }
+        return dns.state == .installed && dns.ownership == .vaelen && dns.responderState == .ownedRunning && dns.health == "healthy"
     }
 
     private func finishRelationshipMutation(error: Error? = nil) {
         relationshipMutationInFlight = false
         relationshipOperation = nil
         relationshipError = error?.localizedDescription
+    }
+}
+
+private enum HelperRegistrationError: LocalizedError {
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .failed(let detail): return "Vaelen could not prepare its privileged DNS helper: \(detail)"
+        }
     }
 }
 
@@ -933,6 +1138,7 @@ private struct ServiceRow<Actions: View>: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .help(subtitle)
                 }
             }
             Spacer(minLength: VaelenUI.spacing8)
@@ -1008,9 +1214,12 @@ struct ServicesView: View {
                     .padding(.top, VaelenUI.spacing12)
                     .padding(.bottom, VaelenUI.spacing6)
                 if let dns {
-                    ServiceRow(title: "DNS", subtitle: dns.conflict, state: dnsState(dns).title, stateSymbol: dnsState(dns).symbol, stateTint: dnsState(dns).tint, busy: model.serviceOperationIs(for: "DNS")) {
-                        if dns.health == "healthy" && dns.responderState == .ownedRunning { Button("Stop DNS") { Task { await model.stopDNS() } } }
-                        else { Button("Retry DNS Start") { Task { await model.startDNS() } } }
+                    let control = ServiceControlPresentation.dns(status: dns, savedOn: model.savedServiceIntents?.contains("dns"), blockedReason: model.startupIssue(for: "dns"))
+                    ServiceRow(title: "DNS", subtitle: control.detail, state: control.title, stateSymbol: serviceSymbol(control.title), stateTint: serviceTint(control.title), busy: model.serviceOperationIs(for: "DNS")) {
+                        if control.action == .enable { Button("Enable DNS") { Task { await model.startDNS() } } }
+                        if control.action == .retry { Button("Retry DNS Start") { Task { await model.startDNS() } } }
+                        if control.action == .stop || control.action == .disable { Button("Stop DNS") { Task { await model.stopDNS() } } }
+                        if control.canDisable && control.action == .retry { Button("Disable DNS") { Task { await model.stopDNS() } } }
                     }
                 }
                 if let tls {
@@ -1020,11 +1229,11 @@ struct ServicesView: View {
                     }
                 }
                 if let ports {
-                    ServiceRow(title: "Standard Ports", subtitle: nil, state: ports.state == .healthy ? "Enabled" : "Needs attention", stateSymbol: ports.state == .healthy ? "checkmark" : "exclamationmark.triangle", stateTint: ports.state == .healthy ? .secondary : .orange, busy: model.serviceOperationIs(for: "standard ports")) {
-                        if ports.state != .healthy && ports.state != .installed {
-                            Button(ports.state == .absent ? "Enable Standard Ports" : "Retry Standard Ports") { Task { await model.installStandardPorts() } }
-                        }
-                        if ports.state == .healthy || ports.state == .installed { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
+                    let control = ServiceControlPresentation.standardPorts(status: ports, savedOn: model.savedServiceIntents?.contains("standard-ports"), blockedReason: model.startupIssue(for: "standard-ports"))
+                    ServiceRow(title: "Standard Ports", subtitle: control.detail, state: control.title, stateSymbol: serviceSymbol(control.title), stateTint: serviceTint(control.title), busy: model.serviceOperationIs(for: "standard ports")) {
+                        if control.action == .enable { Button("Enable Standard Ports") { Task { await model.installStandardPorts() } } }
+                        if control.action == .retry { Button("Retry Standard Ports") { Task { await model.installStandardPorts() } } }
+                        if control.action == .disable { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
                     }
                 }
                 if let operation = model.serviceOperation {
@@ -1081,6 +1290,14 @@ struct ServicesView: View {
 
     private func dnsState(_ dns: DNSStatus) -> ServicePresentation {
         dns.supportsLocalResolution ? .init("Ready", "checkmark", .secondary) : .init("Needs attention", "exclamationmark.triangle", .orange)
+    }
+
+    private func serviceSymbol(_ title: String) -> String {
+        title == "Needs attention" || title == "State unavailable" ? "exclamationmark.triangle" : (title.hasPrefix("On") || title == "Enabled" ? "checkmark" : "circle")
+    }
+
+    private func serviceTint(_ title: String) -> Color {
+        title == "Needs attention" || title == "State unavailable" ? .orange : .secondary
     }
 
     @ViewBuilder private func mysqlActions(_ mysql: MySQLStatus) -> some View {
