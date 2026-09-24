@@ -260,17 +260,16 @@ final class AppModel {
     }
 
     func installStandardPorts() async {
-        guard beginServiceOperation("Enabling standard ports…"), let client else { return }
-        do {
+        await performServiceCommand("Enabling standard ports…", service: "standard-ports") { [self] client in
             try await preparePrivilegedHelper(using: client)
-            _ = try await client.portsInstall(); await refresh()
-        } catch { finishServiceOperation(error: error.localizedDescription); return }
-        finishServiceOperation()
+            _ = try await client.portsInstall()
+        }
     }
 
     func removeStandardPorts() async {
-        guard beginServiceOperation("Disabling standard ports…"), let client else { return }
-        do { _ = try await client.portsRemove(); await refresh(); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) }
+        await performServiceCommand("Disabling standard ports…", service: "standard-ports") { client in
+            _ = try await client.portsRemove()
+        }
     }
 
     func startDNS() async {
@@ -648,6 +647,7 @@ final class AppModel {
             let dns = try? await refreshClient.dnsStatus()
             let mysql = try? await refreshClient.mysqlStatus()
             let mailpit = try? await refreshClient.mailpitStatus()
+            let observedPorts = try? await refreshClient.portsStatus()
             guard generation == refreshGeneration else {
                 await refreshClient.disconnect()
                 return
@@ -655,13 +655,14 @@ final class AppModel {
 
             let projects: [ProjectWire]
             let tls: TLSStatus?
-            let ports: StandardPortsStatus?
-            if case .running(_, let currentProjects, _, _, _, let currentTLS, let currentPorts, _, _) = state {
-                projects = currentProjects; tls = currentTLS; ports = currentPorts
+            let currentPorts: StandardPortsStatus?
+            if case .running(_, let currentProjects, _, _, _, let currentTLS, let cachedPorts, _, _) = state {
+                projects = currentProjects; tls = currentTLS
+                currentPorts = observedPorts ?? cachedPorts
             } else {
-                projects = []; tls = nil; ports = nil
+                projects = []; tls = nil; currentPorts = nil
             }
-            state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
+            state = .running(status, projects, php, routing, dns, tls, currentPorts, mysql, mailpit)
             startupServiceIssues = status.serviceIssues ?? [:]
             if serviceErrorService == "dns", Self.isAuthoritativelyHealthyDNS(dns) {
                 let supersededError = serviceError

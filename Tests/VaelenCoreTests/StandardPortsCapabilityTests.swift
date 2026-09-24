@@ -135,6 +135,35 @@ final class StandardPortsCapabilityTests: XCTestCase {
         XCTAssertEqual(occurrences, 2, "reference lines must not duplicate")
     }
 
+    func testInstallRemoveInstallReacquiresPFWithinSameCapabilityLifetime() async throws {
+        let fixture = try makeFixture(); defer { tearDown(fixture) }
+        let originalConf = StandardPortsForwardingPolicy.addingReference(
+            to: "# historical compatible PF configuration\n",
+            anchorPath: fixture.paths.anchorPath
+        )
+        try originalConf.write(toFile: fixture.paths.pfConfPath, atomically: true, encoding: .utf8)
+        try StandardPortsForwardingPolicy.writeAnchor(to: fixture.paths.anchorPath)
+        let preservedConf = try Data(contentsOf: URL(fileURLWithPath: fixture.paths.pfConfPath))
+        let preservedAnchor = try Data(contentsOf: URL(fileURLWithPath: fixture.paths.anchorPath))
+        let occupancy = Occupancy(); occupancy.ports = [80, 443]
+        let capability = makeCapability(fixture, occupancy: occupancy, backendHealthy: true)
+
+        let firstActivation = try await capability.install()
+        XCTAssertEqual(firstActivation.state, .healthy)
+        let disabled = try await capability.remove()
+        XCTAssertEqual(disabled.ownership, .external)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixture.paths.pfConfPath)), preservedConf)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixture.paths.anchorPath)), preservedAnchor)
+        let pfEnabledAfterRemove = await fixture.privileged.isPFEnabled()
+        XCTAssertFalse(pfEnabledAfterRemove)
+
+        let secondActivation = try await capability.install()
+        XCTAssertEqual(secondActivation.state, .healthy)
+        XCTAssertTrue(try XCTUnwrap(try fixture.ledger.standardPortsRecord()).active)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixture.paths.pfConfPath)), preservedConf)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixture.paths.anchorPath)), preservedAnchor)
+    }
+
     func testHealthyRequiresBackendAndReachablePorts() async throws {
         let fixture = try makeFixture(); defer { tearDown(fixture) }
         let occupancy = Occupancy()

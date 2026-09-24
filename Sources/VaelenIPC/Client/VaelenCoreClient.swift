@@ -1,12 +1,27 @@
 import Foundation
 import VaelenCore
 
-public enum CoreClientError: Error, Equatable, Sendable {
+public enum CoreClientError: Error, Equatable, Sendable, LocalizedError {
     case coreUnavailable
     case protocolIncompatible(client: Int, core: Int)
     case coreIncompatible(reason: String)
     case invalidResponse
     case remote(IPCErrorPayload)
+
+    public var errorDescription: String? {
+        switch self {
+        case .coreUnavailable:
+            return "Vaelen Core is unavailable. Try again or relaunch Vaelen."
+        case .protocolIncompatible(let client, let core):
+            return "Vaelen Core protocol mismatch (client \(client), Core \(core)). Restart Vaelen and try again."
+        case .coreIncompatible(let reason):
+            return reason
+        case .invalidResponse:
+            return "Vaelen Core returned an invalid response. Restart Vaelen and try again."
+        case .remote(let payload):
+            return payload.message
+        }
+    }
 }
 
 public actor VaelenCoreClient {

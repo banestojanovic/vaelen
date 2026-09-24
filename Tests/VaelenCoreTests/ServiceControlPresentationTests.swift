@@ -114,4 +114,22 @@ final class ServiceControlPresentationTests: XCTestCase {
         XCTAssertEqual(view.action, .retry)
         XCTAssertFalse(view.canDisable)
     }
+
+    func testStandardPortsDisableRefreshUsesUnownedOffSnapshotInsteadOfStaleOwnedState() {
+        // After remove, Core has relinquished the active ledger record while
+        // compatible historical PF files remain. The refreshed observation
+        // must not preserve the pre-remove owned snapshot in the UI.
+        let postRemoveStatus = StandardPortsStatus(
+            state: .unhealthy,
+            detail: "PF integration is present but active forwarding has not been verified",
+            ownership: .external
+        )
+
+        let view = ServiceControlPresentation.standardPorts(status: postRemoveStatus, savedOn: false)
+
+        XCTAssertEqual(view.title, "Off · Existing PF configuration")
+        XCTAssertEqual(view.action, .enable)
+        XCTAssertFalse(view.canDisable)
+        XCTAssertFalse(view.detail?.contains("saved off") == true)
+    }
 }
