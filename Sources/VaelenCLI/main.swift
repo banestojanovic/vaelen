@@ -8,7 +8,7 @@ enum CLICommand {
     case status(json: Bool)
     case doctor(json: Bool)
     case routeTLS(hostname: String?, secure: Bool)
-    case link(path: String)
+    case link(path: String?)
     case unlink(path: String)
     case links(json: Bool)
     case park(path: String)
@@ -105,6 +105,47 @@ func routeTLSUpdate(_ intent: RouteIntent, secure: Bool) -> RouteIntent? {
     return RouteIntent(route: Route(id: intent.route.id, hostname: intent.route.hostname, target: intent.route.target, tls: mode), projectID: intent.projectID, projectPath: intent.projectPath)
 }
 
+func routesForProject(_ routes: [RouteIntent], projectID: UUID?, projectPath: String) -> [RouteIntent] {
+    let canonicalPath = URL(fileURLWithPath: projectPath).standardizedFileURL.resolvingSymlinksInPath().path
+    return routes.filter { route in
+        if projectID != nil && route.projectID == projectID { return true }
+        if let path = route.projectPath { return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path == canonicalPath }
+        let docroot: String
+        switch route.route.target {
+        case .fastCGI(_, let value), .staticFiles(let value): docroot = value
+        case .http: return false
+        }
+        let root = URL(fileURLWithPath: docroot).standardizedFileURL
+        let inferredProjectPath = root.lastPathComponent == "public" ? root.deletingLastPathComponent().path : root.path
+        return URL(fileURLWithPath: inferredProjectPath).resolvingSymlinksInPath().path == canonicalPath
+    }
+}
+
+func hostnameCollision(_ hostname: String, candidateProjectRoutes: [RouteIntent], allRoutes: [RouteIntent]) -> RouteIntent? {
+    guard let collision = allRoutes.first(where: { $0.route.hostname.caseInsensitiveCompare(hostname) == .orderedSame }) else { return nil }
+    return candidateProjectRoutes.contains(where: { $0.route.id == collision.route.id }) ? nil : collision
+}
+
+func preflightLinkCollision(hostname: String, projectPath: String, routes: [RouteIntent]) -> RouteIntent? {
+    let samePathRoutes = routesForProject(routes, projectID: nil, projectPath: projectPath)
+    guard samePathRoutes.isEmpty else { return nil }
+    return hostnameCollision(hostname, candidateProjectRoutes: [], allRoutes: routes)
+}
+
+func withNewLinkRollback<Value>(linkCreatedByInvocation: Bool, rollback: () async -> Void, operation: () async throws -> Value) async throws -> Value {
+    do { return try await operation() }
+    catch {
+        if linkCreatedByInvocation { await rollback() }
+        throw error
+    }
+}
+
+func linkFailureDescription(_ error: Error) -> String {
+    if let clientError = error as? CoreClientError, case .remote(let payload) = clientError { return payload.message }
+    if let cliError = error as? CLIError { return cliError.description }
+    return String(describing: error)
+}
+
 private struct ProjectListEnvelope: Encodable { let projects: [ProjectWire] }
 private struct ParkedPathListEnvelope: Encodable { let paths: [ParkedPathWire] }
 private struct RouteListEnvelope: Encodable { let routes: [RouteIntent] }
@@ -199,7 +240,7 @@ struct VaelenCLIMain {
         case "ports": body = groupHelp("val ports <status|install|remove>", [("status [--json]", "Show standard local port status"), ("install", "Enable standard local ports"), ("remove", "Remove standard local port forwarding")], examples: ["val ports status"])
         case "shell": body = groupHelp("val shell <status|install|uninstall>", [("status", "Show PHP shell integration"), ("install", "Install PHP shell integration"), ("uninstall", "Remove PHP shell integration")], examples: ["val shell status"])
         case "status": body = "Usage: val status [--json]\nShow whether Vaelen Core is running."
-        case "link": body = "Usage: val link <project-directory>\nLink a project folder to Vaelen.\nExample: val link ./my-app"
+        case "link": body = "Usage: val link [project-directory]\nLink and serve a project folder. With no directory, use the current directory.\nExample: val link\nExample: val link ./my-app"
         case "unlink": body = "Usage: val unlink <project-directory>\nUnlink a project without deleting its files.\nExample: val unlink ./my-app"
         case "park": body = "Usage: val park <workspace-folder>\nPark a folder in your workspace.\nExample: val park ~/Code/old-project"
         case "unpark": body = "Usage: val unpark <workspace-folder>\nUnpark a folder without deleting it.\nExample: val unpark ~/Code/old-project"
@@ -388,7 +429,9 @@ struct VaelenCLIMain {
             case "activate": return .projectActivate(selector: parsed.selector, json: parsed.json)
             default: throw CLIError.usage
             }
-        case "link": return .link(path: try requiredPath(args))
+        case "link":
+            guard args.count <= 2 else { throw CLIError.usage }
+            return .link(path: args.count == 2 ? args[1] : nil)
         case "unlink": return .unlink(path: try requiredPath(args))
         case "park": return .park(path: try requiredPath(args))
         case "unpark": return .unpark(path: try requiredPath(args))
@@ -608,9 +651,85 @@ struct VaelenCLIMain {
                 print("Vaelen\nCore       \(status.core.state == .running ? "Running" : "Unavailable")\nVersion    \(status.core.version)\nPID        \(status.core.pid)\nProtocol   \(status.protocolVersion)")
             }
         case .link(let path):
+            let workingPath = URL(fileURLWithPath: workingDirectory).standardizedFileURL.resolvingSymlinksInPath().path
+            var preflightRoutes: [RouteIntent] = []
+            if path == nil {
+                preflightRoutes = try await client.routeList()
+                let linkedAtPath = routesForProject(preflightRoutes, projectID: nil, projectPath: workingPath)
+                if linkedAtPath.isEmpty {
+                    let expectedHost = URL(fileURLWithPath: workingPath).lastPathComponent + ".test"
+                    if let collision = preflightLinkCollision(hostname: expectedHost, projectPath: workingPath, routes: preflightRoutes) {
+                        throw CLIError.message("Cannot link this project: \(expectedHost) is already routed to another project (\(collision.projectPath ?? "existing route")). Nothing was registered or changed.")
+                    }
+                }
+            }
             let result = try await client.link(path: path, workingDirectory: workingDirectory, name: nil)
             guard let project = result.project else { throw CLIError.message("Core returned no linked project.") }
-            print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(displayPath(project.path))")
+            guard path == nil else {
+                print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(displayPath(project.path))")
+                break
+            }
+            let canonicalPath = URL(fileURLWithPath: project.path).standardizedFileURL.resolvingSymlinksInPath().path
+            var attemptedRoute: RouteIntent?
+            var rollbackProblems = [String]()
+            let servingRoute: RouteIntent
+            do {
+                servingRoute = try await withNewLinkRollback(linkCreatedByInvocation: result.created, rollback: {
+                    if let attemptedRoute {
+                        do {
+                            let routes = try await client.routeList()
+                            if routes.contains(where: { $0.route.id == attemptedRoute.route.id && $0.projectID == attemptedRoute.projectID && $0.projectPath == attemptedRoute.projectPath }) {
+                                _ = try await client.routeRemove(attemptedRoute.route.id)
+                            }
+                        } catch { rollbackProblems.append("could not remove route \(attemptedRoute.route.id): \(message(for: error))") }
+                    }
+                    guard result.created else { return }
+                    do {
+                        let projects = try await client.linkedProjects()
+                        if projects.contains(where: { $0.id == project.id && URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path == canonicalPath }) {
+                            try await client.unlink(path: canonicalPath, name: nil, workingDirectory: canonicalPath)
+                        }
+                    } catch { rollbackProblems.append("could not undo the newly created project link: \(message(for: error))") }
+                }) {
+                    let report = try await client.projectInspect(selector: canonicalPath, workingDirectory: canonicalPath)
+                    let allRoutes = try await client.routeList()
+                    let ownedRoutes = routesForProject(allRoutes, projectID: project.id, projectPath: canonicalPath)
+                    guard ownedRoutes.count <= 1 else { throw CLIError.message("The project has multiple Vaelen routes. Review ‘val route list’; no route was changed.") }
+                    if let existing = ownedRoutes.first { return existing }
+                    let hostname = URL(fileURLWithPath: canonicalPath).lastPathComponent + ".test"
+                    if let collision = hostnameCollision(hostname, candidateProjectRoutes: ownedRoutes, allRoutes: allRoutes) {
+                        throw CLIError.message("\(hostname) is already routed to another project (\(collision.projectPath ?? "existing route")).")
+                    }
+                    guard let relativeRoot = report.derived.framework.suggestedDocumentRoot else {
+                        throw CLIError.message("Vaelen could not determine a supported document root. Add or correct the project’s web entry point, then retry.")
+                    }
+                    let documentRoot = URL(fileURLWithPath: canonicalPath).appendingPathComponent(relativeRoot).standardizedFileURL.path
+                    var isDirectory: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: documentRoot, isDirectory: &isDirectory), isDirectory.boolValue else {
+                        throw CLIError.message("The planned document root does not exist: \(documentRoot).")
+                    }
+                    let target: RouteTarget
+                    let detectedFramework = report.derived.framework.framework.lowercased()
+                    if report.derived.framework.composerPHPRequirement != nil || detectedFramework.contains("php") || detectedFramework.contains("laravel") || detectedFramework.contains("wordpress") {
+                        guard report.observed.php.fpmHealth == "healthy", let socket = report.observed.php.fpmSocket else {
+                            throw CLIError.message("The PHP runtime is not healthy/available. Start or install the required PHP version, then retry.")
+                        }
+                        target = .fastCGI(socketPath: socket, documentRoot: documentRoot)
+                    } else {
+                        target = .staticFiles(documentRoot: documentRoot)
+                    }
+                    let intent = RouteIntent(route: Route(hostname: hostname, target: target, tls: .disabled), projectID: project.id, projectPath: canonicalPath)
+                    attemptedRoute = intent
+                    let router = try await client.routingStatus()
+                    guard router.state == .running, router.health == .healthy else { throw CLIError.message("Vaelen routing is not healthy; no route was applied.") }
+                    return try await client.routeAdd(intent)
+                }
+            } catch {
+                let cleanup = rollbackProblems.isEmpty ? "" : " Rollback was incomplete: \(rollbackProblems.joined(separator: "; "))."
+                let disposition = result.created ? "The project link created by this invocation was rolled back." : "The pre-existing project link and all existing routes were left unchanged."
+                throw CLIError.message("Could not finish linking \(project.name): \(linkFailureDescription(error)). \(disposition)\(cleanup)")
+            }
+            print("\(result.created ? "Linked" : "Already linked") \(project.name)\nServing \(servingRoute.route.hostname) at \(servingRoute.route.tls == .local ? "https" : "http")://\(servingRoute.route.hostname)")
         case .unlink(let path):
             try await client.unlink(path: path, name: nil, workingDirectory: workingDirectory)
             print("Unlinked project")
