@@ -139,7 +139,11 @@ final class AppModel {
                 try await client.connect()
             } catch let error as CoreClientError {
                 guard case .coreUnavailable = error else { throw error }
-                try CoreProcessManager.shared.start()
+                let coreStarted = try await CoreStartupHelperGate.run(
+                    reconcileHelper: { try await self.registerCurrentPrivilegedHelper() },
+                    startCore: { try CoreProcessManager.shared.start() }
+                )
+                guard coreStarted else { throw HelperRegistrationError.failed(Self.helperApprovalGuidance) }
                 var connected = false
                 for _ in 0..<20 {
                     try await Task.sleep(for: .milliseconds(100))
@@ -258,20 +262,7 @@ final class AppModel {
     func installStandardPorts() async {
         guard beginServiceOperation("Enabling standard ports…"), let client else { return }
         do {
-            // Register the bundled LaunchDaemon through macOS. System Settings
-            // owns administrator approval; Vaelen never handles credentials.
-            if #available(macOS 13, *) {
-                let service = SMAppService.daemon(plistName: "dev.vaelen.privileged-helper.plist")
-                if service.status == .requiresApproval {
-                    finishServiceOperation(error: "Approve Vaelen’s privileged daemon in System Settings → General → Login Items & Extensions → Allow in the Background, then retry.")
-                    return
-                }
-                if service.status != .enabled { try service.register() }
-                guard service.status == .enabled else {
-                    finishServiceOperation(error: "Approve Vaelen’s privileged daemon in System Settings → General → Login Items & Extensions → Allow in the Background, then retry.")
-                    return
-                }
-            }
+            try await preparePrivilegedHelper(using: client)
             _ = try await client.portsInstall(); await refresh()
         } catch { finishServiceOperation(error: error.localizedDescription); return }
         finishServiceOperation()
@@ -284,17 +275,7 @@ final class AppModel {
 
     func startDNS() async {
         await performServiceCommand("Starting DNS…", service: "dns") { [self] client in
-            guard try await registerCurrentPrivilegedHelper() else { throw HelperRegistrationError.failed(Self.helperApprovalGuidance) }
-            // DNS status performs a read-only resolver inspection through the
-            // Core's privileged XPC client. Record helper preparation after
-            // this succeeds, independently of the following DNS acquisition.
-            let helperProbe = try await client.dnsStatus()
-            guard helperProbe.health != "privilege-unavailable" else {
-                throw HelperRegistrationError.failed("The registered privileged helper did not respond to Core’s XPC inspection.")
-            }
-            let digest = try helperRegistrationDigest()
-            UserDefaults.standard.set(digest, forKey: Self.registeredHelperDigestKey)
-            UserDefaults.standard.removeObject(forKey: Self.pendingHelperDigestKey)
+            try await preparePrivilegedHelper(using: client)
             _ = try await client.dnsInstall(takeover: false)
         }
     }
@@ -316,13 +297,20 @@ final class AppModel {
         let registeredDigest = defaults.string(forKey: Self.registeredHelperDigestKey)
         let pendingDigest = defaults.string(forKey: Self.pendingHelperDigestKey)
 
-        if service.status == .enabled, registeredDigest == digest || pendingDigest == digest {
+        switch HelperRegistrationDigestPolicy.resolve(
+            serviceEnabled: service.status == .enabled,
+            serviceRequiresApproval: service.status == .requiresApproval,
+            packagedDigest: digest,
+            registeredDigest: registeredDigest,
+            pendingDigest: pendingDigest
+        ) {
+        case .useCurrentRegistration:
             // A normal launch must not churn a valid durable registration.
             return true
-        }
-
-        if service.status == .requiresApproval, registeredDigest == digest || pendingDigest == digest {
+        case .approvalRequired:
             return false
+        case .reconcile:
+            break
         }
 
         if (service.status == .enabled || service.status == .requiresApproval), registeredDigest != digest {
@@ -370,6 +358,21 @@ final class AppModel {
         let manifestURL = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Resources/vaelen-privileged-helper.manifest")
         return try String(contentsOf: manifestURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Reuses the accepted SMAppService digest reconciliation and read-only
+    /// helper probe for every user-triggered operation requiring the helper.
+    /// The digest is committed as registered only after Core successfully
+    /// reaches the current helper through the supported XPC path.
+    private func preparePrivilegedHelper(using client: VaelenCoreClient) async throws {
+        guard try await registerCurrentPrivilegedHelper() else { throw HelperRegistrationError.failed(Self.helperApprovalGuidance) }
+        let helperProbe = try await client.dnsStatus()
+        guard helperProbe.health != "privilege-unavailable" else {
+            throw HelperRegistrationError.failed("The registered privileged helper did not respond to Core’s XPC inspection.")
+        }
+        let digest = try helperRegistrationDigest()
+        UserDefaults.standard.set(digest, forKey: Self.registeredHelperDigestKey)
+        UserDefaults.standard.removeObject(forKey: Self.pendingHelperDigestKey)
     }
 
     func stopDNS() async {
