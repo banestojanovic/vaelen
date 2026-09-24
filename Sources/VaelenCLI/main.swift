@@ -7,6 +7,7 @@ enum CLICommand {
     case help
     case status(json: Bool)
     case doctor(json: Bool)
+    case routeTLS(hostname: String?, secure: Bool)
     case link(path: String)
     case unlink(path: String)
     case links(json: Bool)
@@ -68,6 +69,42 @@ enum CLICommand {
     case portsRemove
 }
 
+enum RouteSelectionError: Error, Equatable {
+    case notFound(String)
+    case noRouteForDirectory
+    case ambiguous([String])
+}
+
+func selectSiteRoute(_ routes: [RouteIntent], hostname: String?, workingDirectory: String) throws -> RouteIntent {
+    if let hostname {
+        guard let route = routes.first(where: { $0.route.hostname.caseInsensitiveCompare(hostname) == .orderedSame }) else { throw RouteSelectionError.notFound(hostname) }
+        return route
+    }
+    let cwd = URL(fileURLWithPath: workingDirectory).standardizedFileURL.resolvingSymlinksInPath().path
+    let matches = routes.filter { intent in
+        let path: String
+        if let projectPath = intent.projectPath { path = projectPath }
+        else {
+            switch intent.route.target {
+            case .fastCGI(_, let documentRoot), .staticFiles(let documentRoot):
+                let root = URL(fileURLWithPath: documentRoot).standardizedFileURL
+                path = root.lastPathComponent == "public" ? root.deletingLastPathComponent().path : root.path
+            case .http: return false
+            }
+        }
+        return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path == cwd
+    }
+    guard !matches.isEmpty else { throw RouteSelectionError.noRouteForDirectory }
+    guard matches.count == 1 else { throw RouteSelectionError.ambiguous(matches.map(\.route.hostname).sorted()) }
+    return matches[0]
+}
+
+func routeTLSUpdate(_ intent: RouteIntent, secure: Bool) -> RouteIntent? {
+    let mode: TLSMode = secure ? .local : .disabled
+    guard intent.route.tls != mode else { return nil }
+    return RouteIntent(route: Route(id: intent.route.id, hostname: intent.route.hostname, target: intent.route.target, tls: mode), projectID: intent.projectID, projectPath: intent.projectPath)
+}
+
 private struct ProjectListEnvelope: Encodable { let projects: [ProjectWire] }
 private struct ParkedPathListEnvelope: Encodable { let paths: [ParkedPathWire] }
 private struct RouteListEnvelope: Encodable { let routes: [RouteIntent] }
@@ -108,6 +145,7 @@ struct VaelenCLIMain {
             let sections: [(String, [(String, String)])] = [
                 ("Projects", [("link", "Link a project"), ("links", "List linked projects"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
                 ("Overview", [("status", "Show Vaelen status"), ("doctor", "Check Vaelen services")]),
+                ("Web", [("secure", "Enable HTTPS for a site route"), ("unsecure", "Serve a site route over HTTP")]),
                 ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
                 ("Networking", [("routing", "Manage router"), ("route", "Manage project routes"), ("dns", "Manage DNS"), ("tls", "Manage HTTPS"), ("ports", "Manage web ports")]),
                 ("Integration", [("shell", "PHP shell integration")])
@@ -125,6 +163,8 @@ struct VaelenCLIMain {
         let body: String
         switch name {
         case "doctor": body = "Usage: val doctor [--json]\nCheck Vaelen Core and managed service health without starting or repairing services.\nExample: val doctor --json"
+        case "secure": body = "Usage: val secure [hostname]\nEnable local HTTPS and HTTP-to-HTTPS redirect for an existing route. Without a hostname, the current directory must resolve to exactly one route.\nExample: val secure app.test"
+        case "unsecure": body = "Usage: val unsecure [hostname]\nServe an existing route over HTTP without redirect. Without a hostname, the current directory must resolve to exactly one route. Browsers may retain a cached HTTPS redirect.\nExample: val unsecure app.test"
         case "project": body = groupHelp("val project <command> [project] [options]", [
                 ("status [project] [--json]", "Show project environment summary"),
                 ("inspect [project] [--json]", "Show configuration and diagnostics"),
@@ -325,6 +365,9 @@ struct VaelenCLIMain {
             return .help
         case "status": return .status(json: args.dropFirst().elementsEqual(["--json"]))
         case "doctor": return .doctor(json: try listJSONOption(args))
+        case "secure", "unsecure":
+            guard args.count <= 2 else { throw CLIError.usage }
+            return .routeTLS(hostname: args.count == 2 ? args[1] : nil, secure: first == "secure")
         case "links": return .links(json: try listJSONOption(args))
         case "parks", "paths": return .parks(json: try listJSONOption(args))
         case "project":
@@ -424,8 +467,8 @@ struct VaelenCLIMain {
             case "associate":
                 guard args.count == 4, let routeUUID = UUID(uuidString: args[2]), let projectUUID = UUID(uuidString: args[3]) else { throw CLIError.usage }
                 return .routeAssociate(RouteID(rawValue: routeUUID), ProjectID(rawValue: projectUUID))
-             default: throw CLIError.usage
-             }
+            default: throw CLIError.usage
+            }
         case "mailpit":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
@@ -650,6 +693,18 @@ struct VaelenCLIMain {
             let routes = try await client.routeList()
             if json { print(String(decoding: try IPCCodec.encode(RouteListEnvelope(routes: routes)), as: UTF8.self)) }
             else { routes.forEach { intent in print("\(intent.route.id)\t\(intent.route.hostname)\t\(targetDescription(intent.route.target))\tDesired") } }
+        case .routeTLS(let hostname, let secure):
+            let routes = try await client.routeList()
+            let intent: RouteIntent
+            do { intent = try selectSiteRoute(routes, hostname: hostname, workingDirectory: workingDirectory) }
+            catch RouteSelectionError.notFound(let value) { throw CLIError.message("No Vaelen route exists for \(value). Add an explicit route with ‘val route add’, then retry.") }
+            catch RouteSelectionError.noRouteForDirectory { throw CLIError.message("No site route is associated with the current directory. Specify an existing hostname (val secure <hostname>) or add a route with ‘val route add’.") }
+            catch RouteSelectionError.ambiguous { throw CLIError.message("Multiple site routes are associated with the current directory. Specify the exact hostname: val \(secure ? "secure" : "unsecure") <hostname>.") }
+            let result: RouteIntent
+            if let update = routeTLSUpdate(intent, secure: secure) { result = try await client.routeAdd(update) }
+            else { result = intent }
+            print("\(secure ? "Secured" : "Unsecured"): \(secure ? "https" : "http")://\(result.route.hostname)")
+            if !secure { print("A browser may retain a cached HTTPS redirect; clear its site data or try a private window if it keeps opening HTTPS.") }
         case .routeAdd(let hostname, let documentRoot, let socketPath, let projectID, let tls):
             let target: RouteTarget = socketPath.map { .fastCGI(socketPath: $0, documentRoot: documentRoot) } ?? .staticFiles(documentRoot: documentRoot)
             let result = try await client.routeAdd(.init(route: .init(hostname: hostname, target: target, tls: tls ? .local : .disabled), projectID: projectID))
