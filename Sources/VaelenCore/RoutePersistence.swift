@@ -23,6 +23,15 @@ public struct RouteIntent: Codable, Equatable, Sendable {
     }
 }
 
+public struct ParkRouteOwnership: Codable, Equatable, Sendable {
+    public let routeID: RouteID
+    public let parentPath: String
+    public let childPath: String
+    public init(routeID: RouteID, parentPath: String, childPath: String) {
+        self.routeID = routeID; self.parentPath = parentPath; self.childPath = childPath
+    }
+}
+
 public final class RouteIntentRepository: @unchecked Sendable {
     private let store: SQLiteStateStore
     private let targetMutationHook: (() throws -> Void)?
@@ -40,7 +49,10 @@ public final class RouteIntentRepository: @unchecked Sendable {
     }
 
     public func remove(id: RouteID) throws {
-        try store.query("DELETE FROM route_intents WHERE id = ?", bind: { store.bind(id.description, to: $0, index: 1) }) { _ in }
+        try store.transaction {
+            try store.query("DELETE FROM park_route_ownership WHERE route_id = ?", bind: { store.bind(id.description, to: $0, index: 1) }) { _ in }
+            try store.query("DELETE FROM route_intents WHERE id = ?", bind: { store.bind(id.description, to: $0, index: 1) }) { _ in }
+        }
     }
 
     public func all() throws -> [RouteIntent] {
@@ -141,11 +153,72 @@ public final class RouteIntentRepository: @unchecked Sendable {
     }
 
     public func associateMetadata(id: RouteID, projectID: UUID, projectPath: String) throws {
-        try store.query("UPDATE route_intents SET project_id = ?, project_path = ? WHERE id = ?", bind: { statement in
-            store.bind(projectID.uuidString, to: statement, index: 1)
-            store.bind(projectPath, to: statement, index: 2)
-            store.bind(id.description, to: statement, index: 3)
-        }) { _ in }
+        try store.transaction {
+            try store.query("UPDATE route_intents SET project_id = ?, project_path = ? WHERE id = ?", bind: { statement in
+                store.bind(projectID.uuidString, to: statement, index: 1)
+                store.bind(projectPath, to: statement, index: 2)
+                store.bind(id.description, to: statement, index: 3)
+            }) { _ in }
+            // Explicit association promotes a park-served route out of its
+            // parent-owned set while preserving the route itself.
+            try store.query("DELETE FROM park_route_ownership WHERE route_id = ?", bind: { store.bind(id.description, to: $0, index: 1) }) { _ in }
+        }
+    }
+
+    public func parkRouteOwnerships() throws -> [ParkRouteOwnership] {
+        var result = [ParkRouteOwnership]()
+        try store.query("SELECT route_id,parent_path,child_path FROM park_route_ownership ORDER BY parent_path,child_path") { statement in
+            guard let uuid = UUID(uuidString: store.columnString(statement, 0) ?? ""),
+                  let parentPath = store.columnString(statement, 1),
+                  let childPath = store.columnString(statement, 2) else { throw SQLiteStateError.invalidRecord }
+            result.append(.init(routeID: RouteID(rawValue: uuid), parentPath: parentPath, childPath: childPath))
+        }
+        return result
+    }
+
+    public func insertParkOwnedRoute(_ intent: RouteIntent, parentPath: String, childPath: String) throws {
+        try store.transaction {
+            guard try all().allSatisfy({ $0.route.id != intent.route.id }) else { throw SQLiteStateError.invalidRecord }
+            try upsert(intent)
+            try store.query("INSERT INTO park_route_ownership (route_id,parent_path,child_path) VALUES (?,?,?)", bind: { statement in
+                store.bind(intent.route.id.description, to: statement, index: 1)
+                store.bind(parentPath, to: statement, index: 2)
+                store.bind(childPath, to: statement, index: 3)
+            }) { _ in }
+        }
+    }
+
+    public func removeParkOwnedRoutes(_ ownerships: [ParkRouteOwnership]) throws -> [RouteIntent] {
+        try store.transaction {
+            let currentRoutes = try all()
+            var removed = [RouteIntent]()
+            for ownership in ownerships {
+                var matches = false
+                try store.query("SELECT route_id FROM park_route_ownership WHERE route_id = ? AND parent_path = ? AND child_path = ?", bind: { statement in
+                    store.bind(ownership.routeID.description, to: statement, index: 1)
+                    store.bind(ownership.parentPath, to: statement, index: 2)
+                    store.bind(ownership.childPath, to: statement, index: 3)
+                }) { _ in matches = true }
+                guard matches else { continue }
+                if let route = currentRoutes.first(where: { $0.route.id == ownership.routeID }),
+                   route.projectID == nil, route.projectPath.map({ URL(fileURLWithPath: $0).standardizedFileURL.path }) == Optional(ownership.childPath) {
+                    removed.append(route)
+                    try store.query("DELETE FROM route_intents WHERE id = ?", bind: { store.bind(ownership.routeID.description, to: $0, index: 1) }) { _ in }
+                }
+                // If metadata no longer proves park ownership, retain the route
+                // as explicit and relinquish only the obsolete ownership mark.
+                try store.query("DELETE FROM park_route_ownership WHERE route_id = ? AND parent_path = ? AND child_path = ?", bind: { statement in
+                    store.bind(ownership.routeID.description, to: statement, index: 1)
+                    store.bind(ownership.parentPath, to: statement, index: 2)
+                    store.bind(ownership.childPath, to: statement, index: 3)
+                }) { _ in }
+            }
+            return removed
+        }
+    }
+
+    public func removeParkOwnership(routeID: RouteID) throws {
+        try store.query("DELETE FROM park_route_ownership WHERE route_id = ?", bind: { store.bind(routeID.description, to: $0, index: 1) }) { _ in }
     }
 
 }

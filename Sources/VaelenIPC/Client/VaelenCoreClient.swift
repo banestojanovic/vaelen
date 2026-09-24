@@ -153,9 +153,10 @@ public actor VaelenCoreClient {
         return result
     }
 
-    public func unpark(path: String?, workingDirectory: String) async throws {
+    public func unpark(path: String?, workingDirectory: String) async throws -> ParkedPathMutationResult {
         let request = IPCRequest(method: .pathUnpark, params: .unpark(UnparkPathRequest(path: path, workingDirectory: workingDirectory)))
-        guard case .parkedPathMutation = try result(from: await send(request)) else { throw CoreClientError.invalidResponse }
+        guard case .parkedPathMutation(let result) = try result(from: await send(request)) else { throw CoreClientError.invalidResponse }
+        return result
     }
 
     public func parkedPaths() async throws -> [ParkedPathWire] {

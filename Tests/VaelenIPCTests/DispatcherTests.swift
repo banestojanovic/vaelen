@@ -48,6 +48,48 @@ private actor BlockedRestoreRouter: Router {
     func attemptCount() -> Int { attempts }
 }
 
+private actor ParkMonitorTestRouter: Router {
+    private var running = true
+    private var observationsStarted = 0
+    private var observationsCompleted = 0
+    func start() async throws { running = true }
+    func stop() async throws { running = false }
+    func status() async -> RouterStatus { .init(provider: "park-monitor-test", state: running ? .running : .stopped, health: running ? .healthy : .unknown, routeCount: 0) }
+    func health() async -> RouterHealth { running ? .healthy : .unhealthy }
+    func reconcile(routes: [Route]) async throws {}
+    func addRoute(_ route: Route) async throws {}
+    func updateRoute(_ route: Route) async throws {}
+    func removeRoute(id: RouteID) async throws {}
+    func observedRoutes() async throws -> [Route] {
+        observationsStarted += 1
+        try? await Task.sleep(for: .milliseconds(250))
+        observationsCompleted += 1
+        return []
+    }
+    func counts() -> (started: Int, completed: Int) { (observationsStarted, observationsCompleted) }
+}
+
+private actor ParkReconciliationTestRouter: Router {
+    private var running = true
+    private var routes: [Route]
+    private var failNextReconcile = false
+
+    init(routes: [Route] = []) { self.routes = routes }
+    func start() async throws { running = true }
+    func stop() async throws { running = false }
+    func status() async -> RouterStatus { .init(provider: "park-reconciliation-test", state: running ? .running : .stopped, health: running ? .healthy : .unknown, routeCount: routes.count) }
+    func health() async -> RouterHealth { running ? .healthy : .unhealthy }
+    func failNextApply() { failNextReconcile = true }
+    func reconcile(routes: [Route]) async throws {
+        if failNextReconcile { failNextReconcile = false; throw RouterError.notRunning }
+        self.routes = routes
+    }
+    func addRoute(_ route: Route) async throws { routes.append(route) }
+    func updateRoute(_ route: Route) async throws { routes.removeAll { $0.id == route.id }; routes.append(route) }
+    func removeRoute(id: RouteID) async throws { routes.removeAll { $0.id == id } }
+    func observedRoutes() async throws -> [Route] { routes }
+}
+
 private struct ShutdownPortsFake: StandardPortsPrivileged {
     let inspection: StandardPortsInspection
     let removals: ShutdownRemovalCounter
@@ -137,6 +179,237 @@ private actor StartupRaceDNSHelper: PrivilegedDNSHelper {
 }
 
 final class DispatcherTests: XCTestCase {
+    func testParkReconcileReportsAndSkipsDuplicateChildNamesAcrossParents() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-name-collision-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstParent = root.appendingPathComponent("first", isDirectory: true)
+        let secondParent = root.appendingPathComponent("second", isDirectory: true)
+        let firstChild = firstParent.appendingPathComponent("shared-name", isDirectory: true)
+        let secondChild = secondParent.appendingPathComponent("shared-name", isDirectory: true)
+        try makeWordPress(at: firstChild)
+        try makeWordPress(at: secondChild)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: firstParent)
+        try await registry.park(path: secondParent)
+        let repository = RouteIntentRepository(store: store)
+        let router = ParkReconciliationTestRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+
+        let result = try await dispatcher.reconcileParkedProjectRoutes()
+
+        XCTAssertTrue(result.conflicts.contains { $0.contains("shared-name.test") && $0.contains(firstChild.path) && $0.contains(secondChild.path) })
+        XCTAssertTrue(result.added.isEmpty)
+        XCTAssertTrue(try repository.all().isEmpty)
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertTrue(appliedRoutes.isEmpty)
+    }
+
+    func testParkReconcileSkipsChildCollidingWithExplicitRouteWithoutChangingIt() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-explicit-collision-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("workspace", isDirectory: true)
+        let child = parent.appendingPathComponent("taken", isDirectory: true)
+        try makeWordPress(at: child)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: parent)
+        let explicit = RouteIntent(route: Route(hostname: "taken.test", target: .staticFiles(documentRoot: root.appendingPathComponent("elsewhere").path), tls: .local))
+        let repository = RouteIntentRepository(store: store)
+        try repository.upsert(explicit)
+        let router = ParkReconciliationTestRouter(routes: [explicit.route])
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+
+        let result = try await dispatcher.reconcileParkedProjectRoutes()
+
+        XCTAssertTrue(result.conflicts.contains { $0.contains("taken.test") })
+        XCTAssertEqual(try repository.all(), [explicit])
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertEqual(appliedRoutes, [explicit.route])
+    }
+
+    func testExactExplicitHostnameAndDocumentRootIsSilentAndNeverParkOwned() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-exact-existing-route-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("workspace", isDirectory: true)
+        let child = parent.appendingPathComponent("already-served", isDirectory: true)
+        try makeWordPress(at: child)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: parent)
+        let explicit = RouteIntent(route: Route(hostname: "already-served.test", target: .staticFiles(documentRoot: child.path), tls: .local))
+        let repository = RouteIntentRepository(store: store)
+        try repository.upsert(explicit)
+        let router = ParkReconciliationTestRouter(routes: [explicit.route])
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+
+        let result = try await dispatcher.reconcileParkedProjectRoutes()
+
+        XCTAssertTrue(result.conflicts.isEmpty)
+        XCTAssertTrue(result.added.isEmpty)
+        XCTAssertTrue(result.removed.isEmpty)
+        XCTAssertEqual(try repository.all(), [explicit])
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertEqual(appliedRoutes, [explicit.route])
+    }
+
+    func testParkChildRemovalDeletesOnlyOwnedRoute() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-child-removal-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("workspace", isDirectory: true)
+        let child = parent.appendingPathComponent("removed-child", isDirectory: true)
+        try makeWordPress(at: child)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: parent)
+        let route = Route(hostname: "removed-child.test", target: .fastCGI(socketPath: "/fixture/php.sock", documentRoot: child.path), tls: .disabled)
+        let parentPath = CanonicalPathService().canonicalize(parent).string
+        let childPath = CanonicalPathService().canonicalize(child).string
+        let repository = RouteIntentRepository(store: store)
+        try repository.insertParkOwnedRoute(RouteIntent(route: route, projectPath: childPath), parentPath: parentPath, childPath: childPath)
+        let router = ParkReconciliationTestRouter(routes: [route])
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+        try FileManager.default.removeItem(at: child)
+
+        let result = try await dispatcher.reconcileParkedProjectRoutes()
+
+        XCTAssertEqual(result.removed, ["removed-child.test"])
+        XCTAssertTrue(try repository.all().isEmpty)
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertTrue(appliedRoutes.isEmpty)
+    }
+
+    func testParkChildRenameRemovesOldOwnedRouteAndPreservesNewExplicitRoute() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-child-rename-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("workspace", isDirectory: true)
+        let oldChild = parent.appendingPathComponent("old-name", isDirectory: true)
+        let newChild = parent.appendingPathComponent("new-name", isDirectory: true)
+        try makeWordPress(at: oldChild)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: parent)
+        let parentPath = CanonicalPathService().canonicalize(parent).string
+        let oldPath = CanonicalPathService().canonicalize(oldChild).string
+        let oldRoute = Route(hostname: "old-name.test", target: .fastCGI(socketPath: "/fixture/php.sock", documentRoot: oldPath), tls: .disabled)
+        let newRoute = Route(hostname: "new-name.test", target: .staticFiles(documentRoot: newChild.path), tls: .local)
+        let oldIntent = RouteIntent(route: oldRoute, projectPath: oldPath)
+        let newIntent = RouteIntent(route: newRoute)
+        let repository = RouteIntentRepository(store: store)
+        try repository.insertParkOwnedRoute(oldIntent, parentPath: parentPath, childPath: oldPath)
+        try repository.upsert(newIntent)
+        let router = ParkReconciliationTestRouter(routes: [oldRoute, newRoute])
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+        try FileManager.default.moveItem(at: oldChild, to: newChild)
+
+        let result = try await dispatcher.reconcileParkedProjectRoutes()
+
+        XCTAssertEqual(result.removed, ["old-name.test"])
+        XCTAssertTrue(result.conflicts.isEmpty)
+        XCTAssertEqual(try repository.all(), [newIntent])
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertEqual(appliedRoutes, [newRoute])
+    }
+
+    func testCoreStartupReconcilesPreviouslyParkedOwnedRouteWithoutParkCommand() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-startup-reconcile-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("workspace", isDirectory: true)
+        let child = parent.appendingPathComponent("startup-child", isDirectory: true)
+        try makeWordPress(at: child)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: parent)
+        let parentPath = CanonicalPathService().canonicalize(parent).string
+        let childPath = CanonicalPathService().canonicalize(child).string
+        let route = Route(hostname: "startup-child.test", target: .fastCGI(socketPath: "/fixture/php.sock", documentRoot: childPath), tls: .local)
+        let repository = RouteIntentRepository(store: store)
+        try repository.insertParkOwnedRoute(RouteIntent(route: route, projectPath: childPath), parentPath: parentPath, childPath: childPath)
+        let router = ParkReconciliationTestRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+
+        try await dispatcher.reconcilePersistedRoutesOnStartup()
+
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertEqual(appliedRoutes, [route])
+        XCTAssertEqual(try repository.all().map(\.route), [route])
+        XCTAssertEqual(try repository.parkRouteOwnerships(), [.init(routeID: route.id, parentPath: parentPath, childPath: childPath)])
+        _ = await dispatcher.shutdownForParentExit()
+    }
+
+    func testUnavailableParkedParentScanDoesNotDeletePreviouslyOwnedRoute() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-incomplete-scan-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("workspace", isDirectory: true)
+        let child = parent.appendingPathComponent("still-owned", isDirectory: true)
+        try makeWordPress(at: child)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        try await registry.park(path: parent)
+        let parentPath = CanonicalPathService().canonicalize(parent).string
+        let childPath = CanonicalPathService().canonicalize(child).string
+        let route = Route(hostname: "still-owned.test", target: .fastCGI(socketPath: "/fixture/php.sock", documentRoot: childPath), tls: .disabled)
+        let repository = RouteIntentRepository(store: store)
+        let intent = RouteIntent(route: route, projectPath: childPath)
+        try repository.insertParkOwnedRoute(intent, parentPath: parentPath, childPath: childPath)
+        let router = ParkReconciliationTestRouter(routes: [route])
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+        try FileManager.default.removeItem(at: parent)
+
+        let result = try await dispatcher.reconcileParkedProjectRoutes()
+
+        XCTAssertTrue(result.removed.isEmpty)
+        XCTAssertTrue(result.issues.contains { $0.contains("left unchanged") })
+        XCTAssertEqual(try repository.all(), [intent])
+        XCTAssertEqual(try repository.parkRouteOwnerships(), [.init(routeID: route.id, parentPath: parentPath, childPath: childPath)])
+        let appliedRoutes = try await router.observedRoutes()
+        XCTAssertEqual(appliedRoutes, [route])
+    }
+
+    private func makeWordPress(at root: URL) throws {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("wp-admin"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("wp-includes"), withIntermediateDirectories: true)
+        try Data("<?php\n".utf8).write(to: root.appendingPathComponent("wp-config.php"))
+        try Data("<?php echo 'fixture';\n".utf8).write(to: root.appendingPathComponent("index.php"))
+    }
+
+    func testShutdownCancelsAndAwaitsInFlightParkRouteMonitor() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-monitor-shutdown-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let router = ParkMonitorTestRouter()
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test", pid: 1),
+            registry: ProjectRegistry(store: store),
+            router: router,
+            routeRepository: RouteIntentRepository(store: store),
+            serviceIntents: ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        )
+        await dispatcher.startParkedProjectRouteMonitoring(intervalSeconds: 1)
+        for _ in 0..<100 {
+            if await router.counts().started > 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let entered = await router.counts()
+        XCTAssertEqual(entered.started, 1, "the monitor should have entered one route observation")
+
+        let shutdown = await dispatcher.shutdownForParentExit()
+        let caddyShutdown = shutdown.components.first(where: { $0.component == "caddy" })
+        XCTAssertEqual(caddyShutdown?.succeeded, true, "Core should finish its normal router shutdown after joining the monitor")
+        let settled = await router.counts()
+        XCTAssertEqual(settled.started, 1)
+        XCTAssertEqual(settled.completed, 1, "shutdown must await the in-flight monitor scan")
+        try await Task.sleep(for: .milliseconds(1_100))
+        let afterCancellation = await router.counts()
+        XCTAssertEqual(afterCancellation.started, settled.started, "the cancelled monitor must not start another scan after shutdown")
+        XCTAssertEqual(afterCancellation.completed, settled.completed, "completed monitor work must remain settled after shutdown")
+    }
+
     func testCoreStatusWaitsForSavedDNSAutostartAndFirstSnapshotIsHealthy() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("status-after-dns-autostart-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }

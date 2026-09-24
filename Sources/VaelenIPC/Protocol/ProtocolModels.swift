@@ -314,13 +314,25 @@ public struct ProjectMutationResult: Codable, Equatable, Sendable {
 public struct ParkedPathMutationResult: Codable, Equatable, Sendable {
     public let path: ParkedPathWire?
     public let created: Bool
-    public init(path: ParkedPathWire?, created: Bool) { self.path = path; self.created = created }
-    private enum CodingKeys: String, CodingKey { case path, created }
+    public let reconciliation: ParkRouteReconciliationSummary?
+    public init(path: ParkedPathWire?, created: Bool, reconciliation: ParkRouteReconciliationSummary? = nil) { self.path = path; self.created = created; self.reconciliation = reconciliation }
+    private enum CodingKeys: String, CodingKey { case path, created, reconciliation }
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(path, forKey: .path)
         if path == nil { try container.encodeNil(forKey: .path) }
         try container.encode(created, forKey: .created)
+        try container.encodeIfPresent(reconciliation, forKey: .reconciliation)
+    }
+}
+
+public struct ParkRouteReconciliationSummary: Codable, Equatable, Sendable {
+    public let added: [String]
+    public let removed: [String]
+    public let conflicts: [String]
+    public let issues: [String]
+    public init(added: [String] = [], removed: [String] = [], conflicts: [String] = [], issues: [String] = []) {
+        self.added = added; self.removed = removed; self.conflicts = conflicts; self.issues = issues
     }
 }
 

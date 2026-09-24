@@ -169,6 +169,23 @@ final class ProjectDiscoveryTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "preserve exactly")
     }
 
+    func testDirectChildScanFindsOnlySupportedImmediateProjectsAndSurfacesUnavailableParent() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let child = root.appendingPathComponent("direct-child", isDirectory: true)
+        try makeLaravel(at: child)
+        let nested = child.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        _ = try makeWordPress(at: nested)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("ordinary"), withIntermediateDirectories: true)
+        let parked = ParkedPath(id: ParkedPathID(), rootPath: CanonicalPath(url: root), availability: .available)
+        let discovered = try ProjectDiscovery().discoverDirectChildren(under: parked)
+        XCTAssertEqual(discovered.map(\.rootPath.string), [child.standardizedFileURL.path])
+
+        let unavailable = ParkedPath(id: parked.id, rootPath: CanonicalPath(url: root.appendingPathComponent("missing")), availability: .missing)
+        XCTAssertThrowsError(try ProjectDiscovery().discoverDirectChildren(under: unavailable))
+    }
+
     private func recursiveContents(of root: URL) throws -> [String] {
         let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey])!
         return enumerator.compactMap { value -> String? in

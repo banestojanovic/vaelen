@@ -17,7 +17,15 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
         XCTAssertThrowsError(try VaelenCLIMain.parse(["park", "one", "two"]))
     }
 
-    func testLinkCommandsAcceptOnlyAnExplicitPath() throws {
+    func testLinkAcceptsOptionalCurrentDirectoryPathButUnlinkRequiresAnExplicitPath() throws {
+        // Current-directory linking is the supported product contract. Keep
+        // this assertion aligned with the committed CLI parser, not the older
+        // explicit-path-only behavior.
+        guard case .link(let currentDirectoryPath) = try VaelenCLIMain.parse(["link"]) else {
+            return XCTFail("link without a path should use the current directory")
+        }
+        XCTAssertNil(currentDirectoryPath)
+
         guard case .link(let path) = try VaelenCLIMain.parse(["link", "project"]) else {
             return XCTFail("link did not parse")
         }
@@ -27,9 +35,9 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
             return XCTFail("unlink did not parse")
         }
         XCTAssertEqual(unlinkedPath, "project")
-        XCTAssertThrowsError(try VaelenCLIMain.parse(["link"]))
         XCTAssertThrowsError(try VaelenCLIMain.parse(["unlink"]))
         XCTAssertThrowsError(try VaelenCLIMain.parse(["unlink", "--name", "project"]))
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["link", "one", "two"]))
     }
 
     func testRelationshipListsSupportOnlyTheStructuredOutputOption() throws {
@@ -53,11 +61,16 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
     }
 
     func testHelpDocumentsProjectRelationshipSyntax() throws {
-        for command in [
-            "val park <directory>", "val parks [--json]", "val unpark <directory>",
-            "val link <project-directory>", "val links [--json]", "val unlink <project-directory>"
-        ] {
-            XCTAssertTrue(VaelenCLIMain.usage.contains(command), "missing help entry: \(command)")
+        let helpEntries = [
+            ("park", "Usage: val park <workspace-folder>"),
+            ("parks", "Usage: val parks [--json]"),
+            ("unpark", "Usage: val unpark <workspace-folder>"),
+            ("link", "Usage: val link [project-directory]"),
+            ("links", "Usage: val links [--json]"),
+            ("unlink", "Usage: val unlink <project-directory>")
+        ]
+        for (command, entry) in helpEntries {
+            XCTAssertTrue(VaelenCLIMain.helpText(for: [command]).contains(entry), "missing current help entry for \(command)")
         }
         guard case .help = try VaelenCLIMain.parse(["--help"]) else {
             return XCTFail("--help did not parse")

@@ -741,9 +741,20 @@ struct VaelenCLIMain {
             let result = try await client.park(path: path, workingDirectory: workingDirectory)
             guard let parked = result.path else { throw CLIError.message("Core returned no parked path.") }
             print("\(result.created ? "Parked" : "Already parked")\n\(displayPath(parked.path))")
+            if let summary = result.reconciliation {
+                for hostname in summary.added { print("Serving http://\(hostname)") }
+                for hostname in summary.removed { print("Removed parked route \(hostname)") }
+                for conflict in summary.conflicts { print("Conflict: \(conflict)") }
+                for issue in summary.issues { print("Warning: \(issue)") }
+            }
         case .unpark(let path):
-            try await client.unpark(path: path, workingDirectory: workingDirectory)
+            let result = try await client.unpark(path: path, workingDirectory: workingDirectory)
             print("Unparked path")
+            if let summary = result.reconciliation {
+                for hostname in summary.removed { print("Removed parked route \(hostname)") }
+                for conflict in summary.conflicts { print("Conflict: \(conflict)") }
+                for issue in summary.issues { print("Warning: \(issue)") }
+            }
         case .parks(let json):
             let paths = try await client.parkedPaths()
             if json { print(String(decoding: try IPCCodec.encode(ParkedPathListEnvelope(paths: paths)), as: UTF8.self)) }

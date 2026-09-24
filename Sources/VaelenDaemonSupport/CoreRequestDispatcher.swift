@@ -3,6 +3,14 @@ import OSLog
 import VaelenCore
 import VaelenIPC
 
+private struct ParkedProjectCandidate {
+    let parentPath: String
+    let project: Project
+    let framework: ProjectFrameworkInspection
+    var childPath: String { project.rootPath.string }
+    var hostname: String { project.name + ".test" }
+}
+
 public actor CoreRequestDispatcher {
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
@@ -19,6 +27,7 @@ public actor CoreRequestDispatcher {
     private var restorationStarted = false
     private var restorationTask: Task<Void, Never>?
     private var routeIntents: [RouteID: RouteIntent]
+    private var parkRouteMonitorTask: Task<Void, Never>?
     private var shutdownBegun = false
     private var shutdownTask: Task<CoreShutdownResponse, Never>?
     private var shutdownRunInFlight = false
@@ -98,6 +107,14 @@ public actor CoreRequestDispatcher {
                 let params = try request.params?.decode(LinkProjectRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Link parameters are required.") }()
                 let mutation = try await registry.linkWithCreation(path: params.path, workingDirectory: params.workingDirectory, name: params.name)
                 let project = mutation.project
+                if let routeRepository,
+                   let owned = try routeRepository.parkRouteOwnerships().first(where: { $0.childPath == project.rootPath.string }),
+                   let intent = routeIntents[owned.routeID],
+                   let projectID = project.id?.rawValue {
+                    try routeRepository.associateMetadata(id: owned.routeID, projectID: projectID, projectPath: project.rootPath.string)
+                    let promoted = RouteIntent(route: intent.route, projectID: projectID, projectPath: project.rootPath.string)
+                    routeIntents[owned.routeID] = promoted
+                }
                 logger.info("Project linked: \(project.rootPath.string, privacy: .public)")
                 return (.init(id: request.id, result: .projectMutation(.init(project: .init(project), created: mutation.created))), true)
             case .projectUnlink:
@@ -152,12 +169,16 @@ public actor CoreRequestDispatcher {
                 let params = try request.params?.decode(ParkPathRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Park parameters are required.") }()
                 let path = try await registry.parkWithCreation(path: params.path, workingDirectory: params.workingDirectory)
                 logger.info("Path parked: \(path.path.rootPath.string, privacy: .public)")
-                return (.init(id: request.id, result: .parkedPathMutation(.init(path: .init(path.path), created: path.created))), true)
+                let summary = try await reconcileParkedProjectRoutes()
+                return (.init(id: request.id, result: .parkedPathMutation(.init(path: .init(path.path), created: path.created, reconciliation: summary))), true)
             case .pathUnpark:
                 let params = try request.params?.decode(UnparkPathRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Unpark parameters are required.") }()
+                let canonical = CanonicalPathService().canonicalize(params.path, relativeTo: params.workingDirectory).string
+                let summary = try await removeParkOwnedRoutes(parentPath: canonical)
                 try await registry.unpark(path: params.path, workingDirectory: params.workingDirectory)
+                await refreshParkRouteMonitor()
                 logger.info("Path unparked")
-                return (.init(id: request.id, result: .parkedPathMutation(.init(path: nil, created: false))), true)
+                return (.init(id: request.id, result: .parkedPathMutation(.init(path: nil, created: false, reconciliation: summary))), true)
             case .pathList:
                 return (.init(id: request.id, result: .parkedPathList(.init(paths: try await registry.parkedPaths().map(ParkedPathWire.init)))), true)
             case .phpVersions:
@@ -328,8 +349,266 @@ public actor CoreRequestDispatcher {
     }
 
     public func reconcilePersistedRoutesOnStartup() async throws {
-        guard (await router.status()).state == .running else { return }
-        try await router.reconcile(routes: routeIntents.values.map(\.route))
+        if (await router.status()).state == .running {
+            try await router.reconcile(routes: routeIntents.values.map(\.route))
+        }
+        let summary = try await reconcileParkedProjectRoutes()
+        if !summary.conflicts.isEmpty || !summary.issues.isEmpty {
+            logger.warning("Startup park route reconciliation reported conflicts/issues: \((summary.conflicts + summary.issues).joined(separator: "; "), privacy: .public)")
+        }
+        startParkedProjectRouteMonitoring()
+    }
+
+    public func reconcileParkedProjectRoutes() async throws -> ParkRouteReconciliationSummary {
+        guard let routeRepository else {
+            return .init(issues: ["Route persistence is unavailable; parked paths were not reconciled."])
+        }
+        let parkedPaths = try await registry.parkedPaths()
+        let parkedByPath = Dictionary(uniqueKeysWithValues: parkedPaths.map { ($0.rootPath.string, $0) })
+        let discovery = ProjectDiscovery()
+        let linkedAndDiscovered = try await registry.projectsList()
+        var candidates = [ParkedProjectCandidate]()
+        var completeParents = Set<String>()
+        var recognizedPathsByParent = [String: Set<String>]()
+        var issues = [String]()
+
+        for parked in parkedPaths {
+            do {
+                let discovered = try discovery.discoverDirectChildren(under: parked)
+                completeParents.insert(parked.rootPath.string)
+                var childPaths = Set<String>()
+                for detected in discovered {
+                    let project = linkedAndDiscovered.first(where: { $0.rootPath == detected.rootPath }) ?? detected
+                    let framework = ProjectFrameworkDetector().inspect(root: URL(fileURLWithPath: project.rootPath.string, isDirectory: true))
+                    childPaths.insert(project.rootPath.string)
+                    candidates.append(.init(parentPath: parked.rootPath.string, project: project, framework: framework))
+                }
+                recognizedPathsByParent[parked.rootPath.string] = childPaths
+            } catch {
+                // A failed or partial scan is never evidence that prior children
+                // disappeared. Preserve all owned routes for this parent.
+                issues.append("Could not completely scan \(parked.rootPath.string); its park-owned routes were left unchanged: \(error)")
+                logger.error("Parked project scan failed for \(parked.rootPath.string, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
+        }
+
+        let ownerships = try routeRepository.parkRouteOwnerships()
+        var staleOwnerships = [ParkRouteOwnership]()
+        for ownership in ownerships {
+            let parentIsParked = parkedByPath[ownership.parentPath] != nil
+            if parentIsParked && !completeParents.contains(ownership.parentPath) { continue }
+            let childStillRecognized = recognizedPathsByParent[ownership.parentPath]?.contains(ownership.childPath) == true
+            if !parentIsParked || !childStillRecognized {
+                staleOwnerships.append(ownership)
+            }
+        }
+
+        // Existing explicit routes are never adopted. Existing park-owned routes
+        // are also left byte-for-byte intact, including their TLS mode.
+        let currentRoutes = routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }
+        let staleIDs = Set(staleOwnerships.map(\.routeID))
+        var ownershipByChild = Dictionary(grouping: ownerships, by: { "\($0.parentPath)\u{0}\($0.childPath)" })
+        var additions = [RouteIntent]()
+        var addedHosts = [String]()
+        var conflicts = [String]()
+        let candidateGroups = Dictionary(grouping: candidates, by: { $0.hostname.lowercased() })
+
+        func documentRoot(of route: Route) -> String? {
+            switch route.target {
+            case .fastCGI(_, let root), .staticFiles(let root): return URL(fileURLWithPath: root).standardizedFileURL.resolvingSymlinksInPath().path
+            case .http: return nil
+            }
+        }
+        func routesForChild(_ candidate: ParkedProjectCandidate) -> [RouteIntent] {
+            return currentRoutes.filter { intent in
+                if let id = candidate.project.id?.rawValue, intent.projectID == id { return true }
+                if let path = intent.projectPath,
+                   URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path == candidate.childPath { return true }
+                // A matching document root is not route ownership. Explicit or
+                // legacy routes without project metadata must remain independent;
+                // hostname collision handling below leaves them untouched.
+                return false
+            }
+        }
+
+        for (hostKey, group) in candidateGroups.sorted(by: { $0.key < $1.key }) {
+            let currentOwners = group.compactMap { candidate in
+                ownershipByChild["\(candidate.parentPath)\u{0}\(candidate.childPath)"]?.first
+            }.filter { !staleIDs.contains($0.routeID) && routeIntents[$0.routeID] != nil }
+            let explicitRoutes = group.flatMap(routesForChild)
+            let hasExistingHost = currentRoutes.contains { $0.route.hostname.lowercased() == hostKey && !staleIDs.contains($0.route.id) }
+            let existingClaim = !currentOwners.isEmpty || !explicitRoutes.isEmpty || hasExistingHost
+
+            if group.count > 1 && !existingClaim {
+                let locations = group.map { $0.childPath }.sorted().joined(separator: ", ")
+                conflicts.append("\(hostKey) is requested by multiple parked children (\(locations)); all new claims were skipped.")
+                continue
+            }
+
+            for candidate in group {
+                let key = "\(candidate.parentPath)\u{0}\(candidate.childPath)"
+                let childOwners = ownershipByChild[key] ?? []
+                if let owner = childOwners.first(where: { !staleIDs.contains($0.routeID) }), routeIntents[owner.routeID] != nil {
+                    continue
+                }
+                if !routesForChild(candidate).isEmpty { continue }
+                if group.count == 1,
+                   let relativeRoot = candidate.framework.suggestedDocumentRoot,
+                   let existingForHost = currentRoutes.first(where: { $0.route.hostname.caseInsensitiveCompare(candidate.hostname) == .orderedSame }),
+                   let existingRoot = documentRoot(of: existingForHost.route) {
+                    let expectedRoot = URL(fileURLWithPath: candidate.childPath)
+                        .appendingPathComponent(relativeRoot)
+                        .standardizedFileURL.resolvingSymlinksInPath().path
+                    // An exact hostname+document-root route already serves this
+                    // child. Preserve it as explicit/legacy state; do not claim
+                    // park ownership or warn as if it belonged elsewhere.
+                    if existingRoot == expectedRoot { continue }
+                }
+                if group.count > 1 {
+                    conflicts.append("\(candidate.hostname) for \(candidate.childPath) conflicts with another parked child; skipped.")
+                    continue
+                }
+                if let routeConflict = currentRoutes.first(where: { $0.route.hostname.caseInsensitiveCompare(candidate.hostname) == .orderedSame && !staleIDs.contains($0.route.id) }) {
+                    let ownerPath = routeConflict.projectPath ?? documentRoot(of: routeConflict.route) ?? "an existing route"
+                    conflicts.append("\(candidate.hostname) for \(candidate.childPath) is already routed to \(ownerPath); skipped without changing that route.")
+                    continue
+                }
+                guard let relativeRoot = candidate.framework.suggestedDocumentRoot else {
+                    issues.append("\(candidate.childPath) is recognized as \(candidate.framework.framework), but has no supported document-root plan; no route was created.")
+                    continue
+                }
+                let documentRoot = URL(fileURLWithPath: candidate.childPath).appendingPathComponent(relativeRoot).standardizedFileURL.path
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: documentRoot, isDirectory: &isDirectory), isDirectory.boolValue else {
+                    issues.append("The planned document root for \(candidate.childPath) is unavailable (\(documentRoot)); no route was created.")
+                    continue
+                }
+                let frameworkName = candidate.framework.framework.lowercased()
+                let target: RouteTarget
+                if candidate.framework.composerPHPRequirement != nil || frameworkName.contains("php") || frameworkName.contains("laravel") || frameworkName.contains("wordpress") {
+                    let report = try await projectEnvironmentReport(for: candidate.project)
+                    guard report.observed.php.fpmHealth == "healthy", let socket = report.observed.php.fpmSocket else {
+                        issues.append("PHP for \(candidate.childPath) is not healthy/available; no route was created.")
+                        continue
+                    }
+                    target = .fastCGI(socketPath: socket, documentRoot: documentRoot)
+                } else {
+                    target = .staticFiles(documentRoot: documentRoot)
+                }
+                let validated: Route
+                do { validated = try Route(hostname: candidate.hostname, target: target, tls: .disabled).validated() }
+                catch {
+                    conflicts.append("\(candidate.hostname) is not a valid host for \(candidate.childPath); skipped: \(error)")
+                    continue
+                }
+                let intent = RouteIntent(route: validated, projectID: nil, projectPath: candidate.childPath)
+                additions.append(intent)
+                addedHosts.append(validated.hostname)
+            }
+        }
+
+        // Persist new ownership before provider application so a Core crash can
+        // recover and reconcile the exact route on startup.
+        for intent in additions {
+            guard let candidate = candidates.first(where: { $0.hostname.caseInsensitiveCompare(intent.route.hostname) == .orderedSame && routesForChild($0).isEmpty }) else { continue }
+            do {
+                try routeRepository.insertParkOwnedRoute(intent, parentPath: candidate.parentPath, childPath: candidate.childPath)
+                routeIntents[intent.route.id] = intent
+                ownershipByChild["\(candidate.parentPath)\u{0}\(candidate.childPath)"] = [.init(routeID: intent.route.id, parentPath: candidate.parentPath, childPath: candidate.childPath)]
+            } catch {
+                issues.append("Could not persist park ownership for \(intent.route.hostname): \(error)")
+                addedHosts.removeAll(where: { $0 == intent.route.hostname })
+            }
+        }
+
+        let removableOwnerships = staleOwnerships.filter { ownership in
+            guard let current = routeIntents[ownership.routeID] else { return true }
+            return current.projectID == nil && current.projectPath.map({ URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path }) == Optional(ownership.childPath)
+        }
+        let desiredRoutes = routeIntents.values.filter { !Set(removableOwnerships.map(\.routeID)).contains($0.route.id) }.map(\.route)
+        var providerReady = false
+        let routerStatus = await router.status()
+        if routerStatus.state == .running, routerStatus.health == .healthy {
+            do {
+                let observed = try await router.observedRoutes()
+                if observed.sorted(by: { $0.hostname < $1.hostname }) != desiredRoutes.sorted(by: { $0.hostname < $1.hostname }) {
+                    try await router.reconcile(routes: desiredRoutes)
+                }
+                providerReady = true
+            } catch {
+                issues.append("Park routes are saved, but routing could not apply the current plan: \(error)")
+            }
+        } else {
+            // Desired routes remain durable and will be applied when Caddy starts.
+            providerReady = true
+            if !additions.isEmpty || !removableOwnerships.isEmpty {
+                issues.append("Routing is not healthy; parked route changes are saved for the next router start.")
+            }
+        }
+
+        var removedHosts = [String]()
+        if providerReady, !staleOwnerships.isEmpty {
+            do {
+                let removed = try routeRepository.removeParkOwnedRoutes(staleOwnerships)
+                for intent in removed {
+                    routeIntents.removeValue(forKey: intent.route.id)
+                    removedHosts.append(intent.route.hostname)
+                }
+            } catch {
+                issues.append("The provider applied stale-route removals but ownership cleanup did not persist; Core will retry: \(error)")
+            }
+        }
+        return .init(added: addedHosts.sorted(), removed: removedHosts.sorted(), conflicts: conflicts.sorted(), issues: issues.sorted())
+    }
+
+    public func startParkedProjectRouteMonitoring(intervalSeconds: UInt64 = 5) {
+        guard parkRouteMonitorTask == nil else { return }
+        parkRouteMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: intervalSeconds * 1_000_000_000) }
+                catch { break }
+                guard let self else { break }
+                do {
+                    let summary = try await self.reconcileParkedProjectRoutes()
+                    if !summary.conflicts.isEmpty || !summary.issues.isEmpty {
+                        self.logger.warning("Park route reconciliation reported conflicts/issues: \((summary.conflicts + summary.issues).joined(separator: "; "), privacy: .public)")
+                    }
+                } catch {
+                    self.logger.error("Park route reconciliation failed without deleting existing routes: \(String(describing: error), privacy: .public)")
+                }
+            }
+        }
+    }
+
+    private func removeParkOwnedRoutes(parentPath: String) async throws -> ParkRouteReconciliationSummary {
+        guard let routeRepository else { return .init(issues: ["Route persistence is unavailable; no park routes were removed."]) }
+        let ownerships = try routeRepository.parkRouteOwnerships().filter { $0.parentPath == parentPath }
+        let removable = ownerships.filter { ownership in
+            guard let intent = routeIntents[ownership.routeID] else { return true }
+            return intent.projectID == nil && intent.projectPath.map({ URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path }) == Optional(ownership.childPath)
+        }
+        let preserved = ownerships.filter { !removable.contains($0) }
+        let removeIDs = Set(removable.map(\.routeID))
+        let desiredRoutes = routeIntents.values.filter { !removeIDs.contains($0.route.id) }.map(\.route)
+        let status = await router.status()
+        if status.state == .running {
+            guard status.health == .healthy else { throw IPCErrorPayload(code: .invalidRequest, message: "Unpark was not completed because routing is unhealthy; the parent remains parked and its routes are unchanged.") }
+            do { try await router.reconcile(routes: desiredRoutes) }
+            catch { throw IPCErrorPayload(code: .invalidRequest, message: "Unpark was not completed because owned routes could not be removed: \(error). The parent remains parked.") }
+        }
+        // Do not relinquish ownership until provider changes have succeeded.
+        // If unpark fails, retry/restart must still know which routes belong to
+        // this parent.
+        for ownership in preserved { try routeRepository.removeParkOwnership(routeID: ownership.routeID) }
+        let removed = try routeRepository.removeParkOwnedRoutes(removable)
+        for intent in removed { routeIntents.removeValue(forKey: intent.route.id) }
+        return .init(removed: removed.map(\.route.hostname).sorted())
+    }
+
+    private func refreshParkRouteMonitor() async {
+        parkRouteMonitorTask?.cancel()
+        parkRouteMonitorTask = nil
+        startParkedProjectRouteMonitoring()
     }
 
     /// Kick off one restoration pass without holding up the Core IPC actor.
@@ -407,6 +686,9 @@ public actor CoreRequestDispatcher {
 
     private func performShutdown() async -> CoreShutdownResponse {
         logShutdownTiming("shutdown begin")
+        parkRouteMonitorTask?.cancel()
+        if let parkRouteMonitorTask { await parkRouteMonitorTask.value }
+        parkRouteMonitorTask = nil
         restorationTask?.cancel()
         if let restorationTask { await restorationTask.value }
         var outcomes = [CoreShutdownComponentResult]()

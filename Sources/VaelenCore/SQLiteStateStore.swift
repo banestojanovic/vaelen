@@ -9,7 +9,7 @@ public enum SQLiteStateError: Error, Equatable, Sendable {
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public final class SQLiteStateStore: @unchecked Sendable {
-    public static let schemaVersion = 6
+    public static let schemaVersion = 7
     private var database: OpaquePointer?
     internal var databasePointer: OpaquePointer? { database }
 
@@ -117,6 +117,10 @@ public final class SQLiteStateStore: @unchecked Sendable {
             }
             if version <= 6, try !tableHasColumn("projects", column: "php_override_version") {
                 try execute("ALTER TABLE projects ADD COLUMN php_override_version TEXT NULL")
+            }
+            if version <= 6 {
+                try execute("CREATE TABLE IF NOT EXISTS park_route_ownership (route_id TEXT PRIMARY KEY NOT NULL, parent_path TEXT NOT NULL, child_path TEXT NOT NULL, UNIQUE(parent_path, child_path))")
+                try execute("PRAGMA user_version = 7")
             }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

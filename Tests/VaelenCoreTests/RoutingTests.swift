@@ -20,6 +20,77 @@ final class RoutingTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testParkRouteOwnershipSurvivesReopenAndUnparkRemovalIsScoped() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let database = root.appendingPathComponent("state/vaelen.sqlite")
+        let parkRoute = Route(hostname: "park-child.test", target: .staticFiles(documentRoot: "/tmp/child/public"), tls: .disabled)
+        let explicitRoute = Route(hostname: "explicit.test", target: .staticFiles(documentRoot: "/tmp/explicit/public"), tls: .local)
+        let ownership = ParkRouteOwnership(routeID: parkRoute.id, parentPath: "/tmp/park", childPath: "/tmp/park/child")
+        do {
+            let store = try SQLiteStateStore(databaseURL: database)
+            let repository = RouteIntentRepository(store: store)
+            try repository.insertParkOwnedRoute(RouteIntent(route: parkRoute, projectPath: ownership.childPath), parentPath: ownership.parentPath, childPath: ownership.childPath)
+            try repository.upsert(RouteIntent(route: explicitRoute, projectPath: "/tmp/explicit"))
+        }
+        let repository = RouteIntentRepository(store: try SQLiteStateStore(databaseURL: database))
+        XCTAssertEqual(try repository.parkRouteOwnerships(), [ownership])
+        XCTAssertEqual(try repository.removeParkOwnedRoutes([ownership]).map(\.route), [parkRoute])
+        XCTAssertEqual(try repository.all().map(\.route), [explicitRoute])
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testExplicitAssociationPromotesParkRouteWithoutChangingRoute() throws {
+        let (_, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let route = Route(hostname: "promote.test", target: .staticFiles(documentRoot: "/tmp/promote/public"), tls: .local)
+        let projectID = UUID()
+        try repository.insertParkOwnedRoute(RouteIntent(route: route, projectPath: "/tmp/promote"), parentPath: "/tmp", childPath: "/tmp/promote")
+        try repository.associateMetadata(id: route.id, projectID: projectID, projectPath: "/tmp/promote")
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let promoted = try XCTUnwrap(repository.all().first)
+        XCTAssertEqual(promoted.route, route)
+        XCTAssertEqual(promoted.projectID, projectID)
+    }
+
+    func testParkOwnershipSchemaMigrationPreservesFiveRoutesAndIsIdempotent() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-schema-migration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = root.appendingPathComponent("state/vaelen.sqlite")
+        let priorRoutes = (0..<5).map { index in
+            let projectID = index == 3 ? nil : UUID()
+            let route = Route(
+                id: RouteID(),
+                hostname: ["callthewaiter", "rustovo", "smalltree", "syncproof", "toptaling"][index] + ".test",
+                target: .fastCGI(socketPath: "/fixture/php-\(index).sock", documentRoot: "/fixture/project-\(index)/public"),
+                tls: index == 3 ? .local : (index == 4 ? .disabled : .local)
+            )
+            return RouteIntent(route: route, projectID: projectID, projectPath: "/fixture/project-\(index)")
+        }
+
+        do {
+            let store = try SQLiteStateStore(databaseURL: database)
+            let repository = RouteIntentRepository(store: store)
+            for intent in priorRoutes { try repository.upsert(intent) }
+            // Emulate the durable v6 pre-migration state while leaving every
+            // existing project, route, target, association, and TLS value intact.
+            try store.execute("DROP TABLE park_route_ownership")
+            try store.execute("PRAGMA user_version = 6")
+        }
+
+        do {
+            let migrated = try SQLiteStateStore(databaseURL: database)
+            XCTAssertEqual(try migrated.pragmaVersion(), SQLiteStateStore.schemaVersion)
+            XCTAssertEqual(try RouteIntentRepository(store: migrated).all().sorted { $0.route.hostname < $1.route.hostname }, priorRoutes.sorted { $0.route.hostname < $1.route.hostname })
+            XCTAssertTrue(try RouteIntentRepository(store: migrated).parkRouteOwnerships().isEmpty)
+        }
+
+        let reopened = try SQLiteStateStore(databaseURL: database)
+        XCTAssertEqual(try reopened.pragmaVersion(), SQLiteStateStore.schemaVersion)
+        XCTAssertEqual(try RouteIntentRepository(store: reopened).all().sorted { $0.route.hostname < $1.route.hostname }, priorRoutes.sorted { $0.route.hostname < $1.route.hostname })
+        XCTAssertTrue(try RouteIntentRepository(store: reopened).parkRouteOwnerships().isEmpty)
+    }
+
     func testFastCGITargetUpdateUsesCompareAndSetAndPersists() throws {
         let (_, repository, root) = try repositoryFixture()
         defer { try? FileManager.default.removeItem(at: root) }
