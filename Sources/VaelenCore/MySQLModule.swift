@@ -57,9 +57,13 @@ public struct MySQLStatus: Codable, Equatable, Sendable {
     public let uptime: Int?
     public let memoryBytes: UInt64?
     public let cpuPercent: Double?
+    /// Non-system databases observed through Vaelen's private local socket.
+    /// Nil means the catalog could not be observed; an empty array is an
+    /// authoritative observation that no project databases exist.
+    public let databases: [String]?
 
-    public init(state: MySQLState, health: String, installedVersion: String?, selectedVersion: String?, pid: Int32?, port: Int, socket: String, datadir: String, executablePath: String, uptime: Int? = nil, memoryBytes: UInt64? = nil, cpuPercent: Double? = nil) {
-        self.state = state; self.health = health; self.installedVersion = installedVersion; self.selectedVersion = selectedVersion; self.pid = pid; self.port = port; self.socket = socket; self.datadir = datadir; self.executablePath = executablePath; self.uptime = uptime; self.memoryBytes = memoryBytes; self.cpuPercent = cpuPercent
+    public init(state: MySQLState, health: String, installedVersion: String?, selectedVersion: String?, pid: Int32?, port: Int, socket: String, datadir: String, executablePath: String, uptime: Int? = nil, memoryBytes: UInt64? = nil, cpuPercent: Double? = nil, databases: [String]? = nil) {
+        self.state = state; self.health = health; self.installedVersion = installedVersion; self.selectedVersion = selectedVersion; self.pid = pid; self.port = port; self.socket = socket; self.datadir = datadir; self.executablePath = executablePath; self.uptime = uptime; self.memoryBytes = memoryBytes; self.cpuPercent = cpuPercent; self.databases = databases
     }
 }
 
@@ -215,7 +219,8 @@ public final class MySQLModule: @unchecked Sendable {
         guard processMatches(record) else { return MySQLStatus(state: .unhealthy, health: "identity-unverified", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable) }
         guard isPortOwnedByRecord(record) else { return MySQLStatus(state: .conflict, health: "port-conflict", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable) }
         let healthy = (try? ping(paths: paths)) == true
-        return MySQLStatus(state: healthy ? .running : .unhealthy, health: healthy ? "healthy" : "not-ready", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable, uptime: processUptime(record.pid), memoryBytes: processMemory(record.pid), cpuPercent: processCPU(record.pid))
+        let databases = healthy ? (try? databaseNames(package: package, paths: paths)) : nil
+        return MySQLStatus(state: healthy ? .running : .unhealthy, health: healthy ? "healthy" : "not-ready", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable, uptime: processUptime(record.pid), memoryBytes: processMemory(record.pid), cpuPercent: processCPU(record.pid), databases: databases)
     }
 
     public func start() throws -> MySQLStatus {
@@ -335,13 +340,13 @@ public final class MySQLModule: @unchecked Sendable {
           throw MySQLModuleError.processFailed(logText(paths.log))
       }
     private func writeCredentials(paths: InstancePaths, password: String) throws { try atomicWrite("[client]\nuser=root\npassword=\(password)\nprotocol=socket\nsocket=\(paths.socket.path)\n", to: paths.credentials); try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.credentials.path) }
-     private func runClient(_ executable: String, paths: InstancePaths, arguments: [String], timeout: TimeInterval = 10) throws {
+     @discardableResult private func runClient(_ executable: String, paths: InstancePaths, arguments: [String], timeout: TimeInterval = 10) throws -> String {
          let process = Process(); process.executableURL = URL(fileURLWithPath: executable)
          var clientArguments = arguments
          let defaultsFile = clientArguments.first(where: { $0.hasPrefix("--defaults-extra-file=") })
          clientArguments.removeAll(where: { $0.hasPrefix("--defaults-extra-file=") })
          process.arguments = (defaultsFile.map { [$0] } ?? []) + ["--protocol=socket", "--socket=\(paths.socket.path)"] + clientArguments
-         let output = Pipe(); process.standardOutput = output; process.standardError = output
+          let output = Pipe(); let error = Pipe(); process.standardOutput = output; process.standardError = error
          try process.run()
          let deadline = Date().addingTimeInterval(timeout)
          while process.isRunning && Date() < deadline { usleep(20_000) }
@@ -352,8 +357,21 @@ public final class MySQLModule: @unchecked Sendable {
              if !process.isRunning { process.waitUntilExit() }
              throw MySQLModuleError.processFailed("MySQL client command timed out")
          }
-         let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
-         guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(String(data: data, encoding: .utf8) ?? "MySQL client failed") }
+          let data = output.fileHandleForReading.readDataToEndOfFile()
+          let errorData = error.fileHandleForReading.readDataToEndOfFile()
+          process.waitUntilExit()
+          let text = String(data: data, encoding: .utf8) ?? ""
+          let errorText = String(data: errorData, encoding: .utf8) ?? ""
+          guard process.terminationStatus == 0 else { throw MySQLModuleError.processFailed(errorText.isEmpty ? (text.isEmpty ? "MySQL client failed" : text) : errorText) }
+          return text
+      }
+     private func databaseNames(package: MySQLPackage?, paths: InstancePaths) throws -> [String] {
+         guard let package else { throw MySQLModuleError.packageMissing(manifest.version) }
+         let output = try runClient(package.clientPath, paths: paths, arguments: [
+             "--defaults-extra-file=\(paths.credentials.path)", "--batch", "--skip-column-names", "-e",
+             "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('mysql','information_schema','performance_schema','sys') ORDER BY SCHEMA_NAME"
+         ], timeout: min(clientCommandTimeout, 2))
+         return output.split(whereSeparator: \.isNewline).map(String.init)
      }
      private func ping(paths: InstancePaths, allowExpiredPassword: Bool = false, timeout: TimeInterval = 0.5) throws -> Bool {
          if allowExpiredPassword { return manager.fileExists(atPath: paths.socket.path) }
