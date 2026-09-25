@@ -12,21 +12,35 @@ public struct TLSTrustControlPresentation: Equatable, Sendable {
     public let title: String
     public let canTrust: Bool
     public let canRemove: Bool
+    public let canManageTrust: Bool
 
     public init(_ status: TLSStatus) {
         if status.trustObserved && status.trustProvenance == .confirmedByVaelen {
             title = "Trusted"
             canTrust = false
             canRemove = true
+            canManageTrust = false
         } else if status.trustObserved {
-            title = "Trusted (origin unknown)"
+            title = "Trusted"
             canTrust = false
             canRemove = false
+            canManageTrust = true
         } else {
             title = "Needs attention"
             canTrust = status.state == .createdButUntrusted
             canRemove = false
+            canManageTrust = false
         }
+    }
+
+    public func manageTrustGuidance(caFingerprint: String?, certificatePath: String?) -> String? {
+        guard canManageTrust else { return nil }
+        guard let caFingerprint, !caFingerprint.isEmpty else {
+            return "Vaelen can observe that local HTTPS is trusted, but does not have persisted evidence that it created this trust setting. Automatic removal is unavailable. The CA fingerprint is unavailable, so do not change any Keychain trust setting."
+        }
+
+        let path = certificatePath.map { "\nCertificate file: \($0)" } ?? ""
+        return "Vaelen can observe that local HTTPS is trusted, but does not have persisted evidence that it created this trust setting. Automatic removal is unavailable.\n\nCertificate: Vaelen Local CA\nSHA-256: \(caFingerprint)\(path)\n\nTo change only this certificate's trust setting, open Keychain Access > login > Certificates, select Vaelen Local CA, and verify its full SHA-256 matches exactly. In Get Info > Trust, only if this exact certificate has an explicit override, change its trust setting to Use System Defaults. Do not delete the certificate or change any other certificate. If the fingerprint differs or no explicit override is shown, stop. Verify with `val tls status --json`: trustObserved should be false and the CA fingerprint should remain the same."
     }
 }
 public enum TLSTrustOperationState: String, Codable, Sendable { case trusted, alreadyTrustedUnknownProvenance, confirmed, untrusted, removed }

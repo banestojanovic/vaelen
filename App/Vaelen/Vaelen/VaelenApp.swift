@@ -1216,6 +1216,8 @@ struct ServicesView: View {
     let mysql: MySQLStatus?
     let mailpit: MailpitStatus?
     let model: AppModel
+    @State private var showingTrustGuidance = false
+    @State private var trustGuidance = ""
 
     var body: some View {
         ScrollView {
@@ -1274,6 +1276,12 @@ struct ServicesView: View {
                     ServiceRow(title: "Local HTTPS", subtitle: nil, state: trustControl.title, stateSymbol: tls.trustObserved ? "checkmark" : "exclamationmark.triangle", stateTint: tls.trustObserved ? .secondary : .orange, busy: model.serviceOperationIs(for: "Local HTTPS")) {
                         if trustControl.canTrust { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
                         if trustControl.canRemove { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
+                        if trustControl.canManageTrust {
+                            Button("Manage Trust…") {
+                                trustGuidance = trustControl.manageTrustGuidance(caFingerprint: tls.caFingerprint, certificatePath: tls.caCertificatePath) ?? "Trust details are unavailable. Do not change any Keychain trust setting."
+                                showingTrustGuidance = true
+                            }
+                        }
                     }
                 }
                 if let ports {
@@ -1298,6 +1306,11 @@ struct ServicesView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxHeight: .infinity)
+        .alert("Manage Local CA Trust", isPresented: $showingTrustGuidance) {
+            Button("Done", role: .cancel) { }
+        } message: {
+            Text(trustGuidance)
+        }
     }
 
     private func mysqlSubtitle(_ mysql: MySQLStatus) -> String {
