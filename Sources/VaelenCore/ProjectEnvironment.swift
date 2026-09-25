@@ -121,6 +121,7 @@ public struct ProjectConfiguredEnvironment: Codable, Equatable, Sendable {
     public let dbHost: String?
     public let dbPort: String?
     public let database: String?
+    public let dbUsername: String?
     public let usernameConfigured: Bool
     public let password: ProjectSecretAvailability
     public let mailer: String?
@@ -131,13 +132,14 @@ public struct ProjectConfiguredEnvironment: Codable, Equatable, Sendable {
     public let interpolationDetected: Bool
     public let source: String
 
-    public init(envFile: String, envFilePresent: Bool, dbConnection: String? = nil, dbHost: String? = nil, dbPort: String? = nil, database: String? = nil, usernameConfigured: Bool = false, password: ProjectSecretAvailability = .unknown, mailer: String? = nil, mailHost: String? = nil, mailPort: String? = nil, mailEncryption: String? = nil, mailPassword: ProjectSecretAvailability = .unknown, interpolationDetected: Bool = false, source: String = ".env") {
+    public init(envFile: String, envFilePresent: Bool, dbConnection: String? = nil, dbHost: String? = nil, dbPort: String? = nil, database: String? = nil, dbUsername: String? = nil, usernameConfigured: Bool = false, password: ProjectSecretAvailability = .unknown, mailer: String? = nil, mailHost: String? = nil, mailPort: String? = nil, mailEncryption: String? = nil, mailPassword: ProjectSecretAvailability = .unknown, interpolationDetected: Bool = false, source: String = ".env") {
         self.envFile = envFile
         self.envFilePresent = envFilePresent
         self.dbConnection = dbConnection
         self.dbHost = dbHost
         self.dbPort = dbPort
         self.database = database
+        self.dbUsername = dbUsername
         self.usernameConfigured = usernameConfigured
         self.password = password
         self.mailer = mailer
@@ -416,7 +418,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         let values = parseDotenv(contents)
         let dbPassword = secretAvailability(values["DB_PASSWORD"])
         let mailPassword = secretAvailability(values["MAIL_PASSWORD"])
-        let configured = ProjectConfiguredEnvironment(envFile: path.path, envFilePresent: true, dbConnection: values["DB_CONNECTION"], dbHost: values["DB_HOST"], dbPort: values["DB_PORT"], database: values["DB_DATABASE"], usernameConfigured: values["DB_USERNAME"]?.isEmpty == false, password: dbPassword, mailer: values["MAIL_MAILER"], mailHost: values["MAIL_HOST"], mailPort: values["MAIL_PORT"], mailEncryption: values["MAIL_ENCRYPTION"] ?? values["MAIL_SCHEME"], mailPassword: mailPassword, interpolationDetected: values.values.contains { $0.contains("${") || $0.contains("$ ") })
+        let configured = ProjectConfiguredEnvironment(envFile: path.path, envFilePresent: true, dbConnection: values["DB_CONNECTION"], dbHost: values["DB_HOST"], dbPort: values["DB_PORT"], database: values["DB_DATABASE"], dbUsername: values["DB_USERNAME"], usernameConfigured: values["DB_USERNAME"]?.isEmpty == false, password: dbPassword, mailer: values["MAIL_MAILER"], mailHost: values["MAIL_HOST"], mailPort: values["MAIL_PORT"], mailEncryption: values["MAIL_ENCRYPTION"] ?? values["MAIL_SCHEME"], mailPassword: mailPassword, interpolationDetected: values.values.contains { $0.contains("${") || $0.contains("$ ") })
         return EnvRead(configured: configured, dbHost: values["DB_HOST"], dbPort: values["DB_PORT"], mailHost: values["MAIL_HOST"], mailPort: values["MAIL_PORT"], databasePassword: dbPassword, mailPassword: mailPassword)
     }
 

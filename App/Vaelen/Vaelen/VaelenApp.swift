@@ -436,6 +436,36 @@ final class AppModel {
         NSWorkspace.shared.open(url)
     }
 
+    func tablePlusAction(_ report: ProjectEnvironmentReport) -> ProjectDatabaseViewerAction {
+        ProjectDatabaseViewerAction.tablePlus(
+            configured: report.configured,
+            mysql: report.observed.mysql,
+            tablePlusInstalled: tablePlusApplicationURL != nil
+        )
+    }
+
+    func openProjectDatabaseInTablePlus(_ report: ProjectEnvironmentReport) {
+        let action = tablePlusAction(report)
+        guard let url = action.url, let applicationURL = tablePlusApplicationURL else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open([url], withApplicationAt: applicationURL, configuration: configuration)
+    }
+
+    private var tablePlusApplicationURL: URL? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.tinyapp.TablePlus")
+    }
+
+    func revealMySQLDataFiles(_ mysql: MySQLStatus) {
+        guard FileManager.default.fileExists(atPath: mysql.datadir) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: mysql.datadir, isDirectory: true)])
+    }
+
+    func revealMySQLBinaries(_ mysql: MySQLStatus) {
+        guard FileManager.default.fileExists(atPath: mysql.executablePath) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: mysql.executablePath)])
+    }
+
     func copyProjectPath(_ project: ProjectWire) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(project.path, forType: .string)
@@ -1062,6 +1092,17 @@ struct ProjectCard: View {
             }
             Spacer(minLength: 0)
             Menu {
+                if let report {
+                    let tablePlus = model.tablePlusAction(report)
+                    Button("Open Database in TablePlus", systemImage: "tablecells") {
+                        model.openProjectDatabaseInTablePlus(report)
+                    }
+                    .disabled(!tablePlus.isEnabled)
+                    if !tablePlus.isEnabled {
+                        Text(tablePlus.reason)
+                    }
+                    Divider()
+                }
                 Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
             } label: {
                 Image(systemName: "ellipsis")
@@ -1310,6 +1351,14 @@ struct ServicesView: View {
         if mysql.state == .notInstalled { Button("Install MySQL") { Task { await model.installMySQL() } } }
         else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy { Button(mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL") { Task { await model.startMySQL() } } }
         if mysql.state == .running { Button("Stop MySQL") { Task { await model.stopMySQL() } } }
+        if mysql.state != .notInstalled {
+            Menu("Reveal") {
+                Button("Data Files", systemImage: "internaldrive") { model.revealMySQLDataFiles(mysql) }
+                    .disabled(!FileManager.default.fileExists(atPath: mysql.datadir))
+                Button("MySQL Binaries", systemImage: "shippingbox") { model.revealMySQLBinaries(mysql) }
+                    .disabled(!FileManager.default.fileExists(atPath: mysql.executablePath))
+            }
+        }
     }
 
     @ViewBuilder private func mailpitActions(_ mailpit: MailpitStatus) -> some View {
