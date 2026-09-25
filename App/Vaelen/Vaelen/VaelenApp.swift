@@ -1217,9 +1217,32 @@ struct ServicesView: View {
     let mailpit: MailpitStatus?
     let model: AppModel
     @State private var showingTrustGuidance = false
-    @State private var trustGuidance = ""
 
     var body: some View {
+        Group {
+            if showingTrustGuidance, let tls {
+                let trustControl = TLSTrustControlPresentation(tls)
+                if trustControl.canManageTrust {
+                    let details = trustControl.manageTrustDetails(caFingerprint: tls.caFingerprint, certificatePath: tls.caCertificatePath)
+                    LocalCATrustDetailsView(
+                        fingerprint: details?.fingerprint,
+                        certificatePath: details?.certificatePath,
+                        explanation: details?.explanation ?? "Trust details are unavailable. Do not change any Keychain trust setting.",
+                        manualSteps: details?.manualSteps
+                    ) {
+                        showingTrustGuidance = false
+                    }
+                } else {
+                    servicesList
+                }
+            } else {
+                servicesList
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private var servicesList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 Text("Runtimes")
@@ -1277,10 +1300,7 @@ struct ServicesView: View {
                         if trustControl.canTrust { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
                         if trustControl.canRemove { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
                         if trustControl.canManageTrust {
-                            Button("Manage Trust…") {
-                                trustGuidance = trustControl.manageTrustGuidance(caFingerprint: tls.caFingerprint, certificatePath: tls.caCertificatePath) ?? "Trust details are unavailable. Do not change any Keychain trust setting."
-                                showingTrustGuidance = true
-                            }
+                            Button("Manage Trust…") { showingTrustGuidance = true }
                         }
                     }
                 }
@@ -1306,11 +1326,6 @@ struct ServicesView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxHeight: .infinity)
-        .alert("Manage Local CA Trust", isPresented: $showingTrustGuidance) {
-            Button("Done", role: .cancel) { }
-        } message: {
-            Text(trustGuidance)
-        }
     }
 
     private func mysqlSubtitle(_ mysql: MySQLStatus) -> String {
@@ -1380,6 +1395,86 @@ struct ServicesView: View {
         else if mailpit.state == .installed || mailpit.state == .stopped || mailpit.state == .unhealthy || mailpit.state == .conflict { Button("Start Mailpit") { Task { await model.startMailpit() } } }
         if mailpit.state == .running { Button("Stop Mailpit") { Task { await model.stopMailpit() } }; Button("Open Mailpit") { Task { await model.openMailpit() } } }
     }
+}
+
+private struct LocalCATrustDetailsView: View {
+    let fingerprint: String?
+    let certificatePath: String?
+    let explanation: String
+    let manualSteps: String?
+    let onBack: () -> Void
+    @State private var copiedFingerprint = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: VaelenUI.spacing10) {
+            HStack {
+                Button("Back to Services", systemImage: "chevron.backward", action: onBack)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityHint("Returns to the Services list and keeps the Vaelen popover open.")
+                Spacer()
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: VaelenUI.spacing12) {
+                    Text("Manage Local CA Trust")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+
+                    VStack(alignment: .leading, spacing: VaelenUI.spacing8) {
+                        if let fingerprint, !fingerprint.isEmpty {
+                            Text("CA certificate SHA-256")
+                                .font(.subheadline.weight(.semibold))
+                            Text(fingerprint)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityLabel("CA certificate SHA-256 fingerprint: \(fingerprint)")
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(fingerprint, forType: .string)
+                                copiedFingerprint = true
+                            } label: {
+                                Label(copiedFingerprint ? "Copied" : "Copy SHA-256", systemImage: copiedFingerprint ? "checkmark" : "doc.on.doc")
+                            }
+                            .accessibilityLabel(copiedFingerprint ? "Fingerprint copied" : "Copy CA SHA-256 fingerprint")
+                            .accessibilityHint("Copies the full CA certificate fingerprint to the clipboard.")
+                            .accessibilityIdentifier("localCATrust.copyFingerprint")
+                        } else {
+                            VaelenStatusLabel("CA fingerprint unavailable. Do not change any Keychain trust setting.", systemImage: "exclamationmark.triangle", tint: .orange)
+                                .font(.caption)
+                        }
+
+                        if let certificatePath, !certificatePath.isEmpty {
+                            Text("Certificate file: \(certificatePath)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(VaelenUI.spacing8)
+                    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: VaelenUI.cornerRadius))
+
+                    Text(explanation)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Why automatic trust removal is unavailable and safe manual Keychain instructions")
+                    if let manualSteps {
+                        Text(manualSteps)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.trailing, VaelenUI.spacing6)
+            }
+            .accessibilityLabel("Local CA trust details")
+        }
+        .padding(VaelenUI.spacing12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
 }
 
 struct SettingsView: View {
