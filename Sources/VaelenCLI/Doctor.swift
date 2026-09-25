@@ -26,12 +26,7 @@ struct DoctorReport: Codable {
     let exitCode: Int32
 
     var terminalOutput: String {
-        var size = winsize()
-        let hasWidth = isatty(STDOUT_FILENO) == 1 && ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0
-        let width = hasWidth ? Int(size.ws_col) : 100
-        let environment = ProcessInfo.processInfo.environment
-        let color = Self.colorEnabled(isTTY: isatty(STDOUT_FILENO) == 1, environment: environment)
-        return render(width: width, color: color)
+        render(width: HumanOutput.terminalWidth, color: HumanOutput.colorEnabled)
     }
 
     static func colorEnabled(isTTY: Bool, environment: [String: String]) -> Bool {

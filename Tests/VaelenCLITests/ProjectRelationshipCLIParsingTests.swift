@@ -2,7 +2,11 @@ import XCTest
 @testable import VaelenCLI
 
 final class ProjectRelationshipCLIParsingTests: XCTestCase {
-    func testParkCommandsRequireAnExplicitPath() throws {
+    func testParkCommandsAcceptCurrentDirectoryOrExplicitPath() throws {
+        guard case .park(let currentParkPath) = try VaelenCLIMain.parse(["park"]) else {
+            return XCTFail("park without a path should use the current directory")
+        }
+        XCTAssertNil(currentParkPath)
         guard case .park(let path) = try VaelenCLIMain.parse(["park", "workspace"]) else {
             return XCTFail("park did not parse")
         }
@@ -12,9 +16,23 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
             return XCTFail("unpark did not parse")
         }
         XCTAssertEqual(unparkedPath, "workspace")
-        XCTAssertThrowsError(try VaelenCLIMain.parse(["park"]))
-        XCTAssertThrowsError(try VaelenCLIMain.parse(["unpark"]))
-        XCTAssertThrowsError(try VaelenCLIMain.parse(["park", "one", "two"]))
+        guard case .unpark(let currentUnparkPath) = try VaelenCLIMain.parse(["unpark"]) else {
+            return XCTFail("unpark without a path should use the current directory")
+        }
+        XCTAssertNil(currentUnparkPath)
+        for args in [["park", "one", "two"], ["unpark", "one", "two"]] {
+            XCTAssertThrowsError(try VaelenCLIMain.parse(args)) { error in
+                XCTAssertTrue(String(describing: error).contains("Usage: val \(args[0]) [workspace-folder]"))
+                XCTAssertFalse(String(describing: error).contains("Usage: val <command>"))
+            }
+        }
+    }
+
+    func testUnparkVerificationUsesTheResolvedCurrentDirectoryTarget() {
+        XCTAssertEqual(
+            VaelenCLIMain.unparkTargetPath(nil, workingDirectory: "/tmp/workspace"),
+            "/tmp/workspace"
+        )
     }
 
     func testLinkAcceptsOptionalCurrentDirectoryPathButUnlinkRequiresAnExplicitPath() throws {
@@ -62,9 +80,9 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
 
     func testHelpDocumentsProjectRelationshipSyntax() throws {
         let helpEntries = [
-            ("park", "Usage: val park <workspace-folder>"),
+            ("park", "Usage: val park [workspace-folder]"),
             ("parks", "Usage: val parks [--json]"),
-            ("unpark", "Usage: val unpark <workspace-folder>"),
+            ("unpark", "Usage: val unpark [workspace-folder]"),
             ("link", "Usage: val link [project-directory]"),
             ("links", "Usage: val links [--json]"),
             ("unlink", "Usage: val unlink <project-directory>")

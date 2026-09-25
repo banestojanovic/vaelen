@@ -11,8 +11,8 @@ enum CLICommand {
     case link(path: String?)
     case unlink(path: String)
     case links(json: Bool)
-    case park(path: String)
-    case unpark(path: String)
+    case park(path: String?)
+    case unpark(path: String?)
     case parks(json: Bool)
     case projectStatus(selector: String?, json: Bool)
     case projectInspect(selector: String?, json: Bool)
@@ -189,21 +189,24 @@ struct VaelenCLIMain {
                 ("Web", [("secure", "Enable HTTPS for a site route"), ("unsecure", "Serve a site route over HTTP")]),
                 ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
                 ("Networking", [("routing", "Manage router"), ("route", "Manage project routes"), ("dns", "Manage DNS"), ("tls", "Manage HTTPS"), ("ports", "Manage web ports")]),
-                ("Integration", [("shell", "PHP shell integration")])
+                ("Integration", [("shell", "PHP shell integration")]),
+                ("Discoverability", [("list", "List available val commands")])
             ]
-            var lines = ["Vaelen — local development environments for your projects.", "", "Usage: val <command> [options]", ""]
+            var lines = wrappedText("Vaelen — local development environments for your projects.", indent: "").components(separatedBy: "\n")
+            lines += ["", "Usage: val <command> [options]", ""]
             for (title, commands) in sections {
                 lines.append(title)
                 lines += rootCommandRows(commands)
                 lines.append("")
             }
-            lines += wrappedText("Run “val <command> --help” for command details.", indent: "").components(separatedBy: "\n")
+            lines += wrappedText("Run “val list” to redisplay commands, or “val <command> --help” for details.", indent: "").components(separatedBy: "\n")
             return lines.joined(separator: "\n")
         }
         let name = path[0]
         let body: String
         switch name {
         case "doctor": body = "Usage: val doctor [--json]\nCheck Vaelen Core and managed service health without starting or repairing services.\nExample: val doctor --json"
+        case "list": body = "Usage: val list\nList available val commands. Use “val <command> --help” for command-specific usage."
         case "secure": body = "Usage: val secure [hostname]\nEnable local HTTPS and HTTP-to-HTTPS redirect for an existing route. Without a hostname, the current directory must resolve to exactly one route.\nExample: val secure app.test"
         case "unsecure": body = "Usage: val unsecure [hostname]\nServe an existing route over HTTP without redirect. Without a hostname, the current directory must resolve to exactly one route. Browsers may retain a cached HTTPS redirect.\nExample: val unsecure app.test"
         case "project": body = groupHelp("val project <command> [project] [options]", [
@@ -242,8 +245,8 @@ struct VaelenCLIMain {
         case "status": body = "Usage: val status [--json]\nShow whether Vaelen Core is running."
         case "link": body = "Usage: val link [project-directory]\nLink and serve a project folder. With no directory, use the current directory.\nExample: val link\nExample: val link ./my-app"
         case "unlink": body = "Usage: val unlink <project-directory>\nUnlink a project without deleting its files.\nExample: val unlink ./my-app"
-        case "park": body = "Usage: val park <workspace-folder>\nPark a folder in your workspace.\nExample: val park ~/Code/old-project"
-        case "unpark": body = "Usage: val unpark <workspace-folder>\nUnpark a folder without deleting it.\nExample: val unpark ~/Code/old-project"
+        case "park": body = "Usage: val park [workspace-folder]\nPark a folder in your workspace. With no folder, use the current directory.\nExample: val park\nExample: val park ~/Code/old-project"
+        case "unpark": body = "Usage: val unpark [workspace-folder]\nUnpark a folder without deleting it. With no folder, use the current directory.\nExample: val unpark\nExample: val unpark ~/Code/old-project"
         case "links": body = "Usage: val links [--json]\nList linked projects."
         case "parks": body = "Usage: val parks [--json]\nList parked workspace folders."
         default: return "Unknown command: \(name). Run ‘val --help’ to see available commands."
@@ -291,9 +294,7 @@ struct VaelenCLIMain {
     }
 
     private static func rootCommandRows(_ commands: [(String, String)]) -> [String] {
-        commands.map { command, description in
-            "  \(command)" + String(repeating: " ", count: max(2, 9 - command.count)) + description
-        }
+        commandRows(commands)
     }
 
     private static func wrappedText(_ text: String, indent: String) -> String {
@@ -314,7 +315,7 @@ struct VaelenCLIMain {
     }
 
     private static func groupTitle(for line: String) -> Bool {
-        ["Projects", "Overview", "Runtime", "Networking", "Integration", "Commands", "Examples", "Example:"].contains(line)
+        ["Projects", "Overview", "Runtime", "Networking", "Integration", "Discoverability", "Commands", "Examples", "Example:"].contains(line)
     }
 
     static func printHelp(_ text: String) {
@@ -323,7 +324,7 @@ struct VaelenCLIMain {
               isatty(STDOUT_FILENO) == 1 else { print(text); return }
         let rendered = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
             let value = String(line)
-            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks"].contains(value)) {
+            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks", "list"].contains(value)) {
                 return "\u{001B}[1;36m\(value)\u{001B}[0m"
             }
             if value.hasPrefix("  "), let gap = value.range(of: "  ", range: value.index(value.startIndex, offsetBy: 2)..<value.endIndex) {
@@ -393,6 +394,14 @@ struct VaelenCLIMain {
                 fail(payload.message, code: 1)
             }
             fail("Vaelen Core returned an invalid response.", code: 1)
+        } catch let error as CLIError {
+            switch error {
+            case .usage, .commandUsage:
+                FileHandle.standardError.write(Data((error.description + "\n").utf8))
+                exit(1)
+            case .message:
+                fail(error.description, code: 1)
+            }
         } catch {
             fail(message(for: error), code: 1)
         }
@@ -404,7 +413,10 @@ struct VaelenCLIMain {
         case "help", "--help", "-h":
             guard args.count == 1 else { throw CLIError.usage }
             return .help
-        case "status": return .status(json: args.dropFirst().elementsEqual(["--json"]))
+        case "list":
+            guard args.count == 1 else { throw CLIError.usage }
+            return .help
+        case "status": return .status(json: try listJSONOption(args))
         case "doctor": return .doctor(json: try listJSONOption(args))
         case "secure", "unsecure":
             guard args.count <= 2 else { throw CLIError.usage }
@@ -433,16 +445,20 @@ struct VaelenCLIMain {
             guard args.count <= 2 else { throw CLIError.usage }
             return .link(path: args.count == 2 ? args[1] : nil)
         case "unlink": return .unlink(path: try requiredPath(args))
-        case "park": return .park(path: try requiredPath(args))
-        case "unpark": return .unpark(path: try requiredPath(args))
+        case "park":
+            guard args.count <= 2 else { throw CLIError.commandUsage("park") }
+            return .park(path: args.count == 2 ? args[1] : nil)
+        case "unpark":
+            guard args.count <= 2 else { throw CLIError.commandUsage("unpark") }
+            return .unpark(path: args.count == 2 ? args[1] : nil)
         case "php":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "versions": return .phpVersions(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "versions": return .phpVersions(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 3 else { throw CLIError.usage }; return .phpInstall(args[2])
             case "update": guard args.count == 3 else { throw CLIError.usage }; return .phpUpdate(args[2])
             case "remove": guard args.count == 3 else { throw CLIError.usage }; return .phpRemove(args[2])
-            case "operation": return .phpOperation(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "operation": return .phpOperation(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "default":
                 if args.count == 2 || (args.count == 3 && args[2] == "--json") { return .phpDefault(json: args.count == 3) }
                 if args.count == 3, args[2] != "set" { return .phpDefaultSet(args[2]) }
@@ -451,7 +467,7 @@ struct VaelenCLIMain {
             case "use": guard args.count == 3 else { throw CLIError.usage }; return .phpUse(args[2])
             case "start": guard args.count == 3 else { throw CLIError.usage }; return .phpStart(args[2])
             case "stop": guard args.count == 3 else { throw CLIError.usage }; return .phpStop(args[2])
-            case "status": guard args.count == 3 || args.count == 4 else { throw CLIError.usage }; return .phpStatus(args[2], json: args.count == 4 && args[3] == "--json")
+            case "status": guard args.count == 3 || args.count == 4 else { throw CLIError.usage }; return .phpStatus(args[2], json: try optionalJSONOption(Array(args.dropFirst(3))))
             case "exec":
                 let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }; return .phpExec(version: nil, arguments: Array(rest.dropFirst(marker + 1)))
             case "resolve": guard args.count == 3, args[2] == "--path" else { throw CLIError.usage }; return .phpResolvePath
@@ -468,13 +484,13 @@ struct VaelenCLIMain {
         case "mysql":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "versions": return .mysqlVersions(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "versions": return .mysqlVersions(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 3 else { throw CLIError.usage }; return .mysqlInstall(args[2])
             case "use": guard args.count == 3 else { throw CLIError.usage }; return .mysqlUse(args[2])
             case "initialize": guard args.count == 2 else { throw CLIError.usage }; return .mysqlInitialize
             case "start": guard args.count == 2 else { throw CLIError.usage }; return .mysqlStart
             case "stop": guard args.count == 2 else { throw CLIError.usage }; return .mysqlStop
-            case "status": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .mysqlStatus(json: args.count == 3 && args[2] == "--json")
+            case "status": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .mysqlStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
             default: throw CLIError.usage
             }
         case "routing":
@@ -488,7 +504,7 @@ struct VaelenCLIMain {
         case "route":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "list": return .routeList(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "list": return .routeList(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "add":
                 guard args.count >= 4 else { throw CLIError.usage }
                 var socket: String?
@@ -515,26 +531,26 @@ struct VaelenCLIMain {
         case "mailpit":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "versions": return .mailpitVersions(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "versions": return .mailpitVersions(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 3 else { throw CLIError.usage }; return .mailpitInstall(args[2])
             case "start": guard args.count == 2 else { throw CLIError.usage }; return .mailpitStart
             case "stop": guard args.count == 2 else { throw CLIError.usage }; return .mailpitStop
-            case "status": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .mailpitStatus(json: args.count == 3 && args[2] == "--json")
+            case "status": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .mailpitStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "open": guard args.count == 2 else { throw CLIError.usage }; return .mailpitOpen
             default: throw CLIError.usage
             }
         case "dns":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "status": return .dnsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
-            case "install": return .dnsInstall(takeover: args.dropFirst(2).elementsEqual(["--takeover"]))
+            case "status": return .dnsStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            case "install": return .dnsInstall(takeover: try optionalFlag(Array(args.dropFirst(2)), flag: "--takeover"))
             case "remove": guard args.count == 2 else { throw CLIError.usage }; return .dnsRemove
             default: throw CLIError.usage
             }
         case "tls":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "status": return .tlsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "status": return .tlsStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 2 else { throw CLIError.usage }; return .tlsInstall
             case "remove": guard args.count == 2 else { throw CLIError.usage }; return .tlsRemove
             case "trust": guard args.count == 2 else { throw CLIError.usage }; return .tlsTrust
@@ -544,7 +560,7 @@ struct VaelenCLIMain {
         case "ports":
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
-            case "status": return .portsStatus(json: args.dropFirst(2).elementsEqual(["--json"]))
+            case "status": return .portsStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 2 else { throw CLIError.usage }; return .portsInstall
             case "remove": guard args.count == 2 else { throw CLIError.usage }; return .portsRemove
             default: throw CLIError.usage
@@ -561,6 +577,16 @@ struct VaelenCLIMain {
     private static func listJSONOption(_ args: [String]) throws -> Bool {
         guard args.count == 1 || args.dropFirst().elementsEqual(["--json"]) else { throw CLIError.usage }
         return args.count == 2
+    }
+
+    private static func optionalJSONOption(_ args: [String]) throws -> Bool {
+        guard args.isEmpty || args == ["--json"] else { throw CLIError.usage }
+        return !args.isEmpty
+    }
+
+    private static func optionalFlag(_ args: [String], flag: String) throws -> Bool {
+        guard args.isEmpty || args == [flag] else { throw CLIError.usage }
+        return !args.isEmpty
     }
 
     private static func projectEnvironmentArguments(_ args: [String]) throws -> (selector: String?, json: Bool) {
@@ -648,7 +674,11 @@ struct VaelenCLIMain {
                 let value = StatusEnvelope(core: StatusPayload(state: status.core.state.rawValue, version: status.core.version, pid: status.core.pid, protocolVersion: status.protocolVersion))
                 print(String(decoding: try IPCCodec.encode(value), as: UTF8.self))
             } else {
-                print("Vaelen\nCore       \(status.core.state == .running ? "Running" : "Unavailable")\nVersion    \(status.core.version)\nPID        \(status.core.pid)\nProtocol   \(status.protocolVersion)")
+                print(HumanOutput.heading("Vaelen") + "\n" + HumanOutput.aligned([
+                    ("Core", status.core.state == .running ? "Running" : "Unavailable"),
+                    ("Version", status.core.version), ("PID", String(status.core.pid)),
+                    ("Protocol", String(status.protocolVersion))
+                ]))
             }
         case .link(let path):
             let workingPath = URL(fileURLWithPath: workingDirectory).standardizedFileURL.resolvingSymlinksInPath().path
@@ -745,15 +775,20 @@ struct VaelenCLIMain {
                 for hostname in summary.added { print("Serving http://\(hostname)") }
                 for hostname in summary.removed { print("Removed parked route \(hostname)") }
                 for conflict in summary.conflicts { print("Conflict: \(conflict)") }
-                for issue in summary.issues { print("Warning: \(issue)") }
+                for issue in summary.issues { print(HumanOutput.warning(issue)) }
             }
         case .unpark(let path):
+            let targetPath = Self.unparkTargetPath(path, workingDirectory: workingDirectory)
             let result = try await client.unpark(path: path, workingDirectory: workingDirectory)
-            print("Unparked path")
+            let remainingPaths = try await client.parkedPaths()
+            guard !remainingPaths.contains(where: { $0.path == targetPath }) else {
+                throw CLIError.message("Vaelen Core reported success, but \(displayPath(targetPath)) is still parked.")
+            }
+            print("Unparked\n\(displayPath(targetPath))")
             if let summary = result.reconciliation {
                 for hostname in summary.removed { print("Removed parked route \(hostname)") }
                 for conflict in summary.conflicts { print("Conflict: \(conflict)") }
-                for issue in summary.issues { print("Warning: \(issue)") }
+                for issue in summary.issues { print(HumanOutput.warning(issue)) }
             }
         case .parks(let json):
             let paths = try await client.parkedPaths()
@@ -822,7 +857,10 @@ struct VaelenCLIMain {
         case .routeList(let json):
             let routes = try await client.routeList()
             if json { print(String(decoding: try IPCCodec.encode(RouteListEnvelope(routes: routes)), as: UTF8.self)) }
-            else { routes.forEach { intent in print("\(intent.route.id)\t\(intent.route.hostname)\t\(targetDescription(intent.route.target))\tDesired") } }
+            else {
+                print(HumanOutput.heading("Routes"))
+                print(HumanOutput.list(routes.map { [String(describing: $0.route.id), $0.route.hostname, targetDescription($0.route.target), $0.route.tls.rawValue] }, headers: ["ID", "Hostname", "Target", "TLS"], empty: "No routes configured."))
+            }
         case .routeTLS(let hostname, let secure):
             let routes = try await client.routeList()
             let intent: RouteIntent
@@ -834,7 +872,7 @@ struct VaelenCLIMain {
             if let update = routeTLSUpdate(intent, secure: secure) { result = try await client.routeAdd(update) }
             else { result = intent }
             print("\(secure ? "Secured" : "Unsecured"): \(secure ? "https" : "http")://\(result.route.hostname)")
-            if !secure { print("A browser may retain a cached HTTPS redirect; clear its site data or try a private window if it keeps opening HTTPS.") }
+            if !secure { print(HumanOutput.warning("A browser may retain a cached HTTPS redirect; clear its site data or try a private window if it keeps opening HTTPS.")) }
         case .routeAdd(let hostname, let documentRoot, let socketPath, let projectID, let tls):
             let target: RouteTarget = socketPath.map { .fastCGI(socketPath: $0, documentRoot: documentRoot) } ?? .staticFiles(documentRoot: documentRoot)
             let result = try await client.routeAdd(.init(route: .init(hostname: hostname, target: target, tls: tls ? .local : .disabled), projectID: projectID))
@@ -898,13 +936,15 @@ struct VaelenCLIMain {
     }
 
     static func linkedProjectsOutput(_ projects: [ProjectWire]) -> String {
-        guard !projects.isEmpty else { return "No linked projects." }
-        return projects.map { "\($0.name)\t\(displayPath($0.path))\t\($0.availability)" }.joined(separator: "\n")
+        HumanOutput.list(projects.map { [$0.name, displayPath($0.path), $0.availability] }, headers: ["Project", "Path", "Availability"], empty: "No linked projects.")
     }
 
     static func parkedPathsOutput(_ paths: [ParkedPathWire]) -> String {
-        guard !paths.isEmpty else { return "No parked folders." }
-        return paths.map { "\(displayPath($0.path))\t\($0.availability)" }.joined(separator: "\n")
+        HumanOutput.list(paths.map { [displayPath($0.path), $0.availability] }, headers: ["Workspace folder", "Availability"], empty: "No parked folders.")
+    }
+
+    static func unparkTargetPath(_ path: String?, workingDirectory: String) -> String {
+        CanonicalPathService().canonicalize(path ?? workingDirectory, relativeTo: workingDirectory).string
     }
 
     private static func targetDescription(_ target: RouteTarget) -> String {
@@ -962,11 +1002,18 @@ struct VaelenCLIMain {
         return "val failed: \(error)"
     }
 
-    private static func fail(_ text: String, code: Int32) -> Never { FileHandle.standardError.write(Data((text + "\n").utf8)); exit(code) }
+    private static func fail(_ text: String, code: Int32) -> Never { FileHandle.standardError.write(Data((HumanOutput.error(text) + "\n").utf8)); exit(code) }
 }
 
 enum CLIError: Error, CustomStringConvertible {
     case usage
+    case commandUsage(String)
     case message(String)
-    var description: String { switch self { case .usage: return VaelenCLIMain.usage; case .message(let text): return text } }
+    var description: String {
+        switch self {
+        case .usage: return VaelenCLIMain.usage
+        case .commandUsage(let command): return VaelenCLIMain.helpText(for: [command])
+        case .message(let text): return text
+        }
+    }
 }
