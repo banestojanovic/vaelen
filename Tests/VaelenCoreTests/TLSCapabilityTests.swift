@@ -300,6 +300,8 @@ final class TLSCapabilityTests: XCTestCase {
     }
     func testLocalNamespaceRejectsPublicNames() throws {
         XCTAssertEqual(try LocalTLSNamespace.validate("api.SyncProof.TEST"), "api.syncproof.test")
+        XCTAssertEqual(try LocalTLSNamespace.validate("*.CallTheWaiter.TEST"), "*.callthewaiter.test")
+        for name in ["*.*.test", "api.*.test", "*.com"] { XCTAssertThrowsError(try LocalTLSNamespace.validate(name)) }
         for name in ["google.com", "github.com", "apple.com", "example.com"] { XCTAssertThrowsError(try LocalTLSNamespace.validate(name)) }
     }
 

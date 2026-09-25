@@ -89,6 +89,9 @@ public actor CaddyRouter: Router {
                       let hosts = hostMatcher["host"] as? [String],
                       let hostname = hosts.first, !hostname.isEmpty,
                       let handlers = rawRoute["handle"] as? [[String: Any]] else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
+                // Wildcard routes are derived routing machinery for a linked
+                // parent project, not independently configured projects.
+                guard !hostname.contains("*") else { continue }
                 if handlers.contains(where: { ($0["handler"] as? String) == "static_response" }) { continue }
                 let route: Route?
                 if let proxy = handlers.first(where: { ($0["handler"] as? String) == "reverse_proxy" }),
@@ -133,24 +136,17 @@ public actor CaddyRouter: Router {
         let httpListen = "127.0.0.1:\(process.httpPort)"
         let httpsListen = "127.0.0.1:\(runtimeConfiguration.httpsPort)"
         let documentEntries: [(String, CaddyRoute)] = routes.flatMap { route in
-            let handlers: [CaddyHandler]
-            switch route.target {
-            case .staticFiles(let documentRoot):
-                handlers = [.fileServer(root: documentRoot)]
-            case .http(let host, let port):
-                handlers = [.reverseProxy(upstream: "\(host):\(port)")]
-            case .fastCGI(let socketPath, let documentRoot):
-                // A leading-wildcard suffix matcher covers PHP scripts at every depth.
-                // Never send them through file_server, including nonexistent scripts.
-                let phpRoute = CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname], path: ["*.php"])], handle: [.variables(root: documentRoot), .fastCGI(socketPath: socketPath)], terminal: true)
-                let staticMatcher = CaddyHostMatcher(host: [route.hostname], file: CaddyFileMatcher(root: documentRoot, tryFiles: ["{http.request.uri.path}"]), not: [CaddyPathMatcher(path: ["*.php"])])
-                let staticRoute = CaddyRoute(match: [staticMatcher], handle: [.fileServer(root: documentRoot)], terminal: true)
-                let fastCGIRoute = CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname])], handle: [.variables(root: documentRoot), .rewrite(uri: "/index.php"), .fastCGI(socketPath: socketPath)], terminal: true)
-                return [(route.hostname, phpRoute), (route.hostname, staticRoute), (route.hostname, fastCGIRoute)]
-            }
-            return [(route.hostname, CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname])], handle: handlers, terminal: true))]
+            Self.documentEntries(route: route, hostname: route.hostname)
+        }
+        let wildcardRoutes = routes.filter { $0.tls == .local }.map { route in
+            (route: route, hostname: "*.\(route.hostname)")
+        }
+        let wildcardEntries: [(String, CaddyRoute)] = wildcardRoutes.flatMap { item in
+            let exactHosts = routes.map(\.hostname).filter { Self.isOneLevelSubdomain($0, of: item.route.hostname) }
+            return Self.documentEntries(route: item.route, hostname: item.hostname, excludedHosts: exactHosts)
         }
         let documents = documentEntries.map(\.1)
+        let wildcardDocuments = wildcardEntries.map(\.1)
         var leaves = [CaddyCertificateFile]()
         var tlsHostnames = [String]()
         for route in routes where route.tls == .local {
@@ -158,20 +154,76 @@ public actor CaddyRouter: Router {
             leaves.append(CaddyCertificateFile(certificate: leaf.certificateURL.path, key: leaf.keyURL.path))
             tlsHostnames.append(route.hostname)
         }
-        // Plain HTTP on the backend port redirects TLS routes to their https:// origin.
-        // Redirect routes precede content routes so they win for TLS hostnames.
+        var wildcardHostnames = [String]()
+        for item in wildcardRoutes {
+            let leaf = try await tls.issueLeaf(hostname: item.hostname)
+            leaves.append(CaddyCertificateFile(certificate: leaf.certificateURL.path, key: leaf.keyURL.path))
+            wildcardHostnames.append(item.hostname)
+        }
+        // Exact TLS routes redirect first. Exact route handlers then precede
+        // per-site wildcard redirects and handlers, so an explicitly managed
+        // tenant host can never be captured by its parent site's wildcard.
         let redirects = tlsHostnames.map { hostname in
             CaddyRoute(match: [CaddyHostMatcher(host: [hostname])], handle: [.redirect(to: "https://{http.request.host}{http.request.uri}")], terminal: true)
         }
-        let httpServer = CaddyHTTPServer(listen: [httpListen], automaticHTTPS: CaddyAutoHTTPS(disable: true), protocols: ["h1", "h2"], tlsConnectionPolicies: nil, routes: redirects + documents)
+        let wildcardRedirects = wildcardRoutes.map { item in
+            let excludedHosts = routes.map(\.hostname).filter { Self.isOneLevelSubdomain($0, of: item.route.hostname) }
+            let not = excludedHosts.isEmpty ? nil : [CaddyPathMatcher(host: excludedHosts)]
+            return CaddyRoute(match: [CaddyHostMatcher(host: [item.hostname], not: not)], handle: [.redirect(to: "https://{http.request.host}{http.request.uri}")], terminal: true)
+        }
+        let httpServer = CaddyHTTPServer(listen: [httpListen], automaticHTTPS: CaddyAutoHTTPS(disable: true), protocols: ["h1", "h2"], tlsConnectionPolicies: nil, routes: redirects + documents + wildcardRedirects + wildcardDocuments)
         var servers = ["vaelen-http": httpServer]
         if !leaves.isEmpty {
-            let httpsDocuments = documentEntries.filter { tlsHostnames.contains($0.0) }.map(\.1)
-            servers["vaelen-https"] = CaddyHTTPServer(listen: [httpsListen], automaticHTTPS: CaddyAutoHTTPS(disable: true), protocols: ["h1", "h2"], tlsConnectionPolicies: [CaddyTLSConnectionPolicy()], routes: httpsDocuments)
+            let exactHTTPS = documentEntries.filter { tlsHostnames.contains($0.0) }.map(\.1)
+            let wildcardHTTPS = wildcardEntries.filter { wildcardHostnames.contains($0.0) }.map(\.1)
+            // Exact routes configured as HTTP-only still shadow the wildcard on
+            // HTTPS; they return a closed response rather than serving the
+            // parent's site under another project's exact hostname.
+            let tlsDisabledExact = routes.filter { route in
+                route.tls == .disabled && wildcardRoutes.contains { Self.isOneLevelSubdomain(route.hostname, of: $0.route.hostname) }
+            }.map { route in
+                CaddyRoute(match: [CaddyHostMatcher(host: [route.hostname])], handle: [.respond(status: 421)], terminal: true)
+            }
+            servers["vaelen-https"] = CaddyHTTPServer(listen: [httpsListen], automaticHTTPS: CaddyAutoHTTPS(disable: true), protocols: ["h1", "h2"], tlsConnectionPolicies: [CaddyTLSConnectionPolicy()], routes: exactHTTPS + tlsDisabledExact + wildcardHTTPS)
         }
         let tlsApp = leaves.isEmpty ? nil : CaddyTLSApp(certificates: CaddyTLSCertificates(loadFiles: leaves))
         let configuration = CaddyConfiguration(admin: CaddyAdminConfiguration(listen: process.adminEndpoint), storage: CaddyStorageConfiguration(root: layout.routingRuntimeDirectoryURL.appendingPathComponent("data").path), apps: CaddyApps(http: CaddyHTTPApp(servers: servers), tls: tlsApp))
         return try JSONEncoder.caddy.encode(configuration)
+    }
+
+    private static func isOneLevelSubdomain(_ hostname: String, of parent: String) -> Bool {
+        guard hostname.hasSuffix(".\(parent)") else { return false }
+        return hostname.dropLast(parent.count + 1).contains(".") == false
+    }
+
+    private static func documentEntries(route: Route, hostname: String, excludedHosts: [String] = []) -> [(String, CaddyRoute)] {
+        func matcher(file: CaddyFileMatcher? = nil, not extraNot: [CaddyPathMatcher]? = nil, path: [String]? = nil) -> CaddyHostMatcher {
+            let excludes = (extraNot ?? []) + (excludedHosts.isEmpty ? [] : [CaddyPathMatcher(host: excludedHosts)])
+            return CaddyHostMatcher(host: [hostname], file: file, not: excludes.isEmpty ? nil : excludes, path: path)
+        }
+        let handlers: [CaddyHandler]
+        switch route.target {
+        case .staticFiles(let documentRoot):
+            handlers = [.fileServer(root: documentRoot)]
+        case .http(let host, let port):
+            handlers = [.reverseProxy(upstream: "\(host):\(port)")]
+        case .fastCGI(let socketPath, let documentRoot):
+            // Existing scripts at any depth go to FPM unchanged.
+            let phpRoute = CaddyRoute(match: [matcher(path: ["*.php"])], handle: [.variables(root: documentRoot), .fastCGI(socketPath: socketPath)], terminal: true)
+            // Directory requests with an index.php must execute that file before
+            // the generic front controller; otherwise WordPress /wp-admin/ is
+            // bootstrapped through the document-root index.php and redirects to itself.
+            let directoryIndex = CaddyRoute(
+                match: [matcher(file: CaddyFileMatcher(root: documentRoot, tryFiles: ["{http.request.uri.path}index.php"]))],
+                handle: [.variables(root: documentRoot), .rewrite(uri: "{http.request.uri.path}index.php"), .fastCGI(socketPath: socketPath)],
+                terminal: true
+            )
+            let staticMatcher = matcher(file: CaddyFileMatcher(root: documentRoot, tryFiles: ["{http.request.uri.path}"]), not: [CaddyPathMatcher(path: ["*.php"])])
+            let staticRoute = CaddyRoute(match: [staticMatcher], handle: [.fileServer(root: documentRoot)], terminal: true)
+            let fastCGIRoute = CaddyRoute(match: [matcher()], handle: [.variables(root: documentRoot), .rewrite(uri: "/index.php"), .fastCGI(socketPath: socketPath)], terminal: true)
+            return [(hostname, phpRoute), (hostname, directoryIndex), (hostname, staticRoute), (hostname, fastCGIRoute)]
+        }
+        return [(hostname, CaddyRoute(match: [matcher()], handle: handlers, terminal: true))]
     }
 }
 
@@ -194,7 +246,7 @@ private struct CaddyTLSConnectionPolicy: Encodable {}
 private struct CaddyRoute: Encodable { let match: [CaddyHostMatcher]; let handle: [CaddyHandler]; let terminal: Bool }
 private struct CaddyHostMatcher: Encodable { let host: [String]; let file: CaddyFileMatcher?; let not: [CaddyPathMatcher]?; let path: [String]?; init(host: [String], file: CaddyFileMatcher? = nil, not: [CaddyPathMatcher]? = nil, path: [String]? = nil) { self.host = host; self.file = file; self.not = not; self.path = path } }
 private struct CaddyFileMatcher: Encodable { let root: String; let tryFiles: [String]; private enum CodingKeys: String, CodingKey { case root; case tryFiles = "try_files" } }
-private struct CaddyPathMatcher: Encodable { let path: [String] }
+private struct CaddyPathMatcher: Encodable { let path: [String]?; let host: [String]?; init(path: [String]? = nil, host: [String]? = nil) { self.path = path; self.host = host } }
 private struct CaddyUpstream: Encodable { let dial: String }
 private struct CaddyTransport: Encodable { let protocolName: String; let splitPath: [String]; private enum CodingKeys: String, CodingKey { case protocolName = "protocol"; case splitPath = "split_path" } }
 
@@ -214,6 +266,7 @@ private struct CaddyHandler: Encodable {
     static func rewrite(uri: String) -> CaddyHandler { CaddyHandler(handler: "rewrite", root: nil, uri: uri, upstreams: nil, transport: nil, splitPath: nil, statusCode: nil, headers: nil) }
     static func fastCGI(socketPath: String) -> CaddyHandler { CaddyHandler(handler: "reverse_proxy", root: nil, uri: nil, upstreams: [CaddyUpstream(dial: "unix//\(socketPath)")], transport: CaddyTransport(protocolName: "fastcgi", splitPath: [".php"]), splitPath: nil, statusCode: nil, headers: nil) }
     static func redirect(to location: String) -> CaddyHandler { CaddyHandler(handler: "static_response", root: nil, uri: nil, upstreams: nil, transport: nil, splitPath: nil, statusCode: 308, headers: ["Location": [location]]) }
+    static func respond(status: Int) -> CaddyHandler { CaddyHandler(handler: "static_response", root: nil, uri: nil, upstreams: nil, transport: nil, splitPath: nil, statusCode: status, headers: nil) }
 
     private enum CodingKeys: String, CodingKey { case handler, root, uri, upstreams, transport, splitPath = "split_path", statusCode = "status_code", headers }
     func encode(to encoder: Encoder) throws {

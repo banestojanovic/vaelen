@@ -122,8 +122,14 @@ extension TLSError: LocalizedError {
 public enum LocalTLSNamespace {
     public static func validate(_ hostname: String) throws -> String {
         let value = hostname.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        guard !value.isEmpty, value.count <= 253, value.hasSuffix(".test"), !value.contains(".."), value.split(separator: ".").allSatisfy({ !$0.isEmpty && $0.count <= 63 && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } }) else { throw TLSError.unsupportedHostname(hostname) }
-        return value
+        let isWildcard = value.hasPrefix("*.")
+        let exactName = isWildcard ? String(value.dropFirst(2)) : value
+        guard !exactName.contains("*"), !exactName.isEmpty, exactName.count <= 253,
+              exactName.hasSuffix(".test"), !exactName.contains(".."),
+              exactName.split(separator: ".").allSatisfy({ !$0.isEmpty && $0.count <= 63 && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } }) else {
+            throw TLSError.unsupportedHostname(hostname)
+        }
+        return isWildcard ? "*.\(exactName)" : exactName
     }
 }
 

@@ -36,6 +36,44 @@ final class CaddyRouterTests: XCTestCase {
         try await router.stop()
     }
 
+    func testPerSiteWildcardTLSPreservesExactHostPrecedenceAndDoesNotServeUnrelatedHosts() async throws {
+        let root = URL(fileURLWithPath: "/tmp/vaelen-wildcard-\(UUID().uuidString)", isDirectory: true)
+        let parentRoot = root.appendingPathComponent("parent", isDirectory: true)
+        let tenantRoot = root.appendingPathComponent("tenant", isDirectory: true)
+        try FileManager.default.createDirectory(at: parentRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tenantRoot, withIntermediateDirectories: true)
+        try Data("parent site".utf8).write(to: parentRoot.appendingPathComponent("index.html"))
+        try Data("exact tenant site".utf8).write(to: tenantRoot.appendingPathComponent("index.html"))
+
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let configuration = try CaddyTestSupport.configuration()
+        let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
+        await supervisor.installPackage(try resolveCaddyPackage())
+        let tls = TLSCapability(layout: layout)
+        _ = try await tls.install()
+        let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
+        addTeardownBlock {
+            try? await router.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await router.start()
+        let parent = Route(hostname: "tenant-parent.test", target: .staticFiles(documentRoot: parentRoot.path), tls: .local)
+        let exactTenant = Route(hostname: "hotel.tenant-parent.test", target: .staticFiles(documentRoot: tenantRoot.path), tls: .local)
+        try await router.reconcile(routes: [parent, exactTenant])
+
+        let parentResponse = try runBackendHTTPS(host: "hotel.tenant-parent.test", port: configuration.httpsPort, path: "/")
+        XCTAssertEqual(parentResponse.status, 200, parentResponse.headers)
+        XCTAssertEqual(parentResponse.body.trimmingCharacters(in: .whitespacesAndNewlines), "exact tenant site")
+        let inheritedResponse = try runBackendHTTPS(host: "another.tenant-parent.test", port: configuration.httpsPort, path: "/")
+        XCTAssertEqual(inheritedResponse.status, 200, inheritedResponse.headers)
+        XCTAssertEqual(inheritedResponse.body.trimmingCharacters(in: .whitespacesAndNewlines), "parent site")
+        let unrelated = try runHTTP(host: "other-parent.test", port: configuration.httpPort, path: "/")
+        XCTAssertNotEqual(unrelated.body.trimmingCharacters(in: .whitespacesAndNewlines), "parent site", "Unrelated hostname was served by the parent site")
+        XCTAssertThrowsError(try runBackendHTTPS(host: "other-parent.test", port: configuration.httpsPort, path: "/"), "Unrelated hostname must not receive the per-site wildcard certificate")
+        let routes = try await router.observedRoutes()
+        XCTAssertEqual(Set(routes.map(\.hostname)), [parent.hostname, exactTenant.hostname])
+    }
+
     func testOfficialCaddyServesControlledPHPFixtureThroughM2FPM() async throws {
         let packageMetadata = VaelenFilesystemLayout().phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
         guard let installedPackage = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageMetadata)) else { throw XCTSkip("M2 PHP-FPM package is not installed") }
@@ -46,6 +84,7 @@ final class CaddyRouterTests: XCTestCase {
         let phpPackage = phpFixture.package
         try Data("<?php echo 'php response';".utf8).write(to: root.appendingPathComponent("index.php"))
         try FileManager.default.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
+        try Data("<?php echo 'directory index response';".utf8).write(to: root.appendingPathComponent("nested/index.php"))
         try Data("<?php echo 'nested response';".utf8).write(to: root.appendingPathComponent("nested/check.php"))
         try FileManager.default.createDirectory(at: root.appendingPathComponent("nested/one/two"), withIntermediateDirectories: true)
         try Data("<?php echo 'deep nested response';".utf8).write(to: root.appendingPathComponent("nested/one/two/deep.php"))
@@ -70,6 +109,10 @@ final class CaddyRouterTests: XCTestCase {
         let route = Route(hostname: "php.test", target: .fastCGI(socketPath: socket, documentRoot: root.path), tls: .disabled)
         try await router.reconcile(routes: [route])
         XCTAssertEqual(try runCurl(host: "php.test", port: configuration.httpPort, path: "/index.php"), "php response")
+        let directoryIndex = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/nested/")
+        XCTAssertEqual(directoryIndex.status, 200, directoryIndex.headers)
+        XCTAssertEqual(directoryIndex.body, "directory index response")
+        XCTAssertFalse(directoryIndex.body.contains("<?php"), directoryIndex.body)
         let phpPath = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/index.php")
         XCTAssertEqual(phpPath.status, 200, phpPath.body)
         XCTAssertFalse(phpPath.body.contains("<?php"), phpPath.body)
