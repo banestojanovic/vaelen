@@ -244,6 +244,17 @@ public actor CoreRequestDispatcher {
                 try serviceIntents.set("caddy", enabled: false); try await router.stop(); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routeList:
                 return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
+            case .routeObservedList:
+                let status = await router.status()
+                guard status.state == .running, status.health == .healthy else {
+                    return (.init(id: request.id, result: .routeObservedList(.init(observedRoutes: nil, unavailableReason: "Router is not observed healthy."))), true)
+                }
+                do {
+                    let observed = try await router.observedRoutes()
+                    return (.init(id: request.id, result: .routeObservedList(.init(observedRoutes: observed.sorted { $0.hostname < $1.hostname }))), true)
+                } catch {
+                    return (.init(id: request.id, result: .routeObservedList(.init(observedRoutes: nil, unavailableReason: "Router routes could not be observed."))), true)
+                }
             case .routeAdd:
                 guard let repository = routeRepository else { throw IPCErrorPayload(code: .internalError, message: "Route persistence is unavailable.") }
                 let intent = try request.params?.decode(RouteIntent.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route parameters are required.") }()

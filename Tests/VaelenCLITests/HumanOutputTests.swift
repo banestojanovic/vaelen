@@ -31,6 +31,8 @@ final class HumanOutputTests: XCTestCase {
         let valid: [[String]] = [
             ["status"], ["status", "--json"], ["doctor"], ["links"], ["links", "--json"],
             ["parks"], ["paths", "--json"], ["link"], ["link", "/tmp/project"], ["unlink", "/tmp/project"],
+            ["parked"], ["parked", "--json"], ["sites"], ["sites", "--json"], ["open"], ["open", "app.test"],
+            ["db"], ["db", "app"], ["site", "driver"], ["site", "driver", "app", "--json"],
             ["park"], ["park", "/tmp/workspace"], ["unpark"], ["unpark", "/tmp/workspace"],
             ["secure"], ["secure", "demo.test"], ["unsecure", "demo.test"],
             ["project", "status"], ["project", "inspect", "demo", "--json"], ["project", "doctor"],
@@ -58,6 +60,8 @@ final class HumanOutputTests: XCTestCase {
 
         let invalid: [[String]] = [
             ["status", "--bad"], ["doctor", "--bad"], ["links", "--bad"], ["parks", "--bad"],
+            ["parked", "--bad"], ["sites", "--bad"], ["open", "one", "two"], ["db", "one", "two"],
+            ["site", "unknown"], ["site", "driver", "--unknown"], ["site", "driver", "one", "two"],
             ["secure", "one", "two"], ["link", "one", "two"], ["unlink", "/tmp/project", "extra"],
             ["park", "one", "two"], ["unpark", "one", "two"], ["project", "status", "a", "b"],
             ["project", "php", "--version"], ["php", "versions", "--bad"], ["php", "install", "8.4", "extra"],

@@ -102,6 +102,7 @@ public enum CoreMethod: String, Sendable {
     case routingStart = "routing.start"
     case routingStop = "routing.stop"
     case routeList = "route.list"
+    case routeObservedList = "route.observedList"
     case routeAdd = "route.add"
     case routeRemove = "route.remove"
     case routeProjectAssociationAttach = "route.project-association.attach"
@@ -400,6 +401,11 @@ public struct RouteProjectAssociationResult: Codable, Equatable, Sendable { publ
 public enum RoutePHPTargetMutationState: String, Codable, Equatable, Sendable { case satisfied, updated, pending }
 public struct RoutePHPTargetUpdateResult: Codable, Equatable, Sendable { public let observation: ProjectPHPRouteTargetObservation; public let state: RoutePHPTargetMutationState; public init(observation: ProjectPHPRouteTargetObservation, state: RoutePHPTargetMutationState) { self.observation = observation; self.state = state } }
 public struct RouteListResult: Codable, Equatable, Sendable { public let routes: [RouteIntent]; public init(routes: [RouteIntent]) { self.routes = routes } }
+public struct RouteObservedListResult: Codable, Equatable, Sendable {
+    public let observedRoutes: [Route]?
+    public let unavailableReason: String?
+    public init(observedRoutes: [Route]?, unavailableReason: String? = nil) { self.observedRoutes = observedRoutes; self.unavailableReason = unavailableReason }
+}
 public struct DNSInstallRequest: Codable, Equatable, Sendable { public let takeover: Bool; public init(takeover: Bool = false) { self.takeover = takeover } }
 public struct DNSStatusResult: Codable, Equatable, Sendable { public let dns: DNSStatus; public init(dns: DNSStatus) { self.dns = dns } }
 public struct TLSStatusResult: Codable, Equatable, Sendable { public let tls: TLSStatus; public init(tls: TLSStatus) { self.tls = tls } }
@@ -430,6 +436,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case phpResolve(PHPResolveResult)
     case routingStatus(RouterStatusResult)
     case routeList(RouteListResult)
+    case routeObservedList(RouteObservedListResult)
     case routeMutation(RouteIntent)
     case routeAssociation(RouteProjectAssociationResult)
     case routePHPTargetUpdate(RoutePHPTargetUpdateResult)
@@ -464,6 +471,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .phpResolve(let value): try value.encode(to: encoder)
         case .routingStatus(let value): try value.encode(to: encoder)
         case .routeList(let value): try value.encode(to: encoder)
+        case .routeObservedList(let value): try value.encode(to: encoder)
         case .routeMutation(let value): try value.encode(to: encoder)
         case .routeAssociation(let value): try value.encode(to: encoder)
         case .routePHPTargetUpdate(let value): try value.encode(to: encoder)
@@ -502,6 +510,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["cliPath"] != nil, let result = try? IPCCodec.decode(PHPResolveResult.self, from: data) { self = .phpResolve(result) }
         else if fields["router"] != nil, let result = try? IPCCodec.decode(RouterStatusResult.self, from: data) { self = .routingStatus(result) }
         else if fields["routes"] != nil, let result = try? IPCCodec.decode(RouteListResult.self, from: data) { self = .routeList(result) }
+        else if fields["observedRoutes"] != nil || fields["unavailableReason"] != nil, let result = try? IPCCodec.decode(RouteObservedListResult.self, from: data) { self = .routeObservedList(result) }
         else if fields["route"] != nil, fields["state"] != nil, let result = try? IPCCodec.decode(RouteProjectAssociationResult.self, from: data) { self = .routeAssociation(result) }
         else if fields["observation"] != nil, let result = try? IPCCodec.decode(RoutePHPTargetUpdateResult.self, from: data) { self = .routePHPTargetUpdate(result) }
         else if fields["route"] != nil, let result = try? IPCCodec.decode(RouteIntent.self, from: data) { self = .routeMutation(result) }

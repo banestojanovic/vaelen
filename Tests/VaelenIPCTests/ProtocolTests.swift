@@ -12,6 +12,20 @@ final class ProtocolTests: XCTestCase {
         guard case .projectPHP(let selection) = restored.result else { return XCTFail("project PHP response did not decode") }
         XCTAssertEqual(selection.overrideVersion, "8.4.23")
     }
+
+    func testObservedRouteListDistinguishesObservedEmptyFromUnavailable() throws {
+        let request = IPCRequest(method: .routeObservedList)
+        XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)).knownMethod, .routeObservedList)
+        let empty = IPCResponse(id: request.id, result: .routeObservedList(.init(observedRoutes: [])))
+        let missing = IPCResponse(id: request.id, result: .routeObservedList(.init(observedRoutes: nil, unavailableReason: "Router is stopped")))
+        let decodedEmpty = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(empty))
+        let decodedMissing = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(missing))
+        guard case .routeObservedList(let observed)? = decodedEmpty.result else { return XCTFail("Observed route list did not decode") }
+        XCTAssertEqual(observed.observedRoutes, [])
+        guard case .routeObservedList(let unavailable)? = decodedMissing.result else { return XCTFail("Unavailable route list did not decode") }
+        XCTAssertNil(unavailable.observedRoutes)
+        XCTAssertEqual(unavailable.unavailableReason, "Router is stopped")
+    }
     func testUnknownProtocolVersionSurvivesEnvelopeDecoding() throws {
         let request = IPCRequest(rawMethod: "core.status", protocolVersion: 2)
         let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))

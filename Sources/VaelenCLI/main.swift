@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import AppKit
 import VaelenCore
 import VaelenIPC
 
@@ -14,6 +15,11 @@ enum CLICommand {
     case park(path: String?)
     case unpark(path: String?)
     case parks(json: Bool)
+    case parked(json: Bool)
+    case sites(json: Bool)
+    case siteDriver(selector: String?, json: Bool)
+    case openSite(selector: String?)
+    case databaseOpen(selector: String?)
     case projectStatus(selector: String?, json: Bool)
     case projectInspect(selector: String?, json: Bool)
     case projectDoctor(selector: String?, json: Bool)
@@ -184,7 +190,7 @@ struct VaelenCLIMain {
     static func helpText(for path: [String]) -> String {
         if path.isEmpty {
             let sections: [(String, [(String, String)])] = [
-                ("Projects", [("link", "Link a project"), ("links", "List linked projects"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
+                ("Projects", [("link", "Link a project"), ("links", "List linked projects"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("parked", "List sites discovered in parked folders"), ("sites", "List configured sites and serving observations"), ("open", "Open a configured site"), ("db", "Open an eligible project database"), ("site", "Inspect a site driver"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
                 ("Overview", [("status", "Show Vaelen status"), ("doctor", "Check Vaelen services")]),
                 ("Web", [("secure", "Enable HTTPS for a site route"), ("unsecure", "Serve a site route over HTTP")]),
                 ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
@@ -249,6 +255,11 @@ struct VaelenCLIMain {
         case "unpark": body = "Usage: val unpark [workspace-folder]\nUnpark a folder without deleting it. With no folder, use the current directory.\nExample: val unpark\nExample: val unpark ~/Code/old-project"
         case "links": body = "Usage: val links [--json]\nList linked projects."
         case "parks": body = "Usage: val parks [--json]\nList parked workspace folders."
+        case "parked": body = "Usage: val parked [--json]\nList projects discovered inside parked workspace folders. This is distinct from val parks, which lists the folders themselves. Missing parked folders are reported separately."
+        case "sites": body = "Usage: val sites [--json]\nList configured route sites, project availability, and the router's independent serving observation. A configured route is not assumed to be served."
+        case "open": body = "Usage: val open [hostname|project]\nOpen the exact selected site's configured HTTP or HTTPS URL. Without a selector, the current directory must match exactly one configured site route."
+        case "db": body = "Usage: val db [project]\nOpen a project database in TablePlus only when the menu-bar action's MySQL eligibility checks pass. Credentials are never printed."
+        case "site": body = "Usage: val site driver [project] [--json]\nReport detected framework and evidence separately from every configured route target and its exact Caddy route observation. No route, multiple routes, missing projects, and unknown frameworks are reported without guessing."
         default: return "Unknown command: \(name). Run ‘val --help’ to see available commands."
         }
         return "\(name)\n\n\(body)\n"
@@ -324,7 +335,7 @@ struct VaelenCLIMain {
               isatty(STDOUT_FILENO) == 1 else { print(text); return }
         let rendered = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
             let value = String(line)
-            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks", "list"].contains(value)) {
+            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks", "parked", "sites", "open", "db", "site", "list"].contains(value)) {
                 return "\u{001B}[1;36m\(value)\u{001B}[0m"
             }
             if value.hasPrefix("  "), let gap = value.range(of: "  ", range: value.index(value.startIndex, offsetBy: 2)..<value.endIndex) {
@@ -423,6 +434,20 @@ struct VaelenCLIMain {
             return .routeTLS(hostname: args.count == 2 ? args[1] : nil, secure: first == "secure")
         case "links": return .links(json: try listJSONOption(args))
         case "parks", "paths": return .parks(json: try listJSONOption(args))
+        case "parked": return .parked(json: try listJSONOption(args))
+        case "sites": return .sites(json: try listJSONOption(args))
+        case "open": guard args.count <= 2 else { throw CLIError.commandUsage("open") }; return .openSite(selector: args.count == 2 ? args[1] : nil)
+        case "db": guard args.count <= 2 else { throw CLIError.commandUsage("db") }; return .databaseOpen(selector: args.count == 2 ? args[1] : nil)
+        case "site":
+            guard args.count >= 2, args[1] == "driver" else { throw CLIError.commandUsage("site") }
+            var selector: String?
+            var json = false
+            for value in args.dropFirst(2) {
+                if value == "--json", !json { json = true }
+                else if !value.hasPrefix("-"), selector == nil { selector = value }
+                else { throw CLIError.commandUsage("site") }
+            }
+            return .siteDriver(selector: selector, json: json)
         case "project":
             guard args.count >= 2 else { throw CLIError.usage }
             if args[1] == "php" {
@@ -794,6 +819,76 @@ struct VaelenCLIMain {
             let paths = try await client.parkedPaths()
             if json { print(String(decoding: try IPCCodec.encode(ParkedPathListEnvelope(paths: paths)), as: UTF8.self)) }
             else { print(parkedPathsOutput(paths)) }
+        case .parked(let json):
+            let projects = discoveredParkedProjects(try await client.projectList())
+            let folders = try await client.parkedPaths()
+            let unavailable = folders.filter { $0.availability != PathAvailability.available.rawValue }
+            if json { print(String(decoding: try IPCCodec.encode(ParkedSitesEnvelope(sites: projects, unavailableFolders: unavailable)), as: UTF8.self)) }
+            else {
+                print(parkedSitesHumanOutput(projects, folders: folders))
+                for folder in unavailable { print(HumanOutput.warning("Parked folder unavailable: \(displayPath(folder.path)) (\(folder.availability))")) }
+            }
+        case .sites(let json):
+            let routes = try await client.routeList()
+            let projects = try await client.projectList()
+            let routerObservation = try await client.routeObservedList()
+            let items = configuredSiteItems(routes: routes, projects: projects, observedRoutes: routerObservation.observedRoutes, unavailableReason: routerObservation.unavailableReason)
+            if json { print(String(decoding: try IPCCodec.encode(SitesEnvelope(sites: items)), as: UTF8.self)) }
+            else {
+                let note = HumanOutput.wrap("Configured routes and live router observations are shown separately.", width: HumanOutput.terminalWidth)
+                print(HumanOutput.heading("Configured sites", subtitle: note))
+                print(HumanOutput.list(items.map { [$0.hostname, $0.target, $0.tls, $0.project ?? "—", $0.projectAvailability, caddyObservationLabel($0.caddyObservationState), $0.url] }, headers: ["Hostname", "Target", "TLS", "Project", "Availability", "Caddy route", "URL"], empty: "No configured site routes."))
+            }
+        case .siteDriver(let selector, let json):
+            let projects = try await client.projectList()
+            let project = try selectedProject(selector, projects: projects, workingDirectory: workingDirectory)
+            let available = project.availability == PathAvailability.available.rawValue && FileManager.default.isReadableFile(atPath: project.path)
+            let inspection = available ? ProjectFrameworkDetector().inspect(root: URL(fileURLWithPath: project.path, isDirectory: true)) : ProjectFrameworkInspection(framework: "Generic/Unknown", confidence: .low, evidence: [])
+            let routes = try await client.routeList()
+            let caddy = try await client.routeObservedList()
+            let selectedRoutes = siteDriverRoutes(project: project, routeIntents: routes, observedRoutes: caddy.observedRoutes, unavailableReason: caddy.unavailableReason)
+            let result = SiteDriverEnvelope(
+                project: project.name,
+                path: project.path,
+                detectedFramework: inspection.confidence == .low ? "Unknown" : inspection.framework,
+                frameworkConfidence: inspection.confidence.rawValue,
+                evidence: available ? inspection.evidence : ["Project folder is unavailable; framework could not be inspected."],
+                configuredRouteCount: selectedRoutes.count,
+                configuredRoutes: selectedRoutes
+            )
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else {
+                print(HumanOutput.heading("Site driver"))
+                print(HumanOutput.aligned([("Project", result.project), ("Path", displayPath(result.path)), ("Detected framework", result.detectedFramework), ("Framework confidence", result.frameworkConfidence)]))
+                print("Framework evidence")
+                if result.evidence.isEmpty { print("  No recognized framework markers found.") }
+                else { result.evidence.forEach { print(HumanOutput.wrap($0, width: max(20, HumanOutput.terminalWidth - 4), firstPrefix: "  ", nextPrefix: "  ")) } }
+                print("Configured serving routes")
+                if result.configuredRoutes.isEmpty { print("  No configured route belongs to this project.") }
+                else {
+                    let rows = result.configuredRoutes.map { [$0.hostname, $0.target, $0.tls, caddyObservationLabel($0.caddyObservationState)] }
+                    print(HumanOutput.list(rows, headers: ["Hostname", "Configured target", "TLS", "Caddy route"], empty: "No configured route belongs to this project."))
+                }
+            }
+        case .openSite(let selector):
+            let projects = try await client.projectList()
+            let routes = try await client.routeList()
+            let route = try selectedRoute(selector, projects: projects, routes: routes, workingDirectory: workingDirectory)
+            guard let url = siteURL(for: route.route) else { throw CLIError.message("The selected configured site has an invalid URL.") }
+            try launchExternalURL(url)
+            print("Opening \(url.absoluteString)")
+        case .databaseOpen(let selector):
+            let projects = try await client.projectList()
+            let project = try selectedProject(selector, projects: projects, workingDirectory: workingDirectory)
+            guard project.availability == PathAvailability.available.rawValue, FileManager.default.isReadableFile(atPath: project.path) else {
+                throw CLIError.message("Project \(project.name) is unavailable at \(displayPath(project.path)); its database settings cannot be inspected.")
+            }
+            let report = try await client.projectInspect(selector: project.path, workingDirectory: workingDirectory)
+            let tablePlusURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.tinyapp.TablePlus")
+            let action = ProjectDatabaseViewerAction.tablePlus(configured: report.configured, mysql: report.observed.mysql, tablePlusInstalled: tablePlusURL != nil)
+            guard let url = action.url, tablePlusURL != nil else { throw CLIError.message("Cannot open \(project.name)'s database in TablePlus: \(action.reason).") }
+            try launchExternalURL(url, bundleIdentifier: "com.tinyapp.TablePlus")
+            print("Opened \(project.name)'s configured database in TablePlus.")
         case .projectStatus(let selector, let json):
             let report = try await client.projectStatus(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectSummary(report)) }
