@@ -232,6 +232,12 @@ public actor CoreRequestDispatcher {
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); try serviceIntents.set("php:\(params.version)", enabled: false); return (.init(id: request.id, result: .phpStatus(.init(status: try module.stop(requestedVersion: params.version)))), true)
             case .phpStatus:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.status(requestedVersion: params.version)))), true)
+            case .phpConfiguration:
+                let module = try phpModule(); return (.init(id: request.id, result: .phpConfiguration(phpConfigurationWire(try module.configuration()))), true)
+            case .phpConfigurationUpdate:
+                let module = try phpModule(); let params = try request.params?.decode(PHPConfigurationUpdateRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP configuration settings are required.") }()
+                let settings = params.settings.map { PHPManagedSettings(uploadLimitMB: $0.uploadLimitMB, memoryLimitMB: $0.memoryLimitMB, maxExecutionTimeSeconds: $0.maxExecutionTimeSeconds, maxInputVariables: $0.maxInputVariables, postLimitMB: $0.postLimitMB) }
+                return (.init(id: request.id, result: .phpConfiguration(phpConfigurationWire(try module.updateConfiguration(version: params.version, settings: settings)))), true)
             case .mysqlVersions:
                 let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
             case .mysqlInstall:
@@ -826,10 +832,12 @@ public actor CoreRequestDispatcher {
             return .init(code: .invalidRequest, message: "PHP package metadata is unavailable. Installed runtimes remain usable.")
         case .invalidManifest:
             return .init(code: .invalidRequest, message: "PHP package metadata is invalid and cannot be installed.")
+        case .validationFailed(let detail):
+            return .init(code: .invalidRequest, message: detail)
+        case .processFailed(let detail):
+            return .init(code: .internalError, message: "PHP runtime operation failed: \(detail)")
         case .processIdentityMismatch:
             return .init(code: .invalidRequest, message: "PHP-FPM could not be verified safely; no process was changed.")
-        case .validationFailed, .processFailed:
-            return .init(code: .internalError, message: "PHP runtime could not be made healthy. Existing PHP runtimes were not changed.")
         default:
             return .init(code: .internalError, message: "PHP operation could not be completed.")
         }
@@ -941,6 +949,19 @@ public actor CoreRequestDispatcher {
             usage[version] = value
         }
         return catalog.withProjectUsage(Array(usage.values))
+    }
+
+    private func phpConfigurationWire(_ value: PHPConfigurationSnapshot) -> PHPConfigurationResult {
+        let defaults = value.defaultSettings
+        return PHPConfigurationResult(
+            defaultSettings: PHPSettingsValues(uploadLimitMB: defaults.uploadLimitMB, memoryLimitMB: defaults.memoryLimitMB, maxExecutionTimeSeconds: defaults.maxExecutionTimeSeconds, maxInputVariables: defaults.maxInputVariables, postLimitMB: defaults.postLimitMB),
+            versions: value.versions.map { item in
+                let settings = item.settings
+                return PHPVersionConfiguration(version: item.version, settings: PHPSettingsValues(uploadLimitMB: settings.uploadLimitMB, memoryLimitMB: settings.memoryLimitMB, maxExecutionTimeSeconds: settings.maxExecutionTimeSeconds, maxInputVariables: settings.maxInputVariables, postLimitMB: settings.postLimitMB), inheritsDefault: item.inheritsDefault, cliIniPath: item.cliIniPath, fpmIniPath: item.fpmIniPath, fpmConfigurationPath: item.fpmConfigurationPath, fpmRunning: item.fpmRunning)
+            },
+            directory: value.directory,
+            affectedVersions: value.affectedVersions
+        )
     }
 
     private func activate(project: Project) async throws -> ProjectReconciliationExecutionResult {

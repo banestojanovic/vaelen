@@ -90,6 +90,10 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
         for (command, entry) in helpEntries {
             XCTAssertTrue(VaelenCLIMain.helpText(for: [command]).contains(entry), "missing current help entry for \(command)")
         }
+        XCTAssertTrue(VaelenCLIMain.helpText(for: ["php"]).contains("config [version]"))
+        guard case .phpConfig(version: nil) = try VaelenCLIMain.parse(["php", "config"]) else { return XCTFail("PHP config should open the managed configuration folder") }
+        guard case .phpConfig(version: "8.4.23") = try VaelenCLIMain.parse(["php", "config", "8.4.23"]) else { return XCTFail("PHP config version should select the version-specific FPM ini") }
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["php", "config", "8.4.23", "unexpected"]))
         guard case .help = try VaelenCLIMain.parse(["--help"]) else {
             return XCTFail("--help did not parse")
         }

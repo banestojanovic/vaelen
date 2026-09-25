@@ -200,6 +200,14 @@ public actor VaelenCoreClient {
     public func phpStart(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStart, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
     public func phpStop(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStop, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
     public func phpStatus(_ version: String) async throws -> PHPStatus { guard case .phpStatus(let result) = try result(from: await send(IPCRequest(method: .phpStatus, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.status }
+    public func phpConfiguration() async throws -> PHPConfigurationResult {
+        guard case .phpConfiguration(let result) = try result(from: await send(IPCRequest(method: .phpConfiguration, params: .empty))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+    public func updatePHPConfiguration(version: String?, settings: PHPSettingsValues?) async throws -> PHPConfigurationResult {
+        guard case .phpConfiguration(let result) = try result(from: await send(IPCRequest(method: .phpConfigurationUpdate, params: .phpConfigurationUpdate(.init(version: version, settings: settings))))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
     public func mysqlVersions() async throws -> MySQLVersionsPayload { guard case .mysqlVersions(let result) = try result(from: await send(IPCRequest(method: .mysqlVersions))) else { throw CoreClientError.invalidResponse }; return result.mysql }
     public func mysqlInstall(_ version: String) async throws -> MySQLVersionsPayload { guard case .mysqlVersions(let result) = try result(from: await send(IPCRequest(method: .mysqlInstall, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.mysql }
     public func mysqlUse(_ version: String) async throws -> MySQLVersionsPayload { guard case .mysqlVersions(let result) = try result(from: await send(IPCRequest(method: .mysqlUse, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.mysql }

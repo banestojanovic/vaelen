@@ -124,6 +124,58 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertTrue(try reloaded.runtimeCatalog().installedVersions.first { $0.version == fixture.package.version }?.running == true)
     }
 
+    func testManagedConfigurationUsesPersistentIniAndVersionOverrideInheritsExplicitly() throws {
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+
+        let initial = try fixture.module.configuration()
+        XCTAssertEqual(initial.directory, fixture.layout.configurationDirectoryURL.appendingPathComponent("php").path)
+        let runtime = try XCTUnwrap(initial.versions.first)
+        XCTAssertTrue(runtime.inheritsDefault)
+        XCTAssertEqual(runtime.settings.uploadLimitMB, 2)
+        XCTAssertEqual(runtime.settings.postLimitMB, 8)
+        XCTAssertEqual(runtime.settings.memoryLimitMB, 128)
+        XCTAssertEqual(runtime.settings.maxExecutionTimeSeconds, 30)
+        XCTAssertEqual(runtime.settings.maxInputVariables, 1_000)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.cliIniPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.fpmIniPath))
+
+        let cli = try fixture.module.exec(requestedVersion: fixture.package.version, workingDirectory: fixture.root.path, arguments: ["-r", "echo ini_get('upload_max_filesize').'|'.ini_get('post_max_size').'|'.ini_get('memory_limit').'|'.ini_get('max_execution_time').'|'.ini_get('max_input_vars');"])
+        XCTAssertEqual(cli.status, 0, cli.output)
+        XCTAssertTrue(cli.output.contains("2M|8M|128M|0|1000"), cli.output)
+        let iniInfo = try fixture.module.exec(requestedVersion: fixture.package.version, workingDirectory: fixture.root.path, arguments: ["--ini"])
+        XCTAssertEqual(iniInfo.status, 0, iniInfo.output)
+        XCTAssertTrue(iniInfo.output.contains("Loaded Configuration File:         \(runtime.cliIniPath)"), iniInfo.output)
+
+        let override = PHPManagedSettings(uploadLimitMB: 20, memoryLimitMB: 256, maxExecutionTimeSeconds: 45, maxInputVariables: 2_000, postLimitMB: 8)
+        let update = try fixture.module.updateConfiguration(version: fixture.package.version, settings: override)
+        let configured = try XCTUnwrap(update.versions.first)
+        XCTAssertFalse(configured.inheritsDefault)
+        XCTAssertEqual(configured.settings.postLimitMB, 21, "POST limit is raised above upload size")
+        let ini = try String(contentsOfFile: configured.fpmIniPath, encoding: .utf8)
+        XCTAssertTrue(ini.contains("upload_max_filesize = 20M"), ini)
+        XCTAssertTrue(ini.contains("post_max_size = 21M"), ini)
+        XCTAssertTrue(ini.contains("max_execution_time = 45"), ini)
+
+        let changedDefault = PHPManagedSettings(uploadLimitMB: 4, memoryLimitMB: 192, maxExecutionTimeSeconds: 60, maxInputVariables: 1_500, postLimitMB: 8)
+        let defaultUpdate = try fixture.module.updateConfiguration(version: nil, settings: changedDefault)
+        let inherited = try XCTUnwrap(defaultUpdate.versions.first)
+        XCTAssertFalse(inherited.inheritsDefault)
+        XCTAssertEqual(inherited.settings, configured.settings, "A version override must remain independent of later shared-default edits")
+
+        let reloaded = PHPModule(layout: fixture.layout, location: FilePHPManifestLocation(manifestURL: fixture.root.appendingPathComponent("fixture-manifest.json")))
+        XCTAssertEqual(try reloaded.configuration(), defaultUpdate)
+    }
+
+    func testPHPConfigurationRejectsInvalidValuesBeforePersisting() throws {
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+        let invalid = PHPManagedSettings(uploadLimitMB: 0, memoryLimitMB: 128, maxExecutionTimeSeconds: 30, maxInputVariables: 1_000, postLimitMB: 8)
+        XCTAssertThrowsError(try fixture.module.updateConfiguration(version: nil, settings: invalid))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.layout.configurationDirectoryURL.appendingPathComponent("php/settings.json").path))
+        XCTAssertEqual(try fixture.module.configuration().defaultSettings.uploadLimitMB, 2)
+    }
+
     private func isolatedFixture() throws -> IsolatedPHPFixture {
         let layout = VaelenFilesystemLayout()
         let metadata = layout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
@@ -196,7 +248,7 @@ final class PHPModuleTests: XCTestCase {
         try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
         try Data("fixture script\n".utf8).write(to: workingDirectory.appendingPathComponent("test.php"))
-        try Data("#!/bin/sh\nprintf 'cwd=%s\\n' \"$PWD\"\nprintf 'script='\ncat \"$1\"\nshift\nfor argument in \"$@\"; do printf 'arg=<%s>\\n' \"$argument\"; done\n".utf8).write(to: executable)
+        try Data("#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then shift 2; fi\nprintf 'cwd=%s\\n' \"$PWD\"\nprintf 'script='\ncat \"$1\"\nshift\nfor argument in \"$@\"; do printf 'arg=<%s>\\n' \"$argument\"; done\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
 
         let package = PHPPackage(version: "8.4.23", architecture: "arm64", packagePath: packageDirectory.path, cliPath: executable.path, fpmPath: executable.path, source: "fixture", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())

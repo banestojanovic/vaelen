@@ -76,6 +76,9 @@ final class AppModel {
     private(set) var state: State = .connecting
     private(set) var projectReports: [ProjectEnvironmentReport] = []
     private(set) var phpCatalog: PHPRuntimeCatalog?
+    private(set) var phpConfiguration: PHPConfigurationResult?
+    private(set) var phpConfigurationError: String?
+    private(set) var phpConfigurationSaving = false
     private(set) var phpOperation: PHPOperationState?
     private(set) var phpError: String?
     private(set) var phpRequestInFlight = false
@@ -427,6 +430,37 @@ final class AppModel {
 
     func setDefaultPHP(_ version: String) async {
         await performPHPCommand(version) { _ = try await $0.phpDefaultSet(version) }
+    }
+
+    func refreshPHPConfiguration() async {
+        guard let client else { phpConfigurationError = "Vaelen Core is not connected."; return }
+        do { phpConfiguration = try await client.phpConfiguration(); phpConfigurationError = nil }
+        catch { phpConfigurationError = error.localizedDescription }
+    }
+
+    func savePHPConfiguration(version: String?, settings: PHPSettingsValues?) async {
+        guard let client, !phpConfigurationSaving else { return }
+        phpConfigurationSaving = true
+        defer { phpConfigurationSaving = false }
+        do {
+            phpConfiguration = try await client.updatePHPConfiguration(version: version, settings: settings)
+            phpConfigurationError = nil
+            await refresh()
+            await refreshPHPConfiguration()
+        } catch {
+            phpConfigurationError = error.localizedDescription
+            await refreshPHPConfiguration()
+        }
+    }
+
+    func openPHPConfigurationFiles() async {
+        guard let client else { phpConfigurationError = "Vaelen Core is not connected."; return }
+        do {
+            let configuration = try await client.phpConfiguration()
+            let url = URL(fileURLWithPath: configuration.directory, isDirectory: true)
+            guard NSWorkspace.shared.open(url) else { throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: url.path]) }
+            phpConfigurationError = nil
+        } catch { phpConfigurationError = "Could not open Vaelen PHP configuration files: \(error.localizedDescription)" }
     }
 
     func phpOperationIs(for version: String) -> Bool {
@@ -1360,7 +1394,12 @@ struct ServicesView: View {
                     .padding(.bottom, VaelenUI.spacing6)
                 if let php {
                     ServiceRow(title: "PHP", subtitle: php.installed.isEmpty ? "Not installed" : php.installed.map(\.version).joined(separator: " · "), state: php.default.map { "Default \($0)" } ?? "Ready", stateSymbol: "circle.fill", stateTint: .secondary) {
-                        EmptyView()
+                        Button("Open Configuration Files…", systemImage: "doc.text.magnifyingglass") {
+                            Task { await model.openPHPConfigurationFiles() }
+                        }
+                        if let error = model.phpConfigurationError {
+                            Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
 
@@ -1679,6 +1718,68 @@ struct PHPSettingsView: View {
                     }
                 }
 
+                SettingsGroup(title: "PHP Configuration", footer: "These settings are stored under Vaelen’s Application Support folder. Upload and POST size affect web requests; memory and input-variable limits apply to both web and CLI PHP. Execution time controls web requests; managed CLI PHP remains unlimited.") {
+                    if let configuration = model.phpConfiguration {
+                        VStack(alignment: .leading, spacing: VaelenUI.spacing12) {
+                            PHPSettingsEditor(settings: configuration.defaultSettings, title: "Shared Default", saveTitle: "Save Shared Default", saving: model.phpConfigurationSaving) { settings in
+                                Task { await model.savePHPConfiguration(version: nil, settings: settings) }
+                            }
+                            ForEach(configuration.versions, id: \.version) { version in
+                                Divider().opacity(0.5)
+                                VStack(alignment: .leading, spacing: VaelenUI.spacing8) {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("PHP \(version.version)").font(.subheadline.weight(.medium))
+                                            Text(version.inheritsDefault ? "Inherits the shared default" : "Version-specific override")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        if !version.inheritsDefault {
+                                            Button("Use Shared Default") {
+                                                Task { await model.savePHPConfiguration(version: version.version, settings: nil) }
+                                            }
+                                            .disabled(model.phpConfigurationSaving)
+                                        }
+                                    }
+                                    PHPSettingsEditor(settings: version.settings, title: "PHP \(version.version)", saveTitle: "Save PHP \(version.version)", saving: model.phpConfigurationSaving) { settings in
+                                        Task { await model.savePHPConfiguration(version: version.version, settings: settings) }
+                                    }
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("FPM uses \(version.fpmIniPath)")
+                                        Text("Managed CLI uses \(version.cliIniPath)")
+                                        Text("FPM pool config (generated): \(version.fpmConfigurationPath)")
+                                    }
+                                    .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                                    if version.fpmRunning {
+                                        Label("PHP-FPM is running with these settings.", systemImage: "checkmark.circle.fill")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    } else {
+                                        Label("Settings will be used the next time PHP-FPM starts.", systemImage: "info.circle")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            Button("Open Configuration Files…", systemImage: "folder") {
+                                Task { await model.openPHPConfigurationFiles() }
+                            }
+                            .padding(.top, VaelenUI.spacing6)
+                        }
+                    } else {
+                        HStack(spacing: VaelenUI.spacing8) {
+                            ProgressView().controlSize(.small)
+                            Text(model.phpConfigurationError ?? "Loading managed PHP configuration…")
+                                .font(.caption).foregroundStyle(model.phpConfigurationError == nil ? Color.secondary : Color.red)
+                            if model.phpConfigurationError != nil {
+                                Button("Retry") { Task { await model.refreshPHPConfiguration() } }
+                            }
+                        }
+                    }
+                    if let error = model.phpConfigurationError, model.phpConfiguration != nil {
+                        VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red)
+                            .font(.caption).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
                 SettingsGroup(title: "Installed Versions") {
                     if catalog.installedVersions.isEmpty {
                         VaelenEmptyState(title: "No Installed PHP", systemImage: "shippingbox", message: "Vaelen has no managed PHP runtimes to show.")
@@ -1753,6 +1854,7 @@ struct PHPSettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .task { if model.phpConfiguration == nil { await model.refreshPHPConfiguration() } }
     }
 
     private func phpOperationDescription(target: String, operation: PHPOperationState?) -> String {
@@ -1764,6 +1866,72 @@ struct PHPSettingsView: View {
         case .installing: return "Installing PHP \(target)…"
         case .removing: return "Removing PHP \(target)…"
         default: return "Working on PHP \(target)…"
+        }
+    }
+}
+
+private struct PHPSettingsEditor: View {
+    let settings: PHPSettingsValues
+    let title: String
+    let saveTitle: String
+    let saving: Bool
+    let save: (PHPSettingsValues) -> Void
+    @State private var uploadLimitMB: Int
+    @State private var memoryLimitMB: Int
+    @State private var maxExecutionTimeSeconds: Int
+    @State private var maxInputVariables: Int
+
+    init(settings: PHPSettingsValues, title: String, saveTitle: String, saving: Bool, save: @escaping (PHPSettingsValues) -> Void) {
+        self.settings = settings; self.title = title; self.saveTitle = saveTitle; self.saving = saving; self.save = save
+        _uploadLimitMB = State(initialValue: settings.uploadLimitMB)
+        _memoryLimitMB = State(initialValue: settings.memoryLimitMB)
+        _maxExecutionTimeSeconds = State(initialValue: settings.maxExecutionTimeSeconds)
+        _maxInputVariables = State(initialValue: settings.maxInputVariables)
+    }
+
+    private var postLimitMB: Int { max(settings.postLimitMB, uploadLimitMB + 1) }
+    private var valid: Bool { (1...2048).contains(uploadLimitMB) && (16...4096).contains(memoryLimitMB) && (0...86_400).contains(maxExecutionTimeSeconds) && (100...1_000_000).contains(maxInputVariables) && postLimitMB <= 2049 }
+    private var unchanged: Bool {
+        uploadLimitMB == settings.uploadLimitMB && memoryLimitMB == settings.memoryLimitMB && maxExecutionTimeSeconds == settings.maxExecutionTimeSeconds && maxInputVariables == settings.maxInputVariables && postLimitMB == settings.postLimitMB
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: VaelenUI.spacing8) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Grid(alignment: .leading, horizontalSpacing: VaelenUI.spacing8, verticalSpacing: VaelenUI.spacing8) {
+                settingRow("Maximum upload size", value: $uploadLimitMB, unit: "MB", accessibility: "Maximum upload size for \(title)")
+                GridRow {
+                    Text("POST body limit").foregroundStyle(.secondary)
+                    Text("\(postLimitMB) MB · managed automatically").gridCellColumns(2).foregroundStyle(.secondary)
+                }
+                settingRow("Memory limit", value: $memoryLimitMB, unit: "MB", accessibility: "PHP memory limit for \(title)")
+                settingRow("Maximum execution time", value: $maxExecutionTimeSeconds, unit: "seconds", accessibility: "PHP maximum execution time for \(title)")
+                settingRow("Maximum input variables", value: $maxInputVariables, unit: "variables", accessibility: "PHP maximum input variables for \(title)")
+            }
+            Text("Vaelen keeps post_max_size at least 1 MB above upload_max_filesize so multipart overhead cannot make the upload limit ineffective.")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("Upload and POST size affect web requests. Memory and maximum input variables apply to web and CLI PHP. Maximum execution time controls FPM/web requests; managed CLI PHP remains unlimited.")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button(saveTitle) {
+                    save(PHPSettingsValues(uploadLimitMB: uploadLimitMB, memoryLimitMB: memoryLimitMB, maxExecutionTimeSeconds: maxExecutionTimeSeconds, maxInputVariables: maxInputVariables, postLimitMB: postLimitMB))
+                }
+                .disabled(saving || unchanged || !valid)
+            }
+        }
+        .onChange(of: settings) { _, value in
+            uploadLimitMB = value.uploadLimitMB; memoryLimitMB = value.memoryLimitMB; maxExecutionTimeSeconds = value.maxExecutionTimeSeconds; maxInputVariables = value.maxInputVariables
+        }
+    }
+
+    private func settingRow(_ label: String, value: Binding<Int>, unit: String, accessibility: String) -> some View {
+        GridRow {
+            Text(label)
+            TextField(label, value: value, format: .number)
+                .labelsHidden().multilineTextAlignment(.trailing).frame(width: 78)
+                .accessibilityLabel(accessibility)
+            Text(unit).font(.caption).foregroundStyle(.secondary)
         }
     }
 }

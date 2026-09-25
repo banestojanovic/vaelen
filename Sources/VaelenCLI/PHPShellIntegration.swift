@@ -8,7 +8,7 @@ enum PHPShellIntegration {
     static let shellBlock = #"""
     # >>> Vaelen PHP runtime resolution >>>
     function php() {
-      local _vaelen_php_path _vaelen_php_result _vaelen_php_status _vaelen_activity
+      local _vaelen_php_path _vaelen_php_result _vaelen_php_status _vaelen_activity _vaelen_php_version _vaelen_php_ini
       _vaelen_php_result="$("$HOME/Library/Application Support/Vaelen/bin/vaelen-php-resolver" php resolve --path 2>&1)"
       _vaelen_php_status=$?
       if (( _vaelen_php_status != 0 )); then
@@ -31,7 +31,13 @@ enum PHPShellIntegration {
         print -u2 "Vaelen could not resolve an executable PHP runtime. Check that Vaelen Core is running and a PHP version is installed."
         return 127
       fi
-      "$_vaelen_php_path" "$@"
+      _vaelen_php_version="${_vaelen_php_path:h:t}"
+      _vaelen_php_ini="$HOME/Library/Application Support/Vaelen/config/php/versions/${_vaelen_php_version}/cli.ini"
+      if [[ ! -r "$_vaelen_php_ini" ]]; then
+        print -u2 "Vaelen's managed PHP configuration for ${_vaelen_php_version} is unavailable. Open Vaelen Settings → PHP and retry."
+        return 127
+      fi
+      PHPRC="$_vaelen_php_ini" PHP_INI_SCAN_DIR="" "$_vaelen_php_path" "$@"
     }
     # <<< Vaelen PHP runtime resolution <<<
     """#

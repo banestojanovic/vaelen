@@ -50,6 +50,7 @@ final class CaddyRouterTests: XCTestCase {
         try FileManager.default.createDirectory(at: root.appendingPathComponent("nested/one/two"), withIntermediateDirectories: true)
         try Data("<?php echo 'deep nested response';".utf8).write(to: root.appendingPathComponent("nested/one/two/deep.php"))
         try Data("asset response".utf8).write(to: root.appendingPathComponent("asset.txt"))
+        try Data("<?php echo json_encode(['upload' => ini_get('upload_max_filesize'), 'post' => ini_get('post_max_size'), 'memory' => ini_get('memory_limit'), 'execution' => ini_get('max_execution_time'), 'input' => ini_get('max_input_vars')]);".utf8).write(to: root.appendingPathComponent("vaelen-settings.php"))
 
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
@@ -86,6 +87,31 @@ final class CaddyRouterTests: XCTestCase {
         let asset = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/asset.txt")
         XCTAssertEqual(asset.status, 200, asset.body)
         XCTAssertEqual(asset.body, "asset response")
+
+        let beforeSettings = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/vaelen-settings.php")
+        XCTAssertEqual(beforeSettings.status, 200, beforeSettings.body)
+        let before = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(beforeSettings.body.utf8)) as? [String: String])
+        XCTAssertEqual(before["upload"], "2M")
+        XCTAssertEqual(before["post"], "8M")
+        XCTAssertEqual(before["memory"], "128M")
+        XCTAssertEqual(before["execution"], "30")
+        XCTAssertEqual(before["input"], "1000")
+
+        let changed = PHPManagedSettings(uploadLimitMB: 16, memoryLimitMB: 256, maxExecutionTimeSeconds: 47, maxInputVariables: 2_222, postLimitMB: 8)
+        let applied = try php.updateConfiguration(version: nil, settings: changed)
+        XCTAssertEqual(applied.affectedVersions, [phpPackage.version])
+        XCTAssertEqual(try php.status(requestedVersion: phpPackage.version).state, .running)
+        let afterSettings = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/vaelen-settings.php")
+        XCTAssertEqual(afterSettings.status, 200, afterSettings.body)
+        let after = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(afterSettings.body.utf8)) as? [String: String])
+        XCTAssertEqual(after["upload"], "16M")
+        XCTAssertEqual(after["post"], "17M", "POST limit must leave overhead above upload limit")
+        XCTAssertEqual(after["memory"], "256M")
+        XCTAssertEqual(after["execution"], "47")
+        XCTAssertEqual(after["input"], "2222")
+        let cli = try php.exec(requestedVersion: phpPackage.version, workingDirectory: root.path, arguments: ["-r", "echo ini_get('memory_limit').'|'.ini_get('max_execution_time').'|'.ini_get('upload_max_filesize');"])
+        XCTAssertEqual(cli.status, 0, cli.output)
+        XCTAssertTrue(cli.output.contains("256M|0|16M"), cli.output)
     }
 
     func testOfficialCaddyRoundTripsNormalizedFastCGIRoute() async throws {

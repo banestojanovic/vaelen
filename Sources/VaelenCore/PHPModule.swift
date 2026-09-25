@@ -229,6 +229,38 @@ public struct PHPStatus: Codable, Equatable, Sendable {
     public let isDefault: Bool
 }
 
+public struct PHPManagedSettings: Codable, Equatable, Sendable {
+    public let uploadLimitMB: Int
+    public let memoryLimitMB: Int
+    public let maxExecutionTimeSeconds: Int
+    public let maxInputVariables: Int
+    public let postLimitMB: Int
+    public init(uploadLimitMB: Int, memoryLimitMB: Int, maxExecutionTimeSeconds: Int, maxInputVariables: Int, postLimitMB: Int) {
+        self.uploadLimitMB = uploadLimitMB; self.memoryLimitMB = memoryLimitMB; self.maxExecutionTimeSeconds = maxExecutionTimeSeconds; self.maxInputVariables = maxInputVariables; self.postLimitMB = postLimitMB
+    }
+}
+public struct PHPManagedVersionConfiguration: Codable, Equatable, Sendable {
+    public let version: String
+    public let settings: PHPManagedSettings
+    public let inheritsDefault: Bool
+    public let cliIniPath: String
+    public let fpmIniPath: String
+    public let fpmConfigurationPath: String
+    public let fpmRunning: Bool
+    public init(version: String, settings: PHPManagedSettings, inheritsDefault: Bool, cliIniPath: String, fpmIniPath: String, fpmConfigurationPath: String, fpmRunning: Bool) {
+        self.version = version; self.settings = settings; self.inheritsDefault = inheritsDefault; self.cliIniPath = cliIniPath; self.fpmIniPath = fpmIniPath; self.fpmConfigurationPath = fpmConfigurationPath; self.fpmRunning = fpmRunning
+    }
+}
+public struct PHPConfigurationSnapshot: Codable, Equatable, Sendable {
+    public let defaultSettings: PHPManagedSettings
+    public let versions: [PHPManagedVersionConfiguration]
+    public let directory: String
+    public let affectedVersions: [String]
+    public init(defaultSettings: PHPManagedSettings, versions: [PHPManagedVersionConfiguration], directory: String, affectedVersions: [String] = []) {
+        self.defaultSettings = defaultSettings; self.versions = versions; self.directory = directory; self.affectedVersions = affectedVersions
+    }
+}
+
 /// Core-authoritative, read-only PHP inventory. Installation, default
 /// selection, and process state are deliberately represented independently.
 public struct PHPUpdateObservation: Codable, Equatable, Sendable {
@@ -340,7 +372,7 @@ public struct PHPProjectUsage: Codable, Equatable, Sendable {
     public init(version: String, explicit: Int = 0, inherited: Int = 0) { self.version = version; self.explicit = explicit; self.inherited = inherited }
 }
 
-public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove, defaultSelection }
+public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove, defaultSelection, configurationUpdate }
 public enum PHPOperationPhase: String, Codable, Sendable { case starting, downloading, verifying, installing, ready, removing, removed, failed }
 public struct PHPOperationState: Codable, Equatable, Sendable {
     public let kind: PHPOperationKind
@@ -371,6 +403,11 @@ private struct PHPDevelopmentConfiguration: Codable, Sendable {
     let catalogURL: String?
 }
 
+private struct PHPConfigurationStoreRecord: Codable {
+    var defaultSettings: PHPManagedSettings
+    var versionOverrides: [String: PHPManagedSettings]
+}
+
 private final class PHPRemoteResultBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Result<Data, Error>?
@@ -387,6 +424,7 @@ public final class PHPModule: @unchecked Sendable {
     private var activeOperation: PHPOperationState?
     private var lastOperation: PHPOperationState?
     private var ownedFPMProcesses: [String: OwnedChildProcess] = [:]
+    private let defaultPHPSettings = PHPManagedSettings(uploadLimitMB: 2, memoryLimitMB: 128, maxExecutionTimeSeconds: 30, maxInputVariables: 1_000, postLimitMB: 8)
 
     public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false) {
         self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog
@@ -470,6 +508,15 @@ public final class PHPModule: @unchecked Sendable {
             let target = try self.manifest(for: requestedVersion).phpVersion
             let currentDefault = self.defaultVersion()
             let package = try self.installUnlocked(requestedVersion: target)
+            if let targetFamily = PHPVersion(target)?.family {
+                let source = self.eligibleInstalledVersions().filter { PHPVersion($0.version)?.family == targetFamily && $0.version != target }
+                    .max { (PHPVersion($0.version) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1.version) ?? .init(major: 0, minor: 0, patch: 0)) }
+                if let source, var settings = try? self.loadPHPConfiguration(), settings.versionOverrides[target] == nil,
+                   let existingOverride = settings.versionOverrides[source.version] {
+                    settings.versionOverrides[target] = existingOverride
+                    try self.savePHPConfiguration(settings)
+                }
+            }
             if let currentDefault, PHPVersion(currentDefault)?.family == PHPVersion(target)?.family, currentDefault != target {
                 _ = try self.setDefaultUnlocked(requestedVersion: target)
             }
@@ -640,13 +687,140 @@ public final class PHPModule: @unchecked Sendable {
         return persisted
     }
 
+    public func configuration() throws -> PHPConfigurationSnapshot {
+        let stored = try loadPHPConfiguration()
+        if !manager.fileExists(atPath: phpSettingsFile.path) { try savePHPConfiguration(stored) }
+        let installed = eligibleInstalledVersions()
+        var versions = [PHPManagedVersionConfiguration]()
+        for package in installed {
+            let override = stored.versionOverrides[package.version]
+            let settings = override ?? stored.defaultSettings
+            let paths = try writePHPIniFiles(version: package.version, settings: settings)
+            let fpmConfig = layout.phpInstancesDirectoryURL.appendingPathComponent(package.version).appendingPathComponent("config/php-fpm.conf").path
+            let isRunning = (try? status(requestedVersion: package.version).state) == .running
+            versions.append(PHPManagedVersionConfiguration(version: package.version, settings: settings, inheritsDefault: override == nil, cliIniPath: paths.cli.path, fpmIniPath: paths.fpm.path, fpmConfigurationPath: fpmConfig, fpmRunning: isRunning))
+        }
+        return PHPConfigurationSnapshot(defaultSettings: stored.defaultSettings, versions: versions, directory: phpConfigurationDirectory.path)
+    }
+
+    public func updateConfiguration(version requestedVersion: String?, settings requestedSettings: PHPManagedSettings?) throws -> PHPConfigurationSnapshot {
+        try executeOperation(kind: .configurationUpdate, targetVersion: requestedVersion ?? "default") {
+            let before = try self.loadPHPConfiguration()
+            var after = before
+            if let requestedVersion {
+                let package = try self.resolveExactEligible(requestedVersion)
+                if let requestedSettings {
+                    after.versionOverrides[package.version] = try self.validatedSettings(requestedSettings)
+                } else {
+                    after.versionOverrides.removeValue(forKey: package.version)
+                }
+            } else {
+                guard let requestedSettings else { throw PHPModuleError.validationFailed("Default PHP settings cannot be cleared.") }
+                after.defaultSettings = try self.validatedSettings(requestedSettings)
+            }
+
+            let affected = self.eligibleInstalledVersions().filter { package in
+                (before.versionOverrides[package.version] ?? before.defaultSettings) != (after.versionOverrides[package.version] ?? after.defaultSettings)
+            }
+            let running = affected.filter { (try? self.status(requestedVersion: $0.version).state) == .running }
+            do {
+                try self.savePHPConfiguration(after)
+                for package in affected {
+                    _ = try self.writePHPIniFiles(version: package.version, settings: after.versionOverrides[package.version] ?? after.defaultSettings)
+                }
+                for package in running { _ = try self.stop(requestedVersion: package.version) }
+                for package in running {
+                    let restarted = try self.start(requestedVersion: package.version)
+                    guard restarted.state == .running, restarted.health == "healthy" else { throw PHPModuleError.processFailed("PHP-FPM \(package.version) did not become healthy after applying its configuration.") }
+                }
+            } catch {
+                let applyFailure = String(describing: error)
+                // Preferences and per-version INI files are restored before
+                // restarting any runtime stopped by the failed application.
+                do {
+                    try self.savePHPConfiguration(before)
+                    for package in affected {
+                        _ = try self.writePHPIniFiles(version: package.version, settings: before.versionOverrides[package.version] ?? before.defaultSettings)
+                    }
+                    for package in running {
+                        if (try? self.status(requestedVersion: package.version).state) == .running {
+                            _ = try self.stop(requestedVersion: package.version)
+                        }
+                    }
+                    for package in running {
+                        let restored = try self.start(requestedVersion: package.version)
+                        guard restored.state == .running, restored.health == "healthy" else {
+                            throw PHPModuleError.processFailed("PHP-FPM \(package.version) did not return to a healthy state with its previous settings.")
+                        }
+                    }
+                } catch {
+                    throw PHPModuleError.processFailed("PHP settings could not be applied (\(applyFailure)); rollback also failed (\(error)). Review the saved settings and PHP-FPM status before retrying.")
+                }
+                throw PHPModuleError.processFailed("PHP settings could not be applied (\(applyFailure)). The previous settings were restored and affected PHP-FPM runtimes are healthy.")
+            }
+            let inventory = try self.configuration()
+            return PHPConfigurationSnapshot(defaultSettings: inventory.defaultSettings, versions: inventory.versions, directory: inventory.directory, affectedVersions: running.map(\.version))
+        }
+    }
+
+    private var phpConfigurationDirectory: URL { layout.configurationDirectoryURL.appendingPathComponent("php", isDirectory: true) }
+    private var phpSettingsFile: URL { phpConfigurationDirectory.appendingPathComponent("settings.json") }
+    private func phpVersionConfigurationDirectory(_ version: String) -> URL { phpConfigurationDirectory.appendingPathComponent("versions", isDirectory: true).appendingPathComponent(version, isDirectory: true) }
+    private func loadPHPConfiguration() throws -> PHPConfigurationStoreRecord {
+        guard manager.fileExists(atPath: phpSettingsFile.path) else { return PHPConfigurationStoreRecord(defaultSettings: defaultPHPSettings, versionOverrides: [:]) }
+        do {
+            var record = try JSONDecoder().decode(PHPConfigurationStoreRecord.self, from: Data(contentsOf: phpSettingsFile))
+            record.defaultSettings = try validatedSettings(record.defaultSettings)
+            for (version, settings) in record.versionOverrides {
+                guard PHPVersion(version)?.isStable == true else { throw PHPModuleError.validationFailed("Invalid PHP version in the saved configuration: \(version)") }
+                record.versionOverrides[version] = try validatedSettings(settings)
+            }
+            return record
+        } catch let error as PHPModuleError { throw error }
+        catch { throw PHPModuleError.validationFailed("The saved PHP settings file is unreadable: \(error.localizedDescription)") }
+    }
+    private func effectivePHPSettings(version: String) throws -> PHPManagedSettings {
+        let stored = try loadPHPConfiguration()
+        if !manager.fileExists(atPath: phpSettingsFile.path) { try savePHPConfiguration(stored) }
+        return stored.versionOverrides[version] ?? stored.defaultSettings
+    }
+    private func savePHPConfiguration(_ record: PHPConfigurationStoreRecord) throws {
+        try makeDirectories([phpConfigurationDirectory])
+        try atomicWrite(record, to: phpSettingsFile)
+    }
+    private func validatedSettings(_ settings: PHPManagedSettings) throws -> PHPManagedSettings {
+        guard (1...2048).contains(settings.uploadLimitMB) else { throw PHPModuleError.validationFailed("Maximum upload size must be between 1 and 2048 MB.") }
+        guard (16...4096).contains(settings.memoryLimitMB) else { throw PHPModuleError.validationFailed("PHP memory limit must be between 16 and 4096 MB.") }
+        guard (0...86_400).contains(settings.maxExecutionTimeSeconds) else { throw PHPModuleError.validationFailed("Maximum execution time must be between 0 and 86400 seconds.") }
+        guard (100...1_000_000).contains(settings.maxInputVariables) else { throw PHPModuleError.validationFailed("Maximum input variables must be between 100 and 1000000.") }
+        let minimumPost = settings.uploadLimitMB + 1
+        let post = max(settings.postLimitMB, minimumPost)
+        guard post <= 2049 else { throw PHPModuleError.validationFailed("POST size limit cannot exceed 2049 MB.") }
+        return PHPManagedSettings(uploadLimitMB: settings.uploadLimitMB, memoryLimitMB: settings.memoryLimitMB, maxExecutionTimeSeconds: settings.maxExecutionTimeSeconds, maxInputVariables: settings.maxInputVariables, postLimitMB: post)
+    }
+    private func writePHPIniFiles(version: String, settings rawSettings: PHPManagedSettings) throws -> (cli: URL, fpm: URL) {
+        let settings = try validatedSettings(rawSettings)
+        let directory = phpVersionConfigurationDirectory(version)
+        try makeDirectories([directory])
+        let common = "upload_max_filesize = \(settings.uploadLimitMB)M\npost_max_size = \(settings.postLimitMB)M\nmemory_limit = \(settings.memoryLimitMB)M\nmax_input_vars = \(settings.maxInputVariables)\n"
+        let fpm = directory.appendingPathComponent("fpm.ini")
+        let cli = directory.appendingPathComponent("cli.ini")
+        try atomicWrite(common + "max_execution_time = \(settings.maxExecutionTimeSeconds)\n", to: fpm)
+        // The packaged CLI has historically been unlimited (0 seconds).
+        // Keep that behavior unless the user invokes CLI PHP explicitly with -d.
+        try atomicWrite(common + "max_execution_time = 0\n", to: cli)
+        return (cli, fpm)
+    }
+
     public func executable(requestedVersion: String? = nil) throws -> String { try resolveInstalled(requestedVersion ?? defaultVersion() ?? "latest").cliPath }
 
     public func exec(requestedVersion: String? = nil, workingDirectory: String, arguments: [String]) throws -> (status: Int32, output: String) {
         let directory = URL(fileURLWithPath: workingDirectory).standardizedFileURL
         var isDirectory: ObjCBool = false
         guard manager.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { throw PHPModuleError.invalidWorkingDirectory(workingDirectory) }
-        let process = Process(); let pipe = Pipe(); process.executableURL = URL(fileURLWithPath: try executable(requestedVersion: requestedVersion)); process.arguments = arguments; process.currentDirectoryURL = directory; process.standardOutput = pipe; process.standardError = pipe
+        let version = try resolveInstalled(requestedVersion ?? defaultVersion() ?? "latest").version
+        let config = try writePHPIniFiles(version: version, settings: effectivePHPSettings(version: version))
+        let process = Process(); let pipe = Pipe(); process.executableURL = URL(fileURLWithPath: try executable(requestedVersion: version)); process.arguments = ["-c", config.cli.path] + arguments; process.currentDirectoryURL = directory; process.environment = ProcessInfo.processInfo.environment.merging(["PHP_INI_SCAN_DIR": ""]) { _, managed in managed }; process.standardOutput = pipe; process.standardError = pipe
         try process.run(); process.waitUntilExit(); return (process.terminationStatus, String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
     }
 
@@ -694,10 +868,11 @@ public final class PHPModule: @unchecked Sendable {
         let config = instance.appendingPathComponent("config/php-fpm.conf"); let socket = socketPath(package.version); let log = layout.phpLogsDirectoryURL.appendingPathComponent("\(package.version).log")
         try makeDirectories([config.deletingLastPathComponent(), layout.phpLogsDirectoryURL, layout.rootURL.appendingPathComponent("runtime/sockets/php", isDirectory: true)])
         try? manager.removeItem(atPath: socket)
+        let ini = try writePHPIniFiles(version: package.version, settings: effectivePHPSettings(version: package.version))
         let content = "[global]\ndaemonize = no\nerror_log = \(log.path)\n\n[vaelen]\nuser = \(NSUserName())\ngroup = \(NSUserName())\nlisten = \(socket)\nlisten.mode = 0600\npm = dynamic\npm.max_children = 2\npm.start_servers = 1\npm.min_spare_servers = 1\npm.max_spare_servers = 2\n"
         try atomicWrite(content, to: config)
         if !manager.fileExists(atPath: log.path) { manager.createFile(atPath: log.path, contents: nil) }
-        let process = Process(); process.executableURL = URL(fileURLWithPath: package.fpmPath); process.arguments = ["-y", config.path, "-F"]; process.standardOutput = try FileHandle(forWritingTo: log); process.standardError = process.standardOutput
+        let process = Process(); process.executableURL = URL(fileURLWithPath: package.fpmPath); process.arguments = ["-c", ini.fpm.path, "-y", config.path, "-F"]; process.environment = ProcessInfo.processInfo.environment.merging(["PHP_INI_SCAN_DIR": ""]) { _, managed in managed }; process.standardOutput = try FileHandle(forWritingTo: log); process.standardError = process.standardOutput
         try process.run()
         let child = OwnedChildProcess(process: process, label: "PHP-FPM \(package.version)")
         ownedFPMProcesses[package.version] = child

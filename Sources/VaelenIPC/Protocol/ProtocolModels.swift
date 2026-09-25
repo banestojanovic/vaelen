@@ -86,6 +86,8 @@ public enum CoreMethod: String, Sendable {
     case phpStart = "php.start"
     case phpStop = "php.stop"
     case phpStatus = "php.status"
+    case phpConfiguration = "php.configuration"
+    case phpConfigurationUpdate = "php.configuration.update"
     case mysqlVersions = "mysql.versions"
     case mysqlInstall = "mysql.install"
     case mysqlUse = "mysql.use"
@@ -131,6 +133,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case unpark(UnparkPathRequest)
     case phpVersion(PHPVersionRequest)
     case phpExec(PHPExecRequest)
+    case phpConfigurationUpdate(PHPConfigurationUpdateRequest)
     case phpResolve(PHPResolveRequest)
     case route(RouteIntent)
     case routeRemove(RouteRemoveRequest)
@@ -152,6 +155,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .unpark(let value): try value.encode(to: encoder)
         case .phpVersion(let value): try value.encode(to: encoder)
         case .phpExec(let value): try value.encode(to: encoder)
+        case .phpConfigurationUpdate(let value): try value.encode(to: encoder)
         case .phpResolve(let value): try value.encode(to: encoder)
         case .route(let value): try value.encode(to: encoder)
         case .routeRemove(let value): try value.encode(to: encoder)
@@ -171,6 +175,9 @@ public enum RequestParams: Codable, Equatable, Sendable {
             }
             if fields["version"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPVersionRequest.self, from: IPCCodec.encode(value)) {
                 self = .phpVersion(params); return
+            }
+            if fields["settings"] != nil, let params = try? IPCCodec.decode(PHPConfigurationUpdateRequest.self, from: IPCCodec.encode(value)) {
+                self = .phpConfigurationUpdate(params); return
             }
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
             if fields["workingDirectory"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPResolveRequest.self, from: IPCCodec.encode(value)) { self = .phpResolve(params); return }
@@ -363,6 +370,42 @@ public struct ParkedPathListResult: Codable, Equatable, Sendable {
 }
 
 public struct PHPVersionRequest: Codable, Equatable, Sendable { public let version: String; public init(version: String) { self.version = version } }
+public struct PHPSettingsValues: Codable, Equatable, Sendable {
+    public let uploadLimitMB: Int
+    public let memoryLimitMB: Int
+    public let maxExecutionTimeSeconds: Int
+    public let maxInputVariables: Int
+    public let postLimitMB: Int
+    public init(uploadLimitMB: Int, memoryLimitMB: Int, maxExecutionTimeSeconds: Int, maxInputVariables: Int, postLimitMB: Int) {
+        self.uploadLimitMB = uploadLimitMB; self.memoryLimitMB = memoryLimitMB; self.maxExecutionTimeSeconds = maxExecutionTimeSeconds; self.maxInputVariables = maxInputVariables; self.postLimitMB = postLimitMB
+    }
+}
+public struct PHPVersionConfiguration: Codable, Equatable, Sendable {
+    public let version: String
+    public let settings: PHPSettingsValues
+    public let inheritsDefault: Bool
+    public let cliIniPath: String
+    public let fpmIniPath: String
+    public let fpmConfigurationPath: String
+    public let fpmRunning: Bool
+    public init(version: String, settings: PHPSettingsValues, inheritsDefault: Bool, cliIniPath: String, fpmIniPath: String, fpmConfigurationPath: String, fpmRunning: Bool) {
+        self.version = version; self.settings = settings; self.inheritsDefault = inheritsDefault; self.cliIniPath = cliIniPath; self.fpmIniPath = fpmIniPath; self.fpmConfigurationPath = fpmConfigurationPath; self.fpmRunning = fpmRunning
+    }
+}
+public struct PHPConfigurationResult: Codable, Equatable, Sendable {
+    public let defaultSettings: PHPSettingsValues
+    public let versions: [PHPVersionConfiguration]
+    public let directory: String
+    public let affectedVersions: [String]
+    public init(defaultSettings: PHPSettingsValues, versions: [PHPVersionConfiguration], directory: String, affectedVersions: [String] = []) {
+        self.defaultSettings = defaultSettings; self.versions = versions; self.directory = directory; self.affectedVersions = affectedVersions
+    }
+}
+public struct PHPConfigurationUpdateRequest: Codable, Equatable, Sendable {
+    public let version: String?
+    public let settings: PHPSettingsValues?
+    public init(version: String?, settings: PHPSettingsValues?) { self.version = version; self.settings = settings }
+}
 public struct PHPExecRequest: Codable, Equatable, Sendable { public let version: String?; public let workingDirectory: String; public let arguments: [String]; public init(version: String? = nil, workingDirectory: String, arguments: [String]) { self.version = version; self.workingDirectory = workingDirectory; self.arguments = arguments } }
 public struct PHPResolveRequest: Codable, Equatable, Sendable { public let workingDirectory: String; public init(workingDirectory: String) { self.workingDirectory = workingDirectory } }
 public struct PHPResolveResult: Codable, Equatable, Sendable { public let version: String; public let cliPath: String; public let projectName: String?; public init(version: String, cliPath: String, projectName: String?) { self.version = version; self.cliPath = cliPath; self.projectName = projectName } }
@@ -428,6 +471,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case phpCatalog(PHPRuntimeCatalogResult)
     case phpOperation(PHPOperationResult)
     case phpStatus(PHPStatusResult)
+    case phpConfiguration(PHPConfigurationResult)
     case mysqlVersions(MySQLVersionsResult)
     case mysqlStatus(MySQLStatusResult)
     case mailpitVersions(MailpitVersionsResult)
@@ -463,6 +507,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .phpCatalog(let value): try value.encode(to: encoder)
         case .phpOperation(let value): try value.encode(to: encoder)
         case .phpStatus(let value): try value.encode(to: encoder)
+        case .phpConfiguration(let value): try value.encode(to: encoder)
         case .mysqlVersions(let value): try value.encode(to: encoder)
         case .mysqlStatus(let value): try value.encode(to: encoder)
         case .mailpitVersions(let value): try value.encode(to: encoder)
@@ -506,6 +551,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["operation"] != nil, let result = try? IPCCodec.decode(PHPOperationResult.self, from: data) { self = .phpOperation(result) }
         else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }
         else if fields["status"] != nil, let result = try? IPCCodec.decode(PHPStatusResult.self, from: data) { self = .phpStatus(result) }
+        else if fields["defaultSettings"] != nil, let result = try? IPCCodec.decode(PHPConfigurationResult.self, from: data) { self = .phpConfiguration(result) }
         else if fields["exitStatus"] != nil, let result = try? IPCCodec.decode(PHPExecResult.self, from: data) { self = .phpExec(result) }
         else if fields["cliPath"] != nil, let result = try? IPCCodec.decode(PHPResolveResult.self, from: data) { self = .phpResolve(result) }
         else if fields["router"] != nil, let result = try? IPCCodec.decode(RouterStatusResult.self, from: data) { self = .routingStatus(result) }

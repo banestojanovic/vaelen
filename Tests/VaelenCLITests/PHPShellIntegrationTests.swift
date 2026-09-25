@@ -42,6 +42,14 @@ final class PHPShellIntegrationTests: XCTestCase {
         XCTAssertEqual(result.stderr, "")
     }
 
+    func testManagedPHPSetsItsPerVersionPHPRC() throws {
+        let result = try runShell(resolverExit: 0, resolverOutput: "managed", activity: "active", createManagedPHP: true, reportManagedConfiguration: true)
+        XCTAssertEqual(result.status, 0)
+        XCTAssertTrue(result.stdout.hasPrefix("managed --version ["), result.stdout)
+        XCTAssertTrue(result.stdout.contains("/Library/Application Support/Vaelen/config/php/versions/8.4.23/cli.ini]"), result.stdout)
+        XCTAssertEqual(result.stderr, "")
+    }
+
     func testActiveVaelenWithMissingSelectedRuntimeDoesNotFallThrough() throws {
         let result = try runShell(resolverExit: 0, resolverOutput: "missing", activity: "active")
 
@@ -54,7 +62,8 @@ final class PHPShellIntegrationTests: XCTestCase {
         resolverExit: Int32,
         resolverOutput: String,
         activity: String?,
-        createManagedPHP: Bool = false
+        createManagedPHP: Bool = false,
+        reportManagedConfiguration: Bool = false
     ) throws -> (status: Int32, stdout: String, stderr: String) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-shell-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -63,7 +72,7 @@ final class PHPShellIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: resolver.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        let resolverPrint = createManagedPHP ? "printf '%s\\n' \"$HOME/managed\"" : "printf '%s\\n' '\(resolverOutput)'"
+        let resolverPrint = createManagedPHP ? "printf '%s\\n' \"$HOME/Library/Application Support/Vaelen/packages/php/8.4.23/php\"" : "printf '%s\\n' '\(resolverOutput)'"
         try executable("#!/bin/sh\n\(resolverPrint)\nexit \(resolverExit)\n", at: resolver)
         try executable("#!/bin/sh\nprintf 'external'\nprintf ' %s' \"$@\"\nprintf '\\n'\n", at: bin.appendingPathComponent("php"))
         let activityFile = root.appendingPathComponent("Library/Application Support/Vaelen/state/activity")
@@ -73,7 +82,13 @@ final class PHPShellIntegrationTests: XCTestCase {
         }
 
         if createManagedPHP {
-            try executable("#!/bin/sh\nprintf 'managed'\nprintf ' %s' \"$@\"\nprintf '\\n'\n", at: root.appendingPathComponent("managed"))
+            let managedScript = reportManagedConfiguration
+                ? "#!/bin/sh\nprintf 'managed'; printf ' %s' \"$@\"; printf ' [%s]\\n' \"$PHPRC\"\n"
+                : "#!/bin/sh\nprintf 'managed'\nprintf ' %s' \"$@\"\nprintf '\\n'\n"
+            try executable(managedScript, at: root.appendingPathComponent("Library/Application Support/Vaelen/packages/php/8.4.23/php"))
+            let ini = root.appendingPathComponent("Library/Application Support/Vaelen/config/php/versions/8.4.23/cli.ini")
+            try FileManager.default.createDirectory(at: ini.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("memory_limit = 128M\n".utf8).write(to: ini)
         }
 
         let script = PHPShellIntegration.shellBlock + "\nphp --version\n"

@@ -4,6 +4,18 @@ import AppKit
 import VaelenCore
 import VaelenIPC
 
+private struct PHPConfigurationEditorPreference: Codable {
+    let bundleIdentifier: String
+    let applicationPath: String
+
+    static func load() throws -> PHPConfigurationEditorPreference? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Vaelen/config/editor.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
+    }
+}
+
 enum CLICommand {
     case help
     case status(json: Bool)
@@ -42,6 +54,7 @@ enum CLICommand {
     case phpStart(String)
     case phpStop(String)
     case phpStatus(String, json: Bool)
+    case phpConfig(version: String?)
     case mysqlVersions(json: Bool)
     case mysqlInstall(String)
     case mysqlUse(String)
@@ -247,6 +260,7 @@ struct VaelenCLIMain {
                 ("start <version>", "Start PHP-FPM"),
                 ("stop <version>", "Stop PHP-FPM"),
                 ("status <version> [--json]", "Show PHP runtime status"),
+                ("config [version]", "Open managed PHP configuration files; with a version, edit its FPM ini"),
                 ("exec -- <arguments>", "Run PHP with the selected version"),
                 ("resolve --path", "Print the project PHP executable")
             ], examples: ["val php install 8.3", "val php resolve --path"])
@@ -514,6 +528,7 @@ struct VaelenCLIMain {
             case "start": guard args.count == 3 else { throw CLIError.usage }; return .phpStart(args[2])
             case "stop": guard args.count == 3 else { throw CLIError.usage }; return .phpStop(args[2])
             case "status": guard args.count == 3 || args.count == 4 else { throw CLIError.usage }; return .phpStatus(args[2], json: try optionalJSONOption(Array(args.dropFirst(3))))
+            case "config": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .phpConfig(version: args.count == 3 ? args[2] : nil)
             case "exec":
                 let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }; return .phpExec(version: nil, arguments: Array(rest.dropFirst(marker + 1)))
             case "resolve": guard args.count == 3, args[2] == "--path" else { throw CLIError.usage }; return .phpResolvePath
@@ -971,6 +986,34 @@ struct VaelenCLIMain {
         case .phpStart(let version): let result = try await client.phpStart(version); print("PHP \(result.version) FPM \(result.state.rawValue) \(result.health)")
         case .phpStop(let version): let result = try await client.phpStop(version); print("PHP \(result.version) FPM \(result.state.rawValue)")
         case .phpStatus(let version, let json): let result = try await client.phpStatus(version); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("PHP \(result.version)\nPackage    \(result.package == nil ? "Missing" : "Installed")\nFPM        \(result.state.rawValue)\nPID        \(result.pid.map(String.init) ?? "none")\nSocket     \(displayPath(result.socket))\nHealth     \(result.health)") }
+        case .phpConfig(let version):
+            let configuration = try await client.phpConfiguration()
+            let preference = try PHPConfigurationEditorPreference.load()
+            guard let preference else { throw CLIError.message("No editor is configured. Choose an installed editor in Vaelen Settings → General, then run ‘val php config’ again.") }
+            let appURL = URL(fileURLWithPath: preference.applicationPath, isDirectory: true).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: appURL.path), Bundle(url: appURL)?.bundleIdentifier == preference.bundleIdentifier else {
+                throw CLIError.message("The configured editor ‘\(preference.bundleIdentifier)’ is no longer installed at \(preference.applicationPath). Choose it again in Vaelen Settings → General.")
+            }
+            if let version {
+                guard let runtime = configuration.versions.first(where: { $0.version == version }) else { throw CLIError.message("PHP \(version) is not installed by Vaelen. Run ‘val php versions’ to see installed versions.") }
+                let configURL = URL(fileURLWithPath: runtime.fpmIniPath)
+                let openConfiguration = NSWorkspace.OpenConfiguration(); openConfiguration.activates = true
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    NSWorkspace.shared.open([configURL], withApplicationAt: appURL, configuration: openConfiguration) { _, error in
+                        if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+                    }
+                }
+                print("Opening PHP \(version) FPM configuration: \(runtime.fpmIniPath)")
+            } else {
+                let directoryURL = URL(fileURLWithPath: configuration.directory, isDirectory: true)
+                let openConfiguration = NSWorkspace.OpenConfiguration(); openConfiguration.activates = true
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    NSWorkspace.shared.open([directoryURL], withApplicationAt: appURL, configuration: openConfiguration) { _, error in
+                        if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+                    }
+                }
+                print("Opened Vaelen PHP configuration folder in \(preference.bundleIdentifier): \(configuration.directory)")
+            }
         case .mysqlVersions(let json): let result = try await client.mysqlVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nAvailable  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))\nSelected   \(result.default ?? "none")") }
         case .mysqlInstall(let version): let result = try await client.mysqlInstall(version); print("Installed MySQL \(result.installed.first(where: { $0.version == version })?.version ?? version)")
         case .mysqlUse(let version): let result = try await client.mysqlUse(version); print("Using MySQL \(result.default ?? version)")

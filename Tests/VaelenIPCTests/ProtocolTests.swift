@@ -3,6 +3,18 @@ import XCTest
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
+    func testPHPConfigurationRequestsAndResponsesRoundTrip() throws {
+        let settings = PHPSettingsValues(uploadLimitMB: 16, memoryLimitMB: 256, maxExecutionTimeSeconds: 45, maxInputVariables: 2_000, postLimitMB: 17)
+        let request = IPCRequest(method: .phpConfigurationUpdate, params: .phpConfigurationUpdate(.init(version: "8.4.23", settings: settings)))
+        let decodedRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(decodedRequest.knownMethod, .phpConfigurationUpdate)
+        let configuration = PHPConfigurationResult(defaultSettings: settings, versions: [PHPVersionConfiguration(version: "8.4.23", settings: settings, inheritsDefault: false, cliIniPath: "/managed/cli.ini", fpmIniPath: "/managed/fpm.ini", fpmConfigurationPath: "/instance/php-fpm.conf", fpmRunning: true)], directory: "/managed/php", affectedVersions: ["8.4.23"])
+        let response = IPCResponse(id: request.id, result: .phpConfiguration(configuration))
+        let decodedResponse = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .phpConfiguration(let restored)? = decodedResponse.result else { return XCTFail("PHP configuration response did not decode") }
+        XCTAssertEqual(restored, configuration)
+    }
+
     func testProjectPHPSelectionRoundTripsThroughJSON() throws {
         let request = IPCRequest(method: .projectPHP, params: .projectPHP(.init(selector: "syncproof", workingDirectory: "/tmp/syncproof", version: "8.4.23")))
         let decoded = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
