@@ -39,12 +39,12 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
         // Current-directory linking is the supported product contract. Keep
         // this assertion aligned with the committed CLI parser, not the older
         // explicit-path-only behavior.
-        guard case .link(let currentDirectoryPath) = try VaelenCLIMain.parse(["link"]) else {
+        guard case .link(let currentDirectoryPath, nil) = try VaelenCLIMain.parse(["link"]) else {
             return XCTFail("link without a path should use the current directory")
         }
         XCTAssertNil(currentDirectoryPath)
 
-        guard case .link(let path) = try VaelenCLIMain.parse(["link", "project"]) else {
+        guard case .link(let path, nil) = try VaelenCLIMain.parse(["link", "project"]) else {
             return XCTFail("link did not parse")
         }
         XCTAssertEqual(path, "project")

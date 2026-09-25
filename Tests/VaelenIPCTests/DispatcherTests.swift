@@ -1190,6 +1190,83 @@ while True:
         XCTAssertTrue(FileManager.default.fileExists(atPath: project.path))
     }
 
+    func testParkedProjectRouteOwnershipSurvivesLinkUnlinkRelinkAndUnparkLifecycle() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        let project = workspace.appendingPathComponent("child", isDirectory: true)
+        try FileManager.default.createDirectory(at: project.appendingPathComponent("public"), withIntermediateDirectories: true)
+        try Data("artisan".utf8).write(to: project.appendingPathComponent("artisan"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let repository = RouteIntentRepository(store: store)
+        let parentPath = workspace.standardizedFileURL.path
+        let childPath = project.standardizedFileURL.path
+        _ = try await registry.park(path: workspace)
+        let initialRoute = Route(hostname: "child.test", target: .staticFiles(documentRoot: project.appendingPathComponent("public").path), tls: .disabled)
+        try repository.insertParkOwnedRoute(.init(route: initialRoute, projectPath: childPath), parentPath: parentPath, childPath: childPath)
+        let router = ParkReconciliationTestRouter(routes: [initialRoute])
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: repository)
+
+        let initialOwner = try XCTUnwrap(repository.parkRouteOwnerships().first)
+        XCTAssertEqual(initialOwner.childPath, childPath)
+        XCTAssertEqual(initialOwner.routeID, initialRoute.id)
+
+        let linked = await dispatcher.dispatch(.init(method: .projectLink, params: .link(.init(path: project.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectMutation(let linkedResult) = linked.response.result, let firstID = linkedResult.project?.id else { return XCTFail("project link failed") }
+        XCTAssertEqual(try repository.parkRouteOwnerships(), [], "an explicitly linked park-served route is promoted to explicit route ownership")
+        let linkedRoute = try XCTUnwrap(repository.all().first)
+        XCTAssertEqual(linkedRoute.route, initialRoute)
+        XCTAssertEqual(linkedRoute.projectID, firstID)
+        XCTAssertEqual(linkedRoute.projectPath, childPath)
+
+        let secondRoute = Route(hostname: "api.child.test", target: initialRoute.target, tls: .local)
+        _ = await dispatcher.dispatch(.init(method: .routeAdd, params: .route(.init(route: secondRoute, projectID: firstID, projectPath: childPath))), handshaken: true)
+        let beforeUnlink = try repository.all().sorted { $0.route.hostname < $1.route.hostname }
+        XCTAssertEqual(Set(beforeUnlink.map(\.route.id)), Set([initialRoute.id, secondRoute.id]))
+        XCTAssertEqual(beforeUnlink.map(\.projectID), [firstID, firstID])
+        let observedBeforeUnlink = try await router.observedRoutes().sorted { $0.hostname < $1.hostname }
+        XCTAssertEqual(observedBeforeUnlink, [initialRoute, secondRoute].sorted { $0.hostname < $1.hostname })
+
+        let unlinked = await dispatcher.dispatch(.init(method: .projectUnlink, params: .unlink(.init(path: project.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectMutation = unlinked.response.result else { return XCTFail("project unlink failed") }
+        let afterUnlink = try repository.all().sorted { $0.route.hostname < $1.route.hostname }
+        XCTAssertEqual(afterUnlink.map(\.route), beforeUnlink.map(\.route))
+        XCTAssertEqual(afterUnlink.map(\.route.id), beforeUnlink.map(\.route.id))
+        XCTAssertEqual(afterUnlink.map(\.route.target), beforeUnlink.map(\.route.target))
+        XCTAssertEqual(afterUnlink.map(\.route.tls), beforeUnlink.map(\.route.tls))
+        XCTAssertEqual(afterUnlink.map(\.projectID), [nil, nil])
+        XCTAssertEqual(afterUnlink.map(\.projectPath), [childPath, childPath])
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let observedAfterUnlink = try await router.observedRoutes().sorted { $0.hostname < $1.hostname }
+        XCTAssertEqual(observedAfterUnlink, [initialRoute, secondRoute].sorted { $0.hostname < $1.hostname })
+
+        let relinked = await dispatcher.dispatch(.init(method: .projectLink, params: .link(.init(path: project.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectMutation(let relinkResult) = relinked.response.result, let secondID = relinkResult.project?.id else { return XCTFail("relink failed") }
+        XCTAssertNotEqual(secondID, firstID)
+        let afterRelink = try repository.all().sorted { $0.route.hostname < $1.route.hostname }
+        XCTAssertEqual(afterRelink.map(\.route.id), beforeUnlink.map(\.route.id))
+        XCTAssertEqual(afterRelink.map(\.projectID), [secondID, secondID])
+        XCTAssertEqual(afterRelink.map(\.route.target), beforeUnlink.map(\.route.target))
+        XCTAssertEqual(afterRelink.map(\.route.tls), beforeUnlink.map(\.route.tls))
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+
+        let unparked = await dispatcher.dispatch(.init(method: .pathUnpark, params: .unpark(.init(path: workspace.path, workingDirectory: root.path))), handshaken: true)
+        guard case .parkedPathMutation(let unparkResult) = unparked.response.result else { return XCTFail("unpark failed") }
+        XCTAssertTrue(unparkResult.reconciliation?.removed.isEmpty ?? true, "promoted explicit hostnames are retained on unpark")
+        let finalRoutes = try repository.all().sorted { $0.route.hostname < $1.route.hostname }
+        XCTAssertEqual(finalRoutes.map(\.route.id), beforeUnlink.map(\.route.id))
+        XCTAssertEqual(finalRoutes.map(\.projectID), [secondID, secondID])
+        XCTAssertTrue(try repository.parkRouteOwnerships().isEmpty)
+        let remainingProjects = try await registry.linkedProjects()
+        XCTAssertTrue(remainingProjects.contains { $0.id?.rawValue == secondID })
+        XCTAssertFalse(finalRoutes.contains { route in route.projectID != nil && route.projectID != secondID })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: childPath))
+        let observedAfterUnpark = try await router.observedRoutes().sorted { $0.hostname < $1.hostname }
+        XCTAssertEqual(observedAfterUnpark, [initialRoute, secondRoute].sorted { $0.hostname < $1.hostname })
+    }
+
     func testM13TrustAndUntrustTraverseDispatcherWithParameterlessRequests() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

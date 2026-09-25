@@ -24,6 +24,7 @@ public struct ProjectFrameworkDetector: @unchecked Sendable {
             "config/": isDirectory(root.appendingPathComponent("config", isDirectory: true)),
             "public/index.php": fileManager.fileExists(atPath: root.appendingPathComponent("public/index.php").path)
         ]
+        let hasRootPHP = fileManager.fileExists(atPath: root.appendingPathComponent("index.php").path)
         var evidence = markers.filter(\.value).map(\.key).sorted()
         var composerPHP: String?
         if let object = jsonObject(at: root.appendingPathComponent("composer.json")),
@@ -42,6 +43,9 @@ public struct ProjectFrameworkDetector: @unchecked Sendable {
             && markers["public/index.php"] == true
         if laravel {
             return .init(framework: "Laravel", confidence: .high, evidence: Array(Set(evidence)).sorted(), suggestedDocumentRoot: "public/", composerPHPRequirement: composerPHP)
+        }
+        if hasRootPHP {
+            return .init(framework: "Generic PHP", confidence: .medium, evidence: Array(Set(evidence + ["index.php"])).sorted(), suggestedDocumentRoot: "", composerPHPRequirement: composerPHP)
         }
         if markers.values.filter({ $0 }).count >= 2 {
             return .init(framework: "Generic PHP", confidence: .medium, evidence: Array(Set(evidence)).sorted(), suggestedDocumentRoot: isDirectory(root.appendingPathComponent("public", isDirectory: true)) ? "public/" : nil, composerPHPRequirement: composerPHP)

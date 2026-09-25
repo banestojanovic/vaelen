@@ -82,6 +82,8 @@ final class AppModel {
     private(set) var phpRequestTarget: String?
     private(set) var parkedFolders: [ParkedPathWire] = []
     private(set) var linkedProjects: [ProjectWire] = []
+    private(set) var configuredRoutes: [RouteIntent]?
+    private(set) var configuredRoutesError: String?
     private(set) var trustError: String?
     private(set) var serviceOperation: String?
     private(set) var serviceError: String?
@@ -213,6 +215,15 @@ final class AppModel {
             let projects = try await client.projectList()
             let linkedProjects = try await client.linkedProjects()
             let parkedFolders = try await client.parkedPaths()
+            let configuredRoutes: [RouteIntent]?
+            let configuredRoutesError: String?
+            do {
+                configuredRoutes = try await client.routeList()
+                configuredRoutesError = nil
+            } catch {
+                configuredRoutes = nil
+                configuredRoutesError = error.localizedDescription
+            }
             var reports = [ProjectEnvironmentReport]()
             for project in projects {
                 if let report = try? await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path) {
@@ -223,6 +234,8 @@ final class AppModel {
             let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
             projectReports = reports
+            self.configuredRoutes = configuredRoutes
+            self.configuredRoutesError = configuredRoutesError
             if relationshipGeneration == relationshipSnapshotGeneration {
                 self.linkedProjects = linkedProjects
                 self.parkedFolders = parkedFolders
@@ -443,6 +456,12 @@ final class AppModel {
 
     func openProjectSite(_ report: ProjectEnvironmentReport) {
         guard let url = projectSiteURL(report) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func openProjectRoute(_ route: RouteIntent) {
+        let scheme = route.route.tls == .local ? "https" : "http"
+        guard let url = URL(string: "\(scheme)://\(route.route.hostname)") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -1081,7 +1100,9 @@ struct ProjectsView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: VaelenUI.spacing8) {
                     ForEach(projects, id: \.path) { project in
-                        ProjectCard(project: project, report: reports.first { $0.identity.path == project.path }, model: model)
+                        let report = reports.first { $0.identity.path == project.path }
+                        let routes = routesForProject(project, report: report, configured: model.configuredRoutes)
+                        ProjectCard(project: project, report: report, routes: routes, model: model)
                     }
                 }
             }
@@ -1090,9 +1111,18 @@ struct ProjectsView: View {
     }
 }
 
+private func routesForProject(_ project: ProjectWire, report: ProjectEnvironmentReport?, configured: [RouteIntent]?) -> [RouteIntent]? {
+    guard let configured else { return nil }
+    let verifiedDocumentRoot = report?.derived.framework.suggestedDocumentRoot.map {
+        URL(fileURLWithPath: project.path).appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+    return ProjectRouteAttribution.routes(for: project.id, verifiedDocumentRoot: verifiedDocumentRoot, from: configured)
+}
+
 struct ProjectCard: View {
     let project: ProjectWire
     let report: ProjectEnvironmentReport?
+    let routes: [RouteIntent]?
     let model: AppModel
 
     var body: some View {
@@ -1115,13 +1145,20 @@ struct ProjectCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            if let report {
-                if let url = model.projectSiteURL(report) {
-                    Text(url.absoluteString)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+            if let routes {
+                if routes.count == 1, let route = routes.first {
+                    Text("\(route.route.tls == .local ? "HTTPS" : "HTTP") · \(route.route.hostname)")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                } else if routes.count > 1 {
+                    Text("\(routes.count) site hostnames configured")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
+            } else {
+                Label("Site route state unavailable", systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.orange)
+                    .help(model.configuredRoutesError ?? "Vaelen could not read configured routes.")
+            }
+            if let report {
                 if let summary = environmentSummary(report), !summary.isEmpty {
                     Text(summary)
                         .font(.caption)
@@ -1142,8 +1179,18 @@ struct ProjectCard: View {
                     .font(.caption2)
             }
             HStack {
-                if let report, model.projectSiteURL(report) != nil {
-                    Button("Open Site", systemImage: "safari") { model.openProjectSite(report) }
+                if let routes, routes.count == 1, let route = routes.first {
+                    Button("Open \(route.route.hostname)", systemImage: "safari") { model.openProjectRoute(route) }
+                } else if let routes, routes.count > 1 {
+                    Menu("Open Site", systemImage: "safari") {
+                        ForEach(routes, id: \.route.id) { route in
+                            Button("\(route.route.tls == .local ? "HTTPS" : "HTTP") · \(route.route.hostname)") { model.openProjectRoute(route) }
+                        }
+                    }
+                } else if routes == nil {
+                    Label("Site routes unavailable", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .help(model.configuredRoutesError ?? "Vaelen could not read configured routes.")
                 }
                 Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }
                     .disabled(!model.canOpenProjectFolder(project))
@@ -1967,6 +2014,7 @@ private struct ExplicitProjectRow: View {
 
     var body: some View {
         let report = model.projectReports.first { $0.identity.path == project.path }
+        let routes = routesForProject(project, report: report, configured: model.configuredRoutes)
         HStack(spacing: VaelenUI.spacing8) {
             Image(systemName: "shippingbox").foregroundStyle(.secondary).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
@@ -1975,6 +2023,15 @@ private struct ExplicitProjectRow: View {
                     Text("\(framework) · \(displayPath(project.path))").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 } else {
                     Text(displayPath(project.path)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if let routes, !routes.isEmpty {
+                    Text(routes.map { "\($0.route.tls == .local ? "HTTPS" : "HTTP") · \($0.route.hostname)" }.joined(separator: " · "))
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                        .accessibilityLabel("Site routes: " + routes.map(\.route.hostname).joined(separator: ", "))
+                } else if routes == nil {
+                    Label("Site routes unavailable", systemImage: "exclamationmark.triangle")
+                        .font(.caption2).foregroundStyle(.orange)
+                        .help(model.configuredRoutesError ?? "Vaelen could not read configured routes.")
                 }
                 projectPHPSummary(report)
             }

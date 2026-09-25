@@ -107,20 +107,40 @@ public actor CoreRequestDispatcher {
                 let params = try request.params?.decode(LinkProjectRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Link parameters are required.") }()
                 let mutation = try await registry.linkWithCreation(path: params.path, workingDirectory: params.workingDirectory, name: params.name)
                 let project = mutation.project
-                if let routeRepository,
-                   let owned = try routeRepository.parkRouteOwnerships().first(where: { $0.childPath == project.rootPath.string }),
-                   let intent = routeIntents[owned.routeID],
-                   let projectID = project.id?.rawValue {
-                    try routeRepository.associateMetadata(id: owned.routeID, projectID: projectID, projectPath: project.rootPath.string)
-                    let promoted = RouteIntent(route: intent.route, projectID: projectID, projectPath: project.rootPath.string)
-                    routeIntents[owned.routeID] = promoted
+                if let routeRepository, let projectID = project.id?.rawValue {
+                    let parkedIDs = Set(try routeRepository.parkRouteOwnerships().filter { $0.childPath == project.rootPath.string }.map(\.routeID))
+                    let projectRoutes = Array(routeIntents.filter { $0.value.projectPath == project.rootPath.string || parkedIDs.contains($0.key) })
+                    for (routeID, intent) in projectRoutes {
+                        try routeRepository.associateMetadata(id: routeID, projectID: projectID, projectPath: project.rootPath.string)
+                        routeIntents[routeID] = RouteIntent(route: intent.route, projectID: projectID, projectPath: project.rootPath.string)
+                    }
                 }
                 logger.info("Project linked: \(project.rootPath.string, privacy: .public)")
                 return (.init(id: request.id, result: .projectMutation(.init(project: .init(project), created: mutation.created))), true)
             case .projectUnlink:
                 let params = try request.params?.decode(UnlinkProjectRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Unlink parameters are required.") }()
+                let linkedBeforeUnlink: Project?
+                if let name = params.name {
+                    let matches = try await registry.linkedProjects().filter { $0.name == name }
+                    linkedBeforeUnlink = matches.count == 1 ? matches[0] : nil
+                } else {
+                    let path = params.path ?? params.workingDirectory
+                    let canonical = CanonicalPathService().canonicalize(path, relativeTo: params.workingDirectory).string
+                    let linkedProjects = try await registry.linkedProjects()
+                    let routeProjectIDs = Set(routeIntents.values.filter { $0.projectPath == canonical || $0.projectPath == path }.compactMap(\.projectID))
+                    linkedBeforeUnlink = linkedProjects.first { project in
+                        (project.rootPath.string == canonical || project.rootPath.string == path)
+                            || project.id.map { routeProjectIDs.contains($0.rawValue) } == true
+                    }
+                }
                 if let name = params.name { try await registry.unlink(name: name) }
                 else { try await registry.unlink(path: params.path ?? params.workingDirectory, workingDirectory: params.workingDirectory) }
+                if let projectID = linkedBeforeUnlink?.id?.rawValue, let routeRepository {
+                    try routeRepository.disassociateProject(projectID: projectID)
+                    for (routeID, intent) in Array(routeIntents) where intent.projectID == projectID {
+                        routeIntents[routeID] = RouteIntent(route: intent.route, projectPath: intent.projectPath)
+                    }
+                }
                 logger.info("Project unlinked")
                 return (.init(id: request.id, result: .projectMutation(.init(project: nil, created: false))), true)
             case .projectLinks:

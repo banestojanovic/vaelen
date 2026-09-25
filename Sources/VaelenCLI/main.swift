@@ -9,7 +9,7 @@ enum CLICommand {
     case status(json: Bool)
     case doctor(json: Bool)
     case routeTLS(hostname: String?, secure: Bool)
-    case link(path: String?)
+    case link(path: String?, hostname: String?)
     case unlink(path: String)
     case links(json: Bool)
     case park(path: String?)
@@ -132,6 +132,18 @@ func hostnameCollision(_ hostname: String, candidateProjectRoutes: [RouteIntent]
     return candidateProjectRoutes.contains(where: { $0.route.id == collision.route.id }) ? nil : collision
 }
 
+enum AdditionalHostConfigurationError: Error, Equatable {
+    case differingTargets
+    case differingTLSModes
+}
+
+func additionalHostConfiguration(from routes: [RouteIntent]) throws -> (target: RouteTarget, tls: TLSMode)? {
+    guard let first = routes.first else { return nil }
+    guard routes.allSatisfy({ $0.route.target == first.route.target }) else { throw AdditionalHostConfigurationError.differingTargets }
+    guard routes.allSatisfy({ $0.route.tls == first.route.tls }) else { throw AdditionalHostConfigurationError.differingTLSModes }
+    return (first.route.target, first.route.tls)
+}
+
 func preflightLinkCollision(hostname: String, projectPath: String, routes: [RouteIntent]) -> RouteIntent? {
     let samePathRoutes = routesForProject(routes, projectID: nil, projectPath: projectPath)
     guard samePathRoutes.isEmpty else { return nil }
@@ -249,8 +261,8 @@ struct VaelenCLIMain {
         case "ports": body = groupHelp("val ports <status|install|remove>", [("status [--json]", "Show standard local port status"), ("install", "Enable standard local ports"), ("remove", "Remove standard local port forwarding")], examples: ["val ports status"])
         case "shell": body = groupHelp("val shell <status|install|uninstall>", [("status", "Show PHP shell integration"), ("install", "Install PHP shell integration"), ("uninstall", "Remove PHP shell integration")], examples: ["val shell status"])
         case "status": body = "Usage: val status [--json]\nShow whether Vaelen Core is running."
-        case "link": body = "Usage: val link [project-directory]\nLink and serve a project folder. With no directory, use the current directory.\nExample: val link\nExample: val link ./my-app"
-        case "unlink": body = "Usage: val unlink <project-directory>\nUnlink a project without deleting its files.\nExample: val unlink ./my-app"
+        case "link": body = "Usage: val link [project-directory] [--host HOST]\nLink and serve a project folder. With no directory, use the current directory. Use --host to add an exact hostname; repeating the same host is safe. New hosts inherit configuration only when all current project routes have the same target and TLS mode. If they differ, Vaelen refuses to guess; use ‘val route add’ with an explicit target and TLS choice.\nExample: val link ./my-app --host api.my-app.test"
+        case "unlink": body = "Usage: val unlink <project-directory>\nRemove Vaelen's explicit project-link relationship without deleting files or changing any route. To remove just one hostname, use ‘val route remove <route-id>’.\nExample: val unlink ./my-app"
         case "park": body = "Usage: val park [workspace-folder]\nPark a folder in your workspace. With no folder, use the current directory.\nExample: val park\nExample: val park ~/Code/old-project"
         case "unpark": body = "Usage: val unpark [workspace-folder]\nUnpark a folder without deleting it. With no folder, use the current directory.\nExample: val unpark\nExample: val unpark ~/Code/old-project"
         case "links": body = "Usage: val links [--json]\nList linked projects."
@@ -467,8 +479,17 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "link":
-            guard args.count <= 2 else { throw CLIError.usage }
-            return .link(path: args.count == 2 ? args[1] : nil)
+            var path: String?
+            var hostname: String?
+            var index = 1
+            while index < args.count {
+                if args[index] == "--host", index + 1 < args.count, hostname == nil {
+                    hostname = args[index + 1]; index += 2
+                } else if !args[index].hasPrefix("-"), path == nil {
+                    path = args[index]; index += 1
+                } else { throw CLIError.commandUsage("link") }
+            }
+            return .link(path: path, hostname: hostname)
         case "unlink": return .unlink(path: try requiredPath(args))
         case "park":
             guard args.count <= 2 else { throw CLIError.commandUsage("park") }
@@ -705,14 +726,14 @@ struct VaelenCLIMain {
                     ("Protocol", String(status.protocolVersion))
                 ]))
             }
-        case .link(let path):
+        case .link(let path, let requestedHostname):
             let workingPath = URL(fileURLWithPath: workingDirectory).standardizedFileURL.resolvingSymlinksInPath().path
             var preflightRoutes: [RouteIntent] = []
             if path == nil {
                 preflightRoutes = try await client.routeList()
                 let linkedAtPath = routesForProject(preflightRoutes, projectID: nil, projectPath: workingPath)
                 if linkedAtPath.isEmpty {
-                    let expectedHost = URL(fileURLWithPath: workingPath).lastPathComponent + ".test"
+                    let expectedHost = requestedHostname ?? (URL(fileURLWithPath: workingPath).lastPathComponent + ".test")
                     if let collision = preflightLinkCollision(hostname: expectedHost, projectPath: workingPath, routes: preflightRoutes) {
                         throw CLIError.message("Cannot link this project: \(expectedHost) is already routed to another project (\(collision.projectPath ?? "existing route")). Nothing was registered or changed.")
                     }
@@ -720,7 +741,7 @@ struct VaelenCLIMain {
             }
             let result = try await client.link(path: path, workingDirectory: workingDirectory, name: nil)
             guard let project = result.project else { throw CLIError.message("Core returned no linked project.") }
-            guard path == nil else {
+            guard path == nil || requestedHostname != nil else {
                 print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(displayPath(project.path))")
                 break
             }
@@ -749,11 +770,27 @@ struct VaelenCLIMain {
                     let report = try await client.projectInspect(selector: canonicalPath, workingDirectory: canonicalPath)
                     let allRoutes = try await client.routeList()
                     let ownedRoutes = routesForProject(allRoutes, projectID: project.id, projectPath: canonicalPath)
-                    guard ownedRoutes.count <= 1 else { throw CLIError.message("The project has multiple Vaelen routes. Review ‘val route list’; no route was changed.") }
-                    if let existing = ownedRoutes.first { return existing }
-                    let hostname = URL(fileURLWithPath: canonicalPath).lastPathComponent + ".test"
+                    if requestedHostname == nil {
+                        guard ownedRoutes.count <= 1 else { throw CLIError.message("The project has multiple Vaelen routes. Choose one with --host HOST; no route was changed.") }
+                        if let existing = ownedRoutes.first { return existing }
+                    }
+                    let hostname = requestedHostname ?? (URL(fileURLWithPath: canonicalPath).lastPathComponent + ".test")
+                    if let existing = allRoutes.first(where: { $0.route.hostname.caseInsensitiveCompare(hostname) == .orderedSame }) {
+                        guard ownedRoutes.contains(where: { $0.route.id == existing.route.id }) else {
+                            throw CLIError.message("\(hostname) is already routed to another project (\(existing.projectPath ?? "existing route")). Nothing was changed.")
+                        }
+                        return existing
+                    }
                     if let collision = hostnameCollision(hostname, candidateProjectRoutes: ownedRoutes, allRoutes: allRoutes) {
                         throw CLIError.message("\(hostname) is already routed to another project (\(collision.projectPath ?? "existing route")).")
+                    }
+                    let inheritedConfiguration: (target: RouteTarget, tls: TLSMode)?
+                    do {
+                        inheritedConfiguration = try additionalHostConfiguration(from: ownedRoutes)
+                    } catch AdditionalHostConfigurationError.differingTargets {
+                        throw CLIError.message("This project has routes with different targets. Use ‘val route add’ to choose the new route target explicitly.")
+                    } catch AdditionalHostConfigurationError.differingTLSModes {
+                        throw CLIError.message("This project has routes with different TLS modes. Vaelen will not guess a mode for the new hostname; use ‘val route add’ with an explicit TLS choice.")
                     }
                     guard let relativeRoot = report.derived.framework.suggestedDocumentRoot else {
                         throw CLIError.message("Vaelen could not determine a supported document root. Add or correct the project’s web entry point, then retry.")
@@ -764,6 +801,9 @@ struct VaelenCLIMain {
                         throw CLIError.message("The planned document root does not exist: \(documentRoot).")
                     }
                     let target: RouteTarget
+                    if let inheritedConfiguration {
+                        target = inheritedConfiguration.target
+                    } else {
                     let detectedFramework = report.derived.framework.framework.lowercased()
                     if report.derived.framework.composerPHPRequirement != nil || detectedFramework.contains("php") || detectedFramework.contains("laravel") || detectedFramework.contains("wordpress") {
                         guard report.observed.php.fpmHealth == "healthy", let socket = report.observed.php.fpmSocket else {
@@ -773,7 +813,9 @@ struct VaelenCLIMain {
                     } else {
                         target = .staticFiles(documentRoot: documentRoot)
                     }
-                    let intent = RouteIntent(route: Route(hostname: hostname, target: target, tls: .disabled), projectID: project.id, projectPath: canonicalPath)
+                    }
+                    let tls = inheritedConfiguration?.tls ?? .disabled
+                    let intent = RouteIntent(route: Route(hostname: hostname, target: target, tls: tls), projectID: project.id, projectPath: canonicalPath)
                     attemptedRoute = intent
                     let router = try await client.routingStatus()
                     guard router.state == .running, router.health == .healthy else { throw CLIError.message("Vaelen routing is not healthy; no route was applied.") }
@@ -784,7 +826,7 @@ struct VaelenCLIMain {
                 let disposition = result.created ? "The project link created by this invocation was rolled back." : "The pre-existing project link and all existing routes were left unchanged."
                 throw CLIError.message("Could not finish linking \(project.name): \(linkFailureDescription(error)). \(disposition)\(cleanup)")
             }
-            print("\(result.created ? "Linked" : "Already linked") \(project.name)\nServing \(servingRoute.route.hostname) at \(servingRoute.route.tls == .local ? "https" : "http")://\(servingRoute.route.hostname)")
+            print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(requestedHostname == nil ? "Serving" : "Configured") \(servingRoute.route.hostname) at \(servingRoute.route.tls == .local ? "https" : "http")://\(servingRoute.route.hostname)")
         case .unlink(let path):
             try await client.unlink(path: path, name: nil, workingDirectory: workingDirectory)
             print("Unlinked project")

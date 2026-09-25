@@ -45,6 +45,10 @@ final class CaddyRouterTests: XCTestCase {
         let php = phpFixture.module
         let phpPackage = phpFixture.package
         try Data("<?php echo 'php response';".utf8).write(to: root.appendingPathComponent("index.php"))
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
+        try Data("<?php echo 'nested response';".utf8).write(to: root.appendingPathComponent("nested/check.php"))
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("nested/one/two"), withIntermediateDirectories: true)
+        try Data("<?php echo 'deep nested response';".utf8).write(to: root.appendingPathComponent("nested/one/two/deep.php"))
         try Data("asset response".utf8).write(to: root.appendingPathComponent("asset.txt"))
 
         let layout = VaelenFilesystemLayout(rootURL: root)
@@ -68,6 +72,17 @@ final class CaddyRouterTests: XCTestCase {
         let phpPath = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/index.php")
         XCTAssertEqual(phpPath.status, 200, phpPath.body)
         XCTAssertFalse(phpPath.body.contains("<?php"), phpPath.body)
+        let nested = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/nested/check.php")
+        XCTAssertEqual(nested.status, 200, nested.body)
+        XCTAssertEqual(nested.body, "nested response")
+        XCTAssertFalse(nested.body.contains("<?php"), nested.body)
+        let deepNested = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/nested/one/two/deep.php")
+        XCTAssertEqual(deepNested.status, 200, deepNested.body)
+        XCTAssertEqual(deepNested.body, "deep nested response")
+        XCTAssertFalse(deepNested.body.contains("<?php"), deepNested.body)
+        let missingPHP = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/nested/one/two/missing.php")
+        XCTAssertEqual(missingPHP.status, 404, missingPHP.body)
+        XCTAssertFalse(missingPHP.body.contains("<?php"), missingPHP.body)
         let asset = try runHTTP(host: "php.test", port: configuration.httpPort, path: "/asset.txt")
         XCTAssertEqual(asset.status, 200, asset.body)
         XCTAssertEqual(asset.body, "asset response")

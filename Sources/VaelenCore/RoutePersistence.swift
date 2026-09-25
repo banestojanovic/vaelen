@@ -165,6 +165,15 @@ public final class RouteIntentRepository: @unchecked Sendable {
         }
     }
 
+    /// Removes only the durable project identity from its routes. Route IDs,
+    /// route JSON (including hostname, target, and TLS), project paths, and
+    /// independent park ownership records remain unchanged.
+    public func disassociateProject(projectID: UUID) throws {
+        try store.query("UPDATE route_intents SET project_id = NULL WHERE project_id = ?", bind: {
+            store.bind(projectID.uuidString, to: $0, index: 1)
+        }) { _ in }
+    }
+
     public func parkRouteOwnerships() throws -> [ParkRouteOwnership] {
         var result = [ParkRouteOwnership]()
         try store.query("SELECT route_id,parent_path,child_path FROM park_route_ownership ORDER BY parent_path,child_path") { statement in

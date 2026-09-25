@@ -53,6 +53,25 @@ final class RoutingTests: XCTestCase {
         XCTAssertEqual(promoted.projectID, projectID)
     }
 
+    func testUnlinkDisassociatesProjectIDButPreservesRouteAndParkOwnership() throws {
+        let (_, repository, root) = try repositoryFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let route = Route(hostname: "unlink-park.test", target: .fastCGI(socketPath: "/tmp/php.sock", documentRoot: "/tmp/park/child/public"), tls: .local)
+        let projectID = UUID()
+        let parent = "/tmp/park"
+        let child = "/tmp/park/child"
+        let ownership = ParkRouteOwnership(routeID: route.id, parentPath: parent, childPath: child)
+        try repository.insertParkOwnedRoute(RouteIntent(route: route, projectID: projectID, projectPath: child), parentPath: parent, childPath: child)
+
+        try repository.disassociateProject(projectID: projectID)
+
+        let remaining = try XCTUnwrap(repository.all().first)
+        XCTAssertEqual(remaining.route, route)
+        XCTAssertNil(remaining.projectID)
+        XCTAssertEqual(remaining.projectPath, child)
+        XCTAssertEqual(try repository.parkRouteOwnerships(), [ownership])
+    }
+
     func testParkOwnershipSchemaMigrationPreservesFiveRoutesAndIsIdempotent() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-schema-migration-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
