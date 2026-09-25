@@ -76,6 +76,9 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
         }
         XCTAssertThrowsError(try VaelenCLIMain.parse(["parks", "unexpected"]))
         XCTAssertThrowsError(try VaelenCLIMain.parse(["links", "--json", "unexpected"]))
+        guard case .edit(selector: nil) = try VaelenCLIMain.parse(["edit"]) else { return XCTFail("edit should support current-directory project selection") }
+        guard case .edit(selector: "sample") = try VaelenCLIMain.parse(["edit", "sample"]) else { return XCTFail("edit selector was not parsed") }
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["edit", "one", "two"]))
     }
 
     func testHelpDocumentsProjectRelationshipSyntax() throws {
@@ -85,6 +88,7 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
             ("unpark", "Usage: val unpark [workspace-folder]"),
             ("link", "Usage: val link [project-directory]"),
             ("links", "Usage: val links [--json]"),
+            ("edit", "Usage: val edit [project]"),
             ("unlink", "Usage: val unlink <project-directory>")
         ]
         for (command, entry) in helpEntries {
@@ -101,6 +105,6 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
 
     func testEmptyRelationshipListsHaveClearHumanOutput() {
         XCTAssertEqual(VaelenCLIMain.parkedPathsOutput([]), "No parked folders.")
-        XCTAssertEqual(VaelenCLIMain.linkedProjectsOutput([]), "No linked projects.")
+        XCTAssertEqual(VaelenCLIMain.linkedProjectsOutput([]), "Linked projects\nNo linked projects.")
     }
 }

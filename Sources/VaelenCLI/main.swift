@@ -24,6 +24,7 @@ enum CLICommand {
     case link(path: String?, hostname: String?)
     case unlink(path: String)
     case links(json: Bool)
+    case edit(selector: String?)
     case park(path: String?)
     case unpark(path: String?)
     case parks(json: Bool)
@@ -215,7 +216,7 @@ struct VaelenCLIMain {
     static func helpText(for path: [String]) -> String {
         if path.isEmpty {
             let sections: [(String, [(String, String)])] = [
-                ("Projects", [("link", "Link a project"), ("links", "List linked projects"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("parked", "List sites discovered in parked folders"), ("sites", "List configured sites and serving observations"), ("open", "Open a configured site"), ("db", "Open an eligible project database"), ("site", "Inspect a site driver"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
+                ("Projects", [("link", "Link a project"), ("links", "List linked projects and hosts"), ("edit", "Open project in configured editor"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("parked", "List sites discovered in parked folders"), ("sites", "List configured sites and serving observations"), ("open", "Open a configured site"), ("db", "Open an eligible project database"), ("site", "Inspect a site driver"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
                 ("Overview", [("status", "Show Vaelen status"), ("doctor", "Check Vaelen services")]),
                 ("Web", [("secure", "Enable HTTPS for a site route"), ("unsecure", "Serve a site route over HTTP")]),
                 ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
@@ -280,6 +281,7 @@ struct VaelenCLIMain {
         case "park": body = "Usage: val park [workspace-folder]\nPark a folder in your workspace. With no folder, use the current directory.\nExample: val park\nExample: val park ~/Code/old-project"
         case "unpark": body = "Usage: val unpark [workspace-folder]\nUnpark a folder without deleting it. With no folder, use the current directory.\nExample: val unpark\nExample: val unpark ~/Code/old-project"
         case "links": body = "Usage: val links [--json]\nList linked projects."
+        case "edit": body = "Usage: val edit [project]\nOpen the selected project folder in the editor configured in Vaelen Settings. Without a selector, the current directory must identify exactly one linked project."
         case "parks": body = "Usage: val parks [--json]\nList parked workspace folders."
         case "parked": body = "Usage: val parked [--json]\nList projects discovered inside parked workspace folders. This is distinct from val parks, which lists the folders themselves. Missing parked folders are reported separately."
         case "sites": body = "Usage: val sites [--json]\nList configured route sites, project availability, and the router's independent serving observation. A configured route is not assumed to be served."
@@ -459,6 +461,7 @@ struct VaelenCLIMain {
             guard args.count <= 2 else { throw CLIError.usage }
             return .routeTLS(hostname: args.count == 2 ? args[1] : nil, secure: first == "secure")
         case "links": return .links(json: try listJSONOption(args))
+        case "edit": guard args.count <= 2 else { throw CLIError.commandUsage("edit") }; return .edit(selector: args.count == 2 ? args[1] : nil)
         case "parks", "paths": return .parks(json: try listJSONOption(args))
         case "parked": return .parked(json: try listJSONOption(args))
         case "sites": return .sites(json: try listJSONOption(args))
@@ -848,7 +851,42 @@ struct VaelenCLIMain {
         case .links(let json):
             let projects = try await client.linkedProjects()
             if json { print(String(decoding: try IPCCodec.encode(ProjectListEnvelope(projects: projects)), as: UTF8.self)) }
-            else { print(linkedProjectsOutput(projects)) }
+            else {
+                let routes = try await client.routeList()
+                let observation = try await client.routeObservedList()
+                var phpByProject = [String: String]()
+                for project in projects where project.availability == PathAvailability.available.rawValue {
+                    if let php = try? await client.projectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: workingDirectory), php.available, let version = php.effectiveVersion {
+                        phpByProject[project.path] = version
+                    }
+                }
+                print(linkedProjectsOutput(projects, routes: routes, observedRoutes: observation.observedRoutes, phpByProject: phpByProject))
+            }
+        case .edit(let selector):
+            let projects = try await client.linkedProjects()
+            let project = try selectedProject(selector, projects: projects, workingDirectory: workingDirectory)
+            guard project.registration == ProjectRegistrationKind.linked.rawValue else {
+                throw CLIError.message("\(project.name) is not linked. Link it with ‘val link’ before opening it in the configured editor.")
+            }
+            guard project.availability == PathAvailability.available.rawValue, FileManager.default.isReadableFile(atPath: project.path) else {
+                throw CLIError.message("Project ‘\(project.name)’ is unavailable at \(displayPath(project.path)); it cannot be opened in an editor.")
+            }
+            let preference = try EditorPreferenceStore().load()
+            guard let preference else { throw CLIError.message("No editor is configured. Choose an installed editor in Vaelen Settings → General, then run ‘val edit’ again.") }
+            let appURL = URL(fileURLWithPath: preference.applicationPath, isDirectory: true).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: appURL.path),
+                  Bundle(url: appURL)?.bundleIdentifier == preference.bundleIdentifier else {
+                throw CLIError.message("The configured editor ‘\(preference.bundleIdentifier)’ is no longer installed at \(preference.applicationPath). Choose it again in Vaelen Settings → General.")
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                NSWorkspace.shared.open([URL(fileURLWithPath: project.path, isDirectory: true)], withApplicationAt: appURL, configuration: configuration) { _, error in
+                    if let error { continuation.resume(throwing: error) }
+                    else { continuation.resume() }
+                }
+            }
+            print("Opening \(project.name) in \(preference.bundleIdentifier): \(project.path)")
         case .park(let path):
             let result = try await client.park(path: path, workingDirectory: workingDirectory)
             guard let parked = result.path else { throw CLIError.message("Core returned no parked path.") }
@@ -1115,8 +1153,8 @@ struct VaelenCLIMain {
         return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
     }
 
-    static func linkedProjectsOutput(_ projects: [ProjectWire]) -> String {
-        HumanOutput.list(projects.map { [$0.name, displayPath($0.path), $0.availability] }, headers: ["Project", "Path", "Availability"], empty: "No linked projects.")
+    static func linkedProjectsOutput(_ projects: [ProjectWire], routes: [RouteIntent] = [], observedRoutes: [Route]? = nil, phpByProject: [String: String] = [:]) -> String {
+        linkedProjectsHumanOutput(projects, routes: routes, observedRoutes: observedRoutes, phpByProject: phpByProject)
     }
 
     static func parkedPathsOutput(_ paths: [ParkedPathWire]) -> String {

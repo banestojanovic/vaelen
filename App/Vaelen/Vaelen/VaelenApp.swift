@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Observation
 import ServiceManagement
+import UniformTypeIdentifiers
 import VaelenIPC
 import VaelenCore
 
@@ -475,6 +476,32 @@ final class AppModel {
     func openProjectFolder(_ project: ProjectWire) {
         guard canOpenProjectFolder(project) else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: project.path, isDirectory: true))
+    }
+
+    func openProjectInEditor(_ project: ProjectWire) {
+        guard canOpenProjectFolder(project) else {
+            serviceError = "Project folder is unavailable at \(project.path)."
+            return
+        }
+        do {
+            guard let preference = try EditorPreferenceStore().load() else {
+                serviceError = "No editor is configured. Choose an installed editor in Vaelen Settings → General."
+                return
+            }
+            let appURL = URL(fileURLWithPath: preference.applicationPath, isDirectory: true).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: appURL.path),
+                  Bundle(url: appURL)?.bundleIdentifier == preference.bundleIdentifier else {
+                serviceError = "Configured editor is unavailable. Choose it again in Vaelen Settings → General."
+                return
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.open([URL(fileURLWithPath: project.path, isDirectory: true)], withApplicationAt: appURL, configuration: configuration) { [weak self] _, error in
+                if let error { Task { @MainActor in self?.serviceError = "Could not open project in editor: \(error.localizedDescription)" } }
+            }
+        } catch {
+            serviceError = "Could not read the editor preference: \(error.localizedDescription)"
+        }
     }
 
     func canOpenProjectFolder(_ project: ProjectWire) -> Bool {
@@ -1246,6 +1273,8 @@ struct ProjectCard: View {
                     Divider()
                 }
                 Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
+                Button("Open in Editor", systemImage: "curlybraces") { model.openProjectInEditor(project) }
+                    .disabled(!model.canOpenProjectFolder(project))
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 22, height: 22)
@@ -1666,6 +1695,7 @@ struct SettingsView: View {
 
 struct GeneralSettingsView: View {
     let model: AppModel
+    @State private var editorStatus: String?
 
     var body: some View {
         SettingsContent(title: "General", subtitle: "Vaelen keeps your local development environment ready from the menu bar.") {
@@ -1694,7 +1724,51 @@ struct GeneralSettingsView: View {
                         .help(refreshError)
                 }
             }
+            SettingsGroup(title: "Code Editor", footer: "Used by ‘val edit’ and each project’s Open in Editor action. Vaelen opens the selected folder directly in this exact installed application.") {
+                let selected = try? EditorPreferenceStore().load()
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(selected?.bundleIdentifier ?? "No editor selected")
+                            .font(.subheadline)
+                        if let path = selected?.applicationPath {
+                            Text(path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Spacer()
+                    Button(selected == nil ? "Choose…" : "Change…", systemImage: "app.badge") { chooseEditor() }
+                    if selected != nil {
+                        Button("Clear") { clearEditor() }
+                    }
+                }
+                if let editorStatus { Text(editorStatus).font(.caption).foregroundStyle(.secondary) }
+            }
         }
+    }
+
+    private func chooseEditor() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Code Editor"
+        panel.message = "Select an installed macOS editor application."
+        panel.prompt = "Use Editor"
+        panel.allowedContentTypes = [.application]
+        panel.allowsOtherFileTypes = false
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let bundle = Bundle(url: url), let identifier = bundle.bundleIdentifier else {
+            editorStatus = "Choose a valid installed application bundle."
+            return
+        }
+        do {
+            try EditorPreferenceStore().save(EditorPreference(bundleIdentifier: identifier, applicationPath: url.standardizedFileURL.path))
+            editorStatus = "Editor selected: \(identifier)"
+        } catch { editorStatus = "Could not save editor preference: \(error.localizedDescription)" }
+    }
+
+    private func clearEditor() {
+        do { try EditorPreferenceStore().save(nil); editorStatus = "No editor is configured." }
+        catch { editorStatus = "Could not clear editor preference: \(error.localizedDescription)" }
     }
 }
 

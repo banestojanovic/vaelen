@@ -176,6 +176,50 @@ func routeConfigurationMatches(_ observed: Route, configured: Route) -> Bool {
         && observed.tls == configured.tls
 }
 
+struct LinkedProjectDisplay {
+    let project: ProjectWire
+    let hosts: [(url: String, observation: String)]
+    let effectivePHP: String?
+}
+
+func linkedProjectDisplay(projects: [ProjectWire], routes: [RouteIntent], observedRoutes: [Route]?, phpByProject: [String: String]) -> [LinkedProjectDisplay] {
+    projects.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }.map { project in
+        let projectRoutes = matchingRoutes(for: project, among: routes).sorted { $0.route.hostname.localizedStandardCompare($1.route.hostname) == .orderedAscending }
+        let hosts = projectRoutes.map { intent -> (url: String, observation: String) in
+            let isObserved = observedRoutes?.contains { routeConfigurationMatches($0, configured: intent.route) } ?? false
+            let sameHostname = observedRoutes?.contains { $0.hostname.caseInsensitiveCompare(intent.route.hostname) == .orderedSame } ?? false
+            let state = observedRoutes == nil ? "Caddy observation unavailable" : (isObserved ? "Observed by Caddy" : (sameHostname ? "Caddy has a different route" : "Not observed by Caddy"))
+            return (siteURL(for: intent.route)?.absoluteString ?? "(invalid URL)", state)
+        }
+        return LinkedProjectDisplay(project: project, hosts: hosts, effectivePHP: phpByProject[project.path])
+    }
+}
+
+func linkedProjectsHumanOutput(_ projects: [ProjectWire], routes: [RouteIntent], observedRoutes: [Route]?, phpByProject: [String: String], width: Int = HumanOutput.terminalWidth) -> String {
+    let records = linkedProjectDisplay(projects: projects, routes: routes, observedRoutes: observedRoutes, phpByProject: phpByProject)
+    guard !records.isEmpty else { return HumanOutput.heading("Linked projects") + "\nNo linked projects." }
+    var output = HumanOutput.heading("Linked projects")
+    for record in records {
+        let projectHeading = record.project.name.count <= width ? HumanOutput.heading(record.project.name) : HumanOutput.wrap(record.project.name, width: width)
+        output += "\n\n" + projectHeading
+        let availability = record.project.availability == PathAvailability.available.rawValue ? "Available" : "Folder unavailable · \(record.project.availability)"
+        let rows = [("Path", record.project.path), ("Folder", availability), ("Effective PHP", record.effectivePHP ?? "Unavailable")]
+        for (label, value) in rows {
+            output += "\n" + HumanOutput.wrap(value, width: max(12, width - label.count - 4), firstPrefix: "\(label)  ", nextPrefix: String(repeating: " ", count: label.count + 2))
+        }
+        if record.hosts.isEmpty {
+            output += "\n" + HumanOutput.wrap("Configured hosts", width: max(12, width)) + "\n  None"
+        } else {
+            output += "\n" + HumanOutput.wrap("Configured hosts (configuration is separate from live Caddy observation)", width: max(12, width))
+            for host in record.hosts {
+                output += "\n" + HumanOutput.wrap(host.url, width: max(12, width - 2), firstPrefix: "  ", nextPrefix: "  ")
+                output += "\n" + HumanOutput.wrap("Configured · \(host.observation)", width: max(12, width - 4), firstPrefix: "    ", nextPrefix: "    ")
+            }
+        }
+    }
+    return output
+}
+
 func externalOpenArguments(bundleIdentifier: String?, url: URL) -> [String] {
     if let bundleIdentifier { return ["-b", bundleIdentifier, url.absoluteString] }
     return [url.absoluteString]
