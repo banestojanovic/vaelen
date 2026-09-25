@@ -95,9 +95,14 @@ final class AppModel {
     private(set) var relationshipMutationInFlight = false
     private var client: VaelenCoreClient?
     private var refreshGeneration = 0
+    private var relationshipSnapshotGeneration = 0
     private var refreshInFlight = false
     private var refreshRequested = false
     private var monitorTask: Task<Void, Never>?
+    private var projectSettingsVisible = false
+    private var projectSettingsRefreshTask: Task<Void, Never>?
+    private var projectRelationshipsRefreshInFlight = false
+    private(set) var projectRelationshipsRefreshError: String?
 
     var savedServiceIntents: Set<String>? {
         guard case .running(let status, _, _, _, _, _, _, _, _) = state else { return nil }
@@ -126,6 +131,8 @@ final class AppModel {
 
         refreshGeneration += 1
         let generation = refreshGeneration
+        relationshipSnapshotGeneration += 1
+        let relationshipGeneration = relationshipSnapshotGeneration
         let hasRunningSnapshot: Bool
         if case .running = state { hasRunningSnapshot = true } else { hasRunningSnapshot = false }
         if let client { await client.disconnect() }
@@ -216,8 +223,11 @@ final class AppModel {
             let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
             projectReports = reports
-            self.linkedProjects = linkedProjects
-            self.parkedFolders = parkedFolders
+            if relationshipGeneration == relationshipSnapshotGeneration {
+                self.linkedProjects = linkedProjects
+                self.parkedFolders = parkedFolders
+                projectRelationshipsRefreshError = nil
+            }
             self.phpCatalog = phpCatalog
             self.phpOperation = phpOperation
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
@@ -533,6 +543,56 @@ final class AppModel {
         monitorTask = Task { [weak self] in await self?.monitor() }
     }
 
+    func setProjectSettingsVisible(_ visible: Bool) {
+        guard projectSettingsVisible != visible else { return }
+        projectSettingsVisible = visible
+        if !visible {
+            relationshipSnapshotGeneration += 1
+            projectSettingsRefreshTask?.cancel()
+            projectSettingsRefreshTask = nil
+            return
+        }
+
+        projectSettingsRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled && self.projectSettingsVisible {
+                await self.refreshProjectRelationships()
+                do { try await Task.sleep(for: .seconds(3)) }
+                catch { return }
+            }
+        }
+    }
+
+    private func refreshProjectRelationships() async {
+        guard projectSettingsVisible, !relationshipMutationInFlight,
+              !projectRelationshipsRefreshInFlight else { return }
+        projectRelationshipsRefreshInFlight = true
+        relationshipSnapshotGeneration += 1
+        let generation = relationshipSnapshotGeneration
+        let refreshClient = makeCoreClient()
+        do {
+            try await refreshClient.connect()
+            let linked = try await refreshClient.linkedProjects()
+            let parked = try await refreshClient.parkedPaths()
+            guard generation == relationshipSnapshotGeneration,
+                  projectSettingsVisible, !relationshipMutationInFlight else {
+                await refreshClient.disconnect()
+                projectRelationshipsRefreshInFlight = false
+                return
+            }
+            linkedProjects = linked
+            parkedFolders = parked
+            projectRelationshipsRefreshError = nil
+            await refreshClient.disconnect()
+        } catch {
+            await refreshClient.disconnect()
+            if generation == relationshipSnapshotGeneration && projectSettingsVisible {
+                projectRelationshipsRefreshError = error.localizedDescription
+            }
+        }
+        projectRelationshipsRefreshInFlight = false
+    }
+
     func quitVaelen() async {
         guard !isQuitting else { return }
         // These flags cover only live request/reply operations now; the slow
@@ -619,6 +679,7 @@ final class AppModel {
             return false
         }
         relationshipError = nil
+        relationshipSnapshotGeneration += 1
         relationshipOperation = operation
         relationshipMutationInFlight = true
         return true
@@ -1506,9 +1567,13 @@ struct SettingsView: View {
         .frame(width: 760, height: 520)
         .onAppear {
             model.startMonitoring()
+            model.setProjectSettingsVisible(true)
             DispatchQueue.main.async {
                 SettingsWindowActivation.bringForward()
             }
+        }
+        .onDisappear {
+            model.setProjectSettingsVisible(false)
         }
     }
 }
@@ -1814,6 +1879,10 @@ struct ProjectSettingsView: View {
             }
             if let error = model.relationshipError {
                 VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red).font(.caption)
+            }
+            if let error = model.projectRelationshipsRefreshError {
+                VaelenStatusLabel("Workspace and linked project state may be stale: \(error)", systemImage: "arrow.clockwise.circle", tint: .orange)
+                    .font(.caption)
             }
         }
     }
