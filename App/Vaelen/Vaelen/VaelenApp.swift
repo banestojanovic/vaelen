@@ -38,27 +38,27 @@ struct VaelenApp: App {
     }
 }
 
-/// Official Vaelen marks are kept in the app bundle. The current-color SVG is
-/// used as an AppKit template in the menu bar so macOS controls tinting in light,
-/// dark, and highlighted states. Settings uses the supplied appearance-specific
-/// monochrome artwork rather than recoloring or approximating the mark.
+/// Supplied scalable brand variants are kept in the app bundle. The tiny
+/// menu-bar artwork is an AppKit template so macOS controls light, dark, and
+/// highlighted tinting. Settings uses the supplied icon-only vector as a
+/// template beside native text, which stays crisp in both appearances.
+@MainActor
 private enum VaelenBrand {
     static let menuBarImage: NSImage = {
         guard let url = Bundle.main.url(forResource: "vaelen-mark-currentcolor", withExtension: "svg"),
               let image = NSImage(contentsOf: url) else {
             return NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: "Vaelen") ?? NSImage()
         }
-        image.size = NSSize(width: 18, height: 18 * 145 / 214)
+        image.size = NSSize(width: 21, height: 16.8)
         image.isTemplate = true
         return image
     }()
 
     static var settingsImage: NSImage {
-        let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let asset = isDark ? "vaelen-mark-white" : "vaelen-mark-dark"
-        guard let url = Bundle.main.url(forResource: asset, withExtension: "svg"),
+        guard let url = Bundle.main.url(forResource: "vaelen-mark-dark", withExtension: "svg"),
               let image = NSImage(contentsOf: url) else { return menuBarImage }
-        image.size = NSSize(width: 36, height: 36 * 145 / 214)
+        image.size = NSSize(width: 36, height: 25)
+        image.isTemplate = true
         return image
     }
 }
