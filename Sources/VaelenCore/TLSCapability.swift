@@ -5,6 +5,30 @@ import CryptoKit
 public enum TLSCapabilityState: String, Codable, Sendable { case absent, createdButUntrusted, trusted, unhealthy, ownershipMismatch }
 public enum TLSOwnershipState: String, Codable, Sendable { case unverified, owned, mismatch }
 public enum TLSTrustProvenance: String, Codable, Sendable { case none, confirmedByVaelen }
+
+/// User-facing trust state keeps observed Keychain trust distinct from trust
+/// whose creation Vaelen can safely authorize for removal.
+public struct TLSTrustControlPresentation: Equatable, Sendable {
+    public let title: String
+    public let canTrust: Bool
+    public let canRemove: Bool
+
+    public init(_ status: TLSStatus) {
+        if status.trustObserved && status.trustProvenance == .confirmedByVaelen {
+            title = "Trusted"
+            canTrust = false
+            canRemove = true
+        } else if status.trustObserved {
+            title = "Trusted (origin unknown)"
+            canTrust = false
+            canRemove = false
+        } else {
+            title = "Needs attention"
+            canTrust = status.state == .createdButUntrusted
+            canRemove = false
+        }
+    }
+}
 public enum TLSTrustOperationState: String, Codable, Sendable { case trusted, alreadyTrustedUnknownProvenance, confirmed, untrusted, removed }
 public struct TLSStatus: Codable, Equatable, Sendable {
     public let state: TLSCapabilityState

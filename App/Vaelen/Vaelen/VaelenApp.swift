@@ -1270,9 +1270,10 @@ struct ServicesView: View {
                     }
                 }
                 if let tls {
-                    ServiceRow(title: "Local HTTPS", subtitle: nil, state: tls.trustObserved ? "Trusted" : "Needs attention", stateSymbol: tls.trustObserved ? "checkmark" : "exclamationmark.triangle", stateTint: tls.trustObserved ? .secondary : .orange, busy: model.serviceOperationIs(for: "Local HTTPS")) {
-                        if tls.state == .createdButUntrusted { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
-                        if tls.trustObserved { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
+                    let trustControl = TLSTrustControlPresentation(tls)
+                    ServiceRow(title: "Local HTTPS", subtitle: nil, state: trustControl.title, stateSymbol: tls.trustObserved ? "checkmark" : "exclamationmark.triangle", stateTint: tls.trustObserved ? .secondary : .orange, busy: model.serviceOperationIs(for: "Local HTTPS")) {
+                        if trustControl.canTrust { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
+                        if trustControl.canRemove { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
                     }
                 }
                 if let ports {
