@@ -244,12 +244,17 @@ APPLESCRIPT
 
 smoke_dev() { VAELEN_DEV_INTERNAL=1 smoke; }
 
+is_owned_process_command() {
+  local command="$1"
+  case "$command" in
+    "$CORE"|"$DNS --port 53535"|"$CANONICAL_APP/Contents/Resources/vaelend"|"$CANONICAL_APP/Contents/Resources/vaelendns --port 53535"|*/Vaelen.app/Contents/MacOS/Vaelen) return 0;;
+  esac
+  return 1
+}
+
 owned_pids() {
   ps -axo pid=,command= | while read -r pid command; do
-    case "$command" in
-      "$CORE"|"$DNS --port 53535") echo "$pid";;
-      */Vaelen.app/Contents/MacOS/Vaelen) echo "$pid";;
-    esac
+    is_owned_process_command "$command" && echo "$pid"
   done
 }
 
@@ -257,7 +262,14 @@ stop_owned() {
   local pids; pids="$(owned_pids)"
   [[ -z "$pids" ]] || kill $pids 2>/dev/null || true
   for _ in {1..40}; do pids="$(owned_pids)"; [[ -z "$pids" ]] && return 0; sleep .25; done
-  pids="$(owned_pids)"; [[ -z "$pids" ]] || { echo "$pids" | xargs -n1 kill -KILL; }
+  pids="$(owned_pids)"
+  if [[ -n "$pids" ]]; then
+    echo "stop step timeout: owned Core/DNS/GUI processes still present after 10s: $(echo "$pids" | tr '\n' ' ')" >&2
+    echo "$pids" | xargs -n1 kill -KILL
+    for _ in {1..20}; do pids="$(owned_pids)"; [[ -z "$pids" ]] && return 0; sleep .25; done
+    pids="$(owned_pids)"
+    [[ -z "$pids" ]] || { echo "stop step failed: processes remain after SIGKILL: $(echo "$pids" | tr '\n' ' ')" >&2; return 1; }
+  fi
 }
 
 stop_exact_managed() {
@@ -285,6 +297,7 @@ stop_exact_managed() {
     [[ "$live" == 0 ]] && return 0
     sleep .25
   done
+  echo "stop step failed: managed service PID(s) remained after 10s: $(for file in "$SUPPORT/instances/php/8.4.23/process.json" "$SUPPORT/instances/mysql/default/process.json" "$SUPPORT/instances/caddy/process.json"; do [[ -f "$file" ]] || continue; pid="$(sed -n 's/.*\"pid\":\([0-9][0-9]*\).*/\1/p' "$file")"; [[ -n "$pid" && -n "$(ps -p "$pid" -o pid= 2>/dev/null)" ]] && printf '%s:%s ' "${file##*/}" "$pid"; done)" >&2
   return 1
 }
 
@@ -347,26 +360,54 @@ cleanup_disposable_residue() {
 
 start_runtime() {
   local gui="${1:-$CANONICAL_APP}"
-  [[ -z "$(owned_pids)" ]] || return 1
+  [[ -z "$(owned_pids)" ]] || { echo "start step failed: no owned Vaelen process remains before launch" >&2; return 1; }
   mkdir -p "$RUNTIME/pids" "$LOG"
   "$CORE" >>"$LOG/vaelend-dev.log" 2>&1 & echo $! > "$RUNTIME/pids/harness-vaelend.pid"
   "$DNS" --port 53535 >>"$LOG/vaelendns-dev.log" 2>&1 & echo $! > "$RUNTIME/pids/harness-vaelendns.pid"
   for _ in {1..60}; do [[ -S "$RUNTIME/sockets/core.sock" ]] && break; sleep .25; done
-  [[ -S "$RUNTIME/sockets/core.sock" ]] || return 1
-  "$VAL" php start 8.4.23 >/dev/null || return 1
-  "$VAL" mysql start >/dev/null || return 1
-  "$VAL" routing start >/dev/null || return 1
-  open "$gui" >/dev/null 2>&1 || return 1
+  [[ -S "$RUNTIME/sockets/core.sock" ]] || { echo "start step failed: wait for Core socket (60 x 0.25s)" >&2; return 1; }
+  "$VAL" php start 8.4.23 || { echo "start step failed: val php start 8.4.23" >&2; return 1; }
+  "$VAL" mysql start || { echo "start step failed: val mysql start" >&2; return 1; }
+  "$VAL" routing start || { echo "start step failed: val routing start" >&2; return 1; }
+  open "$gui" || { echo "start step failed: open $gui" >&2; return 1; }
+}
+
+wait_for_enabled_services() (
+  [[ -r "$ROOT/Scripts/vaelen-service-readiness" ]] || {
+    echo "readiness step failed: service readiness helper is missing" >&2
+    return 1
+  }
+  export VAELEN_READINESS_VAL="$VAL"
+  export VAELEN_READINESS_INTENTS="$SUPPORT/state/service-intents.json"
+  source "$ROOT/Scripts/vaelen-service-readiness"
+  wait_enabled_services
+)
+
+recovery_step() {
+  local label="$1" status; shift
+  if "$@"; then
+    printf 'recovery: PASS %s\n' "$label"
+    return 0
+  else
+    status=$?
+    printf 'recovery: FAIL %s (exit=%s)\n' "$label" "$status" >&2
+    return 1
+  fi
 }
 
 recover_runtime() {
-  stop_exact_managed || true
-  "$VAL" routing stop >/dev/null 2>&1 || true
-  "$VAL" php stop 8.4.23 >/dev/null 2>&1 || true
-  "$VAL" mysql stop >/dev/null 2>&1 || true
-  stop_owned || true
-  clear_ephemeral || true
-  start_runtime "$CANONICAL_APP"
+  local failed=0
+  recovery_step 'stop exact managed processes' stop_exact_managed || failed=1
+  recovery_step 'val routing stop' "$VAL" routing stop || failed=1
+  recovery_step 'val php stop 8.4.23' "$VAL" php stop 8.4.23 || failed=1
+  recovery_step 'val mysql stop' "$VAL" mysql stop || failed=1
+  recovery_step 'stop owned Core/DNS/GUI' stop_owned || failed=1
+  recovery_step 'clear ephemeral runtime files' clear_ephemeral || failed=1
+  recovery_step 'start runtime' start_runtime "$CANONICAL_APP" || failed=1
+  recovery_step 'wait for enabled services' wait_for_enabled_services || failed=1
+  if [[ "$failed" == 0 ]]; then echo 'recovery result: PASS'; return 0; fi
+  echo 'recovery result: FAIL (one or more steps above failed)' >&2
+  return 1
 }
 
 CLEAN_RUN=""; CLEAN_MOVED=0; CLEAN_APP_MOVED=0; CLEAN_SUCCEEDED=0
@@ -533,29 +574,32 @@ reset_runtime() {
 }
 
 restart() {
-  local snapshot_dir="$(snapshot "restart-$STAMP")" failure=0
-  smoke || { echo "vaelen-dev: pre-restart smoke failed; recovering runtime" >&2; recover_runtime || true; return 1; }
-  "$VAL" routing stop >/dev/null || failure=1
-  "$VAL" php stop 8.4.23 >/dev/null || failure=1
-  "$VAL" mysql stop >/dev/null || failure=1
-  stop_owned || failure=1
-  clear_ephemeral || failure=1
-  [[ "$failure" == 0 ]] && start_runtime || failure=1
-  if [[ "$failure" != 0 ]]; then
-    echo "vaelen-dev: restart failed; attempting runtime recovery" >&2
-    recover_runtime || true
-    die "restart failed (preservation snapshot: $snapshot_dir)"
+  local snapshot_dir="$(snapshot "restart-$STAMP")" failed_step=""
+  if ! smoke; then failed_step='pre-restart smoke'; fi
+  if [[ -z "$failed_step" ]] && ! "$VAL" routing stop; then failed_step='val routing stop'; fi
+  if [[ -z "$failed_step" ]] && ! "$VAL" php stop 8.4.23; then failed_step='val php stop 8.4.23'; fi
+  if [[ -z "$failed_step" ]] && ! "$VAL" mysql stop; then failed_step='val mysql stop'; fi
+  if [[ -z "$failed_step" ]] && ! stop_owned; then failed_step='stop owned Core/DNS/GUI'; fi
+  if [[ -z "$failed_step" ]] && ! clear_ephemeral; then failed_step='clear ephemeral runtime files'; fi
+  if [[ -z "$failed_step" ]] && ! start_runtime; then failed_step='start runtime'; fi
+  if [[ -z "$failed_step" ]] && ! wait_for_enabled_services; then failed_step='enabled service readiness'; fi
+  if [[ -z "$failed_step" ]] && ! verify_preservation "$snapshot_dir"; then failed_step='verify preservation snapshot'; fi
+  if [[ -z "$failed_step" ]] && ! smoke; then failed_step='post-restart smoke'; fi
+  if [[ -n "$failed_step" ]]; then
+    echo "vaelen-dev: restart failed at step: $failed_step (preservation snapshot: $snapshot_dir); attempting recovery" >&2
+    if recover_runtime; then echo "restart recovery: PASS after failure at $failed_step"; else echo "restart recovery: FAIL after failure at $failed_step" >&2; fi
+    die "restart failed at step '$failed_step' (preservation snapshot: $snapshot_dir)"
   fi
-  verify_preservation "$snapshot_dir" || { echo "vaelen-dev: preservation check failed; recovering runtime" >&2; recover_runtime || true; return 1; }
-  smoke || { echo "vaelen-dev: post-restart smoke failed; recovering runtime" >&2; recover_runtime || true; return 1; }
   echo "restart: PASS"
   echo "preserved: $snapshot_dir"
 }
 
-case "${1:-}" in
-  restart) restart;;
-  reset-runtime) reset_runtime;;
-  clean-install) clean_install;;
-  smoke) smoke;;
-  *) echo "Usage: $0 {restart|reset-runtime|clean-install|smoke}" >&2; exit 2;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    restart) restart;;
+    reset-runtime) reset_runtime;;
+    clean-install) clean_install;;
+    smoke) smoke;;
+    *) echo "Usage: $0 {restart|reset-runtime|clean-install|smoke}" >&2; exit 2;;
+  esac
+fi

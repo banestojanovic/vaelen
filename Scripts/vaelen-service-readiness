@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Bounded, read-only readiness checks shared by signed update and tests.
+set -u
+
+VAL="${VAELEN_READINESS_VAL:-$HOME/Library/Application Support/Vaelen/bin/val}"
+INTENTS="${VAELEN_READINESS_INTENTS:-$HOME/Library/Application Support/Vaelen/state/service-intents.json}"
+TIMEOUT="${VAELEN_READINESS_TIMEOUT:-60}"
+INTERVAL="${VAELEN_READINESS_INTERVAL:-0.5}"
+
+readiness_probe() {
+  local service="$1" output="" status_cmd=() expected=''
+  case "$service" in
+    php:*) status_cmd=("$VAL" php status "${service#php:}"); expected='Health[[:space:]]+healthy';;
+    mysql) status_cmd=("$VAL" mysql status); expected='Health[[:space:]]+healthy';;
+    caddy) status_cmd=("$VAL" routing status); expected='Health[[:space:]]+healthy';;
+    mailpit) status_cmd=("$VAL" mailpit status); expected='Health[[:space:]]+healthy';;
+    dns) status_cmd=("$VAL" dns status); expected='Health[[:space:]]+healthy';;
+    standard-ports) status_cmd=("$VAL" ports status); expected='State[[:space:]]+healthy';;
+    *) printf 'unknown enabled service intent: %s\n' "$service" >&2; return 2;;
+  esac
+  output="$("${status_cmd[@]}" 2>&1)" || true
+  READINESS_LAST_STATE="$(printf '%s\n' "$output" | awk -F'[[:space:]]+' '/^[[:space:]]*(State|Health|FPM|Responder)[[:space:]]+/ { line=$0; sub(/^[[:space:]]*/, "", line); if (state == "") state=line; else state=state "; " line } END { print state }')"
+  [[ -n "$READINESS_LAST_STATE" ]] || READINESS_LAST_STATE="unavailable: $(printf '%s' "$output" | tail -1)"
+  printf '%s\n' "$output" | grep -Eiq "$expected"
+}
+
+wait_enabled_services() {
+  local services service start now elapsed last_timeout="" failed=0
+  [[ -r "$INTENTS" ]] || { echo "readiness: cannot read saved service intents: $INTENTS" >&2; return 1; }
+  services="$(python3 - "$INTENTS" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    intents = json.load(f)
+if not isinstance(intents, dict):
+    raise SystemExit("saved service intents must be a JSON object")
+for name, enabled in sorted(intents.items()):
+    if enabled is True:
+        print(name)
+PY
+)" || { echo "readiness: could not decode saved service intents" >&2; return 1; }
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    start="$(python3 -c 'import time; print(time.monotonic())')"
+    READINESS_LAST_STATE="not yet observed"
+    while :; do
+      if readiness_probe "$service"; then
+        now="$(python3 -c 'import time; print(time.monotonic())')"
+        elapsed="$(python3 -c 'import sys; print(f"{float(sys.argv[1])-float(sys.argv[2]):.1f}")' "$now" "$start")"
+        printf 'readiness: %s healthy after %ss (last observed: %s)\n' "$service" "$elapsed" "$READINESS_LAST_STATE"
+        break
+      fi
+      now="$(python3 -c 'import time; print(time.monotonic())')"
+      elapsed="$(python3 -c 'import sys; print(f"{float(sys.argv[1])-float(sys.argv[2]):.1f}")' "$now" "$start")"
+      if python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$elapsed" "$TIMEOUT"; then
+        printf 'readiness: TIMEOUT service=%s last-observed="%s" elapsed=%ss (limit=%ss)\n' "$service" "$READINESS_LAST_STATE" "$elapsed" "$TIMEOUT" >&2
+        failed=1
+        break
+      fi
+      sleep "$INTERVAL"
+    done
+  done <<< "$services"
+  return "$failed"
+}

@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Safely install a signed product-dev Release app without using clean-install.
+# This updates only the app bundle; the live support root is never replaced.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+SUPPORT="$HOME/Library/Application Support/Vaelen"
+ARTIFACTS="$HOME/Library/Application Support/Vaelen-dev-harness/updates"
+CANONICAL="/Applications/Vaelen.app"
+SOCKET="$SUPPORT/runtime/sockets/core.sock"
+STATE_DB="$SUPPORT/state/vaelen.sqlite"
+TEAM="TFKZJV643G"
+BUNDLE_ID="dev.vaelen.app"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN="$ARTIFACTS/product-dev-$STAMP"
+OLD_APP="/Applications/Vaelen.previous-$STAMP.app"
+STAGED_APP="/Applications/.Vaelen.candidate-$STAMP.app"
+APP="$RUN/derived/Build/Products/Release/Vaelen.app"
+CORE="$APP/Contents/Resources/vaelend"
+
+die() { echo "vaelen-dev-update: $*" >&2; exit 1; }
+note() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+source "$ROOT/Scripts/vaelen-service-readiness"
+team_of() { codesign -dv --verbose=4 "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1; }
+tree_hash() { (cd "$1" && find . -type f -print | LC_ALL=C sort | while IFS= read -r file; do shasum -a 256 "$file"; done) | shasum -a 256 | awk '{print $1}'; }
+schema_constant() {
+  local binary="$1" address value
+  address="$(nm -m "$binary" | awk '/SQLiteStateStoreC13schemaVersionSivpZ$/ {print $1; exit}')"
+  [[ -n "$address" ]] || return 1
+  value="$(otool -s __TEXT __const "$binary" | awk -v address="$address" '$1 == address {print $2; exit}')"
+  [[ "$value" =~ ^[0-9a-fA-F]{8}$ ]] || return 1
+  printf '%d\n' "$((16#$value))"
+}
+route_inventory() {
+  sqlite3 -readonly "$STATE_DB" 'SELECT id || "|" || hex(route_json) || "|" || coalesce(project_id, "") || "|" || coalesce(project_path, "") FROM route_intents ORDER BY id;'
+}
+assert_no_process() {
+  local exact="$1" pid command
+  while read -r pid command; do
+    [[ "$command" == "$exact" ]] && die "unexpected process still running (pid $pid): $command"
+  done < <(ps -axo pid=,command=)
+  return 0
+}
+process_pid_for_command() {
+  # Consume all ps output: exiting awk early can SIGPIPE ps under pipefail.
+  ps -axo pid=,command= | awk -v exact="$1" '$2 == exact && !found { pid=$1; found=1 } END { if (found) print pid }'
+}
+
+[[ -d "$CANONICAL" && -f "$STATE_DB" ]] || die "installed app or live state database is missing"
+[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 7 ]] || die "live database is not schema v7; refusing this update"
+[[ "$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)" == 7 ]] || die "candidate source does not declare schema v7"
+codesign --verify --deep --strict "$CANONICAL" || die "current installed app signature is invalid"
+
+mkdir -p "$ARTIFACTS"
+chmod 700 "$ARTIFACTS"
+mkdir "$RUN" || die "update evidence path already exists: $RUN"
+chmod 700 "$RUN"
+
+# Xcode's configured Release team is the required team. Require the configured
+# Apple Development identity to be present rather than signing ad hoc.
+XCODE_TEAM="$(xcodebuild -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release -showBuildSettings 2>/dev/null | awk '/^[[:space:]]*DEVELOPMENT_TEAM = / { print $3; exit }')"
+[[ "$XCODE_TEAM" == "$TEAM" ]] || die "Release DEVELOPMENT_TEAM is not $TEAM"
+IDENTITY="$(security find-identity -v -p codesigning | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-F]*\) ".*"$/\1/p' | head -1)"
+[[ -n "$IDENTITY" ]] || die "no valid codesigning identity is available"
+
+note "Building signed Release candidate (team $TEAM)"
+if ! xcodebuild -quiet -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release \
+  -derivedDataPath "$RUN/derived" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" DEVELOPMENT_TEAM="$TEAM" build \
+  >"$RUN/build.log" 2>&1; then
+  cat "$RUN/build.log" >&2
+  die "signed Release build failed"
+fi
+[[ -d "$APP" && -x "$CORE" ]] || die "signed Release candidate is incomplete"
+codesign --verify --deep --strict "$APP" || die "candidate app signature verification failed"
+[[ "$(team_of "$APP")" == "$TEAM" ]] || die "candidate app Team ID mismatch"
+[[ "$(team_of "$CORE")" == "$TEAM" ]] || die "candidate embedded Core Team ID mismatch"
+[[ "$(schema_constant "$CORE")" == 7 ]] || die "candidate embedded Core does not support schema v7"
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" == "$BUNDLE_ID" ]] || die "candidate bundle identifier mismatch"
+CORE_SHA="$(shasum -a 256 "$CORE" | awk '{print $1}')"
+APP_SHA="$(tree_hash "$APP")"
+printf 'candidate-app-tree-sha256=%s\ncandidate-core-sha256=%s\ncandidate-core-schema=7\nteam=%s\n' \
+  "$APP_SHA" "$CORE_SHA" "$TEAM" > "$RUN/candidate.manifest"
+
+# Recovery artifacts never restore data: the online SQLite backup is evidence,
+# and rollback restores only the prior app bundle. Live v7 and later MySQL or
+# project writes are never replaced from snapshots.
+note "Capturing app, v7 database, routes, and durable-file hashes"
+ditto "$CANONICAL" "$RUN/app-before.app"
+codesign --verify --deep --strict "$RUN/app-before.app" || die "preserved app copy failed signature verification"
+sqlite3 "$STATE_DB" ".backup '$RUN/state-v7-before.sqlite'" || die "could not make online SQLite backup"
+printf '%s\n' "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" > "$RUN/schema-before.txt"
+route_inventory > "$RUN/routes-before.txt"
+[[ "$(wc -l < "$RUN/routes-before.txt" | tr -d ' ')" -ge 5 ]] || die "fewer than five route records exist; refusing update"
+(cd "$SUPPORT" && find config instances packages state tls -type f -print0 2>/dev/null | xargs -0 shasum -a 256) > "$RUN/durable-before.sha256"
+printf 'installed-app-tree-sha256=%s\ninstalled-embedded-core-sha256=%s\n' \
+  "$(tree_hash "$CANONICAL")" "$(shasum -a 256 "$CANONICAL/Contents/Resources/vaelend" | awk '{print $1}')" >> "$RUN/candidate.manifest"
+
+# Request normal GUI termination. Only the exact harness-recorded repository
+# Core may be signalled, and only when it is the sole verified socket owner.
+note "Requesting normal GUI shutdown"
+GUI_PID=""
+GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
+if [[ -n "$GUI_PID" ]]; then
+  # Quit is asynchronous in the app. AppleScript may report cancellation while
+  # the GUI and Core complete their normal shutdown; process/socket state is the
+  # authority, not the AppleScript reply.
+  if ! osascript -e 'tell application id "dev.vaelen.app" to quit' >/dev/null 2>&1; then
+    note "AppleScript Quit returned an error; waiting for verified GUI/Core/socket exit"
+  fi
+fi
+for _ in {1..80}; do
+  GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
+  [[ -z "$GUI_PID" ]] && break
+  sleep .25
+done
+[[ -z "$GUI_PID" ]] || die "canonical GUI remains running; no process was killed"
+
+for _ in {1..80}; do
+  EMBEDDED_PID="$(process_pid_for_command "$CANONICAL/Contents/Resources/vaelend")"
+  [[ -z "$EMBEDDED_PID" && ! -e "$SOCKET" ]] && break
+  sleep .25
+done
+[[ -z "$EMBEDDED_PID" ]] || die "installed embedded Core remains running (pid $EMBEDDED_PID); no process was killed"
+[[ ! -e "$SOCKET" ]] || die "Core socket remains after GUI/Core exit; refusing to unlink it or install over it"
+
+CURRENT_CORE="$ROOT/.build/release/vaelend"
+CORE_PID_FILE="$SUPPORT/runtime/pids/harness-vaelend.pid"
+if [[ -S "$SOCKET" ]]; then
+  CORE_PID="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
+  [[ "$CORE_PID" =~ ^[0-9]+$ ]] || die "Core socket exists but no harness PID record identifies its owner"
+  [[ "$(ps -p "$CORE_PID" -o command= 2>/dev/null || true)" == "$CURRENT_CORE" ]] || die "Core PID record does not match the running candidate executable"
+  SOCKET_OWNERS="$(lsof -t -- "$SOCKET" 2>/dev/null | sort -u || true)"
+  [[ "$SOCKET_OWNERS" == "$CORE_PID" ]] || die "Core socket owners are not exactly the recorded candidate PID: $SOCKET_OWNERS"
+  note "Gracefully stopping verified repository Core PID $CORE_PID"
+  kill -TERM "$CORE_PID"
+  for _ in {1..80}; do
+    kill -0 "$CORE_PID" 2>/dev/null || break
+    sleep .25
+  done
+  kill -0 "$CORE_PID" 2>/dev/null && die "candidate Core did not stop gracefully"
+  [[ ! -e "$SOCKET" ]] || die "Core socket remains after Core exit; refusing to unlink it"
+fi
+assert_no_process "$CURRENT_CORE"
+assert_no_process "$CANONICAL/Contents/Resources/vaelend"
+[[ ! -e "$SOCKET" ]] || die "Core socket exists without a verified owner; refusing to install"
+
+# Copy and verify on the target volume. Keep the prior app beside the new one
+# for immediate rollback; a separate copy is already preserved under $RUN.
+[[ ! -e "$OLD_APP" && ! -e "$STAGED_APP" ]] || die "update staging path already exists"
+note "Staging signed candidate in /Applications"
+osascript - "$APP" "$STAGED_APP" <<'APPLESCRIPT' || die "authorized candidate staging failed"
+on run argv
+  set sourceApp to item 1 of argv
+  set stagedApp to item 2 of argv
+  do shell script "/usr/bin/ditto " & quoted form of sourceApp & " " & quoted form of stagedApp with administrator privileges
+end run
+APPLESCRIPT
+codesign --verify --deep --strict "$STAGED_APP" || die "staged candidate signature verification failed"
+[[ "$(tree_hash "$STAGED_APP")" == "$APP_SHA" ]] || die "staged candidate bytes differ from verified build"
+
+note "Promoting candidate while retaining the prior app"
+osascript - "$CANONICAL" "$OLD_APP" "$STAGED_APP" <<'APPLESCRIPT' || die "authorized app promotion failed; old app backup remains available"
+on run argv
+  set currentApp to item 1 of argv
+  set previousApp to item 2 of argv
+  set stagedApp to item 3 of argv
+  do shell script "/bin/mv " & quoted form of currentApp & " " & quoted form of previousApp & " && (/bin/mv " & quoted form of stagedApp & " " & quoted form of currentApp & " || { /bin/mv " & quoted form of previousApp & " " & quoted form of currentApp & "; exit 1; })" with administrator privileges
+end run
+APPLESCRIPT
+codesign --verify --deep --strict "$CANONICAL" || die "installed signature invalid; prior app is retained at $OLD_APP"
+[[ "$(tree_hash "$CANONICAL")" == "$APP_SHA" ]] || die "installed bytes differ from candidate; prior app is retained at $OLD_APP"
+[[ "$(team_of "$CANONICAL/Contents/Resources/vaelend")" == "$TEAM" ]] || die "installed Core Team ID mismatch"
+[[ "$(schema_constant "$CANONICAL/Contents/Resources/vaelend")" == 7 ]] || die "installed Core schema mismatch"
+
+note "Launching canonical signed app"
+open "$CANONICAL" || die "canonical app launch failed; live database remains schema v7"
+GUI_PID=""; CORE_PID=""
+for _ in {1..120}; do
+  GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
+  CORE_PID="$(process_pid_for_command "$CANONICAL/Contents/Resources/vaelend")"
+  [[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] && break
+  sleep .25
+done
+[[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] || die "signed embedded Core did not acquire socket; preserve v7 DB and use candidate app backup"
+[[ "$(ps -p "$CORE_PID" -o ppid= | tr -d ' ')" == "$GUI_PID" ]] || die "Core socket owner is not a child of canonical GUI"
+[[ "$(lsof -t -- "$SOCKET" 2>/dev/null | sort -u)" == "$CORE_PID" ]] || die "Core socket ownership does not match embedded Core PID"
+
+note "Checking CLI, schema, and route preservation"
+"$SUPPORT/bin/val" status
+wait_enabled_services || die "enabled service readiness failed; see per-service timeout/observation above"
+[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 7 ]] || die "live DB schema changed; do not restore the saved DB"
+route_inventory > "$RUN/routes-after.txt"
+cmp -s "$RUN/routes-before.txt" "$RUN/routes-after.txt" || die "route records changed; saved DB remains evidence only"
+echo "signed-v7 app update: PASS"
+echo "Core PID=$CORE_PID path=$CANONICAL/Contents/Resources/vaelend"
+echo "Core SHA-256=$CORE_SHA schema=7 Team=$TEAM"
+echo "GUI PID=$GUI_PID"
+echo "prior app backup=$RUN/app-before.app"
+echo "prior installed app=$OLD_APP"
+echo "online v7 DB evidence=$RUN/state-v7-before.sqlite (never auto-restore)"
+echo "update evidence=$RUN"
