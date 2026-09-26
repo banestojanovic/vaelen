@@ -69,6 +69,7 @@ public actor CaddyProcessSupervisor {
     private let manager = FileManager.default
     private var package: CaddyPackage?
     private var ownedChild: OwnedChildProcess?
+    private var identityCommandFailsForTesting = false
 
     public init(layout: VaelenFilesystemLayout, configuration: CaddyRuntimeConfiguration = .init()) {
         self.layout = layout; self.configuration = configuration
@@ -102,13 +103,31 @@ public actor CaddyProcessSupervisor {
     }
 
     public func start() throws -> CaddyProcessStatus {
+        let attemptStarted = Date()
         let package = self.package ?? installedPackage()
         guard let package else { throw CaddyRuntimeError.packageUnavailable }
-        let current = status()
-        if current.state == .running, current.health == .healthy { return current }
+        var current = status()
+        if current.state == .running {
+            // Leave margin for the final status projection and error delivery;
+            // this is deliberately below the externally observed 3s bound.
+            let deadline = Date().addingTimeInterval(2.5)
+            while Date() < deadline {
+                let observed = status()
+                current = observed
+                if observed.state != .running { break }
+                let remaining = deadline.timeIntervalSinceNow
+                if observed.health == .healthy, (try? CaddyAdminClient(endpoint: observed.adminEndpoint).getConfig(timeout: min(0.25, remaining))) != nil { return observed }
+                if remaining > 0 { usleep(useconds_t(min(50_000, remaining * 1_000_000))) }
+            }
+            if current.state == .running {
+                throw CaddyRuntimeError.processFailed("Recorded Caddy PID \(current.pid ?? -1) is still running but its admin endpoint is not ready; refusing to launch another Caddy process")
+            }
+        }
         if current.state == .degraded { throw CaddyRuntimeError.processIdentityMismatch }
-        guard isPortAvailable(configuration.httpPort) else { throw CaddyRuntimeError.portConflict(configuration.httpPort) }
-        guard isPortAvailable(configuration.httpsPort) else { throw CaddyRuntimeError.portConflict(configuration.httpsPort) }
+        let httpAvailability = portAvailability(configuration.httpPort)
+        guard httpAvailability.available else { throw portConflict(configuration.httpPort, preflight: current, bindError: httpAvailability.error, elapsed: Date().timeIntervalSince(attemptStarted), startedAt: attemptStarted) }
+        let httpsAvailability = portAvailability(configuration.httpsPort)
+        guard httpsAvailability.available else { throw portConflict(configuration.httpsPort, preflight: current, bindError: httpsAvailability.error, elapsed: Date().timeIntervalSince(attemptStarted), startedAt: attemptStarted) }
 
         let configURL = layout.routingConfigurationDirectoryURL.appendingPathComponent("caddy.json")
         let admin = adminEndpoint()
@@ -133,9 +152,11 @@ public actor CaddyProcessSupervisor {
         let record = CaddyProcessRecord(pid: process.processIdentifier, version: package.version, executablePath: package.executablePath, arguments: arguments, configPath: configURL.path, adminEndpoint: admin, httpPort: configuration.httpPort, httpsPort: configuration.httpsPort, startedAt: processStartIdentity(process.processIdentifier))
         try atomicWrite(record, to: processRecordURL())
 
-        for _ in 0..<60 {
+        let readinessDeadline = Date().addingTimeInterval(3)
+        while Date() < readinessDeadline {
             let result = status()
-            if result.state == .running, result.health == .healthy, (try? CaddyAdminClient(endpoint: admin).getConfig()) != nil { return result }
+            let remaining = readinessDeadline.timeIntervalSinceNow
+            if result.state == .running, result.health == .healthy, (try? CaddyAdminClient(endpoint: admin).getConfig(timeout: min(0.25, remaining))) != nil { return result }
             usleep(50_000)
         }
         guard ownedChild.terminateAndWait(timeout: 3) else {
@@ -152,12 +173,16 @@ public actor CaddyProcessSupervisor {
         if observed.state == .stopped { return observed }
         guard let record = processRecord() else { return status() }
         let child = ownedChild
-        guard processExists(record.pid), processMatches(record) else {
-            // Forget stale Vaelen metadata, never signal a live PID whose
-            // executable/arguments/start time no longer match the record.
-            try? manager.removeItem(at: processRecordURL())
-            ownedChild = nil
+        switch verifyProcessIdentity(record) {
+        case .gone:
+            removeProcessRecord()
             return CaddyProcessStatus(state: .stopped, health: .unknown, version: record.version, pid: nil, executablePath: record.executablePath, httpPort: record.httpPort, adminEndpoint: record.adminEndpoint)
+        case .unavailable:
+            throw CaddyRuntimeError.processFailed("Cannot verify the identity of live Caddy PID \(record.pid); preserving its process record and leaving it untouched")
+        case .mismatch:
+            throw CaddyRuntimeError.processIdentityMismatch
+        case .matches:
+            break
         }
         let stopped: Bool
         if let child, child.processIdentifier == record.pid {
@@ -168,8 +193,19 @@ public actor CaddyProcessSupervisor {
             // handled above without signaling.
             guard kill(record.pid, SIGTERM) == 0 else { throw CaddyRuntimeError.processFailed("Caddy PID \(record.pid) could not be asked to stop") }
             let deadline = Date().addingTimeInterval(3)
-            while Date() < deadline, processMatches(record) { usleep(20_000) }
-            stopped = !processMatches(record)
+            var confirmedGone = false
+            while Date() < deadline {
+                switch verifyProcessIdentity(record) {
+                case .gone: confirmedGone = true
+                case .matches: usleep(20_000)
+                case .unavailable:
+                    throw CaddyRuntimeError.processFailed("Cannot verify the identity of live Caddy PID \(record.pid) during shutdown; preserving its process record")
+                case .mismatch:
+                    throw CaddyRuntimeError.processIdentityMismatch
+                }
+                if confirmedGone { break }
+            }
+            stopped = confirmedGone || !processExists(record.pid)
         }
         guard stopped else {
             throw CaddyRuntimeError.processFailed("Caddy PID \(record.pid) is still running after the graceful shutdown timeout")
@@ -198,28 +234,133 @@ public actor CaddyProcessSupervisor {
     private func processRecord() -> CaddyProcessRecord? { try? JSONDecoder().decode(CaddyProcessRecord.self, from: Data(contentsOf: processRecordURL())) }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
     private func processHasCommand(_ pid: Int32) -> Bool {
-        guard let output = try? command("/bin/ps", ["-p", "\(pid)", "-o", "command="]) else { return false }
-        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard let output = try? command("/bin/ps", ["-p", "\(pid)", "-o", "command="]) else { return processExists(pid) }
+        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || processExists(pid)
     }
     private func processMatches(_ record: CaddyProcessRecord) -> Bool {
-        if let child = ownedChild, child.processIdentifier == record.pid {
-            guard child.isRunningAndReapedIfExited() else { return false }
+        verifyProcessIdentity(record) == .matches
+    }
+
+    private enum ProcessIdentityVerification: Equatable { case gone, matches, mismatch, unavailable }
+
+    private func verifyProcessIdentity(_ record: CaddyProcessRecord) -> ProcessIdentityVerification {
+        if let child = ownedChild, child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() { return .gone }
+        guard processExists(record.pid) else { return .gone }
+        if identityCommandFailsForTesting { return processExists(record.pid) ? .unavailable : .gone }
+        let commandOutput: String
+        let start: String
+        do {
+            commandOutput = try command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])
+            start = try command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return processExists(record.pid) ? .unavailable : .gone
         }
-        guard processExists(record.pid) else { return false }
-        let commandOutput = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])) ?? ""
-        let start = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return commandOutput.contains(record.executablePath) && record.arguments.allSatisfy { commandOutput.contains($0) } && start == record.startedAt
+        guard processExists(record.pid) else { return .gone }
+        return commandOutput.contains(record.executablePath)
+            && record.arguments.allSatisfy { commandOutput.contains($0) }
+            && start == record.startedAt ? .matches : .mismatch
+    }
+
+    private func removeProcessRecord() {
+        try? manager.removeItem(at: processRecordURL())
+        ownedChild = nil
+    }
+
+    func failIdentityCommandForTesting() {
+        identityCommandFailsForTesting = true
     }
     private func processStartIdentity(_ pid: Int32) -> String { (try? command("/bin/ps", ["-p", "\(pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-    private func command(_ executable: String, _ arguments: [String]) throws -> String { let process = Process(); let pipe = Pipe(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments; process.standardOutput = pipe; try process.run(); let data = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit(); return String(data: data, encoding: .utf8) ?? "" }
+    private func command(_ executable: String, _ arguments: [String]) throws -> String { try boundedCommand(executable, arguments, timeout: 0.75) }
+    private func boundedCommand(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        let process = Process(); let pipe = Pipe(); let finished = DispatchSemaphore(value: 0); let outputBuffer = CaddyCommandOutputBuffer()
+        process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments; process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if !chunk.isEmpty { outputBuffer.append(chunk) }
+        }
+        process.terminationHandler = { _ in finished.signal() }
+        do { try process.run() } catch { pipe.fileHandleForReading.readabilityHandler = nil; throw error }
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if finished.wait(timeout: .now() + 0.25) == .timedOut {
+                if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+                finished.wait()
+            }
+            pipe.fileHandleForReading.readabilityHandler = nil
+            throw CaddyRuntimeError.processFailed("diagnostic process \(executable) exceeded \(timeout)s timeout")
+        }
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let output = outputBuffer.data
+        guard process.terminationStatus == 0 else { throw CaddyRuntimeError.processFailed("diagnostic process \(executable) exited \(process.terminationStatus)") }
+        return String(data: output, encoding: .utf8) ?? ""
+    }
+    func diagnosticCommandForTesting(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        try boundedCommand(executable, arguments, timeout: timeout)
+    }
     private func makeDirectories(_ urls: [URL]) throws { for url in urls { try manager.createDirectory(at: url, withIntermediateDirectories: true); try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path) } }
     private func atomicWrite<T: Encodable>(_ value: T, to url: URL) throws { let temporary = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp"); try JSONEncoder().encode(value).write(to: temporary, options: .atomic); if manager.fileExists(atPath: url.path) { _ = try manager.replaceItemAt(url, withItemAt: temporary) } else { try manager.moveItem(at: temporary, to: url) } }
     private func writeInitialConfiguration(to url: URL, admin: String, dataDirectory: URL) throws {
         let config: [String: Any] = ["admin": ["listen": admin], "storage": ["module": "file_system", "root": dataDirectory.path], "apps": ["http": ["servers": ["vaelen-http": ["listen": ["127.0.0.1:\(configuration.httpPort)"], "automatic_https": ["disable": true], "protocols": ["h1", "h2"], "routes": []]]]]]
         let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .prettyPrinted]); try data.write(to: url, options: .atomic)
     }
-    private func isPortAvailable(_ port: Int) -> Bool {
-        let descriptor = socket(AF_INET, SOCK_STREAM, 0); guard descriptor >= 0 else { return false }; defer { close(descriptor) }
-        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(port).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1")); return withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 } }
+    private func portAvailability(_ port: Int) -> (available: Bool, error: String) {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { let code = errno; return (false, "socket: \(String(cString: strerror(code))) (errno \(code))") }
+        defer { close(descriptor) }
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(port).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard result == 0 else { let code = errno; return (false, "bind: \(String(cString: strerror(code))) (errno \(code))") }
+        return (true, "none")
     }
+
+    private func portConflict(_ port: Int, preflight: CaddyProcessStatus, bindError: String, elapsed: TimeInterval, startedAt: Date) -> CaddyRuntimeError {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let listener = listenerIdentity(port: port)
+        let record = processRecord()
+        let lines = [
+            "Caddy port conflict diagnostic",
+            "timestamp: \(timestamp)",
+            "Core PID: \(ProcessInfo.processInfo.processIdentifier)",
+            "port: 127.0.0.1:\(port)",
+            "preflight: state=\(preflight.state.rawValue) health=\(preflight.health)",
+            "bind error: \(bindError)",
+            "listener: \(listener)",
+            "Vaelen Caddy record: \(record.map { "pid=\($0.pid) executable=\($0.executablePath) config=\($0.configPath) startedAt=\($0.startedAt) ownership=\(ownedChild?.processIdentifier == $0.pid ? "owned-child" : "durable-record-only")" } ?? "unavailable")",
+            "startup timing: elapsed=\(String(format: "%.3f", elapsed))s; attemptStartedAt=\(ISO8601DateFormatter().string(from: startedAt)); conflict detected before this start attempt launched a Caddy process"
+        ]
+        let text = lines.joined(separator: "\n") + "\n"
+        let logURL = layout.caddyLogsDirectoryURL.appendingPathComponent("caddy.log")
+        do {
+            try makeDirectories([layout.caddyLogsDirectoryURL])
+            if !manager.fileExists(atPath: logURL.path) { _ = manager.createFile(atPath: logURL.path, contents: nil) }
+            let handle = try FileHandle(forWritingTo: logURL)
+            try handle.seekToEnd(); try handle.write(contentsOf: Data(text.utf8)); try handle.close()
+        } catch { /* Preserve refusal even when diagnostic persistence is unavailable. */ }
+        return .portConflict(port)
+    }
+
+    private func listenerIdentity(port: Int) -> String {
+        Self.listenerIdentity(port: port) { try boundedCommand($0, $1, timeout: 0.5) }
+    }
+
+    func listenerIdentityForTesting(port: Int, command: (String, [String]) throws -> String) -> String {
+        Self.listenerIdentity(port: port, command: command)
+    }
+
+    private static func listenerIdentity(port: Int, command: (String, [String]) throws -> String) -> String {
+        guard let output = try? command("/usr/sbin/lsof", ["-nP", "-t", "-iTCP:\(port)", "-sTCP:LISTEN"]) else { return "unavailable (lsof could not inspect listeners without elevation)" }
+        let pids = output.split(whereSeparator: \.isNewline).compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        guard !pids.isEmpty else { return "unavailable (no listener PID observable)" }
+        return pids.map { pid in
+            let executable = (try? command("/bin/ps", ["-p", "\(pid)", "-o", "comm="]))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "pid=\(pid) executable=\(executable?.isEmpty == false ? executable! : "unavailable")"
+        }.joined(separator: "; ")
+    }
+}
+
+private final class CaddyCommandOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+    func append(_ data: Data) { lock.lock(); storage.append(data); lock.unlock() }
+    var data: Data { lock.lock(); defer { lock.unlock() }; return storage }
 }

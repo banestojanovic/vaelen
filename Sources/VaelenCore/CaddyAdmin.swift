@@ -10,28 +10,37 @@ public enum CaddyAdminError: Error, Equatable, Sendable {
 
 public struct CaddyAdminClient: Sendable {
     public let endpoint: String
+    public let timeout: TimeInterval
 
-    public init(endpoint: String) { self.endpoint = endpoint }
+    public init(endpoint: String, timeout: TimeInterval = 0.5) { self.endpoint = endpoint; self.timeout = max(0.001, timeout) }
 
     public func getConfig() throws -> Data {
-        try request(method: "GET", path: "/config/", body: nil)
+        try getConfig(timeout: timeout)
     }
 
+    public func getConfig(timeout: TimeInterval?) throws -> Data { try request(method: "GET", path: "/config/", body: nil, timeout: timeout) }
+
     public func load(configuration: Data) throws -> Data {
-        try request(method: "POST", path: "/load", body: configuration)
+        try request(method: "POST", path: "/load", body: configuration, timeout: timeout)
     }
 
     public func stop() throws -> Data {
-        try request(method: "POST", path: "/stop", body: nil)
+        try request(method: "POST", path: "/stop", body: nil, timeout: timeout)
     }
 
-    private func request(method: String, path: String, body: Data?) throws -> Data {
+    private func request(method: String, path: String, body: Data?, timeout: TimeInterval?) throws -> Data {
         guard endpoint.hasPrefix("unix//") else { throw CaddyAdminError.invalidEndpoint }
         let socketPath = String(endpoint.dropFirst("unix//".count))
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw CaddyAdminError.connectionFailed(String(cString: strerror(errno))) }
         defer { close(descriptor) }
-
+        if let timeout {
+            var value = timeval(tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
+            guard setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &value, socklen_t(MemoryLayout<timeval>.size)) == 0,
+                  setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &value, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
+                throw CaddyAdminError.connectionFailed("could not configure admin socket timeout: \(String(cString: strerror(errno)))")
+            }
+        }
         var address = sockaddr_un()
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
         address.sun_family = sa_family_t(AF_UNIX)
@@ -61,7 +70,10 @@ public struct CaddyAdminClient: Sendable {
         while true {
             let count = recv(descriptor, &buffer, buffer.count, 0)
             if count == 0 { break }
-            guard count > 0 else { throw CaddyAdminError.connectionFailed(String(cString: strerror(errno))) }
+            guard count > 0 else {
+                if errno == EAGAIN || errno == EWOULDBLOCK { throw CaddyAdminError.connectionFailed("admin response timed out") }
+                throw CaddyAdminError.connectionFailed(String(cString: strerror(errno)))
+            }
             response.append(buffer, count: count)
         }
         guard let separator = response.range(of: Data("\r\n\r\n".utf8)), let header = String(data: response[..<separator.lowerBound], encoding: .utf8), let statusLine = header.split(separator: "\r\n").first else { throw CaddyAdminError.malformedResponse }
