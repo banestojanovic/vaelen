@@ -38,7 +38,28 @@
 - ADR and release freeze occur only after explicit acceptance.
 - Commit, tag, push, and freeze require explicit user instruction.
 - M13 must not start until explicitly authorized.
-- Only `vaelen-lead` normally edits the checkout.
+- Parallel write agents use separate, named Git worktrees with explicit path
+  ownership. `vaelen-pm` names one integration owner; agents never write into
+  the shared integration checkout unless specifically assigned as that owner.
+
+## Worktree and operation coordination
+
+- OpenCode subagents do not automatically receive isolated worktrees, and the
+  subagent tool has no worktree/working-directory argument. Keep it read-only;
+  create one worktree per parallel writer and launch a separate `opencode run`
+  session from its exact worktree before it can edit. Verify working directory,
+  Git root, branch, and status.
+- Only one named session at a time may use the installed app, installed CLI,
+  service controls, or runtime-mutating harness operations. The PM coordinates
+  the exclusive operation owner and explicit handoff; parallel writers do not
+  use those paths or mutate live projects, routes, services, certificates, or
+  databases.
+- Keep `./Scripts/vaelen-dev clean-install` restricted to its existing exact
+  `restored-m13-product` branch and golden commit guard. It is not the `dev`
+  update path. On `dev`, use the signed `./Scripts/vaelen-dev-update` for an
+  explicitly authorized installed-app update; for CLI-only installation use
+  the guarded `./Scripts/install-cli.sh`. These installed operations require
+  the exclusive slot above.
 
 ## Evidence Discipline
 

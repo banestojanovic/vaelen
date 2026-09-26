@@ -1,7 +1,8 @@
 ---
 description: Strictly read-only Vaelen test and acceptance auditor focused on evidence sufficiency, isolation, failure paths, and public product acceptance.
 mode: subagent
-model: openai/gpt-5.6-luna
+model: openai/gpt-6-luna
+#model: opencode/muse-spark-1.3-contributor-free
 color: warning
 permission:
   read:

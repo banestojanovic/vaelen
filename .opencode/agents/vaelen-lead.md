@@ -1,7 +1,8 @@
 ---
 description: Primary Vaelen implementation and synthesis agent; owns authorized milestone work and may delegate only to the three approved read-only specialists.
 mode: primary
-model: openai/gpt-5.6-luna
+model: openai/gpt-6-luna
+#model: opencode/muse-spark-1.3-contributor-free
 color: primary
 permission:
   read:

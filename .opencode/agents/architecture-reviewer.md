@@ -1,7 +1,8 @@
 ---
 description: Adversarial read-only reviewer for frozen Vaelen architecture, invariants, ownership, lifecycle, and authority boundaries.
 mode: subagent
-model: openai/gpt-5.6-luna
+model: openai/gpt-6-luna
+#model: opencode/muse-spark-1.3-contributor-free
 color: warning
 permission:
   read:

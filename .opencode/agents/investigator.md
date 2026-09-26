@@ -1,7 +1,8 @@
 ---
 description: Strictly read-only Vaelen repository investigator for factual call-path, state-authority, ownership, lifecycle, and reproduction analysis.
 mode: subagent
-model: openai/gpt-5.6-luna
+model: openai/gpt-6-luna
+#model: opencode/muse-spark-1.3-contributor-free
 color: info
 permission:
   read:
