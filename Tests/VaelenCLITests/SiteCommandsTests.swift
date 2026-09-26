@@ -148,4 +148,92 @@ final class SiteCommandsTests: XCTestCase {
         XCTAssertEqual(externalOpenArguments(bundleIdentifier: nil, url: secure), ["https://secure.test"])
         XCTAssertEqual(externalOpenArguments(bundleIdentifier: "com.tinyapp.TablePlus", url: URL(string: "mysql://root@127.0.0.1:3306/app")!), ["-b", "com.tinyapp.TablePlus", "mysql://root@127.0.0.1:3306/app"])
     }
+
+    func testSiteInformationRunsArtisanWithProjectWorkingDirectoryAndPreservesExitAndOutput() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-site-info-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("php")
+        try "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$PWD\" \"$1\" \"$2\" \"$3\"\nprintf 'diagnostic from stderr\\n' >&2\nexit 7\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let result = try runSiteInformation(phpPath: executable.path, projectPath: root.path)
+        XCTAssertEqual(result.exitCode, 7)
+        let invocation = String(result.output.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)[0])
+        let fields = invocation.split(separator: "|", omittingEmptySubsequences: false)
+        XCTAssertEqual(fields.count, 4)
+        XCTAssertEqual(CanonicalPathService().canonicalize(String(fields[0])).string, CanonicalPathService().canonicalize(root.path).string)
+        XCTAssertEqual(Array(fields.dropFirst()), ["artisan", "about", "--no-ansi"])
+        XCTAssertTrue(result.output.contains("diagnostic from stderr"))
+        XCTAssertEqual(siteInfoProcessExitCode(result.exitCode), 7)
+        XCTAssertEqual(siteInfoProcessExitCode(0), 1, "zero must not be treated as a failure status")
+        XCTAssertEqual(siteInfoProcessExitCode(256), 1, "unrepresentable process statuses use generic failure")
+    }
+
+    func testSiteInfoSelectsLaravelFixtureAndRejectsUnsupportedFrameworks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-site-info-laravel-\(UUID().uuidString)", isDirectory: true)
+        for directory in ["public", "bootstrap", "config"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(directory), withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data().write(to: root.appendingPathComponent("artisan"))
+        try Data().write(to: root.appendingPathComponent("public/index.php"))
+        let inspection = ProjectFrameworkDetector().inspect(root: root)
+        XCTAssertTrue(siteInfoSupportsFramework(inspection.framework, confidence: inspection.confidence))
+        let fixture = project(root.path)
+        XCTAssertEqual(try selectedProject(root.path, projects: [fixture], workingDirectory: "/tmp").path, root.path)
+
+        let unknownRoot = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-site-info-unknown-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: unknownRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: unknownRoot) }
+        let unsupported = ProjectFrameworkDetector().inspect(root: unknownRoot)
+        XCTAssertFalse(siteInfoSupportsFramework(unsupported.framework, confidence: unsupported.confidence))
+        XCTAssertFalse(siteInfoSupportsFramework("Laravel", confidence: .low))
+    }
+
+    func testSiteInfoRouteObservationsCoverNoManyAndUnavailableRoutes() {
+        let id = UUID()
+        let app = project("/tmp/site-info-routes", id: id)
+        XCTAssertTrue(siteDriverRoutes(project: app, routeIntents: [], observedRoutes: [], unavailableReason: nil).isEmpty)
+
+        let first = route("one.test", path: app.path, id: id)
+        let second = route("two.test", path: app.path, id: id)
+        let multiple = siteDriverRoutes(project: app, routeIntents: [first, second], observedRoutes: nil, unavailableReason: "router IPC unavailable")
+        XCTAssertEqual(multiple.map(\.hostname), ["one.test", "two.test"])
+        XCTAssertTrue(multiple.allSatisfy { $0.caddyRouteObserved == nil && $0.caddyObservationState == "router IPC unavailable" })
+    }
+
+    func testSiteInfoEnvelopeKeepsConfiguredRouteAndRuntimeObservationSeparate() throws {
+        let route = SiteDriverRoute(hostname: "app.test", target: "Static files", tls: "disabled", caddyRouteObserved: false, caddyObservationState: "exact-route-not-observed")
+        let configuredRoute = SiteInfoConfiguredRoute(hostname: route.hostname, target: route.target, tls: route.tls)
+        let observation = SiteInfoRuntimeObservation(hostname: route.hostname, caddyRouteObserved: route.caddyRouteObserved, caddyObservationState: route.caddyObservationState)
+        let result = SiteInfoEnvelope(project: "app", path: "/tmp/app", detectedFramework: "Laravel", frameworkEvidence: ["artisan"], configuredRoutes: [configuredRoute], runtimeObservations: [observation], applicationCommand: ["php", "artisan", "about", "--no-ansi"], applicationExitCode: 0, applicationOutput: "Laravel 12")
+        let data = try IPCCodec.encode(result)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let configured = try XCTUnwrap((json["configuredRoutes"] as? [[String: Any]])?.first)
+        let runtime = try XCTUnwrap((json["runtimeObservations"] as? [[String: Any]])?.first)
+        XCTAssertNil(configured["caddyRouteObserved"])
+        XCTAssertEqual(runtime["caddyRouteObserved"] as? Bool, false)
+        XCTAssertEqual(json["applicationOutput"] as? String, "Laravel 12")
+        XCTAssertEqual(try JSONDecoder().decode(SiteInfoEnvelope.self, from: data), result)
+        let noRoutes = SiteInfoEnvelope(project: "app", path: "/tmp/app", detectedFramework: "Laravel", frameworkEvidence: ["artisan"], configuredRoutes: [], runtimeObservations: [], applicationCommand: ["php", "artisan", "about", "--no-ansi"], applicationExitCode: 0, applicationOutput: "Laravel 12")
+        let noRouteJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: IPCCodec.encode(noRoutes)) as? [String: Any])
+        XCTAssertEqual((noRouteJSON["configuredRoutes"] as? [Any])?.count, 0)
+        XCTAssertEqual((noRouteJSON["runtimeObservations"] as? [Any])?.count, 0)
+    }
+
+    func testSiteInfoHumanOutputWrapsAndRespectsPlainAndColorPresentation() {
+        let result = SiteInfoEnvelope(project: "example", path: "/tmp/a-very-long-project-path-that-needs-wrapping", detectedFramework: "Laravel", frameworkEvidence: ["artisan"], configuredRoutes: [SiteInfoConfiguredRoute(hostname: "example.test", target: "Static files · document root /tmp/a-very-long-project-path/public", tls: "disabled")], runtimeObservations: [SiteInfoRuntimeObservation(hostname: "example.test", caddyRouteObserved: nil, caddyObservationState: "Caddy provider observation unavailable")], applicationCommand: ["php", "artisan", "about", "--no-ansi"], applicationExitCode: 0, applicationOutput: "Laravel project information")
+        let plain = siteInfoHumanOutput(result, width: 40, color: false)
+        XCTAssertFalse(plain.contains("\u{001B}["))
+        XCTAssertTrue(plain.contains("Laravel project information"))
+        XCTAssertTrue(plain.contains("Runtime observations"))
+        XCTAssertTrue(plain.contains("not HTTP"))
+        XCTAssertTrue(plain.contains("reachability"))
+        XCTAssertFalse(plain.split(separator: "\n").contains { $0.count > 40 }, plain)
+        let colored = siteInfoHumanOutput(result, width: 80, color: true)
+        XCTAssertTrue(colored.contains("\u{001B}[1;36mSite information\u{001B}[0m"))
+        XCTAssertTrue(DoctorReport.colorEnabled(isTTY: true, environment: ["TERM": "xterm"]))
+        XCTAssertFalse(DoctorReport.colorEnabled(isTTY: true, environment: ["NO_COLOR": "1", "TERM": "xterm"]))
+        XCTAssertFalse(DoctorReport.colorEnabled(isTTY: true, environment: ["TERM": "dumb"]))
+    }
 }

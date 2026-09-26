@@ -33,3 +33,9 @@ Use a unique directory in the approved temporary root. Do not use any existing p
 - Focused CaddyRouter (7), ProjectRouteAttribution (4), LinkServingCommand (8), Routing (22), and parked ownership lifecycle (1) tests passed. Final Doctor was Healthy and `./Scripts/vaelen-dev smoke` passed. `git diff --check` passed.
 
 The acceptance work is complete for review. This sheet is not authorization to commit, tag, push, or freeze Slice 2B.
+# Site information acceptance (source and installed CLI)
+
+- `val site info --help` describes the Laravel-only command and effective PHP behavior; invalid subcommands/options show focused usage.
+- In a disposable Laravel fixture with controlled project PHP, verify `artisan about --no-ansi` receives the project working directory, output, and exit status. Confirm `val site info --json` gives stable JSON with application output/status distinct from configured route entries and exact Caddy configuration observation.
+- Verify zero configured routes and Caddy unavailable remain explicit; a configured route or observed Caddy route is not an HTTP-reachability claim. Other/unknown framework fixtures fail with actionable unsupported-driver guidance and do not execute a command.
+- Human output at 40 columns wraps without losing fields; piped output, `NO_COLOR`, and `TERM=dumb` contain no ANSI. JSON contains no ANSI. Use only temporary fixtures; do not touch Syncproof or alter persistent Core state.

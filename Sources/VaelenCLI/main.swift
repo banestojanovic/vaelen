@@ -31,6 +31,7 @@ enum CLICommand {
     case parked(json: Bool)
     case sites(json: Bool)
     case siteDriver(selector: String?, json: Bool)
+    case siteInfo(selector: String?, json: Bool)
     case openSite(selector: String?)
     case databaseOpen(selector: String?)
     case projectStatus(selector: String?, json: Bool)
@@ -214,6 +215,13 @@ struct VaelenCLIMain {
     static let usage = helpText(for: [])
 
     static func helpText(for path: [String]) -> String {
+        if path == ["site", "info"] {
+            let detail = "Run Laravel's artisan about command using the effective project PHP. Configured routes, Caddy route-configuration observations, and application output are distinct; none of the route information proves HTTP reachability. Other frameworks are not yet supported."
+            return "site info\n\nUsage: val site info [project] [--json]\n\(HumanOutput.wrap(detail, width: HumanOutput.terminalWidth))\n"
+        }
+        if path == ["site", "driver"] {
+            return "site driver\n\nUsage: val site driver [project] [--json]\nReport detected framework and evidence separately from every configured route target and its exact Caddy route observation.\n"
+        }
         if path.isEmpty {
             let sections: [(String, [(String, String)])] = [
                 ("Projects", [("link", "Link a project"), ("links", "List linked projects and hosts"), ("edit", "Open project in configured editor"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("parked", "List sites discovered in parked folders"), ("sites", "List configured sites and serving observations"), ("open", "Open a configured site"), ("db", "Open an eligible project database"), ("site", "Inspect a site driver"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
@@ -287,7 +295,7 @@ struct VaelenCLIMain {
         case "sites": body = "Usage: val sites [--json]\nList configured route sites, project availability, and the router's independent serving observation. A configured route is not assumed to be served."
         case "open": body = "Usage: val open [hostname|project]\nOpen the exact selected site's configured HTTP or HTTPS URL. Without a selector, the current directory must match exactly one configured site route."
         case "db": body = "Usage: val db [project]\nOpen a project database in TablePlus only when the menu-bar action's MySQL eligibility checks pass. Credentials are never printed."
-        case "site": body = "Usage: val site driver [project] [--json]\nReport detected framework and evidence separately from every configured route target and its exact Caddy route observation. No route, multiple routes, missing projects, and unknown frameworks are reported without guessing."
+        case "site": body = "Usage: val site <driver|info> [project] [--json]\n  driver  Report detected framework and configured routes.\n  info    Run Laravel's Artisan about using the project's effective PHP. Application output is distinct from route configuration and Caddy observation."
         default: return "Unknown command: \(name). Run ‘val --help’ to see available commands."
         }
         return "\(name)\n\n\(body)\n"
@@ -440,6 +448,8 @@ struct VaelenCLIMain {
                 exit(1)
             case .message:
                 fail(error.description, code: 1)
+            case .applicationFailure(let command, let status):
+                fail("\(command) exited with status \(status).", code: siteInfoProcessExitCode(status))
             }
         } catch {
             fail(message(for: error), code: 1)
@@ -468,7 +478,7 @@ struct VaelenCLIMain {
         case "open": guard args.count <= 2 else { throw CLIError.commandUsage("open") }; return .openSite(selector: args.count == 2 ? args[1] : nil)
         case "db": guard args.count <= 2 else { throw CLIError.commandUsage("db") }; return .databaseOpen(selector: args.count == 2 ? args[1] : nil)
         case "site":
-            guard args.count >= 2, args[1] == "driver" else { throw CLIError.commandUsage("site") }
+            guard args.count >= 2, ["driver", "info"].contains(args[1]) else { throw CLIError.commandUsage("site") }
             var selector: String?
             var json = false
             for value in args.dropFirst(2) {
@@ -476,7 +486,7 @@ struct VaelenCLIMain {
                 else if !value.hasPrefix("-"), selector == nil { selector = value }
                 else { throw CLIError.commandUsage("site") }
             }
-            return .siteDriver(selector: selector, json: json)
+            return args[1] == "driver" ? .siteDriver(selector: selector, json: json) : .siteInfo(selector: selector, json: json)
         case "project":
             guard args.count >= 2 else { throw CLIError.usage }
             if args[1] == "php" {
@@ -965,6 +975,29 @@ struct VaelenCLIMain {
                     print(HumanOutput.list(rows, headers: ["Hostname", "Configured target", "TLS", "Caddy route"], empty: "No configured route belongs to this project."))
                 }
             }
+        case .siteInfo(let selector, let json):
+            let projects = try await client.projectList()
+            let project = try selectedProject(selector, projects: projects, workingDirectory: workingDirectory)
+            guard project.availability == PathAvailability.available.rawValue,
+                  FileManager.default.isReadableFile(atPath: project.path) else {
+                throw CLIError.message("Project folder is unavailable: \(displayPath(project.path))")
+            }
+            let inspection = ProjectFrameworkDetector().inspect(root: URL(fileURLWithPath: project.path, isDirectory: true))
+            guard siteInfoSupportsFramework(inspection.framework, confidence: inspection.confidence) else {
+                throw CLIError.message("Site information currently supports detected Laravel projects only. Detected: \(inspection.framework).")
+            }
+            guard FileManager.default.fileExists(atPath: project.path + "/artisan") else {
+                throw CLIError.message("Laravel Artisan entry point is missing in \(displayPath(project.path)).")
+            }
+            let routes = try await client.routeList()
+            let caddy = try await client.routeObservedList()
+            let configured = siteDriverRoutes(project: project, routeIntents: routes, observedRoutes: caddy.observedRoutes, unavailableReason: caddy.unavailableReason)
+            let phpPath = try await client.resolvePHPExecutable(workingDirectory: project.path).cliPath
+            let application = try runSiteInformation(phpPath: phpPath, projectPath: project.path)
+            let result = SiteInfoEnvelope(project: project.name, path: project.path, detectedFramework: inspection.framework, frameworkEvidence: inspection.evidence, configuredRoutes: configured.map { SiteInfoConfiguredRoute(hostname: $0.hostname, target: $0.target, tls: $0.tls) }, runtimeObservations: configured.map { SiteInfoRuntimeObservation(hostname: $0.hostname, caddyRouteObserved: $0.caddyRouteObserved, caddyObservationState: $0.caddyObservationState) }, applicationCommand: ["php", "artisan", "about", "--no-ansi"], applicationExitCode: application.exitCode, applicationOutput: application.output)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(siteInfoHumanOutput(result, width: HumanOutput.terminalWidth, color: HumanOutput.colorEnabled)) }
+            if application.exitCode != 0 { throw CLIError.applicationFailure("Laravel Artisan about", status: application.exitCode) }
         case .openSite(let selector):
             let projects = try await client.projectList()
             let routes = try await client.routeList()
@@ -1227,11 +1260,13 @@ enum CLIError: Error, CustomStringConvertible {
     case usage
     case commandUsage(String)
     case message(String)
+    case applicationFailure(String, status: Int32)
     var description: String {
         switch self {
         case .usage: return VaelenCLIMain.usage
         case .commandUsage(let command): return VaelenCLIMain.helpText(for: [command])
         case .message(let text): return text
+        case .applicationFailure(let command, let status): return "\(command) exited with status \(status)."
         }
     }
 }

@@ -57,6 +57,81 @@ struct SiteDriverEnvelope: Encodable {
     let configuredRoutes: [SiteDriverRoute]
 }
 
+struct SiteInfoEnvelope: Codable, Equatable {
+    let project: String
+    let path: String
+    let detectedFramework: String
+    let frameworkEvidence: [String]
+    let configuredRoutes: [SiteInfoConfiguredRoute]
+    let runtimeObservations: [SiteInfoRuntimeObservation]
+    let applicationCommand: [String]
+    let applicationExitCode: Int32
+    let applicationOutput: String
+}
+
+struct SiteInfoConfiguredRoute: Codable, Equatable {
+    let hostname: String
+    let target: String
+    let tls: String
+}
+
+struct SiteInfoRuntimeObservation: Codable, Equatable {
+    let hostname: String
+    let caddyRouteObserved: Bool?
+    let caddyObservationState: String
+}
+
+func runSiteInformation(phpPath: String, projectPath: String) throws -> (exitCode: Int32, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: phpPath)
+    process.arguments = ["artisan", "about", "--no-ansi"]
+    process.currentDirectoryURL = URL(fileURLWithPath: projectPath, isDirectory: true)
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+func siteInfoProcessExitCode(_ status: Int32) -> Int32 {
+    (1...255).contains(status) ? status : 1
+}
+
+func siteInfoSupportsFramework(_ framework: String, confidence: ProjectEnvironmentConfidence) -> Bool {
+    framework == "Laravel" && confidence != .low
+}
+
+func siteInfoHumanOutput(_ result: SiteInfoEnvelope, width: Int, color: Bool) -> String {
+    let title = color ? "\u{001B}[1;36mSite information\u{001B}[0m" : "Site information"
+    var lines = [title]
+    for (label, value) in [
+        ("Project", result.project), ("Path", result.path), ("Application", result.detectedFramework),
+        ("Command", result.applicationCommand.joined(separator: " "))
+    ] {
+        lines.append(contentsOf: HumanOutput.wrap("\(label): \(value)", width: width).components(separatedBy: "\n"))
+    }
+    lines.append("")
+    lines.append("Configured routes")
+    if result.configuredRoutes.isEmpty { lines.append("  No configured routes.") }
+    for route in result.configuredRoutes {
+        lines.append(contentsOf: HumanOutput.wrap("\(route.hostname) · \(route.target) · TLS \(route.tls)", width: max(12, width - 2), firstPrefix: "  ", nextPrefix: "  ").components(separatedBy: "\n"))
+    }
+    lines.append("")
+    lines.append(contentsOf: HumanOutput.wrap("Runtime observations (Caddy configuration only; not HTTP reachability)", width: width).components(separatedBy: "\n"))
+    if result.runtimeObservations.isEmpty { lines.append("  No configured routes to observe.") }
+    for observation in result.runtimeObservations {
+        lines.append(contentsOf: HumanOutput.wrap("\(observation.hostname): \(caddyObservationLabel(observation.caddyObservationState))", width: max(12, width - 2), firstPrefix: "  ", nextPrefix: "  ").components(separatedBy: "\n"))
+    }
+    lines.append("")
+    lines.append("Application information (exit \(result.applicationExitCode))")
+    for line in result.applicationOutput.split(separator: "\n", omittingEmptySubsequences: false) {
+        lines.append(contentsOf: HumanOutput.wrap(String(line), width: width).components(separatedBy: "\n"))
+    }
+    return lines.joined(separator: "\n")
+}
+
 func discoveredParkedProjects(_ projects: [ProjectWire]) -> [ProjectWire] {
     projects.filter { ($0.sources ?? []).contains(ProjectVisibilitySource.parkedFolder.rawValue) }
 }
