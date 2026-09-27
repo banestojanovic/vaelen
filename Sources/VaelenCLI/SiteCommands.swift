@@ -104,31 +104,22 @@ func siteInfoSupportsFramework(_ framework: String, confidence: ProjectEnvironme
 }
 
 func siteInfoHumanOutput(_ result: SiteInfoEnvelope, width: Int, color: Bool) -> String {
-    let title = color ? "\u{001B}[1;36mSite information\u{001B}[0m" : "Site information"
-    var lines = [title]
-    for (label, value) in [
-        ("Project", result.project), ("Path", result.path), ("Application", result.detectedFramework),
-        ("Command", result.applicationCommand.joined(separator: " "))
-    ] {
-        lines.append(contentsOf: HumanOutput.wrap("\(label): \(value)", width: width).components(separatedBy: "\n"))
-    }
-    lines.append("")
-    lines.append("Configured routes")
-    if result.configuredRoutes.isEmpty { lines.append("  No configured routes.") }
-    for route in result.configuredRoutes {
-        lines.append(contentsOf: HumanOutput.wrap("\(route.hostname) · \(route.target) · TLS \(route.tls)", width: max(12, width - 2), firstPrefix: "  ", nextPrefix: "  ").components(separatedBy: "\n"))
-    }
-    lines.append("")
-    lines.append(contentsOf: HumanOutput.wrap("Runtime observations (Caddy configuration only; not HTTP reachability)", width: width).components(separatedBy: "\n"))
-    if result.runtimeObservations.isEmpty { lines.append("  No configured routes to observe.") }
-    for observation in result.runtimeObservations {
-        lines.append(contentsOf: HumanOutput.wrap("\(observation.hostname): \(caddyObservationLabel(observation.caddyObservationState))", width: max(12, width - 2), firstPrefix: "  ", nextPrefix: "  ").components(separatedBy: "\n"))
-    }
-    lines.append("")
-    lines.append("Application information (exit \(result.applicationExitCode))")
-    for line in result.applicationOutput.split(separator: "\n", omittingEmptySubsequences: false) {
-        lines.append(contentsOf: HumanOutput.wrap(String(line), width: width).components(separatedBy: "\n"))
-    }
+    var lines = [HumanOutput.heading("Site information", color: color)]
+    let details = [
+        ["Project", result.project], ["Path", result.path], ["Application", result.detectedFramework],
+        ["Command", result.applicationCommand.joined(separator: " ")]
+    ]
+    lines.append(HumanOutput.table(details, headers: ["Property", "Value"], width: width, color: color))
+    lines.append(HumanOutput.heading("Configured routes", color: color))
+    let routeRows = result.configuredRoutes.map { [$0.hostname, $0.target, $0.tls] }
+    lines.append(routeRows.isEmpty ? "No configured routes." : HumanOutput.table(routeRows, headers: ["Hostname", "Target", "TLS"], width: width, color: color))
+    lines.append(HumanOutput.heading("Runtime observations", color: color))
+    lines.append(HumanOutput.wrap("Caddy configuration only; this is not an HTTP reachability check.", width: width))
+    let observations = result.runtimeObservations.map { [$0.hostname, caddyObservationLabel($0.caddyObservationState)] }
+    lines.append(observations.isEmpty ? "No configured routes to observe." : HumanOutput.table(observations, headers: ["Hostname", "Caddy config"], width: width, color: color))
+    lines.append(HumanOutput.heading("Application output · exit \(result.applicationExitCode)", color: color))
+    // Child application output is intentionally relayed byte-for-byte, not tabulated.
+    if !result.applicationOutput.isEmpty { lines.append(result.applicationOutput) }
     return lines.joined(separator: "\n")
 }
 
@@ -136,19 +127,62 @@ func discoveredParkedProjects(_ projects: [ProjectWire]) -> [ProjectWire] {
     projects.filter { ($0.sources ?? []).contains(ProjectVisibilitySource.parkedFolder.rawValue) }
 }
 
-func parkedSitesHumanOutput(_ projects: [ProjectWire], folders: [ParkedPathWire]) -> String {
-    func display(_ path: String) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return path == home ? "~" : (path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path)
+func displayProjectPath(_ path: String) -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    return path == home ? "~" : (path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path)
+}
+
+private func availabilityLabel(_ raw: String) -> String {
+    if raw == PathAvailability.available.rawValue { return "Available" }
+    if raw == "not-applicable" { return "Not applicable" }
+    return "Unavailable · \(raw)"
+}
+
+private func styledState(_ text: String, color: Bool) -> String {
+    let state = text.components(separatedBy: " · ").first ?? text
+    return HumanOutput.semantic(text, tint: HumanOutput.stateColor(state), color: color)
+}
+
+private func caddyShortLabel(_ state: String) -> String {
+    switch state {
+    case "exact-route-observed": return "Observed (config)"
+    case "exact-route-not-observed": return "Not observed"
+    case "hostname-observed-with-different-route": return "Different config"
+    case "caddy-observation-unavailable": return "Unavailable"
+    default: return state
     }
-    let rows = projects.map { project -> [String] in
+}
+
+func parkedSitesHumanOutput(_ projects: [ProjectWire], folders: [ParkedPathWire], width: Int = HumanOutput.terminalWidth, color: Bool = HumanOutput.colorEnabled) -> String {
+    var lines = [HumanOutput.heading("Sites inside parked folders", color: color), ""]
+    guard !projects.isEmpty else {
+        lines.append("No sites discovered in available parked folders.")
+        return lines.joined(separator: "\n")
+    }
+    let rows = projects.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }).map { project -> [String] in
         let parent = folders.filter { project.path.hasPrefix($0.path.hasSuffix("/") ? $0.path : $0.path + "/") }.max { $0.path.count < $1.path.count }?.path ?? "—"
-        let provenance = project.registration == ProjectRegistrationKind.linked.rawValue ? "Linked · parked" : "Discovered"
-        return [project.name, display(project.path), project.detectedFramework ?? "Unknown", provenance, display(parent)]
+        let relationship = project.registration == ProjectRegistrationKind.linked.rawValue ? "Linked · parked" : "Discovered"
+        return [project.name, displayProjectPath(project.path), project.detectedFramework ?? "Unknown", relationship, styledState(availabilityLabel(project.availability), color: color), displayProjectPath(parent)]
     }
-    var output = HumanOutput.heading("Sites inside parked folders") + "\n"
-    output += HumanOutput.list(rows, headers: ["Site", "Path", "Framework", "Relationship", "Parked folder"], empty: "No sites discovered in available parked folders.")
-    return output
+    lines.append(HumanOutput.table(rows, headers: ["Site", "Path", "Framework", "Registration", "Availability", "Parked folder"], width: width, color: color))
+    return lines.joined(separator: "\n")
+}
+
+func sitesHumanOutput(_ items: [SiteListItem], width: Int = HumanOutput.terminalWidth, color: Bool = HumanOutput.colorEnabled) -> String {
+    let note = HumanOutput.wrap("Caddy configuration observation is not HTTP reachability.", width: width)
+    var lines = [HumanOutput.heading("Configured sites", subtitle: note, color: color), ""]
+    guard !items.isEmpty else {
+        lines.append("No configured site routes.")
+        return lines.joined(separator: "\n")
+    }
+    let rows = items.map { item in
+        [item.hostname, item.tls.uppercased(), item.url, item.target,
+         "\(item.project ?? "—") · \(displayProjectPath(item.projectPath ?? "—"))",
+         styledState(availabilityLabel(item.projectAvailability), color: color),
+         styledState(caddyShortLabel(item.caddyObservationState), color: color)]
+    }
+    lines.append(HumanOutput.table(rows, headers: ["Site", "TLS", "URL", "Target", "Project · path", "Availability", "Caddy config"], width: width, color: color))
+    return lines.joined(separator: "\n")
 }
 
 func siteDriverRoutes(project: ProjectWire, routeIntents: [RouteIntent], observedRoutes: [Route]?, unavailableReason: String?) -> [SiteDriverRoute] {
@@ -270,29 +304,22 @@ func linkedProjectDisplay(projects: [ProjectWire], routes: [RouteIntent], observ
     }
 }
 
-func linkedProjectsHumanOutput(_ projects: [ProjectWire], routes: [RouteIntent], observedRoutes: [Route]?, phpByProject: [String: String], width: Int = HumanOutput.terminalWidth) -> String {
+func linkedProjectsHumanOutput(_ projects: [ProjectWire], routes: [RouteIntent], observedRoutes: [Route]?, phpByProject: [String: String], width: Int = HumanOutput.terminalWidth, color: Bool = HumanOutput.colorEnabled) -> String {
     let records = linkedProjectDisplay(projects: projects, routes: routes, observedRoutes: observedRoutes, phpByProject: phpByProject)
-    guard !records.isEmpty else { return HumanOutput.heading("Linked projects") + "\nNo linked projects." }
-    var output = HumanOutput.heading("Linked projects")
-    for record in records {
-        let projectHeading = record.project.name.count <= width ? HumanOutput.heading(record.project.name) : HumanOutput.wrap(record.project.name, width: width)
-        output += "\n\n" + projectHeading
-        let availability = record.project.availability == PathAvailability.available.rawValue ? "Available" : "Folder unavailable · \(record.project.availability)"
-        let rows = [("Path", record.project.path), ("Folder", availability), ("Effective PHP", record.effectivePHP ?? "Unavailable")]
-        for (label, value) in rows {
-            output += "\n" + HumanOutput.wrap(value, width: max(12, width - label.count - 4), firstPrefix: "\(label)  ", nextPrefix: String(repeating: " ", count: label.count + 2))
-        }
-        if record.hosts.isEmpty {
-            output += "\n" + HumanOutput.wrap("Configured hosts", width: max(12, width)) + "\n  None"
-        } else {
-            output += "\n" + HumanOutput.wrap("Configured hosts (configuration is separate from live Caddy observation)", width: max(12, width))
-            for host in record.hosts {
-                output += "\n" + HumanOutput.wrap(host.url, width: max(12, width - 2), firstPrefix: "  ", nextPrefix: "  ")
-                output += "\n" + HumanOutput.wrap("Configured · \(host.observation)", width: max(12, width - 4), firstPrefix: "    ", nextPrefix: "    ")
-            }
+    guard !records.isEmpty else { return HumanOutput.heading("Linked projects", color: color) + "\nNo linked projects." }
+    let note = HumanOutput.wrap("Caddy observes route configuration; this does not test HTTP reachability.", width: width)
+    var lines = [HumanOutput.heading("Linked projects", subtitle: note, color: color), ""]
+    let rows = records.flatMap { record -> [[String]] in
+        let availability = styledState(availabilityLabel(record.project.availability), color: color)
+        let common = [record.project.name, displayProjectPath(record.project.path), styledState(record.effectivePHP ?? "Unavailable", color: color), availability]
+        guard !record.hosts.isEmpty else { return [common + ["—", "No host configured"]] }
+        return record.hosts.map { host in
+            let short = host.observation == "Observed by Caddy" ? "Observed (config)" : (host.observation == "Not observed by Caddy" ? "Not observed" : (host.observation == "Caddy has a different route" ? "Different config" : "Unavailable"))
+            return common + [host.url, styledState(short, color: color)]
         }
     }
-    return output
+    lines.append(HumanOutput.table(rows, headers: ["Project", "Path", "PHP", "Availability", "URL", "Caddy config"], width: width, color: color))
+    return lines.joined(separator: "\n")
 }
 
 func externalOpenArguments(bundleIdentifier: String?, url: URL) -> [String] {

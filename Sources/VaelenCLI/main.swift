@@ -17,12 +17,13 @@ private struct PHPConfigurationEditorPreference: Codable {
 }
 
 enum CLICommand {
-    case help
+    case help(path: [String])
+    case version
     case status(json: Bool)
     case doctor(json: Bool)
     case routeTLS(hostname: String?, secure: Bool)
     case link(path: String?, hostname: String?)
-    case unlink(path: String)
+    case unlink(path: String?)
     case links(json: Bool)
     case edit(selector: String?)
     case park(path: String?)
@@ -48,8 +49,10 @@ enum CLICommand {
     case phpDefault(json: Bool)
     case phpDefaultSet(String)
     case phpUse(String)
-    case phpExec(version: String?, arguments: [String])
+    case phpExec(version: String?, effective: Bool, arguments: [String])
     case phpResolvePath
+    case isolated
+    case phpINI(version: String?)
     case shellStatus
     case shellInstall
     case shellUninstall
@@ -212,157 +215,13 @@ private struct LegacyPortsStatus: Encodable {
 
 @main
 struct VaelenCLIMain {
-    static let usage = helpText(for: [])
+    static let usage = CLIDocumentation.text(for: [])
 
-    static func helpText(for path: [String]) -> String {
-        if path == ["site", "info"] {
-            let detail = "Run Laravel's artisan about command using the effective project PHP. Configured routes, Caddy route-configuration observations, and application output are distinct; none of the route information proves HTTP reachability. Other frameworks are not yet supported."
-            return "site info\n\nUsage: val site info [project] [--json]\n\(HumanOutput.wrap(detail, width: HumanOutput.terminalWidth))\n"
-        }
-        if path == ["site", "driver"] {
-            return "site driver\n\nUsage: val site driver [project] [--json]\nReport detected framework and evidence separately from every configured route target and its exact Caddy route observation.\n"
-        }
-        if path.isEmpty {
-            let sections: [(String, [(String, String)])] = [
-                ("Projects", [("link", "Link a project"), ("links", "List linked projects and hosts"), ("edit", "Open project in configured editor"), ("unlink", "Unlink project; keep files"), ("park", "Park a workspace folder"), ("parks", "List parked folders"), ("parked", "List sites discovered in parked folders"), ("sites", "List configured sites and serving observations"), ("open", "Open a configured site"), ("db", "Open an eligible project database"), ("site", "Inspect a site driver"), ("unpark", "Unpark a workspace folder"), ("project", "Inspect and configure projects")]),
-                ("Overview", [("status", "Show Vaelen status"), ("doctor", "Check Vaelen services")]),
-                ("Web", [("secure", "Enable HTTPS for a site route"), ("unsecure", "Serve a site route over HTTP")]),
-                ("Runtime", [("php", "Manage PHP"), ("mysql", "Manage MySQL"), ("mailpit", "Manage Mailpit")]),
-                ("Networking", [("routing", "Manage router"), ("route", "Manage project routes"), ("dns", "Manage DNS"), ("tls", "Manage HTTPS"), ("ports", "Manage web ports")]),
-                ("Integration", [("shell", "PHP shell integration")]),
-                ("Discoverability", [("list", "List available val commands")])
-            ]
-            var lines = wrappedText("Vaelen — local development environments for your projects.", indent: "").components(separatedBy: "\n")
-            lines += ["", "Usage: val <command> [options]", ""]
-            for (title, commands) in sections {
-                lines.append(title)
-                lines += rootCommandRows(commands)
-                lines.append("")
-            }
-            lines += wrappedText("Run “val list” to redisplay commands, or “val <command> --help” for details.", indent: "").components(separatedBy: "\n")
-            return lines.joined(separator: "\n")
-        }
-        let name = path[0]
-        let body: String
-        switch name {
-        case "doctor": body = "Usage: val doctor [--json]\nCheck Vaelen Core and managed service health without starting or repairing services.\nExample: val doctor --json"
-        case "list": body = "Usage: val list\nList available val commands. Use “val <command> --help” for command-specific usage."
-        case "secure": body = "Usage: val secure [hostname]\nEnable local HTTPS and HTTP-to-HTTPS redirect for an existing route. Without a hostname, the current directory must resolve to exactly one route.\nExample: val secure app.test"
-        case "unsecure": body = "Usage: val unsecure [hostname]\nServe an existing route over HTTP without redirect. Without a hostname, the current directory must resolve to exactly one route. Browsers may retain a cached HTTPS redirect.\nExample: val unsecure app.test"
-        case "project": body = groupHelp("val project <command> [project] [options]", [
-                ("status [project] [--json]", "Show project environment summary"),
-                ("inspect [project] [--json]", "Show configuration and diagnostics"),
-                ("doctor [project] [--json]", "Report project diagnostic findings"),
-                ("plan [project] [--json]", "Preview project setup actions"),
-                ("activate [project] [--json]", "Apply actionable project setup"),
-                ("php [project] [options]", "Set a project PHP version")
-            ], examples: ["val project inspect", "val project php my-app --version 8.3"]) + "\n\n" + wrappedText("PHP options: --version <exact>, --use-default, --json", indent: "  ")
-        case "php": body = groupHelp("val php <command> [arguments]", [
-                ("versions [--json]", "List available and installed PHP"),
-                ("default [--json]", "Show the default PHP version"),
-                ("default set <version>", "Set the default PHP version"),
-                ("install <version>", "Install a PHP version"),
-                ("update <version>", "Update a PHP version"),
-                ("remove <version>", "Remove a PHP version"),
-                ("operation [--json]", "Show the current PHP operation"),
-                ("use <version>", "Select PHP for the shell"),
-                ("start <version>", "Start PHP-FPM"),
-                ("stop <version>", "Stop PHP-FPM"),
-                ("status <version> [--json]", "Show PHP runtime status"),
-                ("config [version]", "Open managed PHP configuration files; with a version, edit its FPM ini"),
-                ("exec -- <arguments>", "Run PHP with the selected version"),
-                ("resolve --path", "Print the project PHP executable")
-            ], examples: ["val php install 8.3", "val php resolve --path"])
-        case "mysql": body = groupHelp("val mysql <command> [arguments]", [
-            ("versions [--json]", "List available and installed MySQL versions"), ("install <version>", "Install a MySQL version"), ("use <version>", "Select the MySQL version"), ("initialize", "Initialize the selected MySQL data"), ("start", "Start MySQL"), ("stop", "Stop MySQL"), ("status [--json]", "Show MySQL status")], examples: ["val mysql status"])
-        case "mailpit": body = groupHelp("val mailpit <command> [arguments]", [
-            ("versions [--json]", "List available and installed versions"), ("install <version>", "Install Mailpit"), ("start", "Start Mailpit"), ("stop", "Stop Mailpit"), ("status [--json]", "Show Mailpit status"), ("open", "Open the Mailpit web interface")], examples: ["val mailpit start"])
-        case "routing": body = groupHelp("val routing <status|start|stop>", [("status", "Show router status"), ("start", "Start routing"), ("stop", "Stop routing")], examples: ["val routing status"])
-        case "route": body = groupHelp("val route <command> [arguments]", [("list [--json]", "List configured routes"), ("add <hostname> <document-root> [options]", "Add a route"), ("remove <route-id>", "Remove a route"), ("associate <route-id> <project-id>", "Associate a route with a project")], examples: ["val route add app.test ./public --tls"]) + "\n\n" + wrappedText("Options: --php-socket <path>, --project-id <uuid>, --tls", indent: "  ")
-        case "dns": body = groupHelp("val dns <status|install|remove> [options]", [("status [--json]", "Show local DNS status"), ("install [--takeover]", "Install local DNS"), ("remove", "Remove Vaelen local DNS")], examples: ["val dns status --json"])
-        case "tls": body = groupHelp("val tls <command>", [("status [--json]", "Show local HTTPS status"), ("install", "Install the local certificate authority"), ("remove", "Remove local HTTPS"), ("trust", "Trust the local certificate authority"), ("untrust", "Remove local CA trust")], examples: ["val tls status"])
-        case "ports": body = groupHelp("val ports <status|install|remove>", [("status [--json]", "Show standard local port status"), ("install", "Enable standard local ports"), ("remove", "Remove standard local port forwarding")], examples: ["val ports status"])
-        case "shell": body = groupHelp("val shell <status|install|uninstall>", [("status", "Show PHP shell integration"), ("install", "Install PHP shell integration"), ("uninstall", "Remove PHP shell integration")], examples: ["val shell status"])
-        case "status": body = "Usage: val status [--json]\nShow whether Vaelen Core is running."
-        case "link": body = "Usage: val link [project-directory] [--host HOST]\nLink and serve a project folder. With no directory, use the current directory. Use --host to add an exact hostname; repeating the same host is safe. New hosts inherit configuration only when all current project routes have the same target and TLS mode. If they differ, Vaelen refuses to guess; use ‘val route add’ with an explicit target and TLS choice.\nExample: val link ./my-app --host api.my-app.test"
-        case "unlink": body = "Usage: val unlink <project-directory>\nRemove Vaelen's explicit project-link relationship without deleting files or changing any route. To remove just one hostname, use ‘val route remove <route-id>’.\nExample: val unlink ./my-app"
-        case "park": body = "Usage: val park [workspace-folder]\nPark a folder in your workspace. With no folder, use the current directory.\nExample: val park\nExample: val park ~/Code/old-project"
-        case "unpark": body = "Usage: val unpark [workspace-folder]\nUnpark a folder without deleting it. With no folder, use the current directory.\nExample: val unpark\nExample: val unpark ~/Code/old-project"
-        case "links": body = "Usage: val links [--json]\nList linked projects."
-        case "edit": body = "Usage: val edit [project]\nOpen the selected project folder in the editor configured in Vaelen Settings. Without a selector, the current directory must identify exactly one linked project."
-        case "parks": body = "Usage: val parks [--json]\nList parked workspace folders."
-        case "parked": body = "Usage: val parked [--json]\nList projects discovered inside parked workspace folders. This is distinct from val parks, which lists the folders themselves. Missing parked folders are reported separately."
-        case "sites": body = "Usage: val sites [--json]\nList configured route sites, project availability, and the router's independent serving observation. A configured route is not assumed to be served."
-        case "open": body = "Usage: val open [hostname|project]\nOpen the exact selected site's configured HTTP or HTTPS URL. Without a selector, the current directory must match exactly one configured site route."
-        case "db": body = "Usage: val db [project]\nOpen a project database in TablePlus only when the menu-bar action's MySQL eligibility checks pass. Credentials are never printed."
-        case "site": body = "Usage: val site <driver|info> [project] [--json]\n  driver  Report detected framework and configured routes.\n  info    Run Laravel's Artisan about using the project's effective PHP. Application output is distinct from route configuration and Caddy observation."
-        default: return "Unknown command: \(name). Run ‘val --help’ to see available commands."
-        }
-        return "\(name)\n\n\(body)\n"
-    }
-
-    private static func groupHelp(_ usage: String, _ commands: [(String, String)], examples: [String]) -> String {
-        var lines = ["Usage: \(usage)", "", "Commands:"]
-        lines += commandRows(commands)
-        lines.append("")
-        lines.append(examples.count == 1 ? "Example:" : "Examples:")
-        lines += examples.map { "  \($0)" }
-        return lines.joined(separator: "\n")
-    }
-
-    private static func commandRows(_ commands: [(String, String)]) -> [String] {
-        let width = max(40, min(120, Int(ProcessInfo.processInfo.environment["COLUMNS"] ?? "80") ?? 80))
-        if width < 60 {
-            return commands.flatMap { syntax, description in
-                wrappedText(syntax, indent: "  ").components(separatedBy: "\n")
-                    + wrappedText(description, indent: "    ").components(separatedBy: "\n")
-            }
-        }
-        let longest = commands.map { $0.0.count }.max() ?? 0
-        let nameWidth = min(longest, max(10, width / 2 - 2))
-        return commands.flatMap { syntax, description -> [String] in
-            let prefix = "  \(syntax)" + String(repeating: " ", count: max(2, nameWidth - syntax.count + 2))
-            let continuation = String(repeating: " ", count: prefix.count)
-            let descriptionWidth = max(8, width - prefix.count)
-            let words = description.split(whereSeparator: \.isWhitespace).map(String.init)
-            var result: [String] = []
-            var line = ""
-            for word in words {
-                if !line.isEmpty && line.count + 1 + word.count > descriptionWidth {
-                    result.append((result.isEmpty ? prefix : continuation) + line)
-                    line = word
-                } else {
-                    line += (line.isEmpty ? "" : " ") + word
-                }
-            }
-            if !line.isEmpty { result.append((result.isEmpty ? prefix : continuation) + line) }
-            return result
-        }
-    }
-
-    private static func rootCommandRows(_ commands: [(String, String)]) -> [String] {
-        commandRows(commands)
-    }
-
-    private static func wrappedText(_ text: String, indent: String) -> String {
-        let width = max(40, min(120, Int(ProcessInfo.processInfo.environment["COLUMNS"] ?? "80") ?? 80))
-        let words = text.split(whereSeparator: \.isWhitespace).map(String.init)
-        var lines: [String] = []
-        var line = indent
-        for word in words {
-            if line.count > indent.count && line.count + 1 + word.count > width {
-                lines.append(line)
-                line = indent + word
-            } else {
-                line += (line == indent ? "" : " ") + word
-            }
-        }
-        if line != indent { lines.append(line) }
-        return lines.joined(separator: "\n")
-    }
+    static func helpText(for path: [String]) -> String { CLIDocumentation.text(for: path) }
 
     private static func groupTitle(for line: String) -> Bool {
-        ["Projects", "Overview", "Runtime", "Networking", "Integration", "Discoverability", "Commands", "Examples", "Example:"].contains(line)
+        let titles = CLIDocumentation.groups + ["PHP commands", "MySQL commands", "Mailpit commands", "Project commands", "Web commands", "Runtime commands", "Networking commands", "Site commands", "Routing commands", "Route commands", "Dns commands", "Tls commands", "Ports commands", "Shell commands", "Commands", "Examples", "Example:"]
+        return titles.contains(line)
     }
 
     static func printHelp(_ text: String) {
@@ -371,7 +230,7 @@ struct VaelenCLIMain {
               isatty(STDOUT_FILENO) == 1 else { print(text); return }
         let rendered = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
             let value = String(line)
-            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks", "parked", "sites", "open", "db", "site", "list"].contains(value)) {
+            if groupTitle(for: value) || (["project", "php", "mysql", "mailpit", "routing", "route", "dns", "tls", "ports", "shell", "status", "link", "unlink", "park", "unpark", "links", "parks", "parked", "sites", "open", "db", "site", "site driver", "site info", "list"].contains(value)) {
                 return "\u{001B}[1;36m\(value)\u{001B}[0m"
             }
             if value.hasPrefix("  "), let gap = value.range(of: "  ", range: value.index(value.startIndex, offsetBy: 2)..<value.endIndex) {
@@ -389,19 +248,19 @@ struct VaelenCLIMain {
     static func main() async {
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
-            if arguments == ["--version"] || arguments == ["-V"] {
-                print("Vaelen \(VaelenBuildInfo.version)")
-                exit(0)
-            }
             if arguments.isEmpty || arguments == ["--help"] || arguments == ["-h"] || arguments == ["help"] {
                 printHelp(usage)
                 exit(0)
             }
             if arguments.last == "--help" || arguments.last == "-h" {
-                printHelp(helpText(for: Array(arguments.dropLast()).filter { $0 != "help" }))
+                printHelp(CLIDocumentation.focusedText(for: Array(arguments.dropLast()).filter { $0 != "help" }))
                 exit(0)
             }
             let command = try parse(arguments)
+            if case .version = command {
+                print("Vaelen \(VaelenBuildInfo.version)")
+                exit(0)
+            }
             if case .doctor(let json) = command {
                 let paths = CoreEndpointPaths()
                 let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
@@ -414,14 +273,17 @@ struct VaelenCLIMain {
                 }
                 exit(report.exitCode)
             }
-            if case .help = command {
-                printHelp(usage)
+            if case .help(let path) = command {
+                printHelp(helpText(for: path))
                 exit(0)
             }
             switch command {
-            case .shellStatus: print(try PHPShellIntegration.status()); exit(0)
-            case .shellInstall: print(try PHPShellIntegration.install()); exit(0)
-            case .shellUninstall: print(try PHPShellIntegration.uninstall()); exit(0)
+            case .shellStatus:
+                let status = try PHPShellIntegration.status()
+                let tint = status.contains("Enabled") ? 32 : status.contains("Broken") ? 31 : 90
+                print(HumanOutput.message(status, tint: tint)); exit(0)
+            case .shellInstall: print(HumanOutput.success(try PHPShellIntegration.install())); exit(0)
+            case .shellUninstall: print(HumanOutput.success(try PHPShellIntegration.uninstall())); exit(0)
             default: break
             }
             let paths = CoreEndpointPaths()
@@ -444,7 +306,7 @@ struct VaelenCLIMain {
         } catch let error as CLIError {
             switch error {
             case .usage, .commandUsage:
-                FileHandle.standardError.write(Data((error.description + "\n").utf8))
+                FileHandle.standardError.write(Data((HumanOutput.semantic(error.description, tint: 31) + "\n").utf8))
                 exit(1)
             case .message:
                 fail(error.description, code: 1)
@@ -459,12 +321,35 @@ struct VaelenCLIMain {
     static func parse(_ args: [String]) throws -> CLICommand {
         guard let first = args.first else { throw CLIError.usage }
         switch first {
-        case "help", "--help", "-h":
+        case "--version", "-V":
             guard args.count == 1 else { throw CLIError.usage }
-            return .help
+            return .version
+        case "help", "--help", "-h":
+            return .help(path: Array(args.dropFirst()))
         case "list":
             guard args.count == 1 else { throw CLIError.usage }
-            return .help
+            return .help(path: ["list"])
+        case "web", "runtime", "networking":
+            guard args.count == 1 else { throw CLIError.commandUsage(first) }
+            return .help(path: [first])
+        case "use":
+            guard args.count == 2 else { throw CLIError.commandUsage("use") }
+            return .phpUse(args[1])
+        case "isolate":
+            guard args.count == 2 || args.count == 3 else { throw CLIError.commandUsage("isolate") }
+            return .projectPHP(selector: args.count == 3 ? args[2] : nil, version: args[1], useDefault: false, json: false)
+        case "unisolate":
+            guard args.count == 1 || args.count == 2 else { throw CLIError.commandUsage("unisolate") }
+            return .projectPHP(selector: args.count == 2 ? args[1] : nil, version: nil, useDefault: true, json: false)
+        case "isolated":
+            guard args.count == 1 else { throw CLIError.commandUsage("isolated") }
+            return .isolated
+        case "which-php":
+            guard args.count == 1 else { throw CLIError.commandUsage("which-php") }
+            return .phpResolvePath
+        case "ini":
+            guard args.count == 1 || args.count == 2 else { throw CLIError.commandUsage("ini") }
+            return .phpINI(version: args.count == 2 ? args[1] : nil)
         case "status": return .status(json: try listJSONOption(args))
         case "doctor": return .doctor(json: try listJSONOption(args))
         case "secure", "unsecure":
@@ -478,6 +363,7 @@ struct VaelenCLIMain {
         case "open": guard args.count <= 2 else { throw CLIError.commandUsage("open") }; return .openSite(selector: args.count == 2 ? args[1] : nil)
         case "db": guard args.count <= 2 else { throw CLIError.commandUsage("db") }; return .databaseOpen(selector: args.count == 2 ? args[1] : nil)
         case "site":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2, ["driver", "info"].contains(args[1]) else { throw CLIError.commandUsage("site") }
             var selector: String?
             var json = false
@@ -488,7 +374,7 @@ struct VaelenCLIMain {
             }
             return args[1] == "driver" ? .siteDriver(selector: selector, json: json) : .siteInfo(selector: selector, json: json)
         case "project":
-            guard args.count >= 2 else { throw CLIError.usage }
+            if args.count == 1 { return .help(path: [first]) }
             if args[1] == "php" {
                 var selector: String?; var version: String?; var useDefault = false; var json = false
                 var i = 2
@@ -510,14 +396,25 @@ struct VaelenCLIMain {
             var hostname: String?
             var index = 1
             while index < args.count {
-                if args[index] == "--host", index + 1 < args.count, hostname == nil {
-                    hostname = args[index + 1]; index += 2
-                } else if !args[index].hasPrefix("-"), path == nil {
-                    path = args[index]; index += 1
-                } else { throw CLIError.commandUsage("link") }
+                let value = args[index]
+                if value == "--host", hostname == nil, index + 1 < args.count {
+                    hostname = args[index + 1]
+                    index += 2
+                } else if value == "--path", path == nil, index + 1 < args.count {
+                    path = args[index + 1]
+                    index += 2
+                } else if !value.hasPrefix("-"), path == nil, hostname == nil {
+                    if Self.looksLikePath(value) { path = value }
+                    else { hostname = Self.linkSiteHostname(value) }
+                    index += 1
+                } else {
+                    throw CLIError.commandUsage("link")
+                }
             }
             return .link(path: path, hostname: hostname)
-        case "unlink": return .unlink(path: try requiredPath(args))
+        case "unlink":
+            guard args.count <= 2 else { throw CLIError.commandUsage("unlink") }
+            return .unlink(path: args.count == 2 ? args[1] : nil)
         case "park":
             guard args.count <= 2 else { throw CLIError.commandUsage("park") }
             return .park(path: args.count == 2 ? args[1] : nil)
@@ -525,7 +422,7 @@ struct VaelenCLIMain {
             guard args.count <= 2 else { throw CLIError.commandUsage("unpark") }
             return .unpark(path: args.count == 2 ? args[1] : nil)
         case "php":
-            guard args.count >= 2 else { throw CLIError.usage }
+            if args.count == 1 { return .help(path: [first]) }
             switch args[1] {
             case "versions": return .phpVersions(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 3 else { throw CLIError.usage }; return .phpInstall(args[2])
@@ -543,11 +440,14 @@ struct VaelenCLIMain {
             case "status": guard args.count == 3 || args.count == 4 else { throw CLIError.usage }; return .phpStatus(args[2], json: try optionalJSONOption(Array(args.dropFirst(3))))
             case "config": guard args.count == 2 || args.count == 3 else { throw CLIError.usage }; return .phpConfig(version: args.count == 3 ? args[2] : nil)
             case "exec":
-                let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }; return .phpExec(version: nil, arguments: Array(rest.dropFirst(marker + 1)))
+                let rest = Array(args.dropFirst(2)); guard let marker = rest.firstIndex(of: "--") else { throw CLIError.usage }
+                let flags = Array(rest[..<marker]); guard flags.allSatisfy({ $0 == "--effective" }), flags.count <= 1 else { throw CLIError.usage }
+                return .phpExec(version: nil, effective: flags.contains("--effective"), arguments: Array(rest.dropFirst(marker + 1)))
             case "resolve": guard args.count == 3, args[2] == "--path" else { throw CLIError.usage }; return .phpResolvePath
              default: throw CLIError.usage
               }
         case "shell":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count == 2 else { throw CLIError.usage }
             switch args[1] {
             case "status": return .shellStatus
@@ -556,7 +456,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "mysql":
-            guard args.count >= 2 else { throw CLIError.usage }
+            if args.count == 1 { return .help(path: [first]) }
             switch args[1] {
             case "versions": return .mysqlVersions(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 3 else { throw CLIError.usage }; return .mysqlInstall(args[2])
@@ -568,6 +468,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "routing":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count == 2 else { throw CLIError.usage }
             switch args[1] {
             case "status": return .routingStatus
@@ -576,6 +477,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "route":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
             case "list": return .routeList(json: try optionalJSONOption(Array(args.dropFirst(2))))
@@ -603,7 +505,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "mailpit":
-            guard args.count >= 2 else { throw CLIError.usage }
+            if args.count == 1 { return .help(path: [first]) }
             switch args[1] {
             case "versions": return .mailpitVersions(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "install": guard args.count == 3 else { throw CLIError.usage }; return .mailpitInstall(args[2])
@@ -614,6 +516,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "dns":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
             case "status": return .dnsStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
@@ -622,6 +525,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "tls":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
             case "status": return .tlsStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
@@ -632,6 +536,7 @@ struct VaelenCLIMain {
             default: throw CLIError.usage
             }
         case "ports":
+            if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2 else { throw CLIError.usage }
             switch args[1] {
             case "status": return .portsStatus(json: try optionalJSONOption(Array(args.dropFirst(2))))
@@ -738,8 +643,39 @@ struct VaelenCLIMain {
 
     private static func execute(_ command: CLICommand, client: VaelenCoreClient, workingDirectory: String) async throws {
         switch command {
-        case .help:
-            print(usage)
+        case .version:
+            print("Vaelen \(VaelenBuildInfo.version)")
+        case .help(let path):
+            print(helpText(for: path), terminator: "")
+        case .isolated:
+            let projects = try await client.linkedProjects()
+            let socketPath = CoreEndpointPaths().socket.path
+            let identity = ClientIdentity(name: "val", version: VaelenBuildInfo.version)
+            let overrides = await withTaskGroup(of: (String, ProjectPHPSelection?).self, returning: [(String, ProjectPHPSelection)].self) { group in
+                for project in projects where project.id != nil {
+                    group.addTask {
+                        let phpClient = VaelenCoreClient(transport: UnixSocketTransport(path: socketPath), identity: identity)
+                        do {
+                            try await phpClient.connect()
+                            let selection = try await phpClient.projectPHP(selector: project.id?.uuidString, workingDirectory: workingDirectory)
+                            await phpClient.disconnect()
+                            return (project.path, selection)
+                        } catch {
+                            await phpClient.disconnect()
+                            return (project.path, nil)
+                        }
+                    }
+                }
+                var values: [(String, ProjectPHPSelection)] = []
+                for await (path, selection) in group where selection?.overrideVersion != nil {
+                    if let selection { values.append((path, selection)) }
+                }
+                return values
+            }
+            let rows = overrides.sorted { $0.0.localizedStandardCompare($1.0) == .orderedAscending }.map { path, selection in
+                [selection.project.name, displayPath(path), selection.overrideVersion ?? "—", selection.effectiveVersion ?? "unavailable"]
+            }
+            print(HumanOutput.heading("Isolated projects") + "\n" + (rows.isEmpty ? "No project-specific PHP overrides." : HumanOutput.table(rows, headers: ["Project", "Path", "Override", "Effective"])))
         case .doctor:
             break
         case .status(let json):
@@ -769,10 +705,6 @@ struct VaelenCLIMain {
             }
             let result = try await client.link(path: path, workingDirectory: workingDirectory, name: nil)
             guard let project = result.project else { throw CLIError.message("Core returned no linked project.") }
-            guard path == nil || requestedHostname != nil else {
-                print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(displayPath(project.path))")
-                break
-            }
             let canonicalPath = URL(fileURLWithPath: project.path).standardizedFileURL.resolvingSymlinksInPath().path
             var attemptedRoute: RouteIntent?
             var rollbackProblems = [String]()
@@ -854,22 +786,18 @@ struct VaelenCLIMain {
                 let disposition = result.created ? "The project link created by this invocation was rolled back." : "The pre-existing project link and all existing routes were left unchanged."
                 throw CLIError.message("Could not finish linking \(project.name): \(linkFailureDescription(error)). \(disposition)\(cleanup)")
             }
-            print("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(requestedHostname == nil ? "Serving" : "Configured") \(servingRoute.route.hostname) at \(servingRoute.route.tls == .local ? "https" : "http")://\(servingRoute.route.hostname)")
+            print(HumanOutput.success("\(result.created ? "Linked" : "Already linked") \(project.name)\n\(requestedHostname == nil ? "Serving" : "Configured") \(servingRoute.route.hostname) at \(servingRoute.route.tls == .local ? "https" : "http")://\(servingRoute.route.hostname)"))
         case .unlink(let path):
-            try await client.unlink(path: path, name: nil, workingDirectory: workingDirectory)
-            print("Unlinked project")
+            let target = Self.unlinkTargetPath(path, workingDirectory: workingDirectory)
+            try await client.unlink(path: target, name: nil, workingDirectory: workingDirectory)
+            print(HumanOutput.success("Unlinked project"))
         case .links(let json):
             let projects = try await client.linkedProjects()
             if json { print(String(decoding: try IPCCodec.encode(ProjectListEnvelope(projects: projects)), as: UTF8.self)) }
             else {
                 let routes = try await client.routeList()
                 let observation = try await client.routeObservedList()
-                var phpByProject = [String: String]()
-                for project in projects where project.availability == PathAvailability.available.rawValue {
-                    if let php = try? await client.projectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: workingDirectory), php.available, let version = php.effectiveVersion {
-                        phpByProject[project.path] = version
-                    }
-                }
+                let phpByProject = await effectivePHPByProject(projects: projects, workingDirectory: workingDirectory)
                 print(linkedProjectsOutput(projects, routes: routes, observedRoutes: observation.observedRoutes, phpByProject: phpByProject))
             }
         case .edit(let selector):
@@ -896,15 +824,15 @@ struct VaelenCLIMain {
                     else { continuation.resume() }
                 }
             }
-            print("Opening \(project.name) in \(preference.bundleIdentifier): \(project.path)")
+            print(HumanOutput.message("Opening \(project.name) in \(preference.bundleIdentifier): \(project.path)"))
         case .park(let path):
             let result = try await client.park(path: path, workingDirectory: workingDirectory)
             guard let parked = result.path else { throw CLIError.message("Core returned no parked path.") }
-            print("\(result.created ? "Parked" : "Already parked")\n\(displayPath(parked.path))")
+            print(HumanOutput.success("\(result.created ? "Parked" : "Already parked")\n\(displayPath(parked.path))"))
             if let summary = result.reconciliation {
-                for hostname in summary.added { print("Serving http://\(hostname)") }
-                for hostname in summary.removed { print("Removed parked route \(hostname)") }
-                for conflict in summary.conflicts { print("Conflict: \(conflict)") }
+                for hostname in summary.added { print(HumanOutput.success("Serving http://\(hostname)")) }
+                for hostname in summary.removed { print(HumanOutput.success("Removed parked route \(hostname)")) }
+                for conflict in summary.conflicts { print(HumanOutput.conflict(conflict)) }
                 for issue in summary.issues { print(HumanOutput.warning(issue)) }
             }
         case .unpark(let path):
@@ -914,10 +842,10 @@ struct VaelenCLIMain {
             guard !remainingPaths.contains(where: { $0.path == targetPath }) else {
                 throw CLIError.message("Vaelen Core reported success, but \(displayPath(targetPath)) is still parked.")
             }
-            print("Unparked\n\(displayPath(targetPath))")
+            print(HumanOutput.success("Unparked\n\(displayPath(targetPath))"))
             if let summary = result.reconciliation {
-                for hostname in summary.removed { print("Removed parked route \(hostname)") }
-                for conflict in summary.conflicts { print("Conflict: \(conflict)") }
+                for hostname in summary.removed { print(HumanOutput.success("Removed parked route \(hostname)")) }
+                for conflict in summary.conflicts { print(HumanOutput.conflict(conflict)) }
                 for issue in summary.issues { print(HumanOutput.warning(issue)) }
             }
         case .parks(let json):
@@ -940,9 +868,7 @@ struct VaelenCLIMain {
             let items = configuredSiteItems(routes: routes, projects: projects, observedRoutes: routerObservation.observedRoutes, unavailableReason: routerObservation.unavailableReason)
             if json { print(String(decoding: try IPCCodec.encode(SitesEnvelope(sites: items)), as: UTF8.self)) }
             else {
-                let note = HumanOutput.wrap("Configured routes and live router observations are shown separately.", width: HumanOutput.terminalWidth)
-                print(HumanOutput.heading("Configured sites", subtitle: note))
-                print(HumanOutput.list(items.map { [$0.hostname, $0.target, $0.tls, $0.project ?? "—", $0.projectAvailability, caddyObservationLabel($0.caddyObservationState), $0.url] }, headers: ["Hostname", "Target", "TLS", "Project", "Availability", "Caddy route", "URL"], empty: "No configured site routes."))
+                print(sitesHumanOutput(items))
             }
         case .siteDriver(let selector, let json):
             let projects = try await client.projectList()
@@ -965,11 +891,11 @@ struct VaelenCLIMain {
             else {
                 print(HumanOutput.heading("Site driver"))
                 print(HumanOutput.aligned([("Project", result.project), ("Path", displayPath(result.path)), ("Detected framework", result.detectedFramework), ("Framework confidence", result.frameworkConfidence)]))
-                print("Framework evidence")
-                if result.evidence.isEmpty { print("  No recognized framework markers found.") }
-                else { result.evidence.forEach { print(HumanOutput.wrap($0, width: max(20, HumanOutput.terminalWidth - 4), firstPrefix: "  ", nextPrefix: "  ")) } }
-                print("Configured serving routes")
-                if result.configuredRoutes.isEmpty { print("  No configured route belongs to this project.") }
+                print(HumanOutput.heading("Framework evidence"))
+                if result.evidence.isEmpty { print("No recognized framework markers found.") }
+                else { print(HumanOutput.table(result.evidence.map { [$0] }, headers: ["Evidence"])) }
+                print(HumanOutput.heading("Configured serving routes"))
+                if result.configuredRoutes.isEmpty { print("No configured route belongs to this project.") }
                 else {
                     let rows = result.configuredRoutes.map { [$0.hostname, $0.target, $0.tls, caddyObservationLabel($0.caddyObservationState)] }
                     print(HumanOutput.list(rows, headers: ["Hostname", "Configured target", "TLS", "Caddy route"], empty: "No configured route belongs to this project."))
@@ -1004,7 +930,7 @@ struct VaelenCLIMain {
             let route = try selectedRoute(selector, projects: projects, routes: routes, workingDirectory: workingDirectory)
             guard let url = siteURL(for: route.route) else { throw CLIError.message("The selected configured site has an invalid URL.") }
             try launchExternalURL(url)
-            print("Opening \(url.absoluteString)")
+            print(HumanOutput.message("Opening \(url.absoluteString)"))
         case .databaseOpen(let selector):
             let projects = try await client.projectList()
             let project = try selectedProject(selector, projects: projects, workingDirectory: workingDirectory)
@@ -1016,7 +942,7 @@ struct VaelenCLIMain {
             let action = ProjectDatabaseViewerAction.tablePlus(configured: report.configured, mysql: report.observed.mysql, tablePlusInstalled: tablePlusURL != nil)
             guard let url = action.url, tablePlusURL != nil else { throw CLIError.message("Cannot open \(project.name)'s database in TablePlus: \(action.reason).") }
             try launchExternalURL(url, bundleIdentifier: "com.tinyapp.TablePlus")
-            print("Opened \(project.name)'s configured database in TablePlus.")
+            print(HumanOutput.success("Opened \(project.name)'s configured database in TablePlus."))
         case .projectStatus(let selector, let json):
             let report = try await client.projectStatus(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectSummary(report)) }
@@ -1035,28 +961,48 @@ struct VaelenCLIMain {
         case .projectPHP(let selector, let version, let useDefault, let json):
             let result = try await client.setProjectPHP(selector: selector, workingDirectory: workingDirectory, version: version, useDefault: useDefault)
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
-            else { print("Project \(result.project.name)\nOverride    \(result.overrideVersion ?? "Uses Default")\nDefault     \(result.defaultVersion ?? "none")\nEffective   \(result.effectiveVersion ?? "unavailable")\nObserved    \(result.observedVersion ?? "not running")") }
+            else { print(HumanOutput.report("Project PHP · \(result.project.name)", rows: [("Override", result.overrideVersion ?? "Uses Default"), ("Default", result.defaultVersion ?? "none"), ("Effective", HumanOutput.state(result.effectiveVersion ?? "unavailable")), ("Observed", HumanOutput.state(result.observedVersion ?? "not running"))])) }
         case .phpVersions(let json):
-            let result = try await client.phpCatalog(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Available  \(result.availableVersions.joined(separator: ", "))\nInstalled  \(result.installedVersions.map(\.version).joined(separator: ", "))\nDefault    \(result.defaultVersion ?? "none")\nRunning    \(result.runningVersions.joined(separator: ", ").isEmpty ? "none" : result.runningVersions.joined(separator: ", "))") }
-        case .phpInstall(let version): let result = try await client.phpInstall(version); print("Installed PHP \(result.version)")
-        case .phpUpdate(let version): let result = try await client.phpUpdate(version); print("Updated PHP \(result.version)")
-        case .phpRemove(let version): _ = try await client.phpRemove(version); print("Removed PHP \(version)")
+            let result = try await client.phpCatalog()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(phpCatalogHumanOutput(result)) }
+        case .phpInstall(let version): let result = try await client.phpInstall(version); print(HumanOutput.success("Installed PHP \(result.version)"))
+        case .phpUpdate(let version): let result = try await client.phpUpdate(version); print(HumanOutput.success("Updated PHP \(result.version)"))
+        case .phpRemove(let version): _ = try await client.phpRemove(version); print(HumanOutput.success("Removed PHP \(version)"))
         case .phpOperation(let json):
-            let operation = try await client.phpOperation(); if json { print(String(decoding: try IPCCodec.encode(PHPOperationResult(operation: operation)), as: UTF8.self)) } else if let operation { print("PHP \(operation.kind.rawValue) \(operation.targetVersion): \(operation.phase.rawValue)\(operation.message.map { " — \($0)" } ?? "")") } else { print("No PHP operation recorded") }
+            let operation = try await client.phpOperation(); if json { print(String(decoding: try IPCCodec.encode(PHPOperationResult(operation: operation)), as: UTF8.self)) } else if let operation { print(HumanOutput.report("PHP operation", rows: [("Operation", "\(operation.kind.rawValue) \(operation.targetVersion)"), ("Phase", HumanOutput.state(operation.phase.rawValue)), ("Details", operation.message ?? "none")])) } else { print(HumanOutput.message("No PHP operation recorded", tint: 90)) }
         case .phpDefault(let json):
-            let catalog = try await client.phpCatalog(); if json { print(String(decoding: try IPCCodec.encode(PHPRuntimeCatalogResult(catalog: catalog)), as: UTF8.self)) } else { print("Default PHP \(catalog.defaultVersion ?? "none")") }
+            let catalog = try await client.phpCatalog(); if json { print(String(decoding: try IPCCodec.encode(PHPRuntimeCatalogResult(catalog: catalog)), as: UTF8.self)) } else { print(HumanOutput.report("Default PHP", rows: [("Server default", HumanOutput.state(catalog.defaultVersion ?? "none"))])) }
         case .phpDefaultSet(let version):
-            let catalog = try await client.phpDefaultSet(version); print("Default PHP \(catalog.defaultVersion ?? version)")
-        case .phpUse(let version): let result = try await client.phpUse(version); print("Using PHP \(result.version) for CLI")
-        case .phpExec(let version, let arguments): let result = try await client.phpExec(version: version, workingDirectory: FileManager.default.currentDirectoryPath, arguments: arguments); print(result.output, terminator: ""); if result.exitStatus != 0 { exit(result.exitStatus) }
+            let catalog = try await client.phpDefaultSet(version); print(HumanOutput.success("Default PHP \(catalog.defaultVersion ?? version)"))
+        case .phpUse(let version): let result = try await client.phpUse(version); print(HumanOutput.success("Using PHP \(result.version) for CLI"))
+        case .phpExec(let version, let effective, let arguments):
+            let selectedVersion: String?
+            if effective {
+                let selection = try await client.projectPHP(selector: nil, workingDirectory: workingDirectory)
+                guard let resolved = selection.effectiveVersion else { throw CLIError.message("No effective managed PHP runtime is available for this project.") }
+                selectedVersion = resolved
+            } else { selectedVersion = version }
+            let result = try await client.phpExec(version: selectedVersion, workingDirectory: workingDirectory, arguments: arguments)
+            print(result.output, terminator: "")
+            if result.exitStatus != 0 { exit(result.exitStatus) }
         case .phpResolvePath:
             print(try await resolvePHPPath(client: client, workingDirectory: workingDirectory))
+        case .phpINI(let requestedVersion):
+            let version: String
+            if let requestedVersion { version = requestedVersion }
+            else {
+                let selection = try await client.projectPHP(selector: nil, workingDirectory: workingDirectory)
+                guard let resolved = selection.effectiveVersion else { throw CLIError.message("No effective managed PHP version is available for this project.") }
+                version = resolved
+            }
+            try await openPHPINI(version: version, client: client)
         case .shellStatus: print(try PHPShellIntegration.status())
         case .shellInstall: print(try PHPShellIntegration.install())
         case .shellUninstall: print(try PHPShellIntegration.uninstall())
-        case .phpStart(let version): let result = try await client.phpStart(version); print("PHP \(result.version) FPM \(result.state.rawValue) \(result.health)")
-        case .phpStop(let version): let result = try await client.phpStop(version); print("PHP \(result.version) FPM \(result.state.rawValue)")
-        case .phpStatus(let version, let json): let result = try await client.phpStatus(version); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("PHP \(result.version)\nPackage    \(result.package == nil ? "Missing" : "Installed")\nFPM        \(result.state.rawValue)\nPID        \(result.pid.map(String.init) ?? "none")\nSocket     \(displayPath(result.socket))\nHealth     \(result.health)") }
+        case .phpStart(let version): let result = try await client.phpStart(version); print(HumanOutput.report("PHP-FPM · \(result.version)", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health))]))
+        case .phpStop(let version): let result = try await client.phpStop(version); print(HumanOutput.report("PHP-FPM · \(result.version)", rows: [("State", HumanOutput.state(result.state.rawValue))]))
+        case .phpStatus(let version, let json): let result = try await client.phpStatus(version); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print(HumanOutput.report("PHP \(result.version)", rows: [("Package", result.package == nil ? "Missing" : "Installed"), ("FPM", HumanOutput.state(result.state.rawValue)), ("PID", result.pid.map(String.init) ?? "none"), ("Socket", displayPath(result.socket)), ("Health", HumanOutput.state(result.health))])) }
         case .phpConfig(let version):
             let configuration = try await client.phpConfiguration()
             let preference = try PHPConfigurationEditorPreference.load()
@@ -1074,7 +1020,7 @@ struct VaelenCLIMain {
                         if let error { continuation.resume(throwing: error) } else { continuation.resume() }
                     }
                 }
-                print("Opening PHP \(version) FPM configuration: \(runtime.fpmIniPath)")
+                print(HumanOutput.message("Opening PHP \(version) FPM configuration: \(runtime.fpmIniPath)"))
             } else {
                 let directoryURL = URL(fileURLWithPath: configuration.directory, isDirectory: true)
                 let openConfiguration = NSWorkspace.OpenConfiguration(); openConfiguration.activates = true
@@ -1083,34 +1029,41 @@ struct VaelenCLIMain {
                         if let error { continuation.resume(throwing: error) } else { continuation.resume() }
                     }
                 }
-                print("Opened Vaelen PHP configuration folder in \(preference.bundleIdentifier): \(configuration.directory)")
+                print(HumanOutput.success("Opened Vaelen PHP configuration folder in \(preference.bundleIdentifier): \(configuration.directory)"))
             }
-        case .mysqlVersions(let json): let result = try await client.mysqlVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nAvailable  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))\nSelected   \(result.default ?? "none")") }
-        case .mysqlInstall(let version): let result = try await client.mysqlInstall(version); print("Installed MySQL \(result.installed.first(where: { $0.version == version })?.version ?? version)")
-        case .mysqlUse(let version): let result = try await client.mysqlUse(version); print("Using MySQL \(result.default ?? version)")
-        case .mysqlInitialize: let result = try await client.mysqlInitialize(); print("MySQL \(result.state.rawValue) \(result.health)")
-        case .mysqlStart: let result = try await client.mysqlStart(); print("MySQL \(result.state.rawValue) \(result.health)")
-        case .mysqlStop: let result = try await client.mysqlStop(); print("MySQL \(result.state.rawValue)")
-         case .mysqlStatus(let json): let result = try await client.mysqlStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("MySQL\nState      \(result.state.rawValue)\nInstalled  \(result.installedVersion ?? "none")\nSelected   \(result.selectedVersion ?? "none")\nPID        \(result.pid.map(String.init) ?? "none")\nPort       127.0.0.1:\(result.port)\nSocket     \(displayPath(result.socket))\nData       \(displayPath(result.datadir))\nHealth     \(result.health)") }
-         case .mailpitVersions(let json): let result = try await client.mailpitVersions(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Mailpit\nAvailable  \(result.available.joined(separator: ", "))\nInstalled  \(result.installed.map(\.version).joined(separator: ", "))") }
-         case .mailpitInstall(let version): let result = try await client.mailpitInstall(version); print("Installed Mailpit \(result.version)")
-         case .mailpitStart: let result = try await client.mailpitStart(); print("Mailpit \(result.state.rawValue) \(result.health)\nSMTP       127.0.0.1:\(result.smtpPort)\nUI         \(result.uiEndpoint)")
-         case .mailpitStop: let result = try await client.mailpitStop(); print("Mailpit \(result.state.rawValue)")
-         case .mailpitStatus(let json): let result = try await client.mailpitStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print("Mailpit\nState      \(result.state.rawValue)\nVersion    \(result.installedVersion ?? "none")\nPID        \(result.pid.map(String.init) ?? "none")\nSMTP       127.0.0.1:\(result.smtpPort)\nUI         \(result.uiEndpoint)\nDatabase   \(displayPath(result.database))\nHealth     \(result.health)") }
+        case .mysqlVersions(let json):
+            let result = try await client.mysqlVersions()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(mysqlCatalogHumanOutput(result)) }
+        case .mysqlInstall(let version): let result = try await client.mysqlInstall(version); print(HumanOutput.success("Installed MySQL \(result.installed.first(where: { $0.version == version })?.version ?? version)"))
+        case .mysqlUse(let version): let result = try await client.mysqlUse(version); print(HumanOutput.success("Using MySQL \(result.default ?? version)"))
+          case .mysqlInitialize: let result = try await client.mysqlInitialize(); print(HumanOutput.report("MySQL initialization", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health))]))
+          case .mysqlStart: let result = try await client.mysqlStart(); print(HumanOutput.report("MySQL", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health))]))
+          case .mysqlStop: let result = try await client.mysqlStop(); print(HumanOutput.report("MySQL", rows: [("State", HumanOutput.state(result.state.rawValue))]))
+         case .mysqlStatus(let json): let result = try await client.mysqlStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print(HumanOutput.heading("MySQL") + "\n" + HumanOutput.aligned([("State", HumanOutput.state(result.state.rawValue)), ("Installed", result.installedVersion ?? "none"), ("Selected", result.selectedVersion ?? "none"), ("PID", result.pid.map(String.init) ?? "none"), ("Port", "127.0.0.1:\(result.port)"), ("Socket", displayPath(result.socket)), ("Data", displayPath(result.datadir)), ("Health", HumanOutput.state(result.health))])) }
+          case .mailpitVersions(let json):
+            let result = try await client.mailpitVersions()
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(mailpitCatalogHumanOutput(result)) }
+         case .mailpitInstall(let version): let result = try await client.mailpitInstall(version); print(HumanOutput.success("Installed Mailpit \(result.version)"))
+          case .mailpitStart: let result = try await client.mailpitStart(); print(HumanOutput.report("Mailpit", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health)), ("SMTP", "127.0.0.1:\(result.smtpPort)"), ("Web UI", result.uiEndpoint)]))
+          case .mailpitStop: let result = try await client.mailpitStop(); print(HumanOutput.report("Mailpit", rows: [("State", HumanOutput.state(result.state.rawValue))]))
+         case .mailpitStatus(let json): let result = try await client.mailpitStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print(HumanOutput.heading("Mailpit") + "\n" + HumanOutput.aligned([("State", HumanOutput.state(result.state.rawValue)), ("Version", result.installedVersion ?? "none"), ("PID", result.pid.map(String.init) ?? "none"), ("SMTP", "127.0.0.1:\(result.smtpPort)"), ("UI", result.uiEndpoint), ("Database", displayPath(result.database)), ("Health", HumanOutput.state(result.health))])) }
          case .mailpitOpen:
              let result = try await client.mailpitStatus(); guard result.state == .running else { throw CLIError.message("Mailpit is not healthy; start it before opening \(result.uiEndpoint).") }; let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/open"); process.arguments = [result.uiEndpoint]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw CLIError.message("Unable to open \(result.uiEndpoint).") }
         case .routingStatus:
-            let result = try await client.routingStatus(); print("Routing\nProvider   \(result.provider)\nVersion    \(result.providerVersion ?? "unknown")\nState      \(result.state.rawValue)\nHealth     \(result.health.rawValue)\nRoutes     \(result.routeCount)")
+              let result = try await client.routingStatus(); print(HumanOutput.report("Routing", rows: [("Provider", result.provider), ("Version", result.providerVersion ?? "unknown"), ("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health.rawValue)), ("Routes", String(result.routeCount))]))
         case .routingStart:
-            let result = try await client.routingStart(); print("Routing \(result.state.rawValue) \(result.health.rawValue)")
+              let result = try await client.routingStart(); print(HumanOutput.report("Routing", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health.rawValue))]))
         case .routingStop:
-            let result = try await client.routingStop(); print("Routing \(result.state.rawValue)")
+              let result = try await client.routingStop(); print(HumanOutput.report("Routing", rows: [("State", HumanOutput.state(result.state.rawValue))]))
         case .routeList(let json):
             let routes = try await client.routeList()
             if json { print(String(decoding: try IPCCodec.encode(RouteListEnvelope(routes: routes)), as: UTF8.self)) }
             else {
                 print(HumanOutput.heading("Routes"))
-                print(HumanOutput.list(routes.map { [String(describing: $0.route.id), $0.route.hostname, targetDescription($0.route.target), $0.route.tls.rawValue] }, headers: ["ID", "Hostname", "Target", "TLS"], empty: "No routes configured."))
+                let rows = routes.map { [String(describing: $0.route.id), $0.route.hostname, targetDescription($0.route.target), $0.route.tls.rawValue] }
+                print(rows.isEmpty ? "No routes configured." : HumanOutput.table(rows, headers: ["ID", "Hostname", "Target", "TLS"]))
             }
         case .routeTLS(let hostname, let secure):
             let routes = try await client.routeList()
@@ -1122,57 +1075,59 @@ struct VaelenCLIMain {
             let result: RouteIntent
             if let update = routeTLSUpdate(intent, secure: secure) { result = try await client.routeAdd(update) }
             else { result = intent }
-            print("\(secure ? "Secured" : "Unsecured"): \(secure ? "https" : "http")://\(result.route.hostname)")
+            print(HumanOutput.success("\(secure ? "Secured" : "Unsecured"): \(secure ? "https" : "http")://\(result.route.hostname)"))
             if !secure { print(HumanOutput.warning("A browser may retain a cached HTTPS redirect; clear its site data or try a private window if it keeps opening HTTPS.")) }
         case .routeAdd(let hostname, let documentRoot, let socketPath, let projectID, let tls):
             let target: RouteTarget = socketPath.map { .fastCGI(socketPath: $0, documentRoot: documentRoot) } ?? .staticFiles(documentRoot: documentRoot)
             let result = try await client.routeAdd(.init(route: .init(hostname: hostname, target: target, tls: tls ? .local : .disabled), projectID: projectID))
-            print("Added route \(result.route.id)\t\(result.route.hostname)\t\(targetDescription(result.route.target))")
+            print(HumanOutput.success("Added route \(result.route.id)  \(result.route.hostname)  \(targetDescription(result.route.target))"))
         case .routeRemove(let id):
-            _ = try await client.routeRemove(id); print("Removed route \(id)")
+            _ = try await client.routeRemove(id); print(HumanOutput.success("Removed route \(id)"))
         case .routeAssociate(let routeID, let projectID):
             let routes = try await client.routeList()
             guard let route = routes.first(where: { $0.route.id == routeID }) else { throw CLIError.message("Route \(routeID) was not found.") }
             let projects = try await client.linkedProjects()
             guard let project = projects.first(where: { $0.id == projectID.rawValue }) else { throw CLIError.message("Linked project \(projectID) was not found.") }
-            print("Route association review\nRoute       \(route.route.id)\nHostname    \(route.route.hostname)\nProject     \(project.name)\nProject ID  \(projectID)\nPath        \(displayPath(project.path))\nMetadata    project_id and project_path only")
+            print(HumanOutput.report("Route association review", rows: [("Route", String(describing: route.route.id)), ("Hostname", route.route.hostname), ("Project", project.name), ("Project ID", String(describing: projectID)), ("Path", displayPath(project.path)), ("Metadata", "project_id and project_path only")]))
             let result = try await client.routeAssociate(routeID: routeID, projectID: projectID)
-            print(result.state == .satisfied ? "Already associated" : "Associated route \(routeID) with project \(projectID)")
+            print(HumanOutput.success(result.state == .satisfied ? "Already associated" : "Associated route \(routeID) with project \(projectID)"))
         case .dnsStatus(let json):
             let result = try await client.dnsStatus()
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
             else {
-                let conflict = result.conflict.map { "\nConflict   \($0)" } ?? ""
-                print("DNS\nState      \(result.state.rawValue)\nOwnership  \(result.ownership.rawValue)\nResponder  \(result.responderState.rawValue)\nResolver   \(result.resolverPath)\nAddress    \(result.address):\(result.port)\nPID        \(result.pid.map(String.init) ?? "none")\nHealth     \(result.health)\(conflict)")
+                var rows: [(String, String)] = [("State", HumanOutput.state(result.state.rawValue)), ("Ownership", HumanOutput.state(result.ownership.rawValue)), ("Responder", HumanOutput.state(result.responderState.rawValue)), ("Resolver", displayPath(result.resolverPath)), ("Address", "\(result.address):\(result.port)"), ("PID", result.pid.map(String.init) ?? "none"), ("Health", HumanOutput.state(result.health))]
+                if let conflict = result.conflict { rows.append(("Conflict", HumanOutput.state("conflict") + " · " + conflict)) }
+                print(HumanOutput.report("DNS", rows: rows))
             }
         case .dnsInstall(let takeover):
-            let result = try await client.dnsInstall(takeover: takeover); print("DNS \(result.state.rawValue) \(result.health)")
+            let result = try await client.dnsInstall(takeover: takeover); print(HumanOutput.report("DNS", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health))]))
         case .dnsRemove:
-            let result = try await client.dnsRemove(); print("DNS \(result.state.rawValue)")
+            let result = try await client.dnsRemove(); print(HumanOutput.report("DNS", rows: [("State", HumanOutput.state(result.state.rawValue))]))
         case .tlsStatus(let json):
             let result = try await client.tlsStatus()
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
-            else { print("Local TLS\nState      \(result.state.rawValue)\nTrust      \(result.trustObserved ? "Trusted" : "Not Trusted")\nPort       \(result.tlsPort)\(result.detail.map { "\\nDetail     \($0)" } ?? "")") }
+            else { print(HumanOutput.report("Local TLS", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Trust", HumanOutput.state(result.trustObserved ? "Trusted" : "Not Trusted")), ("Port", String(result.tlsPort)), ("Detail", result.detail ?? "None")])) }
         case .tlsInstall:
-            let result = try await client.tlsInstall(); print("Local CA \(result.state.rawValue). Trust requires approval in Vaelen.app.")
+            let result = try await client.tlsInstall(); print(HumanOutput.report("Local CA", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Next step", "Trust requires approval in Vaelen.app.")]))
         case .tlsRemove:
-            let result = try await client.tlsRemove(); print("Local TLS \(result.state.rawValue)")
+            let result = try await client.tlsRemove(); print(HumanOutput.report("Local TLS", rows: [("State", HumanOutput.state(result.state.rawValue))]))
         case .tlsTrust:
-            let result = try await client.tlsTrustLocalCA(); print("Local TLS \(result.operation.rawValue): \(result.message)")
+            let result = try await client.tlsTrustLocalCA(); print(HumanOutput.report("Local TLS trust", rows: [("Operation", HumanOutput.state(result.operation.rawValue)), ("Details", result.message)]))
         case .tlsUntrust:
-            let result = try await client.tlsRemoveLocalCATrust(); print("Local TLS \(result.operation.rawValue): \(result.message)")
+            let result = try await client.tlsRemoveLocalCATrust(); print(HumanOutput.report("Local TLS trust", rows: [("Operation", HumanOutput.state(result.operation.rawValue)), ("Details", result.message)]))
         case .portsStatus(let json):
             let result = try await client.portsStatus()
             if json { print(String(decoding: try IPCCodec.encode(LegacyPortsStatusEnvelope(ports: LegacyPortsStatus(result))), as: UTF8.self)) }
             else {
-                let conflict = result.conflict.map { "\nConflict   \($0)" } ?? ""
-                let detail = result.detail.map { "\nDetail     \($0)" } ?? ""
-                print("Standard Local Ports\nState      \(result.state.rawValue)\nHTTP       127.0.0.1:\(result.httpPort) → 127.0.0.1:\(result.backendHTTPPort)\nHTTPS      127.0.0.1:\(result.httpsPort) → 127.0.0.1:\(result.backendHTTPSPort)\(conflict)\(detail)")
+                var rows: [(String, String)] = [("State", HumanOutput.state(result.state.rawValue)), ("HTTP", "127.0.0.1:\(result.httpPort) → 127.0.0.1:\(result.backendHTTPPort)"), ("HTTPS", "127.0.0.1:\(result.httpsPort) → 127.0.0.1:\(result.backendHTTPSPort)")]
+                if let conflict = result.conflict { rows.append(("Conflict", HumanOutput.state("conflict") + " · " + conflict)) }
+                if let detail = result.detail { rows.append(("Detail", detail)) }
+                print(HumanOutput.report("Standard Local Ports", rows: rows))
             }
         case .portsInstall:
-            let result = try await client.portsInstall(); print("Standard Local Ports \(result.state.rawValue).")
+            let result = try await client.portsInstall(); print(HumanOutput.report("Standard Local Ports", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Details", result.detail ?? "None")]))
         case .portsRemove:
-            let result = try await client.portsRemove(); print("Standard Local Ports \(result.state.rawValue)")
+            let result = try await client.portsRemove(); print(HumanOutput.report("Standard Local Ports", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Details", result.detail ?? "None")]))
         }
     }
 
@@ -1181,21 +1136,96 @@ struct VaelenCLIMain {
         return resolution.cliPath
     }
 
+    private static func openPHPINI(version: String, client: VaelenCoreClient) async throws {
+        let configuration = try await client.phpConfiguration()
+        guard let runtime = configuration.versions.first(where: { $0.version == version }) else {
+            throw CLIError.message("PHP \(version) is not installed by Vaelen. Run ‘val php versions’ to see installed versions.")
+        }
+        guard let preference = try PHPConfigurationEditorPreference.load() else {
+            throw CLIError.message("No editor is configured. Choose an installed editor in Vaelen Settings → General.")
+        }
+        let appURL = URL(fileURLWithPath: preference.applicationPath, isDirectory: true).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: appURL.path), Bundle(url: appURL)?.bundleIdentifier == preference.bundleIdentifier else {
+            throw CLIError.message("The configured editor ‘\(preference.bundleIdentifier)’ is no longer installed. Choose it again in Vaelen Settings → General.")
+        }
+        let fileURL = URL(fileURLWithPath: runtime.fpmIniPath)
+        let openConfiguration = NSWorkspace.OpenConfiguration()
+        openConfiguration.activates = true
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: openConfiguration) { _, error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            }
+        }
+        print(HumanOutput.message("Opening PHP \(version) FPM configuration: \(runtime.fpmIniPath)"))
+    }
+
     private static func displayPath(_ path: String) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
     }
 
-    static func linkedProjectsOutput(_ projects: [ProjectWire], routes: [RouteIntent] = [], observedRoutes: [Route]? = nil, phpByProject: [String: String] = [:]) -> String {
-        linkedProjectsHumanOutput(projects, routes: routes, observedRoutes: observedRoutes, phpByProject: phpByProject)
+    static func linkedProjectsOutput(_ projects: [ProjectWire], routes: [RouteIntent] = [], observedRoutes: [Route]? = nil, phpByProject: [String: String] = [:], width: Int = HumanOutput.terminalWidth, color: Bool = HumanOutput.colorEnabled) -> String {
+        linkedProjectsHumanOutput(projects, routes: routes, observedRoutes: observedRoutes, phpByProject: phpByProject, width: width, color: color)
     }
 
-    static func parkedPathsOutput(_ paths: [ParkedPathWire]) -> String {
-        HumanOutput.list(paths.map { [displayPath($0.path), $0.availability] }, headers: ["Workspace folder", "Availability"], empty: "No parked folders.")
+    static func parkedPathsOutput(_ paths: [ParkedPathWire], width: Int = HumanOutput.terminalWidth, color: Bool = HumanOutput.colorEnabled) -> String {
+        var lines = [HumanOutput.heading("Parked folders", color: color), ""]
+        guard !paths.isEmpty else { lines.append("No parked folders."); return lines.joined(separator: "\n") }
+        let rows = paths.sorted(by: { $0.path.localizedStandardCompare($1.path) == .orderedAscending }).map { path -> [String] in
+            let state = path.availability == PathAvailability.available.rawValue ? "Available" : "Unavailable · \(path.availability)"
+            return [displayPath(path.path), HumanOutput.semantic(state, tint: HumanOutput.stateColor(state), color: color)]
+        }
+        lines.append(HumanOutput.table(rows, headers: ["Parked folder", "Availability"], width: width, color: color))
+        return lines.joined(separator: "\n")
+    }
+
+    private static func effectivePHPByProject(projects: [ProjectWire], workingDirectory: String) async -> [String: String] {
+        let availableProjects = projects.filter { $0.availability == PathAvailability.available.rawValue }
+        let socketPath = CoreEndpointPaths().socket.path
+        let identity = ClientIdentity(name: "val", version: VaelenBuildInfo.version)
+        return await withTaskGroup(of: (String, String?).self, returning: [String: String].self) { group in
+            for project in availableProjects {
+                group.addTask {
+                    let phpClient = VaelenCoreClient(transport: UnixSocketTransport(path: socketPath), identity: identity)
+                    do {
+                        try await phpClient.connect()
+                        let selection = try await phpClient.projectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: workingDirectory)
+                        await phpClient.disconnect()
+                        return (project.path, selection.available ? selection.effectiveVersion : nil)
+                    } catch {
+                        await phpClient.disconnect()
+                        return (project.path, nil)
+                    }
+                }
+            }
+            var result = [String: String]()
+            for await (path, version) in group {
+                if let version { result[path] = version }
+            }
+            return result
+        }
     }
 
     static func unparkTargetPath(_ path: String?, workingDirectory: String) -> String {
         CanonicalPathService().canonicalize(path ?? workingDirectory, relativeTo: workingDirectory).string
+    }
+
+    static func unlinkTargetPath(_ path: String?, workingDirectory: String) -> String {
+        guard let path else { return CanonicalPathService().canonicalize(workingDirectory).string }
+        if path.hasPrefix("/") || path == "~" || path.hasPrefix("~/") {
+            return CanonicalPathService().canonicalize(path).string
+        }
+        return URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            .appendingPathComponent(path)
+            .standardizedFileURL.path
+    }
+
+    private static func looksLikePath(_ value: String) -> Bool {
+        value == "~" || value.hasPrefix("~/") || value.hasPrefix("./") || value.hasPrefix("../") || value.hasPrefix("/") || value.contains("/") || value.hasSuffix(".test")
+    }
+
+    private static func linkSiteHostname(_ siteName: String) -> String {
+        siteName.lowercased().hasSuffix(".test") ? siteName : "\(siteName).test"
     }
 
     private static func targetDescription(_ target: RouteTarget) -> String {
@@ -1207,45 +1237,68 @@ struct VaelenCLIMain {
     }
 
     private static func projectSummary(_ report: ProjectEnvironmentReport) -> String {
-        let desiredPHP = report.desired.php ?? "none"
-        let mysql = report.desired.mysql == true ? "requested / \(report.observed.mysql?.state.rawValue ?? "unknown")" : "not requested"
-        let mailpit = report.desired.mailpit == true ? "requested / \(report.observed.mailpit?.state.rawValue ?? "unknown")" : "not requested"
         let warnings = report.diagnostics.filter { $0.severity != .info }.count
-        return "Project \(report.identity.name)\nPath       \(displayPath(report.identity.path))\nFramework  \(report.derived.framework.framework) (\(report.derived.framework.confidence.rawValue))\nPHP        desired \(desiredPHP); \(report.derived.phpResolution)\nMySQL      \(mysql)\nMailpit    \(mailpit)\nRoute      \(report.observed.route.intentExists ? (report.observed.route.hostname ?? "present") : "missing")\nDNS        \(report.observed.dns.health)\nTLS        \(report.observed.tls.trustObserved ? "trusted" : "not trusted")\nWarnings   \(warnings)"
+        let mysql = report.desired.mysql == true ? "Requested · \(HumanOutput.state(report.observed.mysql?.state.rawValue ?? "unknown"))" : "Not requested"
+        let mailpit = report.desired.mailpit == true ? "Requested · \(HumanOutput.state(report.observed.mailpit?.state.rawValue ?? "unknown"))" : "Not requested"
+        let route = report.observed.route.intentExists ? (report.observed.route.hostname ?? "Present") : "Missing"
+        let warningValue = warnings == 0 ? "None" : HumanOutput.semantic("\(warnings) warning\(warnings == 1 ? "" : "s")", tint: 33)
+        return HumanOutput.report("Project · \(report.identity.name)", rows: [
+            ("Path", displayPath(report.identity.path)),
+            ("Framework", "\(report.derived.framework.framework) · confidence \(report.derived.framework.confidence.rawValue)"),
+            ("PHP", "Desired \(report.desired.php ?? "none") · \(report.derived.phpResolution)"),
+            ("MySQL", mysql), ("Mailpit", mailpit), ("Route", route),
+            ("DNS", HumanOutput.state(report.observed.dns.health)),
+            ("TLS", HumanOutput.state(report.observed.tls.trustObserved ? "Trusted" : "Not Trusted")),
+            ("Warnings", warningValue)
+        ])
     }
 
     private static func projectInspection(_ report: ProjectEnvironmentReport) -> String {
         let evidence = report.derived.framework.evidence.joined(separator: ", ")
-        let diagnostics = report.diagnostics.map { "\($0.severity.rawValue.uppercased()) \($0.code): \($0.message)" }.joined(separator: "\n")
         let mailAuthenticationEvidence = report.derived.mailAuthentication.evidence.joined(separator: "; ")
-        return "\(projectSummary(report))\n\nDesired\n  vaelen.yml: \(report.desired.file.rawValue)\n  PHP: \(report.desired.php ?? "unknown")\n  Secure web: \(report.desired.secureWeb.map(String.init) ?? "unknown")\n  MySQL: \(report.desired.mysql.map(String.init) ?? "unknown")\n  Mailpit: \(report.desired.mailpit.map(String.init) ?? "unknown")\n\nConfigured\n  DB: \(report.configured.dbConnection ?? "unknown") \(report.configured.dbHost ?? "unknown"): \(report.configured.dbPort ?? "unknown")\n  Mail: \(report.configured.mailer ?? "unknown") \(report.configured.mailHost ?? "unknown"): \(report.configured.mailPort ?? "unknown")\n  Secrets: database \(report.secret.databasePassword.rawValue), mail \(report.secret.mailPassword.rawValue)\n\nDerived\n  Evidence: \(evidence.isEmpty ? "none" : evidence)\n  Document root: \(report.derived.framework.suggestedDocumentRoot ?? "unknown")\n  Mail authentication: \(report.derived.mailAuthentication.requirement.rawValue)\(mailAuthenticationEvidence.isEmpty ? "" : " (\(mailAuthenticationEvidence))")\n  Config cache: \(report.derived.configCache.state)\n\nDiagnostics\n\(diagnostics.isEmpty ? "none" : diagnostics)"
+        let yesNoUnknown: (Bool?) -> String = { $0.map { $0 ? "On" : "Off" } ?? "Unknown" }
+        let configuredDB = "\(report.configured.dbConnection ?? "unknown") · \(report.configured.dbHost ?? "unknown"): \(report.configured.dbPort ?? "unknown")"
+        let configuredMail = "\(report.configured.mailer ?? "unknown") · \(report.configured.mailHost ?? "unknown"): \(report.configured.mailPort ?? "unknown")"
+        let derivedRows: [(String, String)] = [
+            ("Framework evidence", evidence.isEmpty ? "None" : evidence),
+            ("Document root", report.derived.framework.suggestedDocumentRoot ?? "Unknown"),
+            ("Mail authentication", "\(report.derived.mailAuthentication.requirement.rawValue)\(mailAuthenticationEvidence.isEmpty ? "" : " · \(mailAuthenticationEvidence)")"),
+            ("Config cache", report.derived.configCache.state)
+        ]
+        let diagnosticTable = report.diagnostics.isEmpty ? "No diagnostic findings." : HumanOutput.table(report.diagnostics.map { diagnostic in
+            let tint = diagnostic.severity == .error ? 31 : diagnostic.severity == .warning ? 33 : 90
+            let headline = HumanOutput.semantic("\(diagnostic.severity.rawValue.uppercased()) · \(diagnostic.code)", tint: tint)
+            return [headline, diagnostic.message, diagnostic.suggestion ?? "—"]
+        }, headers: ["Finding", "Detail", "Suggested action"])
+        return [
+            projectSummary(report),
+            HumanOutput.report("Desired", rows: [("Configuration", HumanOutput.state(report.desired.file.rawValue)), ("PHP", report.desired.php ?? "Unknown"), ("Secure web", yesNoUnknown(report.desired.secureWeb)), ("MySQL", yesNoUnknown(report.desired.mysql)), ("Mailpit", yesNoUnknown(report.desired.mailpit)), ("Read error", report.desired.fileError ?? "None")]),
+            HumanOutput.report("Configured", rows: [("Database", configuredDB), ("Mail", configuredMail), ("Secret availability", "Database · \(report.secret.databasePassword.rawValue) · Mail · \(report.secret.mailPassword.rawValue)")]),
+            HumanOutput.report("Derived", rows: derivedRows),
+            HumanOutput.heading("Diagnostics") + "\n" + diagnosticTable
+        ].joined(separator: "\n\n")
     }
 
     private static func projectDoctor(_ report: ProjectEnvironmentReport) -> String {
-        if report.diagnostics.isEmpty { return "No diagnostic findings for \(report.identity.name)." }
-        return report.diagnostics.map { "\($0.severity.rawValue.uppercased()) \($0.code)\n  \($0.message)\($0.suggestion.map { "\n  Suggested: \($0)" } ?? "")" }.joined(separator: "\n")
+        guard !report.diagnostics.isEmpty else { return HumanOutput.success("No diagnostic findings for \(report.identity.name).") }
+        let findings = report.diagnostics.map { diagnostic in
+            let tint = diagnostic.severity == .error ? 31 : diagnostic.severity == .warning ? 33 : 90
+            let header = HumanOutput.semantic("\(diagnostic.severity.rawValue.uppercased()) · \(diagnostic.code)", tint: tint)
+            return [header, diagnostic.message, diagnostic.suggestion ?? "—"]
+        }
+        return HumanOutput.heading("Project diagnostics · \(report.identity.name)") + "\n" + HumanOutput.table(findings, headers: ["Finding", "Detail", "Suggested action"])
     }
 
     private static func projectPlan(_ plan: ProjectReconciliationPlan) -> String {
-        let groups = [
-            ("Satisfied", plan.operations.filter { $0.disposition == .satisfied }),
-            ("Actionable", plan.operations.filter { $0.disposition == .actionable }),
-            ("Blocked or deferred", plan.operations.filter { $0.disposition != .satisfied && $0.disposition != .actionable })
-        ]
-        let sections = groups.compactMap { title, operations -> String? in
-            guard !operations.isEmpty else { return nil }
-            let lines = operations.map { operation in
-                let reason = operation.reason.map { "\n  \($0)" } ?? ""
-                return "  \(operation.id) [\(operation.disposition.rawValue)]\(reason)"
-            }.joined(separator: "\n")
-            return "\(title)\n\(lines)"
-        }.joined(separator: "\n\n")
-        return "Project \(plan.identity.name)\nOverall    \(plan.state.rawValue)\n\n\(sections.isEmpty ? "No operations required." : sections)"
+        let rows = plan.operations.map { operation in
+            (operation.id, "\(HumanOutput.state(operation.disposition.rawValue)) · \(operation.reason ?? operation.action.rawValue)")
+        }
+        return HumanOutput.report("Project setup plan · \(plan.identity.name)", rows: [("Overall", HumanOutput.state(plan.state.rawValue))] + (rows.isEmpty ? [("Operations", "None required")] : rows))
     }
 
     private static func projectActivation(_ execution: ProjectReconciliationExecutionResult) -> String {
-        let operations = execution.operations.map { "\($0.operationID) [\($0.state.rawValue)] \($0.message)" }.joined(separator: "\n")
-        return "Project \(execution.finalPlan.identity.name)\nResult     \(execution.state.rawValue)\n\(operations.isEmpty ? "No operations required." : operations)\nFinal plan \(execution.finalPlan.state.rawValue)"
+        let operationRows = execution.operations.map { ($0.operationID, "\(HumanOutput.state($0.state.rawValue)) · \($0.message)") }
+        return HumanOutput.report("Project activation · \(execution.finalPlan.identity.name)", rows: [("Result", HumanOutput.state(execution.state.rawValue)), ("Final plan", HumanOutput.state(execution.finalPlan.state.rawValue))] + (operationRows.isEmpty ? [("Operations", "None required")] : operationRows))
     }
 
     private static func message(for error: Error) -> String {

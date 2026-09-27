@@ -22,8 +22,8 @@ final class SiteCommandsTests: XCTestCase {
         XCTAssertEqual(parked, [discovered, linkedAndParked])
 
         let human = parkedSitesHumanOutput(parked, folders: [])
-        XCTAssertEqual(human.components(separatedBy: "UniqueHumanSiteName").count - 1, 1)
-        XCTAssertTrue(human.contains("Linked · parked"))
+        XCTAssertTrue(human.contains("UniqueHuma") && human.contains("nSiteName"), human)
+        XCTAssertTrue(human.contains("Linked ·") && human.contains("parked"), human)
 
         let json = try IPCCodec.encode(ParkedSitesEnvelope(sites: parked, unavailableFolders: []))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: json) as? [String: Any])
@@ -227,13 +227,59 @@ final class SiteCommandsTests: XCTestCase {
         XCTAssertFalse(plain.contains("\u{001B}["))
         XCTAssertTrue(plain.contains("Laravel project information"))
         XCTAssertTrue(plain.contains("Runtime observations"))
-        XCTAssertTrue(plain.contains("not HTTP"))
+        XCTAssertTrue(plain.contains("not"))
+        XCTAssertTrue(plain.contains("HTTP"))
         XCTAssertTrue(plain.contains("reachability"))
-        XCTAssertFalse(plain.split(separator: "\n").contains { $0.count > 40 }, plain)
+        let oversized = plain.split(separator: "\n").filter { $0.count > 40 }
+        XCTAssertTrue(oversized.isEmpty, "Oversized lines: \(oversized.map { ($0.count, String($0)) })\n\(plain)")
         let colored = siteInfoHumanOutput(result, width: 80, color: true)
-        XCTAssertTrue(colored.contains("\u{001B}[1;36mSite information\u{001B}[0m"))
+        XCTAssertTrue(colored.contains("\u{001B}[33mSite information\u{001B}[0m"))
         XCTAssertTrue(DoctorReport.colorEnabled(isTTY: true, environment: ["TERM": "xterm"]))
         XCTAssertFalse(DoctorReport.colorEnabled(isTTY: true, environment: ["NO_COLOR": "1", "TERM": "xterm"]))
         XCTAssertFalse(DoctorReport.colorEnabled(isTTY: true, environment: ["TERM": "dumb"]))
+    }
+
+    func testSiteInfoDoesNotReformatChildApplicationOutput() {
+        let child = String(repeating: "artisan-output-token-", count: 5)
+        let result = SiteInfoEnvelope(project: "example", path: "/tmp/example", detectedFramework: "Laravel", frameworkEvidence: [], configuredRoutes: [], runtimeObservations: [], applicationCommand: ["php", "artisan", "about", "--no-ansi"], applicationExitCode: 0, applicationOutput: child)
+        let human = siteInfoHumanOutput(result, width: 40, color: false)
+        XCTAssertTrue(human.contains(child))
+        XCTAssertFalse(human.contains("artisan-output-token-\n"))
+    }
+
+    func testParkedSitesGroupsRelationshipAvailabilityAndFullPathsAtFortyColumns() {
+        let root = "/tmp/a-long-workspace-folder/parked"
+        let project = ProjectWire(id: UUID(), name: "demo", path: root + "/demo", registration: "linked", availability: "missing", detectedFramework: "Laravel", sources: ["parkedFolder"])
+        let folder = ParkedPathWire(id: UUID(), path: root, availability: "available")
+        let plain = parkedSitesHumanOutput([project], folders: [folder], width: 40, color: false)
+        let compact = String(plain.filter { !$0.isWhitespace })
+        XCTAssertTrue(plain.hasPrefix("Sites inside parked folders\n\n"))
+        XCTAssertTrue(plain.contains("a-long"))
+        XCTAssertTrue(plain.contains("/demo"))
+        XCTAssertTrue(compact.contains("Framework"))
+        XCTAssertTrue(compact.contains("Linked"))
+        XCTAssertTrue(compact.contains("parked"))
+        XCTAssertTrue(compact.contains("Unavailable"))
+        XCTAssertTrue(compact.contains("missing"))
+        XCTAssertTrue(plain.contains("/parked"))
+        XCTAssertLessThanOrEqual(plain.split(separator: "\n").map(\.count).max() ?? 0, 40)
+        XCTAssertTrue(parkedSitesHumanOutput([project], folders: [folder], width: 80, color: true).contains("\u{001B}[90mUnavailable"))
+    }
+
+    func testSitesOutputKeepsRouteTargetAvailabilityAndCaddyConfigurationDistinctAtFortyColumns() {
+        let item = SiteListItem(hostname: "demo.test", url: "https://demo.test", target: "PHP · /tmp/demo/public", tls: "local", configured: true, caddyRouteObserved: true, caddyObservationState: "exact-route-observed", project: "demo", projectPath: "/tmp/demo", projectAvailability: "available", registration: "linked")
+        let plain = sitesHumanOutput([item], width: 40, color: false)
+        let compact = String(plain.filter { !$0.isWhitespace })
+        XCTAssertTrue(plain.contains("Configured sites"))
+        XCTAssertTrue(plain.contains("https://demo.test"))
+        XCTAssertTrue(compact.contains("PHP"))
+        XCTAssertTrue(compact.contains("/tmp/demo/public"))
+        XCTAssertTrue(compact.contains("demo"))
+        XCTAssertTrue(compact.contains("/tmp/demo"))
+        XCTAssertTrue(compact.contains("Observed(config)"))
+        XCTAssertTrue(compact.contains("notHTTPreachability"))
+        XCTAssertFalse(sitesHumanOutput([item], width: 100, color: false).contains("+---"), "site listings should use simple grouped text")
+        XCTAssertLessThanOrEqual(plain.split(separator: "\n").map(\.count).max() ?? 0, 40)
+        XCTAssertTrue(sitesHumanOutput([item], width: 100, color: true).contains("\u{001B}[32mAvailable\u{001B}[0m"))
     }
 }

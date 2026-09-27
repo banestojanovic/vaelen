@@ -114,12 +114,13 @@ final class DoctorTests: XCTestCase {
         }
     }
 
-    func testTerminalRendererUsesBorderlessColumnsAndSubtleStateSymbols() {
+    func testTerminalRendererUsesGroupedTextAndSubtleStateSymbols() {
         var snapshot = baseSnapshot(intents: [])
         snapshot.mysql = mysql(.installed, health: "not-initialized")
         let report = DoctorEvaluator.evaluate(snapshot)
         let output = report.render(width: 100, color: false)
-        XCTAssertTrue(output.contains("Check"))
+        XCTAssertFalse(output.contains("+---"))
+        XCTAssertTrue(output.contains("Core"))
         XCTAssertTrue(output.contains("Status"))
         XCTAssertTrue(output.contains("Detail"))
         XCTAssertTrue(output.contains("○ Off"))
@@ -132,15 +133,37 @@ final class DoctorTests: XCTestCase {
         var snapshot = baseSnapshot(intents: ["mysql"])
         snapshot.mysql = mysql(.stopped, health: "stopped")
         let output = DoctorEvaluator.evaluate(snapshot).render(width: 40, color: false)
-        XCTAssertTrue(output.contains("Check  Status  Detail"))
-        XCTAssertTrue(output.contains("Recommendation:"))
+        XCTAssertTrue(output.contains("Core"))
+        XCTAssertTrue(output.contains("val mysql"), output)
+        XCTAssertTrue(output.contains("start"), output)
         XCTAssertFalse(output.split(separator: "\n").contains { $0.count > 40 })
     }
 
     func testTerminalRendererColorsStatusOnlyWhenRequested() {
         let report = DoctorEvaluator.evaluate(baseSnapshot(intents: []))
         XCTAssertTrue(report.render(width: 100, color: true).contains("\u{001B}[32m✓ Healthy"))
+        XCTAssertTrue(report.render(width: 100, color: true).contains("\u{001B}[32mHealthy\u{001B}[0m"))
         XCTAssertFalse(report.render(width: 100, color: false).contains("\u{001B}["))
+    }
+
+    func testFinalResultUsesSemanticColorForDegradedUnavailableAndFailure() {
+        let degraded = DoctorEvaluator.evaluate(baseSnapshot(intents: ["mysql"]))
+        XCTAssertTrue(degraded.render(width: 80, color: true).contains("\u{001B}[33mDegraded"))
+
+        let unavailable = DoctorEvaluator.evaluate(DoctorSnapshot(coreFailure: "not running", coreFailureCode: 3))
+        XCTAssertTrue(unavailable.render(width: 80, color: true).contains("\u{001B}[90mNot running"))
+
+        let incompatible = DoctorEvaluator.evaluate(DoctorSnapshot(coreFailure: "incompatible", coreFailureCode: 4))
+        XCTAssertTrue(incompatible.render(width: 80, color: true).contains("\u{001B}[31mIncompatible"))
+        XCTAssertFalse(incompatible.render(width: 80, color: false).contains("\u{001B}["))
+    }
+
+    func testDoctorWrapsUnbrokenDiagnosticValuesAtFortyColumns() {
+        let snapshot = DoctorSnapshot(coreFailure: String(repeating: "diagnostic-path-segment", count: 5), coreFailureCode: 1)
+        let output = DoctorEvaluator.evaluate(snapshot).render(width: 40, color: false)
+        XCTAssertTrue(output.contains("diagnostic-path-seg"), output)
+        XCTAssertTrue(output.contains("-segmentdiagnostic-"), output)
+        XCTAssertFalse(output.split(separator: "\n").contains { $0.count > 40 }, output)
     }
 
     func testTTYColorPolicyHonorsNoColorDumbTermAndPipes() {

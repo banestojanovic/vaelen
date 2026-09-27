@@ -34,33 +34,11 @@ struct DoctorReport: Codable {
     }
 
     func render(width: Int, color: Bool) -> String {
-        let width = max(20, width)
-        let stacked = width < 76
-        let checkWidth = min(20, max(10, checks.map { $0.name.count }.max() ?? 10))
-        let statusWidth = 18
-        let heading = stacked ? "Check  Status  Detail" : "\("Check".padding(toLength: checkWidth, withPad: " ", startingAt: 0))  \("Status".padding(toLength: statusWidth, withPad: " ", startingAt: 0))  Detail"
-        var lines = ["Vaelen Doctor", "", heading]
-        for check in checks {
+        let rows = checks.map { check -> [String] in
             let (symbol, label, tint) = statusPresentation(check)
             let status = "\(symbol) \(label)"
             let detail = presentationDetail(check)
-            if stacked {
-                lines.append("\(check.name)  \(styled(status, tint: tint, color: color))")
-                lines += wrap(detail, width: max(12, width - 2), indent: "  ")
-            } else {
-                let paddedStatus = status.padding(toLength: statusWidth, withPad: " ", startingAt: 0)
-                let prefix = "\(check.name.padding(toLength: checkWidth, withPad: " ", startingAt: 0))  \(styled(paddedStatus, tint: tint, color: color))  "
-                let detailLines = wrap(detail, width: width, indent: String(repeating: " ", count: checkWidth + statusWidth + 4))
-                lines.append(prefix + (detailLines.first.map { stripIndent($0) } ?? ""))
-                lines += detailLines.dropFirst()
-            }
-            if let recommendation = check.recommendation {
-                lines += wrap("Recommendation: \(recommendation.replacingOccurrences(of: "`", with: ""))", width: width, indent: "  ")
-            }
-        }
-        if !history.isEmpty {
-            lines += ["", "Startup history"]
-            lines += history.flatMap { wrap($0, width: width, indent: "  ") }
+            return [check.name, styled(status, tint: tint, color: color), detail, check.recommendation?.replacingOccurrences(of: "`", with: "") ?? "—"]
         }
         let counts = Dictionary(grouping: checks, by: \.state).mapValues(\.count)
         let suffix = [
@@ -68,8 +46,24 @@ struct DoctorReport: Codable {
             counts[.warning].map { "\($0) warning\($0 == 1 ? "" : "s")" },
             counts[.notChecked].map { "\($0) not checked" }
         ].compactMap { $0 }.joined(separator: ", ")
-        lines += ["", "Result: \(overall == "healthy" ? "Healthy" : overall == "unavailable" ? "Not running" : overall.capitalized)\(suffix.isEmpty ? "" : " · \(suffix)")"]
-        return lines.joined(separator: "\n")
+        let resultTint: Int
+        switch overall {
+        case "healthy": resultTint = 32
+        case "degraded": resultTint = 33
+        case "unavailable": resultTint = 90
+        case "incompatible", "error": resultTint = 31
+        default: resultTint = 0
+        }
+        let result = overall == "healthy" ? "Healthy" : overall == "unavailable" ? "Not running" : overall.capitalized
+        var sections = [
+            HumanOutput.heading("Vaelen Doctor", color: color),
+            HumanOutput.table(rows, headers: ["Check", "Status", "Detail", "Recommendation"], width: width, color: color),
+            HumanOutput.table([[styled(result, tint: resultTint, color: color), suffix.isEmpty ? "No outstanding issues" : suffix]], headers: ["Result", "Summary"], width: width, color: color)
+        ]
+        if !history.isEmpty {
+            sections.append(HumanOutput.heading("Startup history", color: color) + "\n" + HumanOutput.table(history.enumerated().map { ["\($0.offset + 1)", $0.element] }, headers: ["#", "Detail"], width: width, color: color))
+        }
+        return sections.joined(separator: "\n\n")
     }
 
     private func statusPresentation(_ check: DoctorCheck) -> (String, String, Int) {
@@ -112,21 +106,6 @@ struct DoctorReport: Codable {
     private func styled(_ value: String, tint: Int, color: Bool) -> String {
         color && tint != 0 ? "\u{001B}[\(tint)m\(value)\u{001B}[0m" : value
     }
-
-    private func wrap(_ text: String, width: Int, indent: String) -> [String] {
-        let available = max(8, width - indent.count)
-        var result: [String] = []
-        var line = ""
-        for word in text.split(whereSeparator: \.isWhitespace).map(String.init) {
-            if line.isEmpty { line = word }
-            else if line.count + 1 + word.count <= available { line += " " + word }
-            else { result.append(indent + line); line = word }
-        }
-        if !line.isEmpty { result.append(indent + line) }
-        return result
-    }
-
-    private func stripIndent(_ value: String) -> String { String(value.drop(while: { $0 == " " })) }
 }
 
 struct DoctorSnapshot {
