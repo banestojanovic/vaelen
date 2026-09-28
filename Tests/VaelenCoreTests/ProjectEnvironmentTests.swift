@@ -96,6 +96,18 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertEqual(before, after)
     }
 
+    func testEmptyDatabasePasswordIsNotReportedAsFailure() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\nDB_DATABASE=app\nDB_USERNAME=root\nDB_PASSWORD=\n".utf8)
+            .write(to: root.appendingPathComponent(".env"))
+
+        let report = inspect(project(at: root))
+
+        XCTAssertEqual(report.secret.databasePassword, .missing)
+        XCTAssertFalse(report.diagnostics.contains { $0.code == "DB_PASSWORD_MISSING" })
+    }
+
     func testMissingRouteAndUnavailableRequestedServicesProduceDiagnostics() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

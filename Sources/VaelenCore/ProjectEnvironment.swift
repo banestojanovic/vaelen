@@ -567,8 +567,6 @@ public struct ProjectEnvironmentInspector: Sendable {
         }
         if desired.mysql == true, dbEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "DB_ENDPOINT_MISMATCH", service: "database", endpoint: dbEndpoint)) }
         if desired.mailpit == true, mailEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "MAIL_ENDPOINT_MISMATCH", service: "SMTP mail", endpoint: mailEndpoint)) }
-        if env.configured.dbHost != nil, env.configured.dbPort != nil, env.configured.dbConnection == "mysql", env.configured.database != nil, env.configured.password != .unknown { }
-        if env.configured.dbHost != nil, env.configured.dbPort != nil, env.configured.password == .missing { result.append(.init(code: "DB_PASSWORD_MISSING", severity: .warning, message: "A database password is not configured.", suggestion: "Review application configuration explicitly.")) }
         if let diagnostic = Self.mailPasswordDiagnostic(authentication: mailAuthentication.requirement, password: env.configured.mailPassword) { result.append(diagnostic) }
         if cache.state == "present, .env is newer" { result.append(.init(code: "LARAVEL_CONFIG_CACHE_STALE_POSSIBLE", severity: .warning, message: "Laravel config cache exists and .env is newer; effective Laravel configuration is unknown.", suggestion: "Clear the cache explicitly if the application owner intends to do so.")) }
         if !route.intentExists { result.append(.init(code: "ROUTE_INTENT_MISSING", severity: .warning, message: "No Vaelen route intent is associated with this project.", suggestion: "Inspect existing routing before making an explicit route change.")) }
