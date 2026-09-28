@@ -8,6 +8,13 @@ public struct ProjectDatabaseViewerAction: Equatable, Sendable {
 
     public var isEnabled: Bool { url != nil }
 
+    /// Builds an action from runtime and configured project evidence. Desired
+    /// service state is deliberately not an eligibility gate: a project can
+    /// already have a healthy, reachable database configured in its .env.
+    public static func tablePlus(report: ProjectEnvironmentReport, tablePlusInstalled: Bool) -> Self {
+        tablePlus(configured: report.configured, mysql: report.observed.mysql, tablePlusInstalled: tablePlusInstalled)
+    }
+
     public static func tablePlus(
         configured: ProjectConfiguredEnvironment,
         mysql: MySQLStatus?,
@@ -48,6 +55,29 @@ public struct ProjectDatabaseViewerAction: Equatable, Sendable {
     }
 
     private static func disabled(_ reason: String) -> Self { .init(url: nil, reason: reason) }
+}
+
+/// A server-level TablePlus connection that does not select a project
+/// database, user, or password. TablePlus obtains authentication interactively.
+public struct MySQLDatabaseViewerAction: Equatable, Sendable {
+    public let url: URL?
+    public let reason: String
+
+    public var isEnabled: Bool { url != nil }
+
+    public static func tablePlus(mysql: MySQLStatus?, tablePlusInstalled: Bool) -> Self {
+        guard tablePlusInstalled else { return .init(url: nil, reason: "TablePlus is not installed") }
+        guard let mysql else { return .init(url: nil, reason: "Vaelen MySQL status is unavailable") }
+        guard mysql.state == .running, mysql.health == "healthy" else {
+            return .init(url: nil, reason: "Start Vaelen MySQL to open a connection")
+        }
+        var components = URLComponents()
+        components.scheme = "mysql"
+        components.host = "127.0.0.1"
+        components.port = mysql.port
+        guard let url = components.url else { return .init(url: nil, reason: "Vaelen MySQL connection URL is unavailable") }
+        return .init(url: url, reason: "Open Vaelen MySQL in TablePlus")
+    }
 }
 
 private extension String {

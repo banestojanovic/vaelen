@@ -46,9 +46,24 @@ struct VaelenApp: App {
 /// template beside native text, which stays crisp in both appearances.
 @MainActor
 private enum VaelenBrand {
-    // Official mark palette is #38B2F6 → #1B64E9; use its deeper endpoint
-    // consistently for interactive controls and selected state.
-    static let accentColor = Color(red: 27.0 / 255, green: 100.0 / 255, blue: 233.0 / 255)
+    private struct BluePalette {
+        let light: Color
+        let dark: Color
+
+        func foreground(for scheme: ColorScheme) -> Color {
+            scheme == .dark ? dark : light
+        }
+    }
+
+    // Both endpoints are from the official #38B2F6 → #1B64E9 brand gradient.
+    // The brighter endpoint stays legible against dark popover material; the
+    // deeper endpoint provides readable contrast on light surfaces.
+    private static let blue = BluePalette(
+        light: Color(red: 27.0 / 255, green: 100.0 / 255, blue: 233.0 / 255),
+        dark: Color(red: 56.0 / 255, green: 178.0 / 255, blue: 246.0 / 255)
+    )
+    static let accentColor = blue.light
+    static func selectedBlue(for scheme: ColorScheme) -> Color { blue.foreground(for: scheme) }
     static let menuBarImage: NSImage = {
         guard let url = Bundle.main.url(forResource: "vaelen-mark-currentcolor", withExtension: "svg"),
               let image = NSImage(contentsOf: url) else {
@@ -69,6 +84,12 @@ private enum VaelenBrand {
 
     static let headerMarkDark = loadHeaderMark(resource: "vaelen-mark-dark")
     static let headerMarkWhite = loadHeaderMark(resource: "vaelen-mark-white")
+    static let headerMarkBlue: NSImage = {
+        guard let url = Bundle.main.url(forResource: "vaelen-mark-blue", withExtension: "svg"),
+              let image = NSImage(contentsOf: url) else { return settingsImage }
+        image.isTemplate = false
+        return image
+    }()
 
     private static func loadHeaderMark(resource: String) -> NSImage {
         guard let url = Bundle.main.url(forResource: resource, withExtension: "svg"),
@@ -142,6 +163,7 @@ final class AppModel {
     }
 
     func startupIssue(for service: String) -> String? { startupServiceIssues[service] }
+    func isServiceReadPending(_ service: String) -> Bool { pendingServiceReads.contains(service) }
 
     func notePopoverPresented() {
         let count = earlyProjectList?.count ?? {
@@ -232,11 +254,14 @@ final class AppModel {
             projectReports = []
             projectReportErrors = [:]
             beginServiceReadinessCheck(generation: generation)
-            startProjectReports(projects, generation: generation, refreshStarted: refreshStarted)
 
             let statusStarted = ContinuousClock.now
             let status = try await trackedServiceOperation("Core status") { try await client.status() }
             Self.startupLogger.info("startup phase=core-status-ipc elapsed_ms=\(Self.elapsedMilliseconds(since: statusStarted))")
+            // Core status waits for startup restoration. Take the shared report
+            // snapshot only after that barrier, or PHP/MySQL/DNS observations
+            // can be captured mid-restore and surfaced as false project errors.
+            startProjectReports(projects, generation: generation, refreshStarted: refreshStarted)
             startupServiceIssues = status.serviceIssues ?? [:]
             if !startupServiceIssues.isEmpty {
                 finishServiceReadinessCheck(.attention)
@@ -749,11 +774,17 @@ final class AppModel {
     }
 
     func tablePlusAction(_ report: ProjectEnvironmentReport) -> ProjectDatabaseViewerAction {
-        ProjectDatabaseViewerAction.tablePlus(
-            configured: report.configured,
-            mysql: report.observed.mysql,
-            tablePlusInstalled: tablePlusApplicationURL != nil
-        )
+        ProjectDatabaseViewerAction.tablePlus(report: report, tablePlusInstalled: isTablePlusInstalled)
+    }
+
+    var isTablePlusInstalled: Bool { tablePlusApplicationURL != nil }
+
+    func openMySQLInTablePlus(_ mysql: MySQLStatus) {
+        guard let applicationURL = tablePlusApplicationURL,
+              let url = MySQLDatabaseViewerAction.tablePlus(mysql: mysql, tablePlusInstalled: true).url else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open([url], withApplicationAt: applicationURL, configuration: configuration)
     }
 
     func openProjectDatabaseInTablePlus(_ report: ProjectEnvironmentReport) {
@@ -1339,10 +1370,10 @@ struct StatusView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .center, spacing: 8) {
-                Image(nsImage: colorScheme == .dark ? VaelenBrand.headerMarkWhite : VaelenBrand.headerMarkDark)
+                Image(nsImage: VaelenBrand.headerMarkBlue)
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 22, height: 16)
+                    .frame(width: 28, height: 20)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Vaelen").font(.system(.headline, weight: .bold))
@@ -1423,16 +1454,6 @@ struct StatusView: View {
                     ServicesView(status: status, php: php, routing: routing, dns: dns, tls: tls, ports: ports, mysql: mysql, mailpit: mailpit, model: model)
                 }
             }
-            if colorScheme == .light {
-                Rectangle()
-                    .fill(Color.black.opacity(0.035))
-                    .frame(height: 0.6)
-                    .overlay(alignment: .top) {
-                        Rectangle()
-                            .fill(Color.white.opacity(0.58))
-                            .frame(height: 0.5)
-                    }
-            }
             if let error = model.serviceError {
                 Text(error)
                     .font(.caption)
@@ -1480,18 +1501,19 @@ struct StatusView: View {
                 .accessibilityLabel(model.isQuitting ? "Quitting Vaelen" : "Quit Vaelen")
                 .disabled(model.isQuitting)
             }
+            .padding(.top, -3)
         }
         .padding(VaelenUI.popoverPadding)
         .frame(width: 420)
         .frame(height: popoverHeight)
         .background {
             if reduceTransparency {
-                Color(nsColor: .windowBackgroundColor)
+                colorScheme == .light ? Color.white : Color(nsColor: .windowBackgroundColor)
             } else {
                 ZStack {
                     Rectangle().fill(.ultraThinMaterial)
-                    (colorScheme == .light ? Color(hex: 0xF4F5F6) : Color(hex: 0x45464B))
-                        .opacity(colorScheme == .light ? 0.94 : 0.95)
+                    (colorScheme == .light ? Color(hex: 0xEDF1F5) : Color(hex: 0x45464B))
+                        .opacity(colorScheme == .light ? 0.66 : 0.88)
                 }
             }
         }
@@ -1507,8 +1529,8 @@ struct StatusView: View {
         if needsCompactConnectionLayout {
             return min(340, max(245, visibleHeight * 0.46))
         }
-        let preferred = min(660, visibleHeight * 0.72)
-        let usefulMinimum = min(510, visibleHeight * 0.68)
+        let preferred = min(500, visibleHeight * 0.56)
+        let usefulMinimum = min(470, visibleHeight * 0.52)
         return max(usefulMinimum, preferred)
     }
 
@@ -1558,23 +1580,21 @@ struct StatusView: View {
                 .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
-        .foregroundStyle(isSelected
-                         ? (colorScheme == .dark ? Color(hex: 0x38B2F6) : VaelenBrand.accentColor)
-                         : Color.primary.opacity(0.60))
+        .foregroundStyle(isSelected ? VaelenBrand.selectedBlue(for: colorScheme) : Color.primary.opacity(0.60))
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(VaelenBrand.accentColor.opacity(colorScheme == .dark ? 0.23 : 0.12))
+                    .fill(VaelenBrand.selectedBlue(for: colorScheme).opacity(colorScheme == .dark ? 0.23 : 0.12))
                     .overlay {
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .strokeBorder(VaelenBrand.accentColor.opacity(colorScheme == .dark ? 0.28 : 0.18), lineWidth: 0.65)
+                            .strokeBorder(VaelenBrand.selectedBlue(for: colorScheme).opacity(colorScheme == .dark ? 0.28 : 0.18), lineWidth: 0.65)
                     }
             }
         }
         .overlay {
             if isFocused {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(VaelenBrand.accentColor, lineWidth: 2)
+                    .strokeBorder(VaelenBrand.selectedBlue(for: colorScheme), lineWidth: 2)
             }
         }
         .focused($focusedSection, equals: section)
@@ -1708,10 +1728,23 @@ private struct SettingsMenuCommand: View {
     }
 }
 
+private struct PopoverSectionHeading: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 11, weight: .regular))
+            .foregroundStyle(.secondary)
+            .textCase(.uppercase)
+            .tracking(0.45)
+    }
+}
+
 struct ProjectsView: View {
     let projects: [ProjectWire]
     let reports: [ProjectEnvironmentReport]
     let model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expandedProjectPaths = Set<String>()
 
     var body: some View {
@@ -1720,19 +1753,36 @@ struct ProjectsView: View {
                 .frame(minHeight: 180)
         } else {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 5) {
-                    ForEach(projects, id: \.path) { project in
-                        let report = reports.first { $0.identity.path == project.path }
-                        let routes = routesForProject(project, report: report, configured: model.configuredRoutes)
-                        ProjectCard(
-                            project: project,
-                            report: report,
-                            reportError: model.projectReportErrors[project.path],
-                            routes: routes,
-                            model: model,
-                            isExpanded: expandedProjectPaths.contains(project.path),
-                            toggleExpansion: { toggleExpansion(for: project) }
-                        )
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(ProjectFrameworkGroup.allCases, id: \.self) { group in
+                        let groupedProjects = projects.filter { ProjectFrameworkGroup(project: $0) == group }
+                        if !groupedProjects.isEmpty {
+                            let firstGroup = ProjectFrameworkGroup.allCases.first {
+                                candidate in projects.contains { ProjectFrameworkGroup(project: $0) == candidate }
+                            }
+                            VStack(alignment: .leading, spacing: 0) {
+                                PopoverSectionHeading(title: group.title)
+                                    .padding(.horizontal, 9)
+                                    .padding(.top, group == firstGroup ? 14 : 20)
+                                    .padding(.bottom, 3)
+                                ForEach(Array(groupedProjects.enumerated()), id: \.element.path) { index, project in
+                                    let report = reports.first { $0.identity.path == project.path }
+                                    let routes = routesForProject(project, report: report, configured: model.configuredRoutes)
+                                    ProjectCard(
+                                        project: project,
+                                        report: report,
+                                        reportError: model.projectReportErrors[project.path],
+                                        routes: routes,
+                                        model: model,
+                                        isExpanded: expandedProjectPaths.contains(project.path),
+                                        toggleExpansion: { toggleExpansion(for: project) }
+                                    )
+                                    Divider()
+                                        .opacity(0.3)
+                                        .padding(.horizontal, 9)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1741,12 +1791,33 @@ struct ProjectsView: View {
     }
 
     private func toggleExpansion(for project: ProjectWire) {
-        withAnimation(.easeInOut(duration: 0.16)) {
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
             if expandedProjectPaths.contains(project.path) {
                 expandedProjectPaths.remove(project.path)
             } else {
                 expandedProjectPaths.insert(project.path)
             }
+        }
+    }
+}
+
+private enum ProjectFrameworkGroup: CaseIterable {
+    case expo, laravel, wordpress, other
+
+    init(project: ProjectWire) {
+        let framework = project.detectedFramework?.lowercased() ?? ""
+        if framework.contains("expo") { self = .expo }
+        else if framework.contains("laravel") { self = .laravel }
+        else if framework.contains("wordpress") { self = .wordpress }
+        else { self = .other }
+    }
+
+    var title: String {
+        switch self {
+        case .expo: "Expo"
+        case .laravel: "Laravel"
+        case .wordpress: "WordPress"
+        case .other: "Other"
         }
     }
 }
@@ -1768,7 +1839,10 @@ struct ProjectCard: View {
     let isExpanded: Bool
     let toggleExpansion: () -> Void
     @Environment(\.colorScheme) private var colorScheme
-    @State private var isHovered = false
+    private enum FocusedControl: Hashable { case site, database, expansion }
+    @FocusState private var focusedControl: FocusedControl?
+    @State private var hoveredControl: FocusedControl?
+    @State private var rowHovered = false
 
     private var warnings: [ProjectDiagnostic] {
         guard let report, report.identity.registration == .linked else { return [] }
@@ -1787,8 +1861,8 @@ struct ProjectCard: View {
     }
 
     private var databaseAction: ProjectDatabaseViewerAction? {
-        guard let report, report.desired.mysql == true else { return nil }
-        return model.tablePlusAction(report)
+        guard let report else { return nil }
+        return ProjectDatabaseViewerAction.tablePlus(report: report, tablePlusInstalled: model.isTablePlusInstalled)
     }
 
     private var canOpenDatabase: Bool { databaseAction?.isEnabled == true }
@@ -1800,7 +1874,7 @@ struct ProjectCard: View {
                     .frame(width: 18, height: 18)
                     .accessibilityHidden(true)
                 Text(project.name)
-                    .font(.system(.headline, weight: .semibold))
+                    .font(.system(.headline, weight: .regular))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .help(project.name)
@@ -1827,6 +1901,13 @@ struct ProjectCard: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .focused($focusedControl, equals: .site)
+                            .onHover { hoveredControl = $0 ? .site : nil }
+                            .background { actionBackground(for: .site) }
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .strokeBorder(focusedControl == .site ? Color.accentColor.opacity(0.85) : .clear, lineWidth: 1.5)
+                            }
                             .help("Open \(route.route.hostname)")
                             .accessibilityLabel("Open site \(route.route.hostname)")
                         } else if let routes, routes.count > 1 {
@@ -1838,6 +1919,13 @@ struct ProjectCard: View {
                                 Image(systemName: "safari").frame(width: 25, height: 25).contentShape(Rectangle())
                             }
                             .menuStyle(.borderlessButton)
+                            .focused($focusedControl, equals: .site)
+                            .onHover { hoveredControl = $0 ? .site : nil }
+                            .background { actionBackground(for: .site) }
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .strokeBorder(focusedControl == .site ? Color.accentColor.opacity(0.85) : .clear, lineWidth: 1.5)
+                            }
                             .help("Open a project site")
                             .accessibilityLabel("Open site; \(routes.count) hosts available")
                         }
@@ -1851,6 +1939,13 @@ struct ProjectCard: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .focused($focusedControl, equals: .database)
+                            .onHover { hoveredControl = $0 ? .database : nil }
+                            .background { actionBackground(for: .database) }
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .strokeBorder(focusedControl == .database ? Color.accentColor.opacity(0.85) : .clear, lineWidth: 1.5)
+                            }
                             .help(databaseAction?.reason ?? "Open project database in TablePlus")
                             .accessibilityLabel("Open project database in TablePlus")
                         }
@@ -1863,6 +1958,13 @@ struct ProjectCard: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .focused($focusedControl, equals: .expansion)
+                    .onHover { hoveredControl = $0 ? .expansion : nil }
+                    .background { actionBackground(for: .expansion) }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(focusedControl == .expansion ? Color.accentColor.opacity(0.85) : .clear, lineWidth: 1.5)
+                    }
                     .frame(width: 25, height: 25)
                     .help(isExpanded ? "Collapse project details" : "Expand project details")
                     .accessibilityLabel(isExpanded ? "Collapse \(project.name)" : "Expand \(project.name)")
@@ -1871,40 +1973,27 @@ struct ProjectCard: View {
                 .font(.system(size: 11, weight: .medium))
             }
 
-            HStack(spacing: 6) {
-                Color.clear.frame(width: 18, height: 1)
-                if let framework = project.detectedFramework, !framework.isEmpty {
-                    Text(framework)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Text(displayPath(project.path))
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(project.path)
-            }
-
             runtimeSummary
             if isExpanded { expandedDetails }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
         .background {
-            let shape = RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous)
-            shape.fill(colorScheme == .light ? Color(hex: 0xFBFAF9).opacity(0.96) : Color(hex: 0x47494F).opacity(0.97))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(rowHovered || focusedControl != nil
+                      ? Color.primary.opacity(colorScheme == .light ? 0.045 : 0.10)
+                      : .clear)
         }
-        .overlay {
-            RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous)
-                .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.10), lineWidth: 0.65)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous))
-        .shadow(color: Color.black.opacity(colorScheme == .light ? 0.06 : 0.16), radius: isHovered ? 5 : 3.5, x: 0, y: 2)
-        .onHover { isHovered = $0 }
+        .onHover { rowHovered = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Project \(project.name)")
+    }
+
+    private func actionBackground(for control: FocusedControl) -> some View {
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(hoveredControl == control || focusedControl == control
+                  ? Color.primary.opacity(colorScheme == .light ? 0.075 : 0.16)
+                  : .clear)
     }
 
     @ViewBuilder private var runtimeSummary: some View {
@@ -1936,7 +2025,7 @@ struct ProjectCard: View {
     }
 
     private func runtimeBadge(_ name: String, version: String?, state: String) -> some View {
-        let healthy = state.localizedCaseInsensitiveContains("healthy")
+        let healthy = state.split(separator: " ").last?.caseInsensitiveCompare("healthy") == .orderedSame
         return HStack(spacing: 3) {
             Image(systemName: healthy ? "circle.fill" : "circle")
                 .font(.system(size: 6, weight: .semibold))
@@ -1952,6 +2041,12 @@ struct ProjectCard: View {
 
     @ViewBuilder private var expandedDetails: some View {
         VStack(alignment: .leading, spacing: 7) {
+            Text(displayPath(project.path))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(project.path)
             if let routes, routes.count > 1 {
                 ForEach(routes, id: \.route.id) { route in
                     HStack(spacing: 6) {
@@ -1995,7 +2090,7 @@ struct ProjectCard: View {
                     .accessibilityElement(children: .combine)
                 }
             }
-            HStack(spacing: 3) {
+            HStack(spacing: 12) {
                 Button {
                     model.openProjectFolder(project)
                 } label: {
@@ -2121,52 +2216,140 @@ private struct ServicePresentation {
     }
 }
 
+private struct ServiceIconButton: View {
+    enum Emphasis { case start, stop }
+
+    let label: String
+    let systemImage: String
+    var emphasis: Emphasis? = nil
+    var disabled = false
+    let action: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var hovered = false
+    @FocusState private var focused: Bool
+
+    private var emphasisTint: Color? {
+        switch emphasis {
+        case .start: return colorScheme == .light ? Color(hex: 0x398258) : Color(hex: 0x79C895)
+        case .stop: return colorScheme == .light ? Color(hex: 0xB44F46) : Color(hex: 0xE98578)
+        case nil: return nil
+        }
+    }
+
+    private var feedbackVisible: Bool { hovered || focused }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 22, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .foregroundStyle(disabled ? Color.primary.opacity(0.38) : (emphasisTint ?? Color.primary.opacity(0.78)))
+        .disabled(disabled)
+        .focused($focused)
+        .focusable()
+        .background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(feedbackVisible ? (emphasisTint ?? Color.accentColor).opacity(0.12) : .clear)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(feedbackVisible ? (emphasisTint ?? Color.accentColor).opacity(0.38) : .clear, lineWidth: 1)
+        }
+        .onHover { hovered = $0 }
+        .help(label)
+        .accessibilityLabel(label)
+    }
+}
+
 private struct ServiceRow<Actions: View>: View {
+    let icon: String
     let title: String
-    let subtitle: String?
+    let version: String?
     let state: String
     let stateSymbol: String
     let stateTint: Color
+    let pending: Bool
     let busy: Bool
     let actions: Actions
 
-    init(title: String, subtitle: String?, state: String, stateSymbol: String, stateTint: Color, busy: Bool = false, @ViewBuilder actions: () -> Actions) {
+    init(
+        icon: String,
+        title: String,
+        version: String?,
+        state: String,
+        stateSymbol: String,
+        stateTint: Color,
+        pending: Bool = false,
+        busy: Bool = false,
+        @ViewBuilder actions: () -> Actions
+    ) {
+        self.icon = icon
         self.title = title
-        self.subtitle = subtitle
+        self.version = version
         self.state = state
         self.stateSymbol = stateSymbol
         self.stateTint = stateTint
+        self.pending = pending
         self.busy = busy
         self.actions = actions()
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: VaelenUI.spacing8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.body)
-                if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
+        HStack(spacing: VaelenUI.spacing8) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(Color.secondary.opacity(0.72))
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 12.5, weight: .regular))
+                    .lineLimit(1)
+                if let version, !version.isEmpty {
+                    Text(version)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .help(subtitle)
+                        .help(version)
                 }
             }
-            Spacer(minLength: VaelenUI.spacing8)
-            VaelenStatusLabel(state, systemImage: stateSymbol, tint: stateTint)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
+            HStack(spacing: 3) {
+                HStack(spacing: 3) {
+                    if pending {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .accessibilityLabel("Checking \(title) status")
+                        Text("Checking")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Image(systemName: stateSymbol)
+                            .foregroundStyle(stateTint)
+                        Text(state)
+                            .foregroundStyle(stateTint)
+                    }
+                }
                 .font(.caption)
                 .lineLimit(1)
-            if busy { ProgressView().controlSize(.small) }
-            actions
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .disabled(busy)
+                .fixedSize(horizontal: true, vertical: false)
+                if busy {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .accessibilityLabel("\(title) operation in progress")
+                }
+                actions
+                    .disabled(busy || pending)
+            }
         }
-        .padding(.vertical, VaelenUI.spacing8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+        .overlay(alignment: .bottom) { Divider().opacity(0.3) }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(title), \(state)")
+        .accessibilityLabel("\(title), \(pending ? "Checking" : state)")
     }
 }
 
@@ -2209,78 +2392,19 @@ struct ServicesView: View {
     private var servicesList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                Text("Runtimes")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-                    .padding(.bottom, VaelenUI.spacing6)
-                if let php {
-                    ServiceRow(title: "PHP", subtitle: php.installed.isEmpty ? "Not installed" : php.installed.map(\.version).joined(separator: " · "), state: php.default.map { "Default \($0)" } ?? "Ready", stateSymbol: "circle.fill", stateTint: .secondary) {
-                        Button("Open Configuration Files…", systemImage: "doc.text.magnifyingglass") {
-                            Task { await model.openPHPConfigurationFiles() }
-                        }
-                        if let error = model.phpConfigurationError {
-                            Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
+                sectionTitle("Runtimes", first: true)
+                phpRow
 
-                Text("Services")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-                    .padding(.top, VaelenUI.spacing12)
-                    .padding(.bottom, VaelenUI.spacing6)
-                if let mysql {
-                    ServiceRow(title: "MySQL", subtitle: mysqlSubtitle(mysql), state: mysqlState(mysql).title, stateSymbol: mysqlState(mysql).symbol, stateTint: mysqlState(mysql).tint, busy: model.serviceOperationIs(for: "MySQL")) {
-                        mysqlActions(mysql)
-                    }
-                }
-                if let routing {
-                    ServiceRow(title: "Caddy", subtitle: caddySubtitle(routing), state: routingState(routing).title, stateSymbol: routingState(routing).symbol, stateTint: routingState(routing).tint, busy: model.serviceOperationIs(for: "Caddy")) {
-                        if routing.state == .running { Button("Stop Caddy") { Task { await model.stopRouting() } } }
-                        else { Button("Start Caddy") { Task { await model.startRouting() } } }
-                    }
-                }
-                if let mailpit {
-                    ServiceRow(title: "Mailpit", subtitle: mailpitSubtitle(mailpit), state: mailpitState(mailpit).title, stateSymbol: mailpitState(mailpit).symbol, stateTint: mailpitState(mailpit).tint, busy: model.serviceOperationIs(for: "Mailpit")) {
-                        mailpitActions(mailpit)
-                    }
-                }
+                sectionTitle("Services")
+                mysqlRow
+                caddyRow
+                mailpitRow
 
-                Text("Networking")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-                    .padding(.top, VaelenUI.spacing12)
-                    .padding(.bottom, VaelenUI.spacing6)
-                if let dns {
-                    let control = ServiceControlPresentation.dns(status: dns, savedOn: model.savedServiceIntents?.contains("dns"), blockedReason: model.startupIssue(for: "dns"))
-                    ServiceRow(title: "DNS", subtitle: control.detail, state: control.title, stateSymbol: serviceSymbol(control.title), stateTint: serviceTint(control.title), busy: model.serviceOperationIs(for: "DNS")) {
-                        if control.action == .enable { Button("Enable DNS") { Task { await model.startDNS() } } }
-                        if control.action == .retry { Button("Retry DNS Start") { Task { await model.startDNS() } } }
-                        if control.action == .stop || control.action == .disable { Button("Stop DNS") { Task { await model.stopDNS() } } }
-                        if control.canDisable && control.action == .retry { Button("Disable DNS") { Task { await model.stopDNS() } } }
-                    }
-                }
-                if let tls {
-                    let trustControl = TLSTrustControlPresentation(tls)
-                    ServiceRow(title: "Local HTTPS", subtitle: nil, state: trustControl.title, stateSymbol: tls.trustObserved ? "checkmark" : "exclamationmark.triangle", stateTint: tls.trustObserved ? .secondary : .orange, busy: model.serviceOperationIs(for: "Local HTTPS")) {
-                        if trustControl.canTrust { Button("Trust Local CA") { Task { await model.trustLocalCA() } } }
-                        if trustControl.canRemove { Button("Remove Local CA Trust") { Task { await model.removeLocalCATrust() } } }
-                        if trustControl.canManageTrust {
-                            Button("Manage Trust…") { showingTrustGuidance = true }
-                        }
-                    }
-                }
-                if let ports {
-                    let control = ServiceControlPresentation.standardPorts(status: ports, savedOn: model.savedServiceIntents?.contains("standard-ports"), blockedReason: model.startupIssue(for: "standard-ports"))
-                    ServiceRow(title: "Standard Ports", subtitle: control.detail, state: control.title, stateSymbol: serviceSymbol(control.title), stateTint: serviceTint(control.title), busy: model.serviceOperationIs(for: "standard ports")) {
-                        if control.action == .enable { Button("Enable Standard Ports") { Task { await model.installStandardPorts() } } }
-                        if control.action == .retry { Button("Retry Standard Ports") { Task { await model.installStandardPorts() } } }
-                        if control.action == .disable { Button("Disable Standard Ports") { Task { await model.removeStandardPorts() } } }
-                    }
-                }
+                sectionTitle("Networking")
+                dnsRow
+                tlsRow
+                portsRow
+
                 if let operation = model.serviceOperation {
                     VaelenStatusLabel(operation, systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
                         .font(.caption)
@@ -2297,73 +2421,219 @@ struct ServicesView: View {
         .frame(maxHeight: .infinity)
     }
 
-    private func mysqlSubtitle(_ mysql: MySQLStatus) -> String {
-        let version = mysql.selectedVersion ?? mysql.installedVersion
-        return [version, mysql.state == .notInstalled ? nil : "Port \(mysql.port)"].compactMap { $0 }.joined(separator: " · ")
+    private func sectionTitle(_ title: String, first: Bool = false) -> some View {
+        PopoverSectionHeading(title: title)
+            .padding(.top, first ? VaelenUI.spacing12 : 18)
+            .padding(.bottom, 4)
     }
 
-    private func mailpitSubtitle(_ mailpit: MailpitStatus) -> String? {
-        if mailpit.state == .notInstalled { return "Local mail testing" }
-        return [mailpit.installedVersion, "SMTP \(mailpit.smtpPort)"].compactMap { $0 }.joined(separator: " · ")
+    private func resolved(_ value: ServicePresentation?, readLabel: String, present: Bool) -> (ServicePresentation, Bool) {
+        let pending = !present && model.isServiceReadPending(readLabel)
+        if let value { return (value, false) }
+        if pending { return (.init("Checking", "circle.dotted", .secondary), true) }
+        return (.init("Unavailable", "exclamationmark.triangle", .orange), false)
     }
 
-    private func caddySubtitle(_ routing: RouterStatus) -> String {
-        [routing.providerVersion, routing.routeCount == 1 ? "1 routed project" : "\(routing.routeCount) routed projects"].compactMap { $0 }.joined(separator: " · ")
+    private var phpRow: some View {
+        let isPending = model.isServiceReadPending("PHP") && php == nil
+        let state: ServicePresentation
+        if let php {
+            state = php.default != nil
+                ? .init("Default", "checkmark.circle", .secondary)
+                : (php.installed.isEmpty ? .init("Not installed", "circle", .secondary) : .init("Ready", "checkmark.circle", .secondary))
+        } else {
+            state = isPending ? .init("Checking", "circle.dotted", .secondary) : .init("Unavailable", "exclamationmark.triangle", .orange)
+        }
+        return ServiceRow(icon: "chevron.left.forwardslash.chevron.right", title: "PHP", version: php.map { $0.installed.map(\.version).joined(separator: " · ") }, state: state.title, stateSymbol: state.symbol, stateTint: state.tint, pending: isPending) {
+            HStack(spacing: 3) {
+                if php != nil {
+                    ServiceIconButton(label: "Open PHP Configuration Files", systemImage: "doc.text.magnifyingglass") {
+                        Task { await model.openPHPConfigurationFiles() }
+                    }
+                } else if !isPending {
+                    ServiceIconButton(label: "Refresh PHP status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
+    }
+
+    private var mysqlRow: some View {
+        let pending = model.isServiceReadPending("MySQL") && mysql == nil
+        let state = resolved(mysql.map(mysqlState), readLabel: "MySQL", present: mysql != nil).0
+        let busy = model.serviceOperationIs(for: "MySQL")
+        return ServiceRow(icon: "cylinder.fill", title: "MySQL", version: mysql?.selectedVersion ?? mysql?.installedVersion, state: state.title, stateSymbol: state.symbol, stateTint: state.tint, pending: pending, busy: busy) {
+            HStack(spacing: 3) {
+                let tablePlus = MySQLDatabaseViewerAction.tablePlus(mysql: mysql, tablePlusInstalled: model.isTablePlusInstalled)
+                ServiceIconButton(
+                    label: pending ? "Checking MySQL and TablePlus availability" : tablePlus.reason,
+                    systemImage: "cylinder.split.1x2",
+                    disabled: pending || !tablePlus.isEnabled
+                ) {
+                    if let mysql { model.openMySQLInTablePlus(mysql) }
+                }
+                if let mysql {
+                    if mysql.state == .notInstalled {
+                        ServiceIconButton(label: "Install MySQL", systemImage: "arrow.down.to.line") { Task { await model.installMySQL() } }
+                    } else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy {
+                        ServiceIconButton(label: mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL", systemImage: "play.circle", emphasis: .start) { Task { await model.startMySQL() } }
+                    }
+                    if mysql.state == .running {
+                        ServiceIconButton(label: "Stop MySQL", systemImage: "stop.circle", emphasis: .stop) { Task { await model.stopMySQL() } }
+                    }
+                    if mysql.state != .notInstalled {
+                        ServiceIconButton(label: "Reveal MySQL Data Files", systemImage: "folder", disabled: !FileManager.default.fileExists(atPath: mysql.datadir)) { model.revealMySQLDataFiles(mysql) }
+                        ServiceIconButton(label: "Reveal MySQL Binaries", systemImage: "shippingbox", disabled: !FileManager.default.fileExists(atPath: mysql.executablePath)) { model.revealMySQLBinaries(mysql) }
+                    }
+                } else if !pending {
+                    ServiceIconButton(label: "Refresh MySQL status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
+    }
+
+    private var caddyRow: some View {
+        let pending = model.isServiceReadPending("routing") && routing == nil
+        let state = resolved(routing.map(routingState), readLabel: "routing", present: routing != nil).0
+        let busy = model.serviceOperationIs(for: "Caddy")
+        return ServiceRow(icon: "globe", title: "Caddy", version: routing?.providerVersion, state: state.title, stateSymbol: state.symbol, stateTint: state.tint, pending: pending, busy: busy) {
+            HStack(spacing: 3) {
+                if let routing {
+                    if routing.state == .running {
+                        ServiceIconButton(label: "Stop Caddy", systemImage: "stop.circle", emphasis: .stop) { Task { await model.stopRouting() } }
+                    } else {
+                        ServiceIconButton(label: "Start Caddy", systemImage: "play.circle", emphasis: .start) { Task { await model.startRouting() } }
+                    }
+                } else if !pending {
+                    ServiceIconButton(label: "Refresh Caddy status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
+    }
+
+    private var mailpitRow: some View {
+        let pending = model.isServiceReadPending("Mailpit") && mailpit == nil
+        let state = resolved(mailpit.map(mailpitState), readLabel: "Mailpit", present: mailpit != nil).0
+        let busy = model.serviceOperationIs(for: "Mailpit")
+        return ServiceRow(icon: "envelope.fill", title: "Mailpit", version: mailpit?.installedVersion, state: state.title, stateSymbol: state.symbol, stateTint: state.tint, pending: pending, busy: busy) {
+            HStack(spacing: 3) {
+                if let mailpit {
+                    if mailpit.state == .notInstalled {
+                        ServiceIconButton(label: "Install Mailpit", systemImage: "arrow.down.to.line") { Task { await model.installMailpit() } }
+                    } else if mailpit.state == .installed || mailpit.state == .stopped || mailpit.state == .unhealthy || mailpit.state == .conflict {
+                        ServiceIconButton(label: "Start Mailpit", systemImage: "play.circle", emphasis: .start) { Task { await model.startMailpit() } }
+                    }
+                    if mailpit.state == .running {
+                        ServiceIconButton(label: "Stop Mailpit", systemImage: "stop.circle", emphasis: .stop) { Task { await model.stopMailpit() } }
+                        ServiceIconButton(label: "Open Mailpit", systemImage: "arrow.up.right.square") { Task { await model.openMailpit() } }
+                    }
+                } else if !pending {
+                    ServiceIconButton(label: "Refresh Mailpit status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
+    }
+
+    private var dnsRow: some View {
+        let pending = model.isServiceReadPending("DNS") && dns == nil
+        let control = dns.map { ServiceControlPresentation.dns(status: $0, savedOn: model.savedServiceIntents?.contains("dns"), blockedReason: model.startupIssue(for: "dns")) }
+        let state = control.map { ServicePresentation($0.title, serviceSymbol($0.title), serviceTint($0.title)) }
+        let resolvedState = resolved(state, readLabel: "DNS", present: dns != nil).0
+        let busy = model.serviceOperationIs(for: "DNS")
+        return ServiceRow(icon: "network", title: "DNS", version: dns.map { "Port \($0.port)" }, state: resolvedState.title, stateSymbol: resolvedState.symbol, stateTint: resolvedState.tint, pending: pending, busy: busy) {
+            HStack(spacing: 3) {
+                if let control {
+                    if control.action == .enable { ServiceIconButton(label: "Enable DNS", systemImage: "power") { Task { await model.startDNS() } } }
+                    if control.action == .retry { ServiceIconButton(label: "Retry DNS Start", systemImage: "arrow.clockwise") { Task { await model.startDNS() } } }
+                    if control.action == .stop || control.action == .disable { ServiceIconButton(label: "Stop DNS", systemImage: "stop.circle", emphasis: .stop) { Task { await model.stopDNS() } } }
+                    if control.canDisable && control.action == .retry { ServiceIconButton(label: "Disable DNS", systemImage: "power") { Task { await model.stopDNS() } } }
+                } else if !pending {
+                    ServiceIconButton(label: "Refresh DNS status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
+    }
+
+    private var tlsRow: some View {
+        let pending = model.isServiceReadPending("TLS") && tls == nil
+        let trust = tls.map(TLSTrustControlPresentation.init)
+        let state: ServicePresentation?
+        if let tls, let trust {
+            state = .init(trust.title, tls.trustObserved ? "checkmark.circle.fill" : "exclamationmark.triangle", tls.trustObserved ? .green : .orange)
+        } else {
+            state = nil
+        }
+        let resolvedState = resolved(state, readLabel: "TLS", present: tls != nil).0
+        let busy = model.serviceOperationIs(for: "Local HTTPS")
+        return ServiceRow(icon: "lock.fill", title: "Local HTTPS", version: tls.map { "Port \($0.tlsPort)" }, state: resolvedState.title, stateSymbol: resolvedState.symbol, stateTint: resolvedState.tint, pending: pending, busy: busy) {
+            HStack(spacing: 3) {
+                if let trust {
+                    if trust.canTrust { ServiceIconButton(label: "Trust Local CA", systemImage: "lock.open.fill") { Task { await model.trustLocalCA() } } }
+                    if trust.canRemove { ServiceIconButton(label: "Remove Local CA Trust", systemImage: "lock.slash") { Task { await model.removeLocalCATrust() } } }
+                    if trust.canManageTrust { ServiceIconButton(label: "Manage Local CA Trust", systemImage: "info.circle") { showingTrustGuidance = true } }
+                } else if !pending {
+                    ServiceIconButton(label: "Refresh Local HTTPS status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
+    }
+
+    private var portsRow: some View {
+        let pending = model.isServiceReadPending("standard-ports") && ports == nil
+        let control = ports.map { ServiceControlPresentation.standardPorts(status: $0, savedOn: model.savedServiceIntents?.contains("standard-ports"), blockedReason: model.startupIssue(for: "standard-ports")) }
+        let state = control.map { ServicePresentation($0.title, serviceSymbol($0.title), serviceTint($0.title)) }
+        let resolvedState = resolved(state, readLabel: "standard-ports", present: ports != nil).0
+        let busy = model.serviceOperationIs(for: "standard ports")
+        return ServiceRow(icon: "cable.connector", title: "Standard Ports", version: ports.map { "\($0.httpPort) · \($0.httpsPort)" }, state: resolvedState.title, stateSymbol: resolvedState.symbol, stateTint: resolvedState.tint, pending: pending, busy: busy) {
+            HStack(spacing: 3) {
+                if let control {
+                    if control.action == .enable { ServiceIconButton(label: "Enable Standard Ports", systemImage: "power", emphasis: .start) { Task { await model.installStandardPorts() } } }
+                    if control.action == .retry { ServiceIconButton(label: "Retry Standard Ports", systemImage: "arrow.clockwise") { Task { await model.installStandardPorts() } } }
+                    if control.action == .disable { ServiceIconButton(label: "Disable Standard Ports", systemImage: "stop.circle", emphasis: .stop) { Task { await model.removeStandardPorts() } } }
+                } else if !pending {
+                    ServiceIconButton(label: "Refresh Standard Ports status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                }
+            }
+        }
     }
 
     private func mysqlState(_ mysql: MySQLStatus) -> ServicePresentation {
         switch mysql.state {
-        case .running where mysql.health == "healthy": return .init("Running", "circle.fill", .secondary)
+        case .running where mysql.health == "healthy": return .init("Running", "checkmark.circle.fill", .green)
         case .notInstalled: return .init("Not installed", "circle", .secondary)
         case .conflict, .unhealthy: return .init("Needs attention", "exclamationmark.triangle", .orange)
-        default: return .init(mysql.state.rawValue.capitalized, "circle", .secondary)
+        case .stopped, .installed: return .init("Stopped", "pause.circle", .secondary)
+        default: return .init(mysql.state.rawValue.capitalized, "arrow.triangle.2.circlepath", .secondary)
         }
     }
 
     private func mailpitState(_ mailpit: MailpitStatus) -> ServicePresentation {
         switch mailpit.state {
-        case .running where mailpit.health == "healthy": return .init("Running", "circle.fill", .secondary)
+        case .running where mailpit.health == "healthy": return .init("Running", "checkmark.circle.fill", .green)
         case .notInstalled: return .init("Not installed", "circle", .secondary)
         case .conflict, .unhealthy: return .init("Needs attention", "exclamationmark.triangle", .orange)
-        default: return .init(mailpit.state.rawValue.capitalized, "circle", .secondary)
+        case .stopped, .installed: return .init("Stopped", "pause.circle", .secondary)
+        default: return .init(mailpit.state.rawValue.capitalized, "arrow.triangle.2.circlepath", .secondary)
         }
     }
 
     private func routingState(_ routing: RouterStatus) -> ServicePresentation {
-        routing.state == .running && routing.health == .healthy ? .init("Running", "circle.fill", .secondary) : .init("Needs attention", "exclamationmark.triangle", .orange)
-    }
-
-    private func dnsState(_ dns: DNSStatus) -> ServicePresentation {
-        dns.supportsLocalResolution ? .init("Ready", "checkmark", .secondary) : .init("Needs attention", "exclamationmark.triangle", .orange)
+        routing.state == .running && routing.health == .healthy ? .init("Running", "checkmark.circle.fill", .green) : (routing.state == .stopped ? .init("Stopped", "pause.circle", .secondary) : .init("Needs attention", "exclamationmark.triangle", .orange))
     }
 
     private func serviceSymbol(_ title: String) -> String {
-        title == "Needs attention" || title == "State unavailable" ? "exclamationmark.triangle" : (title.hasPrefix("On") || title == "Enabled" ? "checkmark" : "circle")
+        if title == "Needs attention" || title == "State unavailable" { return "exclamationmark.triangle" }
+        if title.localizedCaseInsensitiveContains("start") || title.localizedCaseInsensitiveContains("check") { return "arrow.triangle.2.circlepath" }
+        if title.hasPrefix("On") || title == "Enabled" || title == "Ready" || title == "Trusted" { return "checkmark.circle.fill" }
+        if title == "Off" || title == "Stopped" || title == "Disabled" { return "pause.circle" }
+        return "circle"
     }
 
     private func serviceTint(_ title: String) -> Color {
-        title == "Needs attention" || title == "State unavailable" ? .orange : .secondary
+        if title == "Needs attention" || title == "State unavailable" { return .orange }
+        if title == "Running" || title.hasPrefix("On") || title == "Enabled" || title == "Trusted" { return .green }
+        return .secondary
     }
 
-    @ViewBuilder private func mysqlActions(_ mysql: MySQLStatus) -> some View {
-        if mysql.state == .notInstalled { Button("Install MySQL") { Task { await model.installMySQL() } } }
-        else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy { Button(mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL") { Task { await model.startMySQL() } } }
-        if mysql.state == .running { Button("Stop MySQL") { Task { await model.stopMySQL() } } }
-        if mysql.state != .notInstalled {
-            Menu("Reveal") {
-                Button("Data Files", systemImage: "internaldrive") { model.revealMySQLDataFiles(mysql) }
-                    .disabled(!FileManager.default.fileExists(atPath: mysql.datadir))
-                Button("MySQL Binaries", systemImage: "shippingbox") { model.revealMySQLBinaries(mysql) }
-                    .disabled(!FileManager.default.fileExists(atPath: mysql.executablePath))
-            }
-        }
-    }
-
-    @ViewBuilder private func mailpitActions(_ mailpit: MailpitStatus) -> some View {
-        if mailpit.state == .notInstalled { Button("Install Mailpit") { Task { await model.installMailpit() } } }
-        else if mailpit.state == .installed || mailpit.state == .stopped || mailpit.state == .unhealthy || mailpit.state == .conflict { Button("Start Mailpit") { Task { await model.startMailpit() } } }
-        if mailpit.state == .running { Button("Stop Mailpit") { Task { await model.stopMailpit() } }; Button("Open Mailpit") { Task { await model.openMailpit() } } }
-    }
 }
 
 private struct LocalCATrustDetailsView: View {

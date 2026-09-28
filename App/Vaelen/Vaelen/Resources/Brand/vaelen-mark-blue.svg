@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 56" role="img" aria-labelledby="title desc">
+  <title id="title">Vaelen brand mark</title>
+  <desc id="desc">Mark-only Vaelen symbol in the official blue gradient</desc>
+  <defs>
+    <linearGradient id="vaelen-blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38B2F6"/>
+      <stop offset="1" stop-color="#1B64E9"/>
+    </linearGradient>
+  </defs>
+  <path d="M 10 0 H 77 C 83 0 87 3 90 8 L 133 74 C 136 79 136 83 133 88 L 99 139 C 96 143 93 145 88 145 C 83 145 79 142 76 137 L 2 15 C -2 8 2 0 10 0 Z" transform="translate(0 0) scale(0.377778 0.386207)" fill="url(#vaelen-blue)"/>
+  <circle cx="71" cy="9" r="9" fill="url(#vaelen-blue)"/>
+</svg>

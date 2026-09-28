@@ -15,6 +15,7 @@
 		A00000000000000000000006 /* vaelen-mark-gradient.svg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000016 /* vaelen-mark-gradient.svg */; };
 		A00000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000017 /* Assets.xcassets */; };
 		A00000000000000000000008 /* CoreProcessManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000018 /* CoreProcessManager.swift */; };
+		A00000000000000000000009 /* vaelen-mark-blue.svg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000019 /* vaelen-mark-blue.svg */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +27,7 @@
 		A00000000000000000000016 /* vaelen-mark-gradient.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = vaelen-mark-gradient.svg; sourceTree = "<group>"; };
 		A00000000000000000000017 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
 		A00000000000000000000018 /* CoreProcessManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreProcessManager.swift; sourceTree = "<group>"; };
+		A00000000000000000000019 /* vaelen-mark-blue.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = vaelen-mark-blue.svg; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -66,6 +68,7 @@
 				A00000000000000000000014 /* vaelen-mark-dark.svg */,
 				A00000000000000000000015 /* vaelen-mark-white.svg */,
 				A00000000000000000000016 /* vaelen-mark-gradient.svg */,
+				A00000000000000000000019 /* vaelen-mark-blue.svg */,
 			);
 			name = Brand;
 			path = Resources/Brand;
@@ -138,6 +141,7 @@
 			A00000000000000000000004 /* vaelen-mark-dark.svg in Resources */,
 			A00000000000000000000005 /* vaelen-mark-white.svg in Resources */,
 			A00000000000000000000006 /* vaelen-mark-gradient.svg in Resources */,
+			A00000000000000000000009 /* vaelen-mark-blue.svg in Resources */,
 			A00000000000000000000007 /* Assets.xcassets in Resources */,
 		); runOnlyForDeploymentPostprocessing = 0; };
 		A00000000000000000000033 /* Embed Vaelen Core */ = {
