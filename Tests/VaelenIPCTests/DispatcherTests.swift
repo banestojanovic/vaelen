@@ -73,11 +73,14 @@ private actor ParkReconciliationTestRouter: Router {
     private var running = true
     private var routes: [Route]
     private var failNextReconcile = false
+    private let failObservations: Bool
+    private var statusCalls = 0
+    private var observedRouteCalls = 0
 
-    init(routes: [Route] = []) { self.routes = routes }
+    init(routes: [Route] = [], failObservations: Bool = false) { self.routes = routes; self.failObservations = failObservations }
     func start() async throws { running = true }
     func stop() async throws { running = false }
-    func status() async -> RouterStatus { .init(provider: "park-reconciliation-test", state: running ? .running : .stopped, health: running ? .healthy : .unknown, routeCount: routes.count) }
+    func status() async -> RouterStatus { statusCalls += 1; return .init(provider: "park-reconciliation-test", state: running ? .running : .stopped, health: running ? .healthy : .unknown, routeCount: routes.count) }
     func health() async -> RouterHealth { running ? .healthy : .unhealthy }
     func failNextApply() { failNextReconcile = true }
     func reconcile(routes: [Route]) async throws {
@@ -87,7 +90,8 @@ private actor ParkReconciliationTestRouter: Router {
     func addRoute(_ route: Route) async throws { routes.append(route) }
     func updateRoute(_ route: Route) async throws { routes.removeAll { $0.id == route.id }; routes.append(route) }
     func removeRoute(id: RouteID) async throws { routes.removeAll { $0.id == id } }
-    func observedRoutes() async throws -> [Route] { routes }
+    func observedRoutes() async throws -> [Route] { observedRouteCalls += 1; if failObservations { throw RouterError.notRunning }; return routes }
+    func observationCounts() -> (status: Int, routes: Int) { (statusCalls, observedRouteCalls) }
 }
 
 private struct ShutdownPortsFake: StandardPortsPrivileged {
@@ -371,11 +375,227 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(appliedRoutes, [route])
     }
 
-    private func makeWordPress(at root: URL) throws {
+    @discardableResult
+    private func makeWordPress(at root: URL) throws -> URL {
         try FileManager.default.createDirectory(at: root.appendingPathComponent("wp-admin"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("wp-includes"), withIntermediateDirectories: true)
         try Data("<?php\n".utf8).write(to: root.appendingPathComponent("wp-config.php"))
         try Data("<?php echo 'fixture';\n".utf8).write(to: root.appendingPathComponent("index.php"))
+        return root
+    }
+
+    func testProjectObservationSnapshotReusesSharedProbesAndPreservesReportValues() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-observation-snapshot-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstPath = try makeWordPress(at: root.appendingPathComponent("first"))
+        let secondPath = try makeWordPress(at: root.appendingPathComponent("second"))
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let first = try await registry.link(path: firstPath)
+        let second = try await registry.link(path: secondPath)
+        let router = ParkReconciliationTestRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, routeRepository: RouteIntentRepository(store: store))
+
+        let oldResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: first.id?.rawValue.uuidString, workingDirectory: root.path))), handshaken: true).response
+        guard case .projectEnvironment(let oldReport)? = oldResponse.result else { return XCTFail("Expected the existing individual-report API") }
+        let countsAfterIndividual = await router.observationCounts()
+        XCTAssertEqual(countsAfterIndividual.status, 1)
+        XCTAssertEqual(countsAfterIndividual.routes, 1)
+
+        let snapshotResponse = await dispatcher.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+        guard case .projectObservationSnapshot(let snapshot)? = snapshotResponse.result else { return XCTFail("Expected a shared observation snapshot") }
+        let firstResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: first.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        let secondResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: second.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        guard case .projectEnvironment(let firstReport)? = firstResponse.result,
+              case .projectEnvironment(let secondReport)? = secondResponse.result else { return XCTFail("Both per-project reports should complete independently") }
+
+        XCTAssertEqual(firstReport.report, oldReport.report, "Snapshot-backed diagnostics preserve existing report semantics")
+        XCTAssertEqual(secondReport.report.identity.name, "second")
+        let finalCounts = await router.observationCounts()
+        XCTAssertEqual(finalCounts.status - countsAfterIndividual.status, 1, "Router status is sampled once for the shared refresh snapshot")
+        XCTAssertEqual(finalCounts.routes - countsAfterIndividual.routes, 1, "Observed routes are sampled once for the shared refresh snapshot")
+    }
+
+    func testTwelveProjectRefreshSnapshotProbeAndLatencyTradeoff() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-observation-12-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        var projects = [Project]()
+        for index in 0..<12 {
+            let path = try makeWordPress(at: root.appendingPathComponent("project-\(index)"))
+            projects.append(try await registry.link(path: path))
+        }
+        let router = ParkReconciliationTestRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router)
+
+        let individualStart = ContinuousClock.now
+        for project in projects {
+            let response = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path))), handshaken: true).response
+            guard case .projectEnvironment? = response.result else { return XCTFail("Existing individual report API failed") }
+        }
+        let individualDuration = individualStart.duration(to: .now)
+        let afterIndividual = await router.observationCounts()
+        XCTAssertEqual(afterIndividual.status, 12)
+        XCTAssertEqual(afterIndividual.routes, 12)
+
+        let snapshotStart = ContinuousClock.now
+        let snapshotResponse = await dispatcher.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+        guard case .projectObservationSnapshot(let snapshot)? = snapshotResponse.result else { return XCTFail("Snapshot request failed") }
+        for project in projects {
+            let response = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+            guard case .projectEnvironment? = response.result else { return XCTFail("Snapshot report failed") }
+        }
+        let snapshotDuration = snapshotStart.duration(to: .now)
+        let afterSnapshot = await router.observationCounts()
+        XCTAssertEqual(afterSnapshot.status - afterIndividual.status, 1)
+        XCTAssertEqual(afterSnapshot.routes - afterIndividual.routes, 1)
+        print("[ProjectRefreshBench] 12 projects, Core dispatcher only (no socket/handshake): individual=\(individualDuration), shared-snapshot=\(snapshotDuration), router-status-probes=12→1, route-probes=12→1")
+    }
+
+    func testProjectCardDiscoveryScalesAcrossIsolatedTwelveThirtyAndHundredProjectFixtures() async throws {
+        for count in [12, 30, 100] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-card-scale-\(count)-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+            for index in 0..<count {
+                let path = try makeWordPress(at: root.appendingPathComponent("project-\(index)"))
+                _ = try await registry.link(path: path)
+            }
+            let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry)
+
+            let discoveryStart = ContinuousClock.now
+            let discovered = await dispatcher.dispatch(.init(method: .projectList), handshaken: true).response
+            let discoveryDuration = discoveryStart.duration(to: .now)
+            guard case .projectList(let result)? = discovered.result else { return XCTFail("Project identity discovery failed at N=\(count)") }
+            let projects = result.projects
+            XCTAssertEqual(projects.count, count)
+            XCTAssertTrue(projects.allSatisfy { !$0.name.isEmpty && !$0.path.isEmpty })
+            print("[ProjectCardScale] isolated fixture count=\(count) identities=\(discoveryDuration) known-projects-published=\(projects.count)")
+
+            let snapshot = await dispatcher.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+            guard case .projectObservationSnapshot(let observation)? = snapshot.result else { return XCTFail("Shared observations failed at N=\(count)") }
+            let reportStart = ContinuousClock.now
+            var completed = 0
+            var firstDetail: Duration?
+            await withTaskGroup(of: Bool.self) { group in
+                var next = 0
+                let limit = min(4, projects.count)
+                func submit(_ project: ProjectWire) {
+                    group.addTask {
+                        let response = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.uuidString, workingDirectory: root.path, snapshotID: observation.snapshotID))), handshaken: true).response
+                        if case .projectEnvironment? = response.result { return true }
+                        return false
+                    }
+                }
+                while next < limit { submit(projects[next]); next += 1 }
+                while let success = await group.next() {
+                    if success {
+                        completed += 1
+                        if firstDetail == nil { firstDetail = reportStart.duration(to: .now) }
+                    }
+                    if next < projects.count { submit(projects[next]); next += 1 }
+                }
+            }
+            XCTAssertEqual(completed, count)
+            print("[ProjectCardScale] isolated fixture count=\(count) firstFreshDetail=\(String(describing: firstDetail)) allFreshDetails=\(reportStart.duration(to: .now)) completed=\(completed)")
+        }
+    }
+
+    func testSnapshotPerProjectFailureDoesNotInvalidateSiblingReport() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-observation-partial-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectPath = try makeWordPress(at: root.appendingPathComponent("project"))
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let project = try await registry.link(path: projectPath)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry)
+        let snapshotResponse = await dispatcher.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+        guard case .projectObservationSnapshot(let snapshot)? = snapshotResponse.result else { return XCTFail("Expected a shared observation snapshot") }
+
+        let missingResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: "missing", workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        XCTAssertNotNil(missingResponse.error, "A per-project failure should be reported only for that project")
+        let validResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        guard case .projectEnvironment(let report)? = validResponse.result else { return XCTFail("A sibling report remains available after another project fails") }
+        XCTAssertEqual(report.report.identity.name, "project")
+    }
+
+    func testSnapshotExpiryAndCoreRestartReturnRecoverableTokenError() async throws {
+        let now = Date()
+        XCTAssertTrue(ProjectObservationSnapshotFreshness.isFresh(createdAt: now.addingTimeInterval(-29), now: now))
+        XCTAssertFalse(ProjectObservationSnapshotFreshness.isFresh(createdAt: now.addingTimeInterval(-30), now: now))
+        XCTAssertFalse(ProjectObservationSnapshotFreshness.isFresh(createdAt: now.addingTimeInterval(1), now: now))
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-observation-restart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectPath = try makeWordPress(at: root.appendingPathComponent("project"))
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let project = try await registry.link(path: projectPath)
+        let firstCore = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry)
+        let snapshotResponse = await firstCore.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+        guard case .projectObservationSnapshot(let snapshot)? = snapshotResponse.result else { return XCTFail("Expected snapshot") }
+
+        // A new dispatcher models a Core restart: its in-memory token cache is empty.
+        let restartedCore = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 2), registry: registry)
+        let staleResponse = await restartedCore.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        XCTAssertEqual(staleResponse.error?.code, .projectObservationSnapshotExpired)
+        let recoveredResponse = await restartedCore.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path))), handshaken: true).response
+        guard case .projectEnvironment(let report)? = recoveredResponse.result else { return XCTFail("Fresh individual report should recover after Core restart") }
+        XCTAssertEqual(report.report.identity.name, "project")
+    }
+
+    func testFailedSharedRouteProbeProducesPartialSnapshotAndUsableReport() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-observation-probe-failure-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectPath = try makeWordPress(at: root.appendingPathComponent("project"))
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let project = try await registry.link(path: projectPath)
+        let router = ParkReconciliationTestRouter(failObservations: true)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router)
+        let snapshotResponse = await dispatcher.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+        guard case .projectObservationSnapshot(let snapshot)? = snapshotResponse.result else { return XCTFail("One failed observation should not fail the whole snapshot") }
+        let reportResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        guard case .projectEnvironment(let report)? = reportResponse.result else { return XCTFail("Available project details should survive an unavailable route observation") }
+        XCTAssertEqual(report.report.identity.name, "project")
+        let counts = await router.observationCounts()
+        XCTAssertEqual(counts.routes, 1)
+    }
+
+    func testSlowProjectInspectionDoesNotBlockSiblingReport() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-observation-slow-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let slowPath = try makeWordPress(at: root.appendingPathComponent("slow"))
+        let fastPath = try makeWordPress(at: root.appendingPathComponent("fast"))
+        let fifo = slowPath.appendingPathComponent("vaelen.yml")
+        XCTAssertEqual(mkfifo(fifo.path, S_IRUSR | S_IWUSR), 0)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let slowProject = try await registry.link(path: slowPath)
+        let fastProject = try await registry.link(path: fastPath)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry)
+        let snapshotResponse = await dispatcher.dispatch(.init(method: .projectObservationSnapshot), handshaken: true).response
+        guard case .projectObservationSnapshot(let snapshot)? = snapshotResponse.result else { return XCTFail("Expected a snapshot") }
+
+        let writer = Task.detached {
+            try await Task.sleep(for: .milliseconds(400))
+            let descriptor = open(fifo.path, O_RDWR)
+            guard descriptor >= 0 else { return }
+            let bytes = Array("version: 1\n".utf8)
+            _ = bytes.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress!, bytes.count) }
+            close(descriptor)
+        }
+        let slowRequest = IPCRequest(method: .projectStatus, params: .projectEnvironment(.init(selector: slowProject.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID)))
+        let slowTask = Task { await dispatcher.dispatch(slowRequest, handshaken: true).response }
+        try await Task.sleep(for: .milliseconds(50))
+
+        let start = ContinuousClock.now
+        let fastResponse = await dispatcher.dispatch(.init(method: .projectStatus, params: .projectEnvironment(.init(selector: fastProject.id?.rawValue.uuidString, workingDirectory: root.path, snapshotID: snapshot.snapshotID))), handshaken: true).response
+        let siblingLatency = start.duration(to: .now)
+        guard case .projectEnvironment(let fastReport)? = fastResponse.result else { return XCTFail("Fast sibling report should complete while slow inspection is blocked") }
+        XCTAssertEqual(fastReport.report.identity.name, "fast")
+        XCTAssertLessThan(siblingLatency, .milliseconds(300), "One blocked project-file read must not stall sibling diagnostics")
+        print("[ProjectRefreshIsolation] sibling completed in \(siblingLatency) while another project's vaelen.yml read was held for 400ms")
+        _ = await slowTask.value
+        try await writer.value
     }
 
     func testShutdownCancelsAndAwaitsInFlightParkRouteMonitor() async throws {
@@ -1303,6 +1523,10 @@ while True:
         let old = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "old", version: "0.0.10-dev")))), handshaken: false)
         XCTAssertEqual(old.response.error?.code, .coreIncompatible)
         XCTAssertFalse(old.handshaken)
+
+        let schemaFive = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "installed-val", version: "previous", schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion - 1, buildIdentity: "previous")))), handshaken: false)
+        XCTAssertEqual(schemaFive.response.error?.code, .coreIncompatible, "Schema-5 installed CLI cannot issue commands to schema-6 Core")
+        XCTAssertFalse(schemaFive.handshaken)
 
         let current = await dispatcher.dispatch(IPCRequest(method: .handshake, params: .handshake(.init(client: .init(name: "current", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)))), handshaken: false)
         XCTAssertTrue(current.handshaken)

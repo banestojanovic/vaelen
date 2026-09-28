@@ -58,6 +58,7 @@ final class ProjectDiscoveryTests: XCTestCase {
         XCTAssertEqual(Dictionary(uniqueKeysWithValues: projects.compactMap { project in project.detectedFramework.map { (project.name, $0) } }), [
             "laravel": "Laravel", "wordpress": "WordPress", "react": "React"
         ])
+        XCTAssertEqual(projects.map { $0.rootPath.string }, projects.map { $0.rootPath.string }.sorted())
         XCTAssertTrue(projects.allSatisfy { $0.registrationKind == .discovered && $0.visibilitySources == [.parkedFolder] })
     }
 

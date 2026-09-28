@@ -72,7 +72,10 @@ public struct ProjectDiscovery: @unchecked Sendable {
                 options: [.skipsHiddenFiles]
               ) else { return }
 
-        for child in children.sorted(by: { $0.path < $1.path }) {
+        // Traversal order does not affect the result: discoveries are keyed by
+        // canonical path and sorted once at the public boundary. Avoid sorting
+        // every directory encountered in a workspace tree.
+        for child in children {
             guard !shouldIgnore(child.lastPathComponent),
                   let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
                   values.isDirectory == true || values.isSymbolicLink == true else { continue }

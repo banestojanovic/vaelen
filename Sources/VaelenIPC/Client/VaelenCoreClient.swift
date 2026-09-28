@@ -29,6 +29,8 @@ public actor VaelenCoreClient {
     private let identity: ClientIdentity
     private var decoder = FrameDecoder()
     private var connected = false
+    private var sendInFlight = false
+    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(transport: any CoreTransport, identity: ClientIdentity) {
         self.transport = transport
@@ -39,6 +41,7 @@ public actor VaelenCoreClient {
         do {
             try await transport.connect()
             connected = true
+            decoder = FrameDecoder()
             let request = IPCRequest(method: .handshake, params: .handshake(HandshakeParams(client: ClientIdentity(name: identity.name, version: identity.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))))
             let response = try await send(request)
             do {
@@ -110,16 +113,21 @@ public actor VaelenCoreClient {
         return result.projects
     }
 
-    public func projectStatus(selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
-        try await projectEnvironment(method: .projectStatus, selector: selector, workingDirectory: workingDirectory)
+    public func projectObservationSnapshot() async throws -> UUID {
+        guard case .projectObservationSnapshot(let result) = try result(from: await send(IPCRequest(method: .projectObservationSnapshot))) else { throw CoreClientError.invalidResponse }
+        return result.snapshotID
     }
 
-    public func projectInspect(selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
-        try await projectEnvironment(method: .projectInspect, selector: selector, workingDirectory: workingDirectory)
+    public func projectStatus(selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironment(method: .projectStatus, selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID)
     }
 
-    public func projectDoctor(selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
-        try await projectEnvironment(method: .projectDoctor, selector: selector, workingDirectory: workingDirectory)
+    public func projectInspect(selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironment(method: .projectInspect, selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID)
+    }
+
+    public func projectDoctor(selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironment(method: .projectDoctor, selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID)
     }
 
     public func projectPlan(selector: String?, workingDirectory: String) async throws -> ProjectReconciliationPlan {
@@ -142,9 +150,32 @@ public actor VaelenCoreClient {
         return result
     }
 
-    private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String) async throws -> ProjectEnvironmentReport {
-        guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
-        return result.report
+    private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
+        do {
+            guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID))))) else { throw CoreClientError.invalidResponse }
+            return result.report
+        } catch CoreClientError.remote(let payload) where snapshotID != nil && payload.code == .projectObservationSnapshotExpired {
+            // Snapshot loss/expiry is local to diagnostics. Retry this project
+            // independently with fresh observations; the caller can still
+            // publish its already-known identity/card immediately.
+            return try await projectEnvironment(method: method, selector: selector, workingDirectory: workingDirectory)
+        } catch CoreClientError.coreUnavailable where snapshotID != nil {
+            // A Core restart drops all in-memory snapshot tokens. Reconnect
+            // with bounded backoff, then fall back to the existing fresh path.
+            try await reconnectForSnapshotFallback()
+            return try await projectEnvironment(method: method, selector: selector, workingDirectory: workingDirectory)
+        }
+    }
+
+    private func reconnectForSnapshotFallback() async throws {
+        for attempt in 0..<20 {
+            do { try await connect(); return }
+            catch let error as CoreClientError {
+                guard case .coreUnavailable = error, attempt < 19 else { throw error }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        throw CoreClientError.coreUnavailable
     }
 
     public func park(path: String?, workingDirectory: String) async throws -> ParkedPathMutationResult {
@@ -247,6 +278,11 @@ public actor VaelenCoreClient {
     }
 
     private func send(_ request: IPCRequest) async throws -> IPCResponse {
+        // The actor is re-entrant while awaiting transport I/O. Keep a full
+        // request/response exchange exclusive: the current framed reader has
+        // no pending-request table and must not consume another caller's reply.
+        await acquireSendSlot()
+        defer { releaseSendSlot() }
         do {
             let payload = try IPCCodec.encode(request)
             let frame = try FrameEncoder().encode(payload)
@@ -269,6 +305,24 @@ public actor VaelenCoreClient {
             throw CoreClientError.invalidResponse
         } catch is IPCModelError {
             throw CoreClientError.invalidResponse
+        }
+    }
+
+    private func acquireSendSlot() async {
+        if !sendInFlight {
+            sendInFlight = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            sendWaiters.append(continuation)
+        }
+    }
+
+    private func releaseSendSlot() {
+        if sendWaiters.isEmpty {
+            sendInFlight = false
+        } else {
+            sendWaiters.removeFirst().resume()
         }
     }
 

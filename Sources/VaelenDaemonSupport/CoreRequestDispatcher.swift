@@ -11,6 +11,30 @@ private struct ParkedProjectCandidate {
     var hostname: String { project.name + ".test" }
 }
 
+private struct ProjectReportObservations {
+    let phpObservations: [PHPInstalledPackageObservation]
+    let phpStatuses: [PHPStatus]
+    let phpDefault: String?
+    let routes: [RouteIntent]
+    let router: RouterStatus
+    let runtimeRoutes: [Route]?
+    let linkedProjects: [Project]
+    let phpOverrides: [ProjectID: String]
+    let pendingTransitions: [RouteTargetTransition]
+    let mysql: MySQLStatus?
+    let mailpit: MailpitStatus?
+    let dns: DNSStatus
+    let tls: TLSStatus
+    let ports: StandardPortsStatus
+}
+
+enum ProjectObservationSnapshotFreshness {
+    static let lifetime: TimeInterval = 30
+    static func isFresh(createdAt: Date, now: Date) -> Bool {
+        now.timeIntervalSince(createdAt) >= 0 && now.timeIntervalSince(createdAt) < lifetime
+    }
+}
+
 public actor CoreRequestDispatcher {
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
@@ -31,6 +55,7 @@ public actor CoreRequestDispatcher {
     private var shutdownBegun = false
     private var shutdownTask: Task<CoreShutdownResponse, Never>?
     private var shutdownRunInFlight = false
+    private var projectObservationSnapshots: [UUID: (createdAt: Date, observations: ProjectReportObservations)] = [:]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
@@ -147,10 +172,30 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .projectList(.init(projects: try await registry.linkedProjects().map(ProjectWire.init)))), true)
             case .projectList:
                 return (.init(id: request.id, result: .projectList(.init(projects: try await registry.projectsList().map(ProjectWire.init)))), true)
+            case .projectObservationSnapshot:
+                let observations = try await collectProjectReportObservations()
+                let now = Date()
+                projectObservationSnapshots = projectObservationSnapshots.filter { ProjectObservationSnapshotFreshness.isFresh(createdAt: $0.value.createdAt, now: now) }
+                if projectObservationSnapshots.count >= 8,
+                   let oldest = projectObservationSnapshots.min(by: { $0.value.createdAt < $1.value.createdAt })?.key {
+                    projectObservationSnapshots.removeValue(forKey: oldest)
+                }
+                let snapshotID = UUID()
+                projectObservationSnapshots[snapshotID] = (now, observations)
+                return (.init(id: request.id, result: .projectObservationSnapshot(.init(snapshotID: snapshotID))), true)
             case .projectStatus, .projectInspect, .projectDoctor:
                 let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project environment parameters are required.") }()
                 let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
-                let report = try await projectEnvironmentReport(for: project)
+                let observations: ProjectReportObservations
+                if let snapshotID = params.snapshotID {
+                    guard let snapshot = projectObservationSnapshots[snapshotID], ProjectObservationSnapshotFreshness.isFresh(createdAt: snapshot.createdAt, now: Date()) else {
+                        throw IPCErrorPayload(code: .projectObservationSnapshotExpired, message: "The project observation snapshot expired. Refresh and retry.")
+                    }
+                    observations = snapshot.observations
+                } else {
+                    observations = try await collectProjectReportObservations()
+                }
+                let report = try await projectEnvironmentReport(for: project, observations: observations)
                 return (.init(id: request.id, result: .projectEnvironment(.init(report: report))), true)
             case .projectPlan, .projectActivate:
                 let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project reconciliation parameters are required.") }()
@@ -894,33 +939,72 @@ public actor CoreRequestDispatcher {
         return PHPResolveResult(version: version, cliPath: package.cliPath, projectName: project?.name)
     }
 
-    private func projectEnvironmentReport(for project: Project) async throws -> ProjectEnvironmentReport {
+    private func collectProjectReportObservations() async throws -> ProjectReportObservations {
         let phpObservations = php?.packageObservations() ?? []
         let phpPackages = phpObservations.filter { $0.eligibility == .eligible }.compactMap(\.package)
-        let invalidPHPVersions = phpObservations.filter { $0.eligibility != .eligible }.compactMap(\.version)
         let phpStatuses = phpPackages.compactMap { try? php?.status(requestedVersion: $0.version) }.compactMap { $0 }
-        let routerStatus = await router.status()
-        let runtimeRoutes = try? await router.observedRoutes()
-        let linkedProjects = try await registry.linkedProjects()
+        async let routerStatus = router.status()
+        async let observedRoutes = try? await router.observedRoutes()
+        async let linkedProjects = registry.linkedProjects()
+        async let dnsStatus = dns.status()
+        async let tlsStatus = tls.status()
+        async let portsStatus = ports.status()
+        let routerValue = await routerStatus
+        let runtimeRoutesValue = await observedRoutes
+        let linkedProjectsValue = try await linkedProjects
+        async let phpOverrides = registry.phpOverrides()
+        let phpOverridesValue = try await phpOverrides
         let pendingTransitions = try routeRepository?.pendingTransitions() ?? []
-        let override: String?
-        if let id = project.id { override = try await registry.phpOverride(for: id) } else { override = nil }
-        let report = ProjectEnvironmentInspector().inspect(
-            project: project,
-            routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname },
-            phpPackages: phpPackages,
+        return ProjectReportObservations(
+            phpObservations: phpObservations,
             phpStatuses: phpStatuses,
             phpDefault: php?.defaultVersion(),
-            phpOverride: override,
+            routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname },
+            router: routerValue,
+            runtimeRoutes: runtimeRoutesValue,
+            linkedProjects: linkedProjectsValue,
+            phpOverrides: phpOverridesValue,
+            pendingTransitions: pendingTransitions,
             mysql: mysql?.status(),
             mailpit: mailpit?.status(),
-            router: routerStatus,
-            dns: await dns.status(),
-            tls: await tls.status(),
-            standardPorts: await ports.status(),
-            invalidPHPVersions: invalidPHPVersions,
-            registeredProjects: linkedProjects, runtimeRoutes: runtimeRoutes, pendingTransitions: pendingTransitions
+            dns: await dnsStatus,
+            tls: await tlsStatus,
+            ports: await portsStatus
         )
+    }
+
+    private func projectEnvironmentReport(for project: Project) async throws -> ProjectEnvironmentReport {
+        try await projectEnvironmentReport(for: project, observations: try await collectProjectReportObservations())
+    }
+
+    private func projectEnvironmentReport(for project: Project, observations: ProjectReportObservations) async throws -> ProjectEnvironmentReport {
+        let phpObservations = observations.phpObservations
+        let phpPackages = phpObservations.filter { $0.eligibility == .eligible }.compactMap(\.package)
+        let invalidPHPVersions = phpObservations.filter { $0.eligibility != .eligible }.compactMap(\.version)
+        let phpStatuses = observations.phpStatuses
+        let routerStatus = observations.router
+        let runtimeRoutes = observations.runtimeRoutes
+        let linkedProjects = observations.linkedProjects
+        let pendingTransitions = observations.pendingTransitions
+        let override = project.id.flatMap { observations.phpOverrides[$0] }
+        let report = await Task.detached(priority: .utility) {
+            ProjectEnvironmentInspector().inspect(
+                project: project,
+                routes: observations.routes,
+                phpPackages: phpPackages,
+                phpStatuses: phpStatuses,
+                phpDefault: observations.phpDefault,
+                phpOverride: override,
+                mysql: observations.mysql,
+                mailpit: observations.mailpit,
+                router: routerStatus,
+                dns: observations.dns,
+                tls: observations.tls,
+                standardPorts: observations.ports,
+                invalidPHPVersions: invalidPHPVersions,
+                registeredProjects: linkedProjects, runtimeRoutes: runtimeRoutes, pendingTransitions: pendingTransitions
+            )
+        }.value
         if let routeRepository, let projectID = project.id?.rawValue, runtimeRoutes != nil, routerStatus.state == .running, routerStatus.health == .healthy, report.observed.php.fpmHealth == "healthy", let resolvedVersion = report.observed.php.resolvedVersion, let desiredSocket = report.observed.php.fpmSocket {
             for transition in pendingTransitions where transition.projectID == projectID && transition.desiredSocket == desiredSocket && transition.desiredRoute.target.fastCGISocket == desiredSocket {
                 guard linkedProjects.contains(where: { $0.id?.rawValue == projectID }), let target = report.routeTargets.first(where: { $0.routeID == transition.routeID }), target.disposition == .satisfied, target.resolvedPHPVersion == resolvedVersion, let runtime = runtimeRoutes?.first(where: { $0.hostname == transition.desiredRoute.hostname }), (try? routeProviderFingerprint(runtime)) == transition.desiredProviderFingerprint else { continue }

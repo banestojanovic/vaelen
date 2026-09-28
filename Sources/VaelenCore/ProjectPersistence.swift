@@ -15,6 +15,14 @@ public final class ProjectRepository: @unchecked Sendable {
         try store.query("SELECT php_override_version FROM projects WHERE id = ?", bind: { store.bind(projectID.description, to: $0, index: 1) }) { value = store.columnString($0, 0) }
         return value
     }
+    public func phpOverrides() throws -> [ProjectID: String] {
+        var values = [ProjectID: String]()
+        try store.query("SELECT id,php_override_version FROM projects WHERE php_override_version IS NOT NULL") { statement in
+            guard let id = UUID(uuidString: store.columnString(statement, 0) ?? ""), let version = store.columnString(statement, 1) else { throw SQLiteStateError.invalidRecord }
+            values[ProjectID(rawValue: id)] = version
+        }
+        return values
+    }
     public func setPHPOverride(_ version: String?, for projectID: ProjectID) throws {
         try store.query("UPDATE projects SET php_override_version = ? WHERE id = ?", bind: { statement in
             if let version { store.bind(version, to: statement, index: 1) }

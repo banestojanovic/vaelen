@@ -3,6 +3,7 @@ import AppKit
 import Observation
 import ServiceManagement
 import UniformTypeIdentifiers
+import os
 import VaelenIPC
 import VaelenCore
 
@@ -83,6 +84,7 @@ private enum VaelenBrand {
 @MainActor
 @Observable
 final class AppModel {
+    private static let startupLogger = Logger(subsystem: "dev.vaelen.app", category: "ProjectStartup")
     enum State {
         case connecting
         case running(CoreStatusResponse, [ProjectWire], PHPVersionsResult?, RouterStatus?, DNSStatus?, TLSStatus?, StandardPortsStatus?, MySQLStatus?, MailpitStatus?)
@@ -91,7 +93,11 @@ final class AppModel {
     }
 
     private(set) var state: State = .connecting
+    private(set) var serviceReadiness: CoreServiceReadiness = .checking
+    private(set) var earlyProjectList: [ProjectWire]?
     private(set) var projectReports: [ProjectEnvironmentReport] = []
+    private(set) var projectReportErrors: [String: String] = [:]
+    private(set) var projectStartupMilestones: [String: TimeInterval] = [:]
     private(set) var phpCatalog: PHPRuntimeCatalog?
     private(set) var phpConfiguration: PHPConfigurationResult?
     private(set) var phpConfigurationError: String?
@@ -121,6 +127,10 @@ final class AppModel {
     private var refreshInFlight = false
     private var refreshRequested = false
     private var monitorTask: Task<Void, Never>?
+    private var serviceCheckTimeoutTask: Task<Void, Never>?
+    private var serviceCheckStartedAt: ContinuousClock.Instant?
+    private var pendingServiceReads = Set<String>()
+    private var projectReportsTask: Task<Void, Never>?
     private var projectSettingsVisible = false
     private var projectSettingsRefreshTask: Task<Void, Never>?
     private var projectRelationshipsRefreshInFlight = false
@@ -132,6 +142,15 @@ final class AppModel {
     }
 
     func startupIssue(for service: String) -> String? { startupServiceIssues[service] }
+
+    func notePopoverPresented() {
+        let count = earlyProjectList?.count ?? {
+            if case .running(_, let projects, _, _, _, _, _, _, _) = state { return projects.count }
+            return 0
+        }()
+        let connection = self.earlyProjectList == nil ? "connecting" : "connected"
+        Self.startupLogger.info("startup milestone=popover-view-presented known-projects=\(count) connection=\(connection, privacy: .public)")
+    }
 
     func refresh() async {
         guard !relationshipMutationInFlight else {
@@ -153,6 +172,10 @@ final class AppModel {
 
         refreshGeneration += 1
         let generation = refreshGeneration
+        projectReportsTask?.cancel()
+        projectReportsTask = nil
+        let refreshStarted = ContinuousClock.now
+        projectStartupMilestones = [:]
         relationshipSnapshotGeneration += 1
         let relationshipGeneration = relationshipSnapshotGeneration
         let hasRunningSnapshot: Bool
@@ -165,7 +188,9 @@ final class AppModel {
         )
         self.client = client
         if !hasRunningSnapshot { state = .connecting }
+        if !hasRunningSnapshot { earlyProjectList = nil }
         do {
+            let handshakeStarted = ContinuousClock.now
             do {
                 try await client.connect()
             } catch let error as CoreClientError {
@@ -188,13 +213,38 @@ final class AppModel {
                 }
                 guard connected else { throw CoreClientError.coreUnavailable }
             }
-            let status = try await client.status()
+            Self.startupLogger.info("startup phase=initial-ipc-handshake elapsed_ms=\(Self.elapsedMilliseconds(since: handshakeStarted))")
+            // Core's status response waits for startup service restoration.
+            // Discover over an independent connection so known names/paths
+            // render while that work continues.
+            let discoveryStarted = ContinuousClock.now
+            let projects = try await discoverProjects()
+            let discoveryElapsed = Self.elapsedMilliseconds(since: discoveryStarted)
+            let identitiesReadyAt = Self.elapsedMilliseconds(since: refreshStarted)
+            earlyProjectList = projects
+            projectStartupMilestones["allCardIdentities"] = Double(identitiesReadyAt) / 1_000
+            Self.startupLogger.info("startup phase=project-discovery-ipc count=\(projects.count) elapsed_ms=\(discoveryElapsed)")
+            guard generation == refreshGeneration else { await client.disconnect(); return }
+            if case .running(let oldStatus, _, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state {
+                state = .running(oldStatus, projects, php, routing, dns, tls, ports, mysql, mailpit)
+            }
+            Self.startupLogger.info("startup milestone=all-card-identities-ui-model count=\(projects.count) elapsed_ms=\(Self.elapsedMilliseconds(since: refreshStarted))")
+            projectReports = []
+            projectReportErrors = [:]
+            beginServiceReadinessCheck(generation: generation)
+            startProjectReports(projects, generation: generation, refreshStarted: refreshStarted)
+
+            let statusStarted = ContinuousClock.now
+            let status = try await trackedServiceOperation("Core status") { try await client.status() }
+            Self.startupLogger.info("startup phase=core-status-ipc elapsed_ms=\(Self.elapsedMilliseconds(since: statusStarted))")
             startupServiceIssues = status.serviceIssues ?? [:]
+            if !startupServiceIssues.isEmpty {
+                finishServiceReadinessCheck(.attention)
+            }
             if !VaelenActivitySignal.markActive() {
                 serviceError = "Vaelen is running, but its shell activity signal could not be saved. PHP will refuse to fall back until this is repaired."
             }
             coreLaunchError = nil
-            let currentProjects: [ProjectWire]
             let cachedPHP: PHPVersionsResult?
             let cachedRouting: RouterStatus?
             let cachedDNS: DNSStatus?
@@ -202,37 +252,37 @@ final class AppModel {
             let cachedPorts: StandardPortsStatus?
             let cachedMySQL: MySQLStatus?
             let cachedMailpit: MailpitStatus?
-            if case .running(_, let projects, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state {
-                currentProjects = projects
+            if case .running(_, _, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state {
                 cachedPHP = php; cachedRouting = routing; cachedDNS = dns; cachedTLS = tls
                 cachedPorts = ports; cachedMySQL = mysql; cachedMailpit = mailpit
             } else {
-                currentProjects = []
                 cachedPHP = nil; cachedRouting = nil; cachedDNS = nil; cachedTLS = nil
                 cachedPorts = nil; cachedMySQL = nil; cachedMailpit = nil
             }
             // Core connectivity itself is enough to leave Connecting. Service
             // probes and all project/catalog work may finish afterward.
-            state = .running(status, currentProjects, cachedPHP, cachedRouting, cachedDNS, cachedTLS, cachedPorts, cachedMySQL, cachedMailpit)
+            state = .running(status, projects, cachedPHP, cachedRouting, cachedDNS, cachedTLS, cachedPorts, cachedMySQL, cachedMailpit)
 
-            // Publish a usable Services view before project diagnostics or
-            // remote catalog enrichment. Core connectivity is established by
-            // this point; those slower requests must never own the Connecting
-            // presentation.
-            let php = try? await client.phpVersions()
-            let routing = try? await client.routingStatus()
-            let dns = try? await client.dnsStatus()
-            let tls = try? await client.tlsStatus()
-            let ports = try? await client.portsStatus()
-            let mysql = try? await client.mysqlStatus()
-            let mailpit = try? await client.mailpitStatus()
+            // Service reads use independent IPC connections; each connection
+            // retains strict request/response serialization without one slow
+            // service read blocking the other six.
+            let serviceReadsStarted = ContinuousClock.now
+            async let phpTask = trackedIndependentCoreRead("PHP") { try await $0.phpVersions() }
+            async let routingTask = trackedIndependentCoreRead("routing") { try await $0.routingStatus() }
+            async let dnsTask = trackedIndependentCoreRead("DNS") { try await $0.dnsStatus() }
+            async let tlsTask = trackedIndependentCoreRead("TLS") { try await $0.tlsStatus() }
+            async let portsTask = trackedIndependentCoreRead("standard-ports") { try await $0.portsStatus() }
+            async let mysqlTask = trackedIndependentCoreRead("MySQL") { try await $0.mysqlStatus() }
+            async let mailpitTask = trackedIndependentCoreRead("Mailpit") { try await $0.mailpitStatus() }
+            let (php, routing, dns, tls, ports, mysql, mailpit) = await (phpTask, routingTask, dnsTask, tlsTask, portsTask, mysqlTask, mailpitTask)
+            Self.startupLogger.info("startup phase=seven-service-reads elapsed_ms=\(Self.elapsedMilliseconds(since: serviceReadsStarted))")
             guard generation == refreshGeneration else { await client.disconnect(); return }
-            state = .running(status, currentProjects, php, routing, dns, tls, ports, mysql, mailpit)
+            if startupServiceIssues.isEmpty {
+                let successCount = [php != nil, routing != nil, dns != nil, tls != nil, ports != nil, mysql != nil, mailpit != nil].filter { $0 }.count
+                finishServiceReadinessCheck(CoreServiceReadiness.resolve(serviceIssues: startupServiceIssues, requiredReadCount: 7, completedReadCount: 7, successfulReadCount: successCount))
+            }
+            state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
 
-            // Project discovery, per-project reports, and catalog enrichment
-            // are secondary startup work. They can update the view later, but
-            // they no longer gate Core readiness or service controls.
-            let projects = try await client.projectList()
             let linkedProjects = try await client.linkedProjects()
             let parkedFolders = try await client.parkedPaths()
             let configuredRoutes: [RouteIntent]?
@@ -244,16 +294,9 @@ final class AppModel {
                 configuredRoutes = nil
                 configuredRoutesError = error.localizedDescription
             }
-            var reports = [ProjectEnvironmentReport]()
-            for project in projects {
-                if let report = try? await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path) {
-                    reports.append(report)
-                }
-            }
             let phpCatalog = try? await client.phpCatalog()
             let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
-            projectReports = reports
             self.configuredRoutes = configuredRoutes
             self.configuredRoutesError = configuredRoutesError
             if relationshipGeneration == relationshipSnapshotGeneration {
@@ -270,27 +313,190 @@ final class AppModel {
             await client.disconnect()
             if hasRunningSnapshot || isShowingRunningSnapshot {
                 refreshError = refreshMessage(for: error)
+                if serviceReadiness == .checking { finishServiceReadinessCheck(.unavailable) }
                 return
             }
             if case .coreUnavailable = error {
                 coreLaunchError = "Vaelen Core did not become ready within 2 seconds. Try Refresh or relaunch Vaelen."
             }
             switch error {
-            case .coreUnavailable: state = .unavailable
-            case .protocolIncompatible(let client, let core): state = .incompatible("Protocol mismatch: client \(client), Core \(core). Restart Vaelen Core and try again.")
-            case .coreIncompatible(let reason): state = .incompatible("\(reason) Restart Vaelen Core and try again.")
+            case .coreUnavailable: state = .unavailable; finishServiceReadinessCheck(.unavailable)
+            case .protocolIncompatible(let client, let core): state = .incompatible("Protocol mismatch: client \(client), Core \(core). Restart Vaelen Core and try again."); finishServiceReadinessCheck(.attention)
+            case .coreIncompatible(let reason): state = .incompatible("\(reason) Restart Vaelen Core and try again."); finishServiceReadinessCheck(.attention)
             default: state = .unavailable
             }
+            if !hasRunningSnapshot { finishServiceReadinessCheck(.unavailable) }
+            markPendingProjectReportsUnavailable()
         } catch {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
             if hasRunningSnapshot {
                 refreshError = error.localizedDescription
+                if serviceReadiness == .checking { finishServiceReadinessCheck(.unavailable) }
                 return
             }
             coreLaunchError = error.localizedDescription
             state = .unavailable
+            if !hasRunningSnapshot { finishServiceReadinessCheck(.unavailable) }
+            markPendingProjectReportsUnavailable()
         }
+    }
+
+    private func beginServiceReadinessCheck(generation: Int) {
+        serviceCheckTimeoutTask?.cancel()
+        serviceReadiness = .checking
+        serviceCheckStartedAt = .now
+        pendingServiceReads = []
+        serviceCheckTimeoutTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(12)) } catch { return }
+            guard let self, self.refreshGeneration == generation, self.serviceReadiness == .checking else { return }
+            let outstanding = self.pendingServiceReads.sorted().joined(separator: ",")
+            let elapsed = self.serviceCheckStartedAt.map(Self.elapsedMilliseconds(since:)) ?? 12_000
+            Self.startupLogger.error("startup milestone=service-state-timeout elapsed_ms=\(elapsed) outstanding=\(outstanding, privacy: .public)")
+            let unavailable = CoreServiceReadiness.resolve(serviceIssues: self.startupServiceIssues, requiredReadCount: 7, completedReadCount: 0, successfulReadCount: 0, timedOut: true)
+            self.finishServiceReadinessCheck(unavailable)
+        }
+    }
+
+    private func finishServiceReadinessCheck(_ readiness: CoreServiceReadiness) {
+        serviceCheckTimeoutTask?.cancel()
+        serviceCheckTimeoutTask = nil
+        serviceReadiness = readiness
+        if let started = serviceCheckStartedAt {
+            let result: String
+            switch readiness {
+            case .checking: result = "checking"
+            case .ready: result = "ready"
+            case .attention: result = "attention"
+            case .unavailable: result = "unavailable"
+            }
+            Self.startupLogger.info("startup milestone=service-state-completion result=\(result, privacy: .public) elapsed_ms=\(Self.elapsedMilliseconds(since: started))")
+            serviceCheckStartedAt = nil
+        }
+    }
+
+    private func trackedServiceOperation<Value>(_ label: String, operation: () async throws -> Value) async throws -> Value {
+        pendingServiceReads.insert(label)
+        defer { pendingServiceReads.remove(label) }
+        return try await operation()
+    }
+
+    private func trackedIndependentCoreRead<Value: Sendable>(_ label: String, operation: @escaping @Sendable (VaelenCoreClient) async throws -> Value) async -> Value? {
+        pendingServiceReads.insert(label)
+        defer { pendingServiceReads.remove(label) }
+        return await independentCoreRead(label, operation: operation)
+    }
+
+    private func startProjectReports(_ projects: [ProjectWire], generation: Int, refreshStarted: ContinuousClock.Instant) {
+        Self.startupLogger.info("startup milestone=project-reports-started count=\(projects.count) elapsed_ms=\(Self.elapsedMilliseconds(since: refreshStarted))")
+        if projects.isEmpty {
+            projectStartupMilestones["allFreshDetails"] = Double(Self.elapsedMilliseconds(since: refreshStarted)) / 1_000
+            Self.startupLogger.info("startup milestone=all-fresh-details count=0 elapsed_ms=\(Self.elapsedMilliseconds(since: refreshStarted))")
+            return
+        }
+        projectReportsTask = Task { @MainActor [weak self] in
+            await self?.refreshProjectReports(projects, generation: generation, refreshStarted: refreshStarted)
+        }
+    }
+
+    private func refreshProjectReports(_ projects: [ProjectWire], generation: Int, refreshStarted: ContinuousClock.Instant) async {
+        let reportsStarted = ContinuousClock.now
+        let snapshotID = await independentCoreRead("project-observation-snapshot") { try await $0.projectObservationSnapshot() }
+        guard generation == refreshGeneration, !Task.isCancelled else { return }
+        Self.startupLogger.info("startup phase=report-snapshot elapsed_ms=\(Self.elapsedMilliseconds(since: reportsStarted)) available=\(snapshotID != nil)")
+        await withTaskGroup(of: (String, ProjectEnvironmentReport?, String?).self) { group in
+            var next = 0
+            let concurrency = min(4, projects.count)
+            func submit(_ project: ProjectWire) {
+                group.addTask {
+                    let report = await self.independentCoreRead("report-\(project.name)") { client in
+                        try await client.projectStatus(selector: project.id?.uuidString, workingDirectory: project.path, snapshotID: snapshotID)
+                    }
+                    return (project.path, report, report == nil ? "Project diagnostics unavailable. Refresh to retry." : nil)
+                }
+            }
+            while next < concurrency { submit(projects[next]); next += 1 }
+            while let (path, report, reportError) = await group.next() {
+                guard generation == refreshGeneration, !Task.isCancelled else { group.cancelAll(); return }
+                if let report {
+                    projectReports.removeAll { $0.identity.path == path }
+                    projectReports.append(report)
+                    projectReportErrors.removeValue(forKey: path)
+                    if projectStartupMilestones["firstFreshDetail"] == nil {
+                        let elapsed = Self.elapsedMilliseconds(since: refreshStarted)
+                        projectStartupMilestones["firstFreshDetail"] = Double(elapsed) / 1_000
+                        Self.startupLogger.info("startup milestone=first-fresh-detail elapsed_ms=\(elapsed)")
+                    }
+                } else if let reportError {
+                    projectReportErrors[path] = reportError
+                }
+                if next < projects.count { submit(projects[next]); next += 1 }
+            }
+        }
+        guard generation == refreshGeneration, !Task.isCancelled else { return }
+        let reportElapsed = Self.elapsedMilliseconds(since: reportsStarted)
+        if projectReports.count == projects.count {
+            let elapsed = Self.elapsedMilliseconds(since: refreshStarted)
+            projectStartupMilestones["allFreshDetails"] = Double(elapsed) / 1_000
+            Self.startupLogger.info("startup milestone=all-fresh-details count=\(projects.count) elapsed_ms=\(elapsed)")
+        }
+        Self.startupLogger.info("startup phase=reports count=\(projects.count) completed=\(self.projectReports.count) failed=\(self.projectReportErrors.count) elapsed_ms=\(reportElapsed)")
+        projectReportsTask = nil
+    }
+
+    private func markPendingProjectReportsUnavailable() {
+        guard let earlyProjectList else { return }
+        for project in earlyProjectList where !projectReports.contains(where: { $0.identity.path == project.path }) {
+            projectReportErrors[project.path] = "Core is unavailable; project diagnostics could not be refreshed."
+        }
+    }
+
+    private func independentCoreRead<Value: Sendable>(_ label: String, operation: @escaping @Sendable (VaelenCoreClient) async throws -> Value) async -> Value? {
+        let paths = CoreEndpointPaths()
+        let worker = VaelenCoreClient(
+            transport: UnixSocketTransport(path: paths.socketPath),
+            identity: ClientIdentity(name: "Vaelen.app.project-refresh", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)
+        )
+        do {
+            let handshakeStarted = ContinuousClock.now
+            try await worker.connect()
+            Self.startupLogger.info("startup phase=ipc-handshake label=\(label, privacy: .public) elapsed_ms=\(Self.elapsedMilliseconds(since: handshakeStarted))")
+            let requestStarted = ContinuousClock.now
+            let value = try await operation(worker)
+            Self.startupLogger.info("startup phase=ipc-request label=\(label, privacy: .public) elapsed_ms=\(Self.elapsedMilliseconds(since: requestStarted))")
+            await worker.disconnect()
+            return value
+        } catch {
+            Self.startupLogger.warning("startup phase=ipc-request-failed label=\(label, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            await worker.disconnect()
+            return nil
+        }
+    }
+
+    private func discoverProjects() async throws -> [ProjectWire] {
+        let paths = CoreEndpointPaths()
+        let discoveryClient = VaelenCoreClient(
+            transport: UnixSocketTransport(path: paths.socketPath),
+            identity: ClientIdentity(name: "Vaelen.app.project-list", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity)
+        )
+        do {
+            let handshakeStarted = ContinuousClock.now
+            try await discoveryClient.connect()
+            Self.startupLogger.info("startup phase=ipc-handshake label=project-list elapsed_ms=\(Self.elapsedMilliseconds(since: handshakeStarted))")
+            let requestStarted = ContinuousClock.now
+            let projects = try await discoveryClient.projectList()
+            Self.startupLogger.info("startup phase=ipc-request label=project-list elapsed_ms=\(Self.elapsedMilliseconds(since: requestStarted))")
+            await discoveryClient.disconnect()
+            return projects
+        } catch {
+            await discoveryClient.disconnect()
+            throw error
+        }
+    }
+
+    private static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Int {
+        let components = start.duration(to: .now).components
+        return Int(components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000)
     }
 
     func trustLocalCA() async {
@@ -827,16 +1033,20 @@ final class AppModel {
     private func refreshAuthoritativeServiceState() async {
         refreshGeneration += 1 // invalidate any older, slower reconciliation snapshot
         let generation = refreshGeneration
+        projectReportsTask?.cancel()
+        projectReportsTask = nil
+        beginServiceReadinessCheck(generation: generation)
         let refreshClient = makeCoreClient()
         do {
-            try await refreshClient.connect()
-            let status = try await refreshClient.status()
-            let php = try? await refreshClient.phpVersions()
-            let routing = try? await refreshClient.routingStatus()
-            let dns = try? await refreshClient.dnsStatus()
-            let mysql = try? await refreshClient.mysqlStatus()
-            let mailpit = try? await refreshClient.mailpitStatus()
-            let observedPorts = try? await refreshClient.portsStatus()
+            try await trackedServiceOperation("Core handshake") { try await refreshClient.connect() }
+            let status = try await trackedServiceOperation("Core status") { try await refreshClient.status() }
+            async let phpTask = trackedIndependentCoreRead("PHP") { try await $0.phpVersions() }
+            async let routingTask = trackedIndependentCoreRead("routing") { try await $0.routingStatus() }
+            async let dnsTask = trackedIndependentCoreRead("DNS") { try await $0.dnsStatus() }
+            async let mysqlTask = trackedIndependentCoreRead("MySQL") { try await $0.mysqlStatus() }
+            async let mailpitTask = trackedIndependentCoreRead("Mailpit") { try await $0.mailpitStatus() }
+            async let portsTask = trackedIndependentCoreRead("standard-ports") { try await $0.portsStatus() }
+            let (php, routing, dns, mysql, mailpit, observedPorts) = await (phpTask, routingTask, dnsTask, mysqlTask, mailpitTask, portsTask)
             guard generation == refreshGeneration else {
                 await refreshClient.disconnect()
                 return
@@ -853,6 +1063,8 @@ final class AppModel {
             }
             state = .running(status, projects, php, routing, dns, tls, currentPorts, mysql, mailpit)
             startupServiceIssues = status.serviceIssues ?? [:]
+            let successCount = [php != nil, routing != nil, dns != nil, mysql != nil, mailpit != nil, observedPorts != nil].filter { $0 }.count
+            finishServiceReadinessCheck(CoreServiceReadiness.resolve(serviceIssues: startupServiceIssues, requiredReadCount: 6, completedReadCount: 6, successfulReadCount: successCount))
             if serviceErrorService == "dns", Self.isAuthoritativelyHealthyDNS(dns) {
                 let supersededError = serviceError
                 serviceError = nil
@@ -864,6 +1076,7 @@ final class AppModel {
         } catch {
             await refreshClient.disconnect()
             refreshError = error.localizedDescription
+            finishServiceReadinessCheck(.unavailable)
         }
     }
 
@@ -993,6 +1206,115 @@ private struct VaelenEmptyState: View {
     }
 }
 
+private struct ConnectionProgressPanel: View {
+    let title: String
+    let message: String
+    let symbol: String
+    var isConnecting = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(alignment: .top, spacing: VaelenUI.spacing10) {
+            if isConnecting && !reduceMotion {
+                ProgressView().controlSize(.small).padding(.top, 2)
+            } else {
+                Image(systemName: symbol)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(isConnecting ? Color.accentColor : Color.secondary)
+                    .frame(width: 18, height: 20)
+                    .padding(.top, 1)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(.subheadline, weight: .semibold))
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous)
+                .fill(colorScheme == .light ? Color.white.opacity(0.72) : Color.white.opacity(0.055))
+                .overlay {
+                    RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(colorScheme == .light ? 0.07 : 0.10), lineWidth: 0.7)
+                }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct VaelenLoadingIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if reduceMotion {
+            Image(systemName: "ellipsis.circle")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Loading")
+        } else {
+            ProgressView().controlSize(.mini).accessibilityLabel("Loading")
+        }
+    }
+}
+
+private struct HeaderServiceStatus: View {
+    let readiness: CoreServiceReadiness
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Group {
+            switch readiness {
+            case .checking:
+                HStack(spacing: 5) {
+                    VaelenLoadingIndicator()
+                    statusText("Checking services", color: .secondary)
+                }
+            case .ready:
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(colorScheme == .light ? Color(hex: 0x168B50) : Color(hex: 0x55D98A))
+                        .frame(width: 7, height: 7)
+                    statusText("Ready", color: colorScheme == .light ? Color(hex: 0x168B50) : Color(hex: 0x55D98A))
+                }
+            case .attention:
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    statusText("Needs attention", color: .orange)
+                }
+            case .unavailable:
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.circle")
+                    statusText("Unavailable", color: .secondary)
+                }
+            }
+        }
+        .font(.system(size: 11, weight: .medium))
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
+        .frame(width: 132, alignment: .trailing)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        switch readiness {
+        case .checking: return "Checking services"
+        case .ready: return "Ready"
+        case .attention: return "Service needs attention"
+        case .unavailable: return "Service status unavailable"
+        }
+    }
+
+    private func statusText(_ title: String, color: Color) -> some View {
+        Text(title).foregroundStyle(color)
+    }
+}
+
 struct StatusView: View {
     let model: AppModel
     @State private var selectedSection = Section.projects
@@ -1034,13 +1356,39 @@ struct StatusView: View {
             }
             switch model.state {
             case .connecting:
-                Text("Connecting to Core…").foregroundStyle(.secondary)
+                if let projects = model.earlyProjectList {
+                    if projects.isEmpty {
+                        VaelenEmptyState(title: "No Projects", systemImage: "folder", message: "Core found no projects. Service status is still connecting.")
+                            .frame(minHeight: 130)
+                    } else {
+                        ProjectsView(projects: projects, reports: model.projectReports, model: model)
+                    }
+                } else {
+                    ConnectionProgressPanel(
+                        title: "Connecting to Core",
+                        message: "Your projects will appear as soon as Core responds.",
+                        symbol: "cable.connector"
+                    )
+                }
             case .unavailable:
-                Text(model.coreLaunchError ?? "Vaelen Core is unavailable. Start Vaelen and retry.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: VaelenUI.spacing8) {
+                    ConnectionProgressPanel(
+                        title: "Core Unavailable",
+                        message: model.coreLaunchError ?? "Vaelen Core could not be reached. Retry or relaunch Vaelen.",
+                        symbol: "exclamationmark.circle",
+                        isConnecting: false
+                    )
+                    if let projects = model.earlyProjectList {
+                        if projects.isEmpty {
+                            VaelenEmptyState(title: "No Projects", systemImage: "folder", message: "Core was reached, but is now unavailable.")
+                                .frame(minHeight: 100)
+                        } else {
+                            ProjectsView(projects: projects, reports: model.projectReports, model: model)
+                        }
+                    }
+                }
             case .incompatible(let reason):
-                Text(reason).font(.caption)
+                ConnectionProgressPanel(title: "Core Incompatible", message: reason, symbol: "exclamationmark.triangle", isConnecting: false)
             case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit):
                 if model.refreshError != nil {
                     Label("Refresh failed; showing last known Core state.", systemImage: "exclamationmark.triangle")
@@ -1091,6 +1439,9 @@ struct StatusView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityAddTraits(.updatesFrequently)
+            }
+            if shouldSpacerBeforeFooter {
+                Spacer(minLength: 0)
             }
             HStack(spacing: 7) {
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
@@ -1145,6 +1496,7 @@ struct StatusView: View {
             }
         }
         .onAppear {
+            model.notePopoverPresented()
             model.startMonitoring()
             VaelenAppDelegate.shared?.requestQuit = { Task { await model.quitVaelen() } }
         }
@@ -1152,9 +1504,31 @@ struct StatusView: View {
 
     private var popoverHeight: CGFloat {
         let visibleHeight = NSScreen.main?.visibleFrame.height ?? 900
+        if needsCompactConnectionLayout {
+            return min(340, max(245, visibleHeight * 0.46))
+        }
         let preferred = min(660, visibleHeight * 0.72)
         let usefulMinimum = min(510, visibleHeight * 0.68)
         return max(usefulMinimum, preferred)
+    }
+
+    private var needsCompactConnectionLayout: Bool {
+        switch model.state {
+        case .connecting: return model.earlyProjectList?.isEmpty != false
+        case .unavailable: return model.earlyProjectList?.isEmpty != false
+        case .incompatible: return true
+        case .running: return false
+        }
+    }
+
+    private var shouldSpacerBeforeFooter: Bool {
+        switch model.state {
+        case .connecting: return model.earlyProjectList?.isEmpty != false
+        case .unavailable: return model.earlyProjectList?.isEmpty != false
+        case .incompatible: return true
+        case .running(_, let projects, _, _, _, _, _, _, _):
+            return selectedSection == .projects && projects.isEmpty
+        }
     }
 
     private func presentSettings() {
@@ -1218,21 +1592,20 @@ struct StatusView: View {
     private var coreStatus: some View {
         switch model.state {
         case .connecting:
-            VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
-        case .running:
-            HStack(spacing: 5) {
-                Circle().fill(colorScheme == .light ? Color(hex: 0x168B50) : Color(hex: 0x55D98A))
-                    .frame(width: 7, height: 7)
-                Text("Ready")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(colorScheme == .light ? Color(hex: 0x168B50) : Color(hex: 0x55D98A))
+            if model.earlyProjectList == nil {
+                VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
+                    .frame(width: 132, alignment: .trailing)
+            } else {
+                HeaderServiceStatus(readiness: model.serviceReadiness)
             }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Ready")
+        case .running:
+            HeaderServiceStatus(readiness: model.serviceReadiness)
         case .unavailable:
             VaelenStatusLabel("Core Unavailable", systemImage: "circle", tint: .secondary)
+                .frame(width: 132, alignment: .trailing)
         case .incompatible:
             VaelenStatusLabel("Core Incompatible", systemImage: "exclamationmark.circle", tint: .orange)
+                .frame(width: 132, alignment: .trailing)
         }
     }
 }
@@ -1354,6 +1727,7 @@ struct ProjectsView: View {
                         ProjectCard(
                             project: project,
                             report: report,
+                            reportError: model.projectReportErrors[project.path],
                             routes: routes,
                             model: model,
                             isExpanded: expandedProjectPaths.contains(project.path),
@@ -1388,6 +1762,7 @@ private func routesForProject(_ project: ProjectWire, report: ProjectEnvironment
 struct ProjectCard: View {
     let project: ProjectWire
     let report: ProjectEnvironmentReport?
+    let reportError: String?
     let routes: [RouteIntent]?
     let model: AppModel
     let isExpanded: Bool
@@ -1405,8 +1780,8 @@ struct ProjectCard: View {
         if project.availability != PathAvailability.available.rawValue {
             messages.append("Project folder unavailable")
         }
-        if routes == nil {
-            messages.append(model.configuredRoutesError ?? "Site route state unavailable")
+        if let routeError = model.configuredRoutesError {
+            messages.append(routeError)
         }
         return messages
     }
@@ -1546,9 +1921,14 @@ struct ProjectCard: View {
                 }
             }
             .padding(.leading, 25)
+        } else if let reportError {
+            Label(reportError, systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .padding(.leading, 25)
         } else {
             HStack(spacing: 5) {
-                ProgressView().controlSize(.mini)
+                VaelenLoadingIndicator()
                 Text("Loading project details…").font(.caption2).foregroundStyle(.secondary)
             }
             .padding(.leading, 25)

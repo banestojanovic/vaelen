@@ -325,10 +325,12 @@ public struct ProjectEnvironmentReport: Codable, Equatable, Sendable {
 public struct ProjectEnvironmentRequest: Codable, Equatable, Sendable {
     public let selector: String?
     public let workingDirectory: String
+    public let snapshotID: UUID?
 
-    public init(selector: String? = nil, workingDirectory: String) {
+    public init(selector: String? = nil, workingDirectory: String, snapshotID: UUID? = nil) {
         self.selector = selector
         self.workingDirectory = workingDirectory
+        self.snapshotID = snapshotID
     }
 }
 

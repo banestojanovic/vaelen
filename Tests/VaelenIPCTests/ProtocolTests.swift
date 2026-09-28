@@ -3,6 +3,24 @@ import XCTest
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
+    func testProjectObservationSnapshotAndReferenceRoundTrip() throws {
+        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 6)
+        let snapshotID = UUID()
+        let begin = IPCRequest(method: .projectObservationSnapshot)
+        let decodedBegin = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(begin))
+        XCTAssertEqual(decodedBegin.knownMethod, .projectObservationSnapshot)
+
+        let response = IPCResponse(id: begin.id, result: .projectObservationSnapshot(.init(snapshotID: snapshotID)))
+        let decodedResponse = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .projectObservationSnapshot(let result)? = decodedResponse.result else { return XCTFail("Snapshot token did not decode") }
+        XCTAssertEqual(result.snapshotID, snapshotID)
+
+        let report = IPCRequest(method: .projectStatus, params: .projectEnvironment(.init(selector: "project-id", workingDirectory: "/tmp/project", snapshotID: snapshotID)))
+        let decodedReport = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(report))
+        guard let params = decodedReport.params else { return XCTFail("Snapshot-backed report request did not decode") }
+        XCTAssertEqual(try params.decode(ProjectEnvironmentRequest.self).snapshotID, snapshotID)
+    }
+
     func testPHPConfigurationRequestsAndResponsesRoundTrip() throws {
         let settings = PHPSettingsValues(uploadLimitMB: 16, memoryLimitMB: 256, maxExecutionTimeSeconds: 45, maxInputVariables: 2_000, postLimitMB: 17)
         let request = IPCRequest(method: .phpConfigurationUpdate, params: .phpConfigurationUpdate(.init(version: "8.4.23", settings: settings)))

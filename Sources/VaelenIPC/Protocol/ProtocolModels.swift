@@ -7,7 +7,7 @@ public enum ProtocolVersion: Int, Codable, Sendable {
 
 public enum IPCCompatibility {
     // Increment when an existing client/Core pair can no longer share command models or semantics.
-    public static let schemaVersion = 5
+    public static let schemaVersion = 6
 }
 
 public struct ClientIdentity: Codable, Equatable, Sendable {
@@ -65,6 +65,7 @@ public enum CoreMethod: String, Sendable {
     case projectLinks = "project.links"
     case projectList = "project.list"
     case projectStatus = "project.status"
+    case projectObservationSnapshot = "project.observation-snapshot"
     case projectInspect = "project.inspect"
     case projectDoctor = "project.doctor"
     case projectPlan = "project.plan"
@@ -218,6 +219,7 @@ public enum IPCErrorCode: String, Codable, Sendable {
     case projectNotFound = "PROJECT_NOT_FOUND"
     case projectNameAmbiguous = "PROJECT_NAME_AMBIGUOUS"
     case projectNameConflict = "PROJECT_NAME_CONFLICT"
+    case projectObservationSnapshotExpired = "PROJECT_OBSERVATION_SNAPSHOT_EXPIRED"
     case pathNotFound = "PATH_NOT_FOUND"
     case pathNotDirectory = "PATH_NOT_DIRECTORY"
     case pathUnreadable = "PATH_UNREADABLE"
@@ -354,6 +356,11 @@ public struct ProjectEnvironmentResult: Codable, Equatable, Sendable {
     public init(report: ProjectEnvironmentReport) { self.report = report }
 }
 
+public struct ProjectObservationSnapshotResult: Codable, Equatable, Sendable {
+    public let snapshotID: UUID
+    public init(snapshotID: UUID) { self.snapshotID = snapshotID }
+}
+
 public struct ProjectReconciliationPlanResult: Codable, Equatable, Sendable {
     public let plan: ProjectReconciliationPlan
     public init(plan: ProjectReconciliationPlan) { self.plan = plan }
@@ -462,6 +469,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectMutation(ProjectMutationResult)
     case projectList(ProjectListResult)
     case projectEnvironment(ProjectEnvironmentResult)
+    case projectObservationSnapshot(ProjectObservationSnapshotResult)
     case projectPlan(ProjectReconciliationPlanResult)
     case projectActivation(ProjectReconciliationExecutionResponse)
     case projectPHP(ProjectPHPSelection)
@@ -498,6 +506,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectMutation(let value): try value.encode(to: encoder)
         case .projectList(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
+        case .projectObservationSnapshot(let value): try value.encode(to: encoder)
         case .projectPlan(let value): try value.encode(to: encoder)
         case .projectActivation(let value): try value.encode(to: encoder)
         case .projectPHP(let value): try value.encode(to: encoder)
@@ -537,6 +546,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["coreVersion"] != nil, let result = try? IPCCodec.decode(HandshakeResult.self, from: data) { self = .handshake(result) }
         else if fields["projects"] != nil, let result = try? IPCCodec.decode(ProjectListResult.self, from: data) { self = .projectList(result) }
         else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
+        else if fields["snapshotID"] != nil, let result = try? IPCCodec.decode(ProjectObservationSnapshotResult.self, from: data) { self = .projectObservationSnapshot(result) }
         else if fields["plan"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationPlanResult.self, from: data) { self = .projectPlan(result) }
         else if fields["execution"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationExecutionResponse.self, from: data) { self = .projectActivation(result) }
         else if fields["overrideVersion"] != nil || fields["effectiveVersion"] != nil, let result = try? IPCCodec.decode(ProjectPHPSelection.self, from: data) { self = .projectPHP(result) }
