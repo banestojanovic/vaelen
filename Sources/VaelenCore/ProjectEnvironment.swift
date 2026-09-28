@@ -537,7 +537,34 @@ public struct ProjectEnvironmentInspector: Sendable {
             result.append(.init(code: invalid ? "PHP_PACKAGE_INVALID" : "PHP_FAMILY_UNAVAILABLE", severity: .warning, message: invalid ? "Installed PHP material matches the desired family but is not eligible for project activation." : "The desired PHP family is not installed as an eligible Vaelen runtime.", suggestion: "Install or repair a compatible Vaelen PHP package explicitly."))
         }
         if desired.mysql == true, mysql?.state != .running { result.append(.init(code: "MYSQL_NOT_HEALTHY", severity: .warning, message: "The project requests MySQL, but the Vaelen MySQL service is not running healthy.", suggestion: "Start or inspect MySQL explicitly.")) }
-        if desired.mailpit == true, mailpit?.state != .running { result.append(.init(code: "MAILPIT_NOT_HEALTHY", severity: .warning, message: "The project requests Mailpit, but the Vaelen Mailpit service is not running healthy.", suggestion: "Start or inspect Mailpit explicitly.")) }
+        if desired.mailpit == true {
+            if let mailpit {
+                if mailpit.state != .running || mailpit.health != "healthy" {
+                    let message: String
+                    let suggestion: String
+                    switch mailpit.state {
+                    case .notInstalled:
+                        message = "Mailpit is not installed."
+                        suggestion = "Install Mailpit to use this project's mail capability."
+                    case .installed, .stopped:
+                        message = "Mailpit is stopped."
+                        suggestion = "Start Mailpit to use this project's mail capability."
+                    case .starting:
+                        message = "Mailpit is starting."
+                        suggestion = "Wait for Mailpit to finish starting."
+                    case .running, .unhealthy:
+                        message = "Mailpit is unhealthy."
+                        suggestion = "Review Mailpit status in Services."
+                    case .conflict:
+                        message = "Mailpit cannot start because of a conflict."
+                        suggestion = "Review the Mailpit conflict in Services."
+                    }
+                    result.append(.init(code: "MAILPIT_NOT_HEALTHY", severity: .warning, message: message, suggestion: suggestion))
+                }
+            } else {
+                result.append(.init(code: "MAILPIT_NOT_HEALTHY", severity: .warning, message: "Mailpit status is unavailable.", suggestion: "Refresh Services to check Mailpit."))
+            }
+        }
         if desired.mysql == true, dbEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "DB_ENDPOINT_MISMATCH", service: "database", endpoint: dbEndpoint)) }
         if desired.mailpit == true, mailEndpoint.matches == false { result.append(endpointMismatchDiagnostic(code: "MAIL_ENDPOINT_MISMATCH", service: "SMTP mail", endpoint: mailEndpoint)) }
         if env.configured.dbHost != nil, env.configured.dbPort != nil, env.configured.dbConnection == "mysql", env.configured.database != nil, env.configured.password != .unknown { }

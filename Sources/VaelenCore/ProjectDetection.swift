@@ -17,6 +17,22 @@ public struct ProjectFrameworkDetector: @unchecked Sendable {
             )
         }
 
+        let composer = jsonObject(at: root.appendingPathComponent("composer.json"))
+        let composerRequirements = (composer?["require"] as? [String: Any] ?? [:])
+            .merging(composer?["require-dev"] as? [String: Any] ?? [:]) { current, _ in current }
+        let package = jsonObject(at: root.appendingPathComponent("package.json"))
+        let packageDependencies = (package?["dependencies"] as? [String: Any] ?? [:])
+            .merging(package?["devDependencies"] as? [String: Any] ?? [:]) { current, _ in current }
+        if composerRequirements["symfony/framework-bundle"] != nil {
+            return .init(framework: "Symfony", confidence: .high, evidence: ["composer.json symfony/framework-bundle"], suggestedDocumentRoot: "public/")
+        }
+        if composerRequirements["drupal/core"] != nil || fileManager.fileExists(atPath: root.appendingPathComponent("core/lib/Drupal.php").path) {
+            return .init(framework: "Drupal", confidence: .high, evidence: ["Drupal core marker"], suggestedDocumentRoot: "web/")
+        }
+        if composerRequirements["magento/product-community-edition"] != nil || composerRequirements["magento/product-enterprise-edition"] != nil {
+            return .init(framework: "Magento", confidence: .high, evidence: ["composer.json Magento product package"], suggestedDocumentRoot: "pub/")
+        }
+
         let markers = [
             "artisan": fileManager.fileExists(atPath: root.appendingPathComponent("artisan").path),
             "composer.json": fileManager.fileExists(atPath: root.appendingPathComponent("composer.json").path),
@@ -51,7 +67,7 @@ public struct ProjectFrameworkDetector: @unchecked Sendable {
             return .init(framework: "Generic PHP", confidence: .medium, evidence: Array(Set(evidence)).sorted(), suggestedDocumentRoot: isDirectory(root.appendingPathComponent("public", isDirectory: true)) ? "public/" : nil, composerPHPRequirement: composerPHP)
         }
 
-        if let node = inspectNodeWebProject(root) { return node }
+        if let node = inspectNodeWebProject(root, package: package, dependencies: packageDependencies) { return node }
         return .init(framework: "Generic/Unknown", confidence: .low, evidence: evidence, composerPHPRequirement: composerPHP)
     }
 
@@ -71,11 +87,10 @@ public struct ProjectFrameworkDetector: @unchecked Sendable {
         fileManager.fileExists(atPath: root.appendingPathComponent("wp-config.php").path) ? "wp-config.php" : "wp-config-sample.php"
     }
 
-    private func inspectNodeWebProject(_ root: URL) -> ProjectFrameworkInspection? {
-        guard let package = jsonObject(at: root.appendingPathComponent("package.json")) else { return nil }
-        let dependencies = (package["dependencies"] as? [String: Any] ?? [:])
-            .merging(package["devDependencies"] as? [String: Any] ?? [:]) { current, _ in current }
+    private func inspectNodeWebProject(_ root: URL, package: [String: Any]?, dependencies: [String: Any]) -> ProjectFrameworkInspection? {
+        guard package != nil else { return nil }
         let frameworks: [(key: String, name: String)] = [
+            ("expo", "Expo"), ("react-native", "React Native"), ("@angular/core", "Angular"),
             ("next", "Next.js"), ("nuxt", "Nuxt"), ("@sveltejs/kit", "SvelteKit"),
             ("astro", "Astro"), ("react", "React"), ("vue", "Vue")
         ]

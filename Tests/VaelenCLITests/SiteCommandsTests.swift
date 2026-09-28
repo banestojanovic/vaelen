@@ -140,6 +140,22 @@ final class SiteCommandsTests: XCTestCase {
         XCTAssertTrue(unknownResult.evidence.isEmpty)
     }
 
+    func testFrameworkDetectorRecognizesExtendedWebFrameworkDependencies() throws {
+        let cases: [(String, String)] = [
+            ("expo", "Expo"), ("react-native", "React Native"),
+            ("@angular/core", "Angular")
+        ]
+        for (dependency, expected) in cases {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("vaelen-framework-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let package: [String: Any] = ["dependencies": ["react": "^19", dependency: "^1"]]
+            try JSONSerialization.data(withJSONObject: package).write(to: root.appendingPathComponent("package.json"))
+            XCTAssertEqual(ProjectFrameworkDetector().inspect(root: root).framework, expected)
+        }
+    }
+
     func testOpenURLUsesExactHostnameAndConfiguredTLSMode() throws {
         let secure = try XCTUnwrap(siteURL(for: Route(hostname: "secure.test", target: .staticFiles(documentRoot: "/tmp"), tls: .local)))
         let plain = try XCTUnwrap(siteURL(for: Route(hostname: "plain.test", target: .staticFiles(documentRoot: "/tmp"), tls: .disabled)))

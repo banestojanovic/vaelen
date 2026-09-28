@@ -45,6 +45,9 @@ struct VaelenApp: App {
 /// template beside native text, which stays crisp in both appearances.
 @MainActor
 private enum VaelenBrand {
+    // Official mark palette is #38B2F6 → #1B64E9; use its deeper endpoint
+    // consistently for interactive controls and selected state.
+    static let accentColor = Color(red: 27.0 / 255, green: 100.0 / 255, blue: 233.0 / 255)
     static let menuBarImage: NSImage = {
         guard let url = Bundle.main.url(forResource: "vaelen-mark-currentcolor", withExtension: "svg"),
               let image = NSImage(contentsOf: url) else {
@@ -60,6 +63,19 @@ private enum VaelenBrand {
               let image = NSImage(contentsOf: url) else { return menuBarImage }
         image.size = NSSize(width: 36, height: 25)
         image.isTemplate = true
+        return image
+    }
+
+    static let headerMarkDark = loadHeaderMark(resource: "vaelen-mark-dark")
+    static let headerMarkWhite = loadHeaderMark(resource: "vaelen-mark-white")
+
+    private static func loadHeaderMark(resource: String) -> NSImage {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "svg"),
+              let image = NSImage(contentsOf: url) else { return settingsImage }
+        // Keep the SVG's intrinsic vector representation and viewBox size. The
+        // SwiftUI image below fits it into a 22×16-point frame, allowing AppKit
+        // to resolve the vector at the destination's 1×/Retina backing scale.
+        image.isTemplate = false
         return image
     }
 }
@@ -933,7 +949,7 @@ private enum VaelenUI {
     static let spacing10: CGFloat = 10
     static let spacing12: CGFloat = 12
     static let popoverPadding: CGFloat = 14
-    static let cornerRadius: CGFloat = 8
+    static let cornerRadius: CGFloat = 11
 }
 
 private struct VaelenStatusLabel: View {
@@ -981,16 +997,38 @@ struct StatusView: View {
     let model: AppModel
     @State private var selectedSection = Section.projects
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @FocusState private var focusedSection: Section?
+    @FocusState private var focusedFooterControl: FooterControl?
+    @State private var hoveredFooterControl: FooterControl?
 
     private enum Section: Hashable {
         case projects
         case services
     }
 
+    private enum FooterControl: Hashable {
+        case refresh
+        case settings
+        case quit
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: VaelenUI.spacing12) {
-            HStack {
-                Text("Vaelen").font(.headline)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .center, spacing: 8) {
+                Image(nsImage: colorScheme == .dark ? VaelenBrand.headerMarkWhite : VaelenBrand.headerMarkDark)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 22, height: 16)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Vaelen").font(.system(.headline, weight: .bold))
+                    Text("The developer control center for macOS")
+                        .font(.system(size: 9, weight: .semibold))
+                        .tracking(0.15)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 coreStatus
             }
@@ -1009,12 +1047,25 @@ struct StatusView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                Picker("View", selection: $selectedSection) {
-                    Text("Projects").tag(Section.projects)
-                    Text("Services").tag(Section.services)
+                HStack(spacing: 2) {
+                    sectionButton(.projects, title: "Projects", symbol: "folder.fill")
+                    sectionButton(.services, title: "Services", symbol: "gearshape.2.fill")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                .padding(2)
+                .background {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(colorScheme == .light ? Color(hex: 0xF4F6F8).opacity(0.86) : Color(hex: 0x45474D).opacity(0.92))
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.15), lineWidth: 0.7)
+                        }
+                        .shadow(color: Color.black.opacity(colorScheme == .light ? 0.035 : 0.09), radius: 2, x: 0, y: 1)
+                }
+                .accessibilityElement(children: .contain)
                 .accessibilityLabel("Vaelen section")
 
                 switch selectedSection {
@@ -1024,7 +1075,16 @@ struct StatusView: View {
                     ServicesView(status: status, php: php, routing: routing, dns: dns, tls: tls, ports: ports, mysql: mysql, mailpit: mailpit, model: model)
                 }
             }
-            Divider().opacity(0.65)
+            if colorScheme == .light {
+                Rectangle()
+                    .fill(Color.black.opacity(0.035))
+                    .frame(height: 0.6)
+                    .overlay(alignment: .top) {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.58))
+                            .frame(height: 0.5)
+                    }
+            }
             if let error = model.serviceError {
                 Text(error)
                     .font(.caption)
@@ -1032,22 +1092,58 @@ struct StatusView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityAddTraits(.updatesFrequently)
             }
-            HStack {
+            HStack(spacing: 7) {
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
-                    .labelStyle(.titleAndIcon)
                     .controlSize(.small)
+                    .buttonStyle(PopoverFooterControlStyle(isEmphasized: footerControlIsHighlighted(.refresh)))
+                    .focused($focusedFooterControl, equals: .refresh)
+                    .onHover { hoveredFooterControl = $0 ? .refresh : nil }
                     .accessibilityHint("Refresh Vaelen state")
                 Spacer()
-                Button("Settings…") { presentSettings() }
-                Button(model.isQuitting ? "Quitting Vaelen…" : "Quit Vaelen") {
-                    Task { await model.quitVaelen() }
+                Button { presentSettings() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "gearshape")
+                        Text("Settings")
+                    }
+                    .contentShape(Rectangle())
                 }
+                    .controlSize(.small)
+                    .buttonStyle(PopoverFooterControlStyle(isEmphasized: footerControlIsHighlighted(.settings)))
+                    .focused($focusedFooterControl, equals: .settings)
+                    .onHover { hoveredFooterControl = $0 ? .settings : nil }
+                Button {
+                    Task { await model.quitVaelen() }
+                } label: {
+                    let isHighlighted = footerControlIsHighlighted(.quit)
+                    HStack(spacing: 5) {
+                        Image(systemName: "power")
+                            .foregroundStyle(Color.red)
+                        Text(model.isQuitting ? "Quitting Vaelen…" : "Quit Vaelen")
+                            .foregroundStyle(isHighlighted ? Color.red : Color.primary.opacity(0.82))
+                    }
+                }
+                .controlSize(.small)
+                .buttonStyle(PopoverFooterControlStyle(isEmphasized: footerControlIsHighlighted(.quit), isDanger: true))
+                .focused($focusedFooterControl, equals: .quit)
+                .onHover { hoveredFooterControl = $0 ? .quit : nil }
+                .accessibilityLabel(model.isQuitting ? "Quitting Vaelen" : "Quit Vaelen")
                 .disabled(model.isQuitting)
             }
         }
         .padding(VaelenUI.popoverPadding)
-        .frame(width: 400)
+        .frame(width: 420)
         .frame(height: popoverHeight)
+        .background {
+            if reduceTransparency {
+                Color(nsColor: .windowBackgroundColor)
+            } else {
+                ZStack {
+                    Rectangle().fill(.ultraThinMaterial)
+                    (colorScheme == .light ? Color(hex: 0xF4F5F6) : Color(hex: 0x45464B))
+                        .opacity(colorScheme == .light ? 0.94 : 0.95)
+                }
+            }
+        }
         .onAppear {
             model.startMonitoring()
             VaelenAppDelegate.shared?.requestQuit = { Task { await model.quitVaelen() } }
@@ -1076,18 +1172,109 @@ struct StatusView: View {
         }
     }
 
+    private func sectionButton(_ section: Section, title: String, symbol: String) -> some View {
+        let isSelected = selectedSection == section
+        let isFocused = focusedSection == section
+        return Button { selectedSection = section } label: {
+            Label(title, systemImage: symbol)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(isSelected
+                         ? (colorScheme == .dark ? Color(hex: 0x38B2F6) : VaelenBrand.accentColor)
+                         : Color.primary.opacity(0.60))
+        .background {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(VaelenBrand.accentColor.opacity(colorScheme == .dark ? 0.23 : 0.12))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(VaelenBrand.accentColor.opacity(colorScheme == .dark ? 0.28 : 0.18), lineWidth: 0.65)
+                    }
+            }
+        }
+        .overlay {
+            if isFocused {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(VaelenBrand.accentColor, lineWidth: 2)
+            }
+        }
+        .focused($focusedSection, equals: section)
+        .accessibilityLabel(title)
+        .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityHint(section == .projects ? "Show projects and sites" : "Show runtime and service controls")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func footerControlIsHighlighted(_ control: FooterControl) -> Bool {
+        focusedFooterControl == control || hoveredFooterControl == control
+    }
+
     @ViewBuilder
     private var coreStatus: some View {
         switch model.state {
         case .connecting:
             VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
         case .running:
-            VaelenStatusLabel("Ready", systemImage: "circle.fill", tint: .secondary)
+            HStack(spacing: 5) {
+                Circle().fill(colorScheme == .light ? Color(hex: 0x168B50) : Color(hex: 0x55D98A))
+                    .frame(width: 7, height: 7)
+                Text("Ready")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(colorScheme == .light ? Color(hex: 0x168B50) : Color(hex: 0x55D98A))
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Ready")
         case .unavailable:
             VaelenStatusLabel("Core Unavailable", systemImage: "circle", tint: .secondary)
         case .incompatible:
             VaelenStatusLabel("Core Incompatible", systemImage: "exclamationmark.circle", tint: .orange)
         }
+    }
+}
+
+private struct PopoverFooterControlStyle: ButtonStyle {
+    @Environment(\.colorScheme) private var colorScheme
+    var isEmphasized = false
+    var isDanger = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(Color.primary.opacity(configuration.isPressed ? 0.68 : 0.80))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(backgroundColor(configuration: configuration))
+            }
+            .overlay {
+                if isEmphasized {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(isDanger
+                                      ? Color.red.opacity(0.26)
+                                      : Color.primary.opacity(colorScheme == .light ? 0.10 : 0.18), lineWidth: 0.6)
+                }
+            }
+            .scaleEffect(configuration.isPressed ? 0.99 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .animation(.easeOut(duration: 0.12), value: isEmphasized)
+    }
+
+    private func backgroundColor(configuration: Configuration) -> Color {
+        guard isEmphasized else { return .clear }
+        if isDanger {
+            return Color.red.opacity(configuration.isPressed
+                                    ? (colorScheme == .light ? 0.15 : 0.23)
+                                    : (colorScheme == .light ? 0.075 : 0.13))
+        }
+        return Color.primary.opacity(configuration.isPressed
+                                     ? (colorScheme == .light ? 0.075 : 0.16)
+                                     : (colorScheme == .light ? 0.045 : 0.10))
     }
 }
 
@@ -1152,6 +1339,7 @@ struct ProjectsView: View {
     let projects: [ProjectWire]
     let reports: [ProjectEnvironmentReport]
     let model: AppModel
+    @State private var expandedProjectPaths = Set<String>()
 
     var body: some View {
         if projects.isEmpty {
@@ -1159,15 +1347,32 @@ struct ProjectsView: View {
                 .frame(minHeight: 180)
         } else {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: VaelenUI.spacing8) {
+                LazyVStack(alignment: .leading, spacing: 5) {
                     ForEach(projects, id: \.path) { project in
                         let report = reports.first { $0.identity.path == project.path }
                         let routes = routesForProject(project, report: report, configured: model.configuredRoutes)
-                        ProjectCard(project: project, report: report, routes: routes, model: model)
+                        ProjectCard(
+                            project: project,
+                            report: report,
+                            routes: routes,
+                            model: model,
+                            isExpanded: expandedProjectPaths.contains(project.path),
+                            toggleExpansion: { toggleExpansion(for: project) }
+                        )
                     }
                 }
             }
             .frame(maxHeight: .infinity)
+        }
+    }
+
+    private func toggleExpansion(for project: ProjectWire) {
+        withAnimation(.easeInOut(duration: 0.16)) {
+            if expandedProjectPaths.contains(project.path) {
+                expandedProjectPaths.remove(project.path)
+            } else {
+                expandedProjectPaths.insert(project.path)
+            }
         }
     }
 }
@@ -1185,109 +1390,268 @@ struct ProjectCard: View {
     let report: ProjectEnvironmentReport?
     let routes: [RouteIntent]?
     let model: AppModel
+    let isExpanded: Bool
+    let toggleExpansion: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHovered = false
+
+    private var warnings: [ProjectDiagnostic] {
+        guard let report, report.identity.registration == .linked else { return [] }
+        return report.diagnostics.filter { $0.severity == .warning || $0.severity == .error }
+    }
+
+    private var headerAlertMessages: [String] {
+        var messages = warnings.map(\.message)
+        if project.availability != PathAvailability.available.rawValue {
+            messages.append("Project folder unavailable")
+        }
+        if routes == nil {
+            messages.append(model.configuredRoutesError ?? "Site route state unavailable")
+        }
+        return messages
+    }
+
+    private var databaseAction: ProjectDatabaseViewerAction? {
+        guard let report, report.desired.mysql == true else { return nil }
+        return model.tablePlusAction(report)
+    }
+
+    private var canOpenDatabase: Bool { databaseAction?.isEnabled == true }
 
     var body: some View {
-        HStack(alignment: .top, spacing: VaelenUI.spacing10) {
-            Image(systemName: "folder")
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-                .padding(.top, 2)
-            VStack(alignment: .leading, spacing: VaelenUI.spacing6) {
-            HStack {
-                Text(project.name).font(.headline)
-                Spacer()
-            }
-            if let framework = project.detectedFramework, !framework.isEmpty {
-                Text(framework)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-            Text(displayPath(project.path))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            if let routes {
-                if routes.count == 1, let route = routes.first {
-                    Text("\(route.route.tls == .local ? "HTTPS" : "HTTP") · \(route.route.hostname)")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                } else if routes.count > 1 {
-                    Text("\(routes.count) site hostnames configured")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .center, spacing: 7) {
+                FrameworkMark(framework: project.detectedFramework)
+                    .frame(width: 18, height: 18)
+                    .accessibilityHidden(true)
+                Text(project.name)
+                    .font(.system(.headline, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(project.name)
+                Spacer(minLength: 3)
+                HStack(spacing: 1) {
+                    Group {
+                        if let warning = warnings.first {
+                            Image(systemName: warning.severity == .error ? "exclamationmark.triangle.fill" : "exclamationmark.circle.fill")
+                                .foregroundStyle(warning.severity == .error ? Color.red : Color.orange)
+                        } else if !headerAlertMessages.isEmpty {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .frame(width: 25, height: 25)
+                    .help(headerAlertMessages.joined(separator: "\n"))
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(headerAlertMessages.joined(separator: ". "))
+                    Group {
+                        if let route = routes?.first, routes?.count == 1 {
+                            Button { model.openProjectRoute(route) } label: {
+                                Image(systemName: "safari")
+                                    .frame(width: 25, height: 25)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open \(route.route.hostname)")
+                            .accessibilityLabel("Open site \(route.route.hostname)")
+                        } else if let routes, routes.count > 1 {
+                            Menu {
+                                ForEach(Array(routes.enumerated()), id: \.element.route.id) { _, route in
+                                    Button(route.route.hostname, systemImage: route.route.tls == .local ? "lock.fill" : "globe") { model.openProjectRoute(route) }
+                                }
+                            } label: {
+                                Image(systemName: "safari").frame(width: 25, height: 25).contentShape(Rectangle())
+                            }
+                            .menuStyle(.borderlessButton)
+                            .help("Open a project site")
+                            .accessibilityLabel("Open site; \(routes.count) hosts available")
+                        }
+                    }
+                    .frame(width: 25, height: 25)
+                    Group {
+                        if canOpenDatabase {
+                            Button { model.openProjectDatabaseInTablePlus(report!) } label: {
+                                Image(systemName: "cylinder.split.1x2")
+                                    .frame(width: 25, height: 25)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(databaseAction?.reason ?? "Open project database in TablePlus")
+                            .accessibilityLabel("Open project database in TablePlus")
+                        }
+                    }
+                    .frame(width: 25, height: 25)
+                    Button(action: toggleExpansion) {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .frame(width: 25, height: 25)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 25, height: 25)
+                    .help(isExpanded ? "Collapse project details" : "Expand project details")
+                    .accessibilityLabel(isExpanded ? "Collapse \(project.name)" : "Expand \(project.name)")
+                    .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
                 }
-            } else {
-                Label("Site route state unavailable", systemImage: "exclamationmark.triangle")
-                    .font(.caption2).foregroundStyle(.orange)
-                    .help(model.configuredRoutesError ?? "Vaelen could not read configured routes.")
+                .font(.system(size: 11, weight: .medium))
             }
-            if let report {
-                if let summary = environmentSummary(report), !summary.isEmpty {
-                    Text(summary)
-                        .font(.caption)
+
+            HStack(spacing: 6) {
+                Color.clear.frame(width: 18, height: 1)
+                if let framework = project.detectedFramework, !framework.isEmpty {
+                    Text(framework)
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                if let attention = attentionDiagnostic(report) {
-                    VaelenStatusLabel(attention.message, systemImage: attention.severity == .error ? "exclamationmark.triangle.fill" : "exclamationmark.circle", tint: attention.severity == .error ? .red : .orange)
-                        .font(.caption2)
-                        .lineLimit(2)
-                }
-            } else {
-                VaelenStatusLabel("Project status unavailable", systemImage: "clock", tint: .secondary)
-                    .font(.caption2)
+                Text(displayPath(project.path))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(project.path)
             }
-            if project.availability != PathAvailability.available.rawValue {
-                VaelenStatusLabel("Folder unavailable", systemImage: "exclamationmark.triangle", tint: .orange)
-                    .font(.caption2)
-            }
-            HStack {
-                if let routes, routes.count == 1, let route = routes.first {
-                    Button("Open \(route.route.hostname)", systemImage: "safari") { model.openProjectRoute(route) }
-                } else if let routes, routes.count > 1 {
-                    Menu("Open Site", systemImage: "safari") {
-                        ForEach(routes, id: \.route.id) { route in
-                            Button("\(route.route.tls == .local ? "HTTPS" : "HTTP") · \(route.route.hostname)") { model.openProjectRoute(route) }
-                        }
-                    }
-                } else if routes == nil {
-                    Label("Site routes unavailable", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                        .help(model.configuredRoutesError ?? "Vaelen could not read configured routes.")
-                }
-                Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }
-                    .disabled(!model.canOpenProjectFolder(project))
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-            }
-            Spacer(minLength: 0)
-            Menu {
-                if let report {
-                    let tablePlus = model.tablePlusAction(report)
-                    Button("Open Database in TablePlus", systemImage: "tablecells") {
-                        model.openProjectDatabaseInTablePlus(report)
-                    }
-                    .disabled(!tablePlus.isEnabled)
-                    if !tablePlus.isEnabled {
-                        Text(tablePlus.reason)
-                    }
-                    Divider()
-                }
-                Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
-                Button("Open in Editor", systemImage: "curlybraces") { model.openProjectInEditor(project) }
-                    .disabled(!model.canOpenProjectFolder(project))
-            } label: {
-                Image(systemName: "ellipsis")
-                    .frame(width: 22, height: 22)
-                    .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .accessibilityLabel("More actions for \(project.name)")
+
+            runtimeSummary
+            if isExpanded { expandedDetails }
         }
-        .padding(.vertical, VaelenUI.spacing6)
-        .padding(.horizontal, VaelenUI.spacing8)
-        .background(.quaternary.opacity(0.20), in: RoundedRectangle(cornerRadius: VaelenUI.cornerRadius))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background {
+            let shape = RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous)
+            shape.fill(colorScheme == .light ? Color(hex: 0xFBFAF9).opacity(0.96) : Color(hex: 0x47494F).opacity(0.97))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous)
+                .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.10), lineWidth: 0.65)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: VaelenUI.cornerRadius, style: .continuous))
+        .shadow(color: Color.black.opacity(colorScheme == .light ? 0.06 : 0.16), radius: isHovered ? 5 : 3.5, x: 0, y: 2)
+        .onHover { isHovered = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Project \(project.name)")
+    }
+
+    @ViewBuilder private var runtimeSummary: some View {
+        if let report {
+            HStack(spacing: 7) {
+                if let version = report.observed.php.resolvedVersion {
+                    runtimeBadge("PHP", version: version, state: report.observed.php.fpmHealth)
+                }
+                if report.desired.mysql == true, let mysql = report.observed.mysql {
+                    runtimeBadge("MySQL", version: mysql.selectedVersion ?? mysql.installedVersion, state: "\(mysql.state.rawValue) \(mysql.health)")
+                }
+                if report.desired.mailpit == true, let mailpit = report.observed.mailpit {
+                    runtimeBadge("Mailpit", version: mailpit.installedVersion, state: "\(mailpit.state.rawValue) \(mailpit.health)")
+                }
+            }
+            .padding(.leading, 25)
+        } else {
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("Loading project details…").font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(.leading, 25)
+        }
+    }
+
+    private func runtimeBadge(_ name: String, version: String?, state: String) -> some View {
+        let healthy = state.localizedCaseInsensitiveContains("healthy")
+        return HStack(spacing: 3) {
+            Image(systemName: healthy ? "circle.fill" : "circle")
+                .font(.system(size: 6, weight: .semibold))
+                .foregroundStyle(healthy ? Color.green : Color.secondary)
+            Text(name)
+            if let version { Text(version).foregroundStyle(.secondary) }
+        }
+        .font(.system(size: 10, weight: .medium))
+        .help("\(name) \(version ?? "") · \(state)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(name) \(version ?? "version unavailable"), \(state)")
+    }
+
+    @ViewBuilder private var expandedDetails: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if let routes, routes.count > 1 {
+                ForEach(routes, id: \.route.id) { route in
+                    HStack(spacing: 6) {
+                        Image(systemName: route.route.tls == .local ? "lock.fill" : "globe")
+                            .foregroundStyle(route.route.tls == .local ? Color.green : Color.secondary)
+                        Text(route.route.hostname).font(.caption.weight(.medium)).lineLimit(1)
+                        Spacer(minLength: 4)
+                        Button("Open") { model.openProjectRoute(route) }
+                            .buttonStyle(.bordered).controlSize(.mini)
+                    }
+                }
+            }
+            if routes == nil {
+                Label(model.configuredRoutesError ?? "Site route state unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if project.availability != PathAvailability.available.rawValue {
+                Label("Project folder unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if !warnings.isEmpty {
+                ForEach(Array(warnings.enumerated()), id: \.offset) { _, warning in
+                    HStack(alignment: .top, spacing: 5) {
+                        Image(systemName: warning.severity == .error ? "exclamationmark.triangle.fill" : "exclamationmark.circle.fill")
+                            .foregroundStyle(warning.severity == .error ? Color.red : Color.orange)
+                            .frame(width: 14, alignment: .leading)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(warning.message)
+                                .font(.caption)
+                                .foregroundStyle(warning.severity == .error ? Color.red : Color.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if let suggestion = warning.suggestion {
+                                Text(suggestion)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            HStack(spacing: 3) {
+                Button {
+                    model.openProjectFolder(project)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "folder")
+                        Text("Open Folder")
+                    }
+                }
+                    .accessibilityLabel("Open Folder")
+                    .disabled(!model.canOpenProjectFolder(project))
+                Button {
+                    model.openProjectInEditor(project)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "curlybraces")
+                        Text("Open in Editor")
+                    }
+                }
+                    .accessibilityLabel("Open in Editor")
+                    .disabled(!model.canOpenProjectFolder(project))
+                Button {
+                    model.copyProjectPath(project)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "doc.on.doc")
+                        Text("Copy Path")
+                    }
+                }
+                    .accessibilityLabel("Copy Path")
+            }
+            .buttonStyle(.borderless).controlSize(.small)
+        }
+        .font(.caption)
+            .padding(.leading, 25)
+        .padding(.top, 3)
+        .transition(.identity)
     }
 
     private func environmentSummary(_ report: ProjectEnvironmentReport) -> String? {
@@ -1304,15 +1668,64 @@ struct ProjectCard: View {
         return values.isEmpty ? nil : values.joined(separator: " · ")
     }
 
-    private func attentionDiagnostic(_ report: ProjectEnvironmentReport) -> ProjectDiagnostic? {
-        // Discovery is intentionally read-only. Its normal lack of a route or
-        // requested services is not an error in the Projects surface.
-        guard report.identity.registration == .linked else { return nil }
-        return report.diagnostics.first { diagnostic in
-            guard diagnostic.severity == .error || diagnostic.severity == .warning else { return false }
-            if diagnostic.code == "ROUTE_INTENT_MISSING" && report.desired.secureWeb != true { return false }
-            return true
+}
+
+private struct FrameworkLogo {
+    let asset: String
+    let color: Color
+    let needsDarkModeBacking: Bool
+}
+
+private struct FrameworkMark: View {
+    let framework: String?
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var logo: FrameworkLogo? {
+        guard let framework = framework?.lowercased() else { return nil }
+        if framework.contains("expo") { return .init(asset: "Framework-expo", color: Color(hex: 0x1C2024), needsDarkModeBacking: true) }
+        if framework.contains("react") { return .init(asset: "Framework-react", color: Color(hex: 0x61DAFB), needsDarkModeBacking: false) }
+        if framework.contains("laravel") { return .init(asset: "Framework-laravel", color: Color(hex: 0xFF2D20), needsDarkModeBacking: false) }
+        if framework.contains("next") { return .init(asset: "Framework-nextdotjs", color: Color(hex: 0x000000), needsDarkModeBacking: true) }
+        if framework.contains("wordpress") { return .init(asset: "Framework-wordpress", color: Color(hex: 0x21759B), needsDarkModeBacking: false) }
+        if framework.contains("symfony") { return .init(asset: "Framework-symfony", color: Color(hex: 0x000000), needsDarkModeBacking: true) }
+        if framework.contains("drupal") { return .init(asset: "Framework-drupal", color: Color(hex: 0x0678BE), needsDarkModeBacking: false) }
+        if framework.contains("magento") { return nil }
+        if framework.contains("nuxt") { return .init(asset: "Framework-nuxt", color: Color(hex: 0x00DC82), needsDarkModeBacking: false) }
+        if framework.contains("svelte") { return .init(asset: "Framework-svelte", color: Color(hex: 0xFF3E00), needsDarkModeBacking: false) }
+        if framework.contains("astro") { return .init(asset: "Framework-astro", color: Color(hex: 0xBC52EE), needsDarkModeBacking: false) }
+        if framework.contains("vue") { return .init(asset: "Framework-vuedotjs", color: Color(hex: 0x4FC08D), needsDarkModeBacking: false) }
+        if framework.contains("angular") { return .init(asset: "Framework-angular", color: Color(hex: 0x0F0F11), needsDarkModeBacking: true) }
+        return nil
+    }
+
+    var body: some View {
+        if let logo, NSImage(named: logo.asset) != nil {
+            Image(logo.asset)
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .padding(2)
+                .foregroundStyle(colorScheme == .dark && logo.needsDarkModeBacking ? Color(hex: 0xF2F3F5) : logo.color)
+                .background {
+                    if colorScheme == .dark && logo.needsDarkModeBacking {
+                        Circle().fill(Color.white.opacity(0.10))
+                    }
+                }
+        } else {
+            Image(systemName: "globe.desk")
+                .resizable().scaledToFit().padding(3)
+                .foregroundStyle(.secondary)
         }
+    }
+}
+
+private extension Color {
+    init(hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255,
+            green: Double((hex >> 8) & 0xFF) / 255,
+            blue: Double(hex & 0xFF) / 255
+        )
     }
 }
 

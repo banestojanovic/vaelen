@@ -105,6 +105,9 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertTrue(codes.contains("ROUTE_INTENT_MISSING"))
         XCTAssertTrue(codes.contains("MYSQL_NOT_HEALTHY"))
         XCTAssertTrue(codes.contains("MAILPIT_NOT_HEALTHY"))
+        let mailpit = try XCTUnwrap(report.diagnostics.first { $0.code == "MAILPIT_NOT_HEALTHY" })
+        XCTAssertEqual(mailpit.message, "Mailpit is stopped.")
+        XCTAssertEqual(mailpit.suggestion, "Start Mailpit to use this project's mail capability.")
     }
 
     func testRouteTargetDivergenceRequiresExactDurableTransitionProvenance() throws {
