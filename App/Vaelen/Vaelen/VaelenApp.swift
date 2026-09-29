@@ -25,9 +25,12 @@ struct VaelenApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Settings {
+        Window("Settings", id: "settings") {
             SettingsView(model: model)
         }
+        .defaultSize(width: 1_060, height: 720)
+        .windowResizability(.contentMinSize)
+        .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 SettingsMenuCommand()
@@ -42,8 +45,7 @@ struct VaelenApp: App {
 
 /// Supplied scalable brand variants are kept in the app bundle. The tiny
 /// menu-bar artwork is an AppKit template so macOS controls light, dark, and
-/// highlighted tinting. Settings uses the supplied icon-only vector as a
-/// template beside native text, which stays crisp in both appearances.
+/// highlighted tinting across appearances.
 @MainActor
 enum VaelenBrand {
     private struct BluePalette {

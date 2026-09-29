@@ -28,6 +28,84 @@ final class MySQLModuleTests: XCTestCase {
         XCTAssertTrue(layout.mysqlPackagesDirectoryURL.path.contains("packages/mysql"))
     }
 
+    func testOfficialArchiveExtractionOmitsOnlyDebugDaemonAndKeepsLicense() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mysql-extract-\(UUID().uuidString)", isDirectory: true)
+        defer { makeWritableAndRemove(root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let install = source.appendingPathComponent("mysql-8.4.11-macos15-arm64", isDirectory: true)
+        let bin = install.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        for name in ["mysqld", "mysqld-debug", "mysql", "mysqladmin"] {
+            try Data(name.utf8).write(to: bin.appendingPathComponent(name))
+        }
+        try Data("GPL-2.0 license text".utf8).write(to: install.appendingPathComponent("LICENSE"))
+        let archive = root.appendingPathComponent("fixture.tar.gz")
+        let create = Process()
+        create.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        create.arguments = ["-czf", archive.path, "-C", source.path, "mysql-8.4.11-macos15-arm64"]
+        try create.run()
+        create.waitUntilExit()
+        XCTAssertEqual(create.terminationStatus, 0)
+
+        let destination = root.appendingPathComponent("extracted", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try MySQLModule(layout: VaelenFilesystemLayout(rootURL: root)).extract(archive, to: destination)
+
+        let extracted = destination.appendingPathComponent("mysql-8.4.11-macos15-arm64")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: extracted.appendingPathComponent("bin/mysqld").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: extracted.appendingPathComponent("bin/mysql").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: extracted.appendingPathComponent("bin/mysqladmin").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: extracted.appendingPathComponent("bin/mysqld-debug").path))
+        XCTAssertEqual(try String(contentsOf: extracted.appendingPathComponent("LICENSE"), encoding: .utf8), "GPL-2.0 license text")
+    }
+
+    func testExistingVerifiedPackagePrunesDebugDaemonWithoutTouchingData() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mysql-prune-\(UUID().uuidString)", isDirectory: true)
+        defer { makeWritableAndRemove(root) }
+        let manifest = MySQLManifest.official8_4_11
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let packageURL = layout.mysqlPackagesDirectoryURL.appendingPathComponent(manifest.version, isDirectory: true)
+        let bin = packageURL.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        for name in ["mysqld", "mysqld-debug", "mysql", "mysqladmin"] {
+            let executable = bin.appendingPathComponent(name)
+            try Data(name.utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: executable.path)
+        }
+        let package = MySQLPackage(
+            version: manifest.version,
+            architecture: manifest.architecture,
+            packagePath: packageURL.path,
+            serverPath: bin.appendingPathComponent("mysqld").path,
+            clientPath: bin.appendingPathComponent("mysql").path,
+            adminPath: bin.appendingPathComponent("mysqladmin").path,
+            source: manifest.artifactURL.absoluteString,
+            artifactSHA256: manifest.artifactSHA256,
+            signatureURL: manifest.signatureURL.absoluteString,
+            license: manifest.license,
+            installedAt: Date()
+        )
+        try JSONEncoder().encode(package).write(to: packageURL.appendingPathComponent(".vaelen-package.json"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: bin.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: packageURL.path)
+        let sentinel = layout.mysqlInstancesDirectoryURL.appendingPathComponent("default/data/preserved.db")
+        try FileManager.default.createDirectory(at: sentinel.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: sentinel)
+
+        let module = MySQLModule(layout: layout, downloader: FailingDownloader(), port: 33_417)
+        _ = try module.use(manifest.version)
+        let result = try module.install(requestedVersion: manifest.version)
+
+        XCTAssertEqual(result.serverPath, bin.appendingPathComponent("mysqld").path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bin.appendingPathComponent("mysqld-debug").path))
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            XCTAssertTrue(FileManager.default.isExecutableFile(atPath: bin.appendingPathComponent(name).path))
+        }
+        XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "keep")
+        XCTAssertEqual(module.selectedVersion(), manifest.version)
+        XCTAssertEqual(try (FileManager.default.attributesOfItem(atPath: bin.path)[.posixPermissions] as? NSNumber)?.intValue, 0o555)
+    }
+
     func testRemoveVerifiedPackagePreservesInstanceDataAndClearsSelection() throws {
         guard let source = MySQLModule(layout: .init()).installedVersions().first else { throw XCTSkip("installed MySQL package prerequisite unavailable") }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mysql-remove-\(UUID().uuidString)", isDirectory: true)
@@ -66,15 +144,30 @@ final class MySQLModuleTests: XCTestCase {
         let manifest = MySQLManifest(version: source.version, platform: source.platform, architecture: source.architecture, artifactFile: source.artifactFile, artifactURL: archive, artifactSHA256: source.artifactSHA256, signatureURL: source.signatureURL, license: source.license)
         let module = MySQLModule(layout: VaelenFilesystemLayout(rootURL: root), manifest: manifest, port: try availableLoopbackPort())
         let package = try module.install(requestedVersion: "8.4.11")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: package.serverPath))
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: package.clientPath))
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: package.adminPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: package.packagePath).appendingPathComponent("bin/mysqld-debug").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: package.packagePath).appendingPathComponent("LICENSE").path))
+        let debugBinary = URL(fileURLWithPath: package.packagePath).appendingPathComponent("bin/mysqld-debug")
+        let binDirectory = debugBinary.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binDirectory.path)
+        try Data("legacy debug daemon placeholder".utf8).write(to: debugBinary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: debugBinary.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: binDirectory.path)
         _ = try module.use("8.4.11")
         try module.initialize()
         XCTAssertEqual(module.status().state, .stopped)
         _ = try module.start()
         XCTAssertEqual(module.status().health, "healthy")
+        _ = try module.install(requestedVersion: "8.4.11")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: debugBinary.path), "do not mutate package contents while MySQL is running")
         let credentials = root.appendingPathComponent("instances/mysql/default/client.cnf")
         let query = try run(package.clientPath, ["--defaults-extra-file=\(credentials.path)", "-e", "CREATE DATABASE IF NOT EXISTS m5_acceptance; CREATE TABLE IF NOT EXISTS m5_acceptance.values (value VARCHAR(32)); DELETE FROM m5_acceptance.values; INSERT INTO m5_acceptance.values VALUES ('persisted'); SELECT value FROM m5_acceptance.values;"])
         XCTAssertTrue(query.contains("persisted"))
         _ = try module.stop()
+        _ = try module.install(requestedVersion: "8.4.11")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debugBinary.path), "a stopped, verified legacy package should reclaim its unused debug daemon")
         _ = try module.start()
         let persisted = try run(package.clientPath, ["--defaults-extra-file=\(credentials.path)", "-e", "SELECT value FROM m5_acceptance.values;"])
         XCTAssertTrue(persisted.contains("persisted"))

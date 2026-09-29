@@ -136,7 +136,10 @@ public final class MySQLModule: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard requestedVersion == manifest.version else { throw MySQLModuleError.unsupportedVersion(requestedVersion) }
         guard manifest.platform == "macos", manifest.architecture == "arm64", manifest.artifactSHA256.count == 64 else { throw MySQLModuleError.validationFailed("invalid MySQL manifest") }
-        if let existing = installedVersions().first(where: { $0.version == manifest.version }) { return existing }
+        if let existing = installedVersions().first(where: { $0.version == manifest.version }) {
+            try removeUnusedDebugServer(from: existing)
+            return existing
+        }
         let operation = UUID().uuidString
         let staging = layout.stagingDirectoryURL.appendingPathComponent("mysql-\(manifest.version)-\(operation)", isDirectory: true)
         let download = layout.downloadsDirectoryURL.appendingPathComponent("mysql-\(manifest.version)-\(operation)", isDirectory: true)
@@ -567,7 +570,57 @@ public final class MySQLModule: @unchecked Sendable {
     private func stableSocketSuffix() -> String { String(layout.rootURL.path.utf8.reduce(0) { ($0 &* 31) &+ UInt64($1) }, radix: 16) }
     private func logText(_ url: URL) -> String { (try? String(contentsOf: url, encoding: .utf8)) ?? "" }
     private func validateExecutable(_ path: URL, expected: String) throws { guard manager.isExecutableFile(atPath: path.path), try command("/usr/bin/file", [path.path]).contains("Mach-O 64-bit executable arm64"), try command(path.path, ["--version"]).contains(expected) else { throw MySQLModuleError.validationFailed("unexpected MySQL executable") } }
-    private func extract(_ archive: URL, to directory: URL) throws { let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/tar"); process.arguments = ["-xzf", archive.path, "-C", directory.path]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw MySQLModuleError.validationFailed("archive extraction failed") } }
+    func extract(_ archive: URL, to directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = ["-xzf", archive.path, "-C", directory.path, "--exclude", "*/bin/mysqld-debug"]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw MySQLModuleError.validationFailed("archive extraction failed") }
+    }
+
+    /// Prunes the unused optional debug daemon only from a canonical,
+    /// manifest-verified Vaelen package, and only while MySQL is stopped.
+    private func removeUnusedDebugServer(from package: MySQLPackage) throws {
+        let root = layout.mysqlPackagesDirectoryURL.appendingPathComponent(package.version, isDirectory: true).standardizedFileURL
+        guard package.packagePath == root.path,
+              package.serverPath == root.appendingPathComponent("bin/mysqld").path,
+              package.clientPath == root.appendingPathComponent("bin/mysql").path,
+              package.adminPath == root.appendingPathComponent("bin/mysqladmin").path else {
+            throw MySQLModuleError.validationFailed("MySQL package ownership could not be verified; debug binary was left intact")
+        }
+        let observation = status()
+        guard (observation.state == .stopped || observation.state == .installed), observation.pid == nil else { return }
+
+        let binary = root.appendingPathComponent("bin/mysqld-debug")
+        guard manager.fileExists(atPath: binary.path) else { return }
+        let file = try binary.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
+        guard file.isRegularFile == true, file.isSymbolicLink != true,
+              binary.deletingLastPathComponent().standardizedFileURL == binDirectory.standardizedFileURL else {
+            throw MySQLModuleError.validationFailed("MySQL debug binary ownership could not be verified; file was left intact")
+        }
+
+        let binMode = (try manager.attributesOfItem(atPath: binDirectory.path)[.posixPermissions] as? NSNumber)?.intValue ?? 0o555
+        let attributes = try manager.attributesOfItem(atPath: binary.path)
+        guard (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              (attributes[.referenceCount] as? NSNumber)?.intValue == 1 else {
+            throw MySQLModuleError.validationFailed("MySQL debug binary ownership could not be verified; file was left intact")
+        }
+        let fileMode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o444
+        try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binDirectory.path)
+        do {
+            try manager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: binary.path)
+            try manager.removeItem(at: binary)
+            try manager.setAttributes([.posixPermissions: binMode], ofItemAtPath: binDirectory.path)
+        } catch {
+            if manager.fileExists(atPath: binary.path) {
+                try? manager.setAttributes([.posixPermissions: fileMode], ofItemAtPath: binary.path)
+            }
+            try? manager.setAttributes([.posixPermissions: binMode], ofItemAtPath: binDirectory.path)
+            throw error
+        }
+    }
     private func command(_ path: String, _ arguments: [String]) throws -> String { let process = Process(); let pipe = Pipe(); process.executableURL = URL(fileURLWithPath: path); process.arguments = arguments; process.standardOutput = pipe; process.standardError = pipe; try process.run(); let data = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw MySQLModuleError.validationFailed(String(data: data, encoding: .utf8) ?? path) }; return String(data: data, encoding: .utf8) ?? "" }
     private func sha256(_ url: URL) -> String? { try? command("/usr/bin/shasum", ["-a", "256", url.path]).split(separator: " ").first.map(String.init) }
     private func makeDirectories(_ urls: [URL]) throws { for url in urls { try manager.createDirectory(at: url, withIntermediateDirectories: true); try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path) } }

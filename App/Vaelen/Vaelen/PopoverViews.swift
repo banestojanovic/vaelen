@@ -165,7 +165,7 @@ private struct HeaderServiceStatus: View {
 struct StatusView: View {
     let model: AppModel
     @State private var selectedSection = Section.projects
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @FocusState private var focusedSection: Section?
@@ -370,7 +370,7 @@ struct StatusView: View {
     }
 
     private func presentSettings() {
-        SettingsWindowActivation.openSettings { openSettings() }
+        SettingsWindowActivation.openSettings { openWindow(id: "settings") }
     }
 
     private func sectionButton(_ section: Section, title: String, symbol: String) -> some View {
@@ -531,11 +531,11 @@ enum SettingsWindowActivation {
 }
 
 struct SettingsMenuCommand: View {
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Button("Settings…") {
-            SettingsWindowActivation.openSettings { openSettings() }
+            SettingsWindowActivation.openSettings { openWindow(id: "settings") }
         }
         .keyboardShortcut(",", modifiers: .command)
     }

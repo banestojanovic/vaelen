@@ -32,23 +32,12 @@ struct SettingsView: View {
             .navigationSplitViewColumnWidth(min: 190, ideal: 205, max: 240)
             .navigationTitle("Settings")
         } detail: {
-            VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    Image(nsImage: VaelenBrand.headerMarkBlue).resizable().scaledToFit().frame(width: 37, height: 27).accessibilityLabel("Vaelen")
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Vaelen").font(.system(.title3, design: .rounded).weight(.semibold))
-                        Text("The developer control center for macOS").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 20).padding(.top, 10).padding(.bottom, 8)
-                switch selection {
-                case .services: ServicesSettingsView(model: model)
-                case .general: GeneralSettingsView(model: model, selection: $selection)
-                case .projects: ProjectSettingsView(model: model)
-                case .php: PHPSettingsView(model: model)
-                case .network: NetworkSecuritySettingsView(model: model)
-                }
+            switch selection {
+            case .services: ServicesSettingsView(model: model)
+            case .general: GeneralSettingsView(model: model, selection: $selection)
+            case .projects: ProjectSettingsView(model: model)
+            case .php: PHPSettingsView(model: model)
+            case .network: NetworkSecuritySettingsView(model: model)
             }
         }
         .frame(minWidth: 1_000, idealWidth: 1_060, minHeight: 640, idealHeight: 720)
