@@ -263,6 +263,9 @@ struct ServicesView: View {
         let busy = model.serviceOperationIs(for: "MySQL")
         return ServiceRow(icon: "cylinder.fill", title: "MySQL", version: mysql?.selectedVersion ?? mysql?.installedVersion, state: state.title, stateSymbol: state.symbol, stateTint: state.tint, pending: pending, busy: busy) {
             HStack(spacing: 3) {
+                if mysql?.state == .running {
+                    ServiceIconButton(label: "Stop MySQL", systemImage: "stop.circle", emphasis: .stop) { Task { await model.stopMySQL() } }
+                }
                 let tablePlus = MySQLDatabaseViewerAction.tablePlus(mysql: mysql, tablePlusInstalled: model.isTablePlusInstalled)
                 ServiceIconButton(
                     label: pending ? "Checking MySQL and TablePlus availability" : tablePlus.reason,
@@ -276,9 +279,6 @@ struct ServicesView: View {
                         ServiceIconButton(label: "Install MySQL", systemImage: "arrow.down.to.line") { Task { await model.installMySQL() } }
                     } else if mysql.state == .stopped || mysql.state == .installed || mysql.state == .unhealthy {
                         ServiceIconButton(label: mysql.health == "not-initialized" ? "Initialize and Start MySQL" : "Start MySQL", systemImage: "play.circle", emphasis: .start) { Task { await model.startMySQL() } }
-                    }
-                    if mysql.state == .running {
-                        ServiceIconButton(label: "Stop MySQL", systemImage: "stop.circle", emphasis: .stop) { Task { await model.stopMySQL() } }
                     }
                     if mysql.state != .notInstalled {
                         ServiceIconButton(label: "Reveal MySQL Data Files", systemImage: "folder", disabled: !FileManager.default.fileExists(atPath: mysql.datadir)) { model.revealMySQLDataFiles(mysql) }

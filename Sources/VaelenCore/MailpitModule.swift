@@ -56,6 +56,36 @@ public final class MailpitModule: @unchecked Sendable {
         let final = layout.mailpitPackagesDirectoryURL.appendingPathComponent(manifest.version, isDirectory: true); guard !manager.fileExists(atPath: final.path) else { throw MailpitModuleError.validationFailed("package directory already exists") }; try manager.moveItem(at: staging, to: final); let package = MailpitPackage(version: manifest.version, architecture: manifest.architecture, packagePath: final.path, executablePath: final.appendingPathComponent("mailpit").path, source: manifest.artifactURL.absoluteString, artifactSHA256: manifest.artifactSHA256, license: manifest.license, installedAt: Date()); try atomicWrite(package, to: final.appendingPathComponent(".vaelen-package.json")); try setImmutable(final); return package
     }
 
+    /// Removes only the verified package directory. Mailpit's message database,
+    /// logs, and instance metadata remain in place for a later reinstall.
+    @discardableResult
+    public func remove(requestedVersion: String) throws -> [MailpitPackage] {
+        lock.lock(); defer { lock.unlock() }
+        guard let package = installedVersions().first(where: { $0.version == requestedVersion }),
+              package.packagePath == layout.mailpitPackagesDirectoryURL.appendingPathComponent(requestedVersion, isDirectory: true).standardizedFileURL.path else {
+            throw MailpitModuleError.packageMissing(requestedVersion)
+        }
+        let current = status()
+        guard (current.state == .stopped || current.state == .installed), current.pid == nil,
+              processRecord(instancePaths()) == nil, ownedRecord == nil else {
+            throw MailpitModuleError.processIdentityMismatch
+        }
+        let root = URL(fileURLWithPath: package.packagePath, isDirectory: true)
+        guard root.standardizedFileURL.deletingLastPathComponent() == layout.mailpitPackagesDirectoryURL.standardizedFileURL,
+              (try root.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else {
+            throw MailpitModuleError.validationFailed("package ownership could not be verified; no files were removed")
+        }
+        let urls = [root] + ((manager.enumerator(at: root, includingPropertiesForKeys: [.isSymbolicLinkKey])?.allObjects as? [URL]) ?? [])
+        for url in urls {
+            guard (try url.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else {
+                throw MailpitModuleError.validationFailed("package contains an unexpected symbolic link; no files were removed")
+            }
+        }
+        for url in urls.reversed() { try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path) }
+        try manager.removeItem(at: root)
+        return installedVersions()
+    }
+
     public func status() -> MailpitStatus {
         let package = installedVersions().first(where: { $0.version == manifest.version }); let paths = instancePaths()
         guard let record = processRecord(paths) ?? ownedRecord else { guard let package else { return makeStatus(state: .notInstalled, health: "not-installed", package: nil, pid: nil, paths: paths) }; let conflict = !isPortAvailable(configuration.smtpPort) ? configuration.smtpPort : !isPortAvailable(configuration.httpPort) ? configuration.httpPort : nil; let state: MailpitState = conflict == nil ? (manager.fileExists(atPath: paths.database.path) ? .stopped : .installed) : .conflict; return makeStatus(state: state, health: conflict.map { "port-conflict-\($0)" } ?? (state == .installed ? "installed" : "stopped"), package: package, pid: nil, paths: paths) }

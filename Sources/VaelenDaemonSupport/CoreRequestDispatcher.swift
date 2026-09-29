@@ -287,6 +287,13 @@ public actor CoreRequestDispatcher {
                 let module = try mysqlModule(); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
             case .mysqlInstall:
                 let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
+            case .mysqlRemove:
+                let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }()
+                guard module.installedVersions().contains(where: { $0.version == params.version }) else { throw IPCErrorPayload(code: .invalidRequest, message: "Core could not verify ownership of MySQL \(params.version); no service or files were changed.") }
+                try serviceIntents.set("mysql", enabled: false)
+                _ = try module.stop()
+                let installed = try module.remove(requestedVersion: params.version)
+                return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: installed.map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
             case .mysqlUse:
                 let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }(); _ = try module.use(params.version); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
             case .mysqlInitialize:
@@ -301,6 +308,13 @@ public actor CoreRequestDispatcher {
                 let module = try mailpitModule(); return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: module.installedVersions().map(MailpitPackageWire.init))))), true)
             case .mailpitInstall:
                 let module = try mailpitModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Mailpit version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: module.installedVersions().map(MailpitPackageWire.init))))), true)
+            case .mailpitRemove:
+                let module = try mailpitModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Mailpit version is required.") }()
+                guard module.installedVersions().contains(where: { $0.version == params.version }) else { throw IPCErrorPayload(code: .invalidRequest, message: "Core could not verify ownership of Mailpit \(params.version); no service or files were changed.") }
+                try serviceIntents.set("mailpit", enabled: false)
+                _ = try module.stop()
+                let installed = try module.remove(requestedVersion: params.version)
+                return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: installed.map(MailpitPackageWire.init))))), true)
             case .mailpitStart:
                 let module = try mailpitModule(); try serviceIntents.set("mailpit", enabled: true); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.start()))), true)
             case .mailpitStop:

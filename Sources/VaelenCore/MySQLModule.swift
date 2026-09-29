@@ -172,6 +172,48 @@ public final class MySQLModule: @unchecked Sendable {
 
     public func selectedVersion() -> String? { try? String(contentsOf: layout.configurationDirectoryURL.appendingPathComponent("mysql-default.json"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) }
 
+    /// Removes only a manifest-verified Vaelen package. The MySQL instance,
+    /// credentials, and configuration are deliberately retained.
+    @discardableResult
+    public func remove(requestedVersion: String) throws -> [MySQLPackage] {
+        lock.lock(); defer { lock.unlock() }
+        guard let package = installedVersions().first(where: { $0.version == requestedVersion }),
+              package.packagePath == layout.mysqlPackagesDirectoryURL.appendingPathComponent(requestedVersion, isDirectory: true).standardizedFileURL.path else {
+            throw MySQLModuleError.packageMissing(requestedVersion)
+        }
+        let current = status()
+        guard current.state == .stopped || current.state == .installed else {
+            throw MySQLModuleError.processFailed("MySQL package cannot be removed until Core confirms it is stopped; current state is \(current.state.rawValue)")
+        }
+        guard current.pid == nil else { throw MySQLModuleError.processIdentityMismatch }
+        try makePackageRemovable(at: URL(fileURLWithPath: package.packagePath, isDirectory: true))
+        try manager.removeItem(atPath: package.packagePath)
+        if selectedVersion() == requestedVersion {
+            try? manager.removeItem(at: layout.configurationDirectoryURL.appendingPathComponent("mysql-default.json"))
+        }
+        return installedVersions()
+    }
+
+    private func makePackageRemovable(at root: URL) throws {
+        let expectedParent = layout.mysqlPackagesDirectoryURL.standardizedFileURL
+        guard root.standardizedFileURL.deletingLastPathComponent() == expectedParent,
+              (try root.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else {
+            throw MySQLModuleError.validationFailed("package ownership could not be verified; no files were removed")
+        }
+        let urls = ([root] + ((manager.enumerator(at: root, includingPropertiesForKeys: [.isSymbolicLinkKey])?.allObjects as? [URL]) ?? []))
+        for url in urls {
+            if (try url.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink == true {
+                let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
+                guard resolved.hasPrefix(root.standardizedFileURL.path + "/") else {
+                    throw MySQLModuleError.validationFailed("package contains a symbolic link that escapes its owned directory; no files were removed")
+                }
+            }
+        }
+        for url in urls.reversed() where (try url.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true {
+            try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+        }
+    }
+
     public func initialize() throws {
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }
         if let metadata = instanceMetadata(), metadata.initialized { throw MySQLModuleError.alreadyInitialized }

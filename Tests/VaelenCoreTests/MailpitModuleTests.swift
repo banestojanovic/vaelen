@@ -4,6 +4,32 @@ import Foundation
 @testable import VaelenCore
 
 final class MailpitModuleTests: XCTestCase {
+    func testRemoveVerifiedPackagePreservesInboxDatabaseAndLogs() throws {
+        guard let source = MailpitModule().installedVersions().first else { throw XCTSkip("installed Mailpit package prerequisite unavailable") }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mailpit-remove-\(UUID().uuidString)", isDirectory: true)
+        defer { removeTestRoot(root) }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let packageURL = layout.mailpitPackagesDirectoryURL.appendingPathComponent(source.version, isDirectory: true)
+        try FileManager.default.createDirectory(at: packageURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: source.packagePath), to: packageURL)
+        let chmod = Process(); chmod.executableURL = URL(fileURLWithPath: "/bin/chmod"); chmod.arguments = ["-R", "u+w", packageURL.path]; try chmod.run(); chmod.waitUntilExit()
+        let package = MailpitPackage(version: source.version, architecture: source.architecture, packagePath: packageURL.path, executablePath: packageURL.appendingPathComponent("mailpit").path, source: source.source, artifactSHA256: source.artifactSHA256, license: source.license, installedAt: source.installedAt)
+        try JSONEncoder().encode(package).write(to: packageURL.appendingPathComponent(".vaelen-package.json"))
+        let module = MailpitModule(layout: layout, configuration: try testConfiguration())
+        let database = URL(fileURLWithPath: module.instanceDatabasePath())
+        let log = layout.mailpitLogsDirectoryURL.appendingPathComponent("default.log")
+        try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("inbox-data".utf8).write(to: database)
+        try Data("diagnostic-log".utf8).write(to: log)
+
+        XCTAssertEqual(module.status().state, .stopped)
+        XCTAssertTrue(try module.remove(requestedVersion: source.version).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: packageURL.path))
+        XCTAssertEqual(try Data(contentsOf: database), Data("inbox-data".utf8))
+        XCTAssertEqual(try Data(contentsOf: log), Data("diagnostic-log".utf8))
+    }
+
     func testOwnedFixtureLifecycleReleasesBothListenersAndIsReaped() throws {
         let fixture = try makeFixture(resistTermination: false)
         defer { removeTestRoot(fixture.root) }

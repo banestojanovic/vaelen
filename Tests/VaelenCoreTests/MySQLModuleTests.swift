@@ -28,6 +28,31 @@ final class MySQLModuleTests: XCTestCase {
         XCTAssertTrue(layout.mysqlPackagesDirectoryURL.path.contains("packages/mysql"))
     }
 
+    func testRemoveVerifiedPackagePreservesInstanceDataAndClearsSelection() throws {
+        guard let source = MySQLModule(layout: .init()).installedVersions().first else { throw XCTSkip("installed MySQL package prerequisite unavailable") }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mysql-remove-\(UUID().uuidString)", isDirectory: true)
+        defer { makeWritableAndRemove(root) }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let packageURL = layout.mysqlPackagesDirectoryURL.appendingPathComponent(source.version, isDirectory: true)
+        try FileManager.default.createDirectory(at: packageURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: source.packagePath), to: packageURL)
+        let chmod = Process(); chmod.executableURL = URL(fileURLWithPath: "/bin/chmod"); chmod.arguments = ["-R", "u+w", packageURL.path]; try chmod.run(); chmod.waitUntilExit()
+        let package = MySQLPackage(version: source.version, architecture: source.architecture, packagePath: packageURL.path, serverPath: packageURL.appendingPathComponent("bin/mysqld").path, clientPath: packageURL.appendingPathComponent("bin/mysql").path, adminPath: packageURL.appendingPathComponent("bin/mysqladmin").path, source: source.source, artifactSHA256: source.artifactSHA256, signatureURL: source.signatureURL, license: source.license, installedAt: source.installedAt)
+        try JSONEncoder().encode(package).write(to: packageURL.appendingPathComponent(".vaelen-package.json"))
+        let module = MySQLModule(layout: layout)
+        _ = try module.use(source.version)
+        let sentinel = layout.mysqlInstancesDirectoryURL.appendingPathComponent("default/data/preserved-database-sentinel")
+        try FileManager.default.createDirectory(at: sentinel.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("preserve".utf8).write(to: sentinel)
+
+        XCTAssertEqual(module.status().state, .installed)
+        XCTAssertTrue(try module.remove(requestedVersion: source.version).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: packageURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+        XCTAssertNil(module.selectedVersion())
+        XCTAssertEqual(module.status().state, .notInstalled)
+    }
+
     func testCanonicalDefaultPortIsMySQLPort() {
         XCTAssertEqual(MySQLModule.defaultPort, 3306)
     }

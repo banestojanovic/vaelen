@@ -370,18 +370,7 @@ struct StatusView: View {
     }
 
     private func presentSettings() {
-        // Settings is an explicit user action from a menu-bar popover. Activate
-        // Vaelen first, then make the SwiftUI-created window key once the scene
-        // has had a chance to materialize. The window remains a normal window;
-        // it is not made floating or repeatedly forced to the front.
-        SettingsWindowActivation.activateApplication()
-        openSettings()
-        DispatchQueue.main.async {
-            SettingsWindowActivation.bringForward()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            SettingsWindowActivation.bringForward()
-        }
+        SettingsWindowActivation.openSettings { openSettings() }
     }
 
     private func sectionButton(_ section: Section, title: String, symbol: String) -> some View {
@@ -491,9 +480,25 @@ private struct PopoverFooterControlStyle: ButtonStyle {
 enum SettingsWindowActivation {
     private static var closeObserver: NSObjectProtocol?
 
+    static func openSettings(_ openSettings: () -> Void) {
+        NSApplication.shared.setActivationPolicy(.regular)
+        activateApplication()
+        openSettings()
+        DispatchQueue.main.async { bringForward() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { bringForward() }
+    }
+
     static func activateApplication() {
         NSApplication.shared.activate(ignoringOtherApps: true)
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
+    }
+
+    static func restoreMenuBarOnlyActivation() {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        if let observer = closeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            closeObserver = nil
+        }
     }
 
     static func bringForward() {
@@ -513,10 +518,8 @@ enum SettingsWindowActivation {
                 object: window,
                 queue: .main
             ) { _ in
-                NSApplication.shared.setActivationPolicy(.accessory)
-                if let observer = closeObserver {
-                    NotificationCenter.default.removeObserver(observer)
-                    closeObserver = nil
+                Task { @MainActor in
+                    restoreMenuBarOnlyActivation()
                 }
             }
         }
@@ -532,15 +535,9 @@ struct SettingsMenuCommand: View {
 
     var body: some View {
         Button("Settings…") {
-            SettingsWindowActivation.activateApplication()
-            openSettings()
-            DispatchQueue.main.async {
-                SettingsWindowActivation.bringForward()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                SettingsWindowActivation.bringForward()
-            }
+            SettingsWindowActivation.openSettings { openSettings() }
         }
+        .keyboardShortcut(",", modifiers: .command)
     }
 }
 

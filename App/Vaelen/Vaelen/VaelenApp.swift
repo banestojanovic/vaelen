@@ -69,7 +69,7 @@ enum VaelenBrand {
               let image = NSImage(contentsOf: url) else {
             return NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: "Vaelen") ?? NSImage()
         }
-        image.size = NSSize(width: 21, height: 16.8)
+        image.size = NSSize(width: 15.5, height: 12.5)
         image.isTemplate = true
         return image
     }()
@@ -112,94 +112,77 @@ extension Color {
     }
 }
 
-struct SettingsView: View {
-    let model: AppModel
-    @State private var selection = SettingsPage.general
-
-    private enum SettingsPage: Hashable { case general, projects, php }
-
-    var body: some View {
-        NavigationSplitView {
-            List(selection: $selection) {
-                Section("GENERAL") {
-                    Label("General", systemImage: "gearshape").tag(SettingsPage.general)
-                    Label("Projects", systemImage: "folder").tag(SettingsPage.projects)
-                }
-                Section("DEVELOPMENT") {
-                    Label("PHP", systemImage: "server.rack").tag(SettingsPage.php)
-                }
-            }
-            .listStyle(.sidebar)
-            .navigationTitle("Settings")
-        } detail: {
-            switch selection {
-            case .general: GeneralSettingsView(model: model)
-            case .projects: ProjectSettingsView(model: model)
-            case .php: PHPSettingsView(model: model)
-            }
-        }
-        .frame(width: 760, height: 520)
-        .onAppear {
-            model.startMonitoring()
-            model.setProjectSettingsVisible(true)
-            DispatchQueue.main.async {
-                SettingsWindowActivation.bringForward()
-            }
-        }
-        .onDisappear {
-            model.setProjectSettingsVisible(false)
-        }
-    }
-}
-
 struct GeneralSettingsView: View {
     let model: AppModel
+    @Binding var selection: SettingsPage
     @State private var editorStatus: String?
 
     var body: some View {
-        SettingsContent(title: "General", subtitle: "Vaelen keeps your local development environment ready from the menu bar.") {
-            HStack(spacing: VaelenUI.spacing8) {
-                Image(nsImage: VaelenBrand.settingsImage)
-                    .accessibilityLabel("Vaelen mark")
-                Text("Vaelen")
-                    .font(.headline)
-            }
-            .padding(.bottom, VaelenUI.spacing6)
-            SettingsGroup(title: "Status") {
-                HStack {
-                    switch model.state {
-                    case .running: VaelenStatusLabel("Ready", systemImage: "circle.fill", tint: .secondary)
-                    case .connecting: VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
-                    case .unavailable: VaelenStatusLabel("Unavailable", systemImage: "circle", tint: .secondary)
-                    case .incompatible: VaelenStatusLabel("Needs attention", systemImage: "exclamationmark.circle", tint: .orange)
-                    }
-                    Spacer()
-                    Text("Version \(VaelenBuildInfo.version)").font(.caption).foregroundStyle(.secondary)
-                }
-                if let refreshError = model.refreshError {
-                    VaelenStatusLabel("Showing last known state", systemImage: "clock.arrow.circlepath", tint: .orange)
-                        .font(.caption)
-                        .padding(.top, VaelenUI.spacing6)
-                        .help(refreshError)
-                }
-            }
-            SettingsGroup(title: "Code Editor", footer: "Used by ‘val edit’ and each project’s Open in Editor action. Vaelen opens the selected folder directly in this exact installed application.") {
-                let selected = try? EditorPreferenceStore().load()
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(selected?.bundleIdentifier ?? "No editor selected")
-                            .font(.subheadline)
-                        if let path = selected?.applicationPath {
-                            Text(path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        let editor = try? EditorPreferenceStore().load()
+        VStack(spacing: 0) {
+            SettingsPageHeader("General", subtitle: "Preferences for Vaelen on this Mac.") { EmptyView() }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    SettingsInsetCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Vaelen Core").font(.headline)
+                                    Text("Core is the source of truth for managed services, projects, and local network state.").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                switch model.state {
+                                case .running:
+                                    SettingsStateBadge(title: model.refreshError == nil ? "Connected" : "Showing last confirmed state", tone: model.refreshError == nil ? .healthy : .attention)
+                                case .connecting:
+                                    SettingsStateBadge(title: "Checking", tone: .pending)
+                                case .unavailable:
+                                    SettingsStateBadge(title: "Unavailable", tone: .attention)
+                                case .incompatible:
+                                    SettingsStateBadge(title: "Needs attention", tone: .attention)
+                                }
+                            }
+                            HStack(spacing: 8) {
+                                Text("Version \(VaelenBuildInfo.version)").font(.caption).foregroundStyle(.secondary)
+                                if let refreshError = model.refreshError { Text("· \(refreshError)").font(.caption).foregroundStyle(.orange).lineLimit(2) }
+                                Spacer()
+                                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
+                            }
+                            if model.phpCatalog?.installedVersions.isEmpty != false {
+                                Divider()
+                                HStack(alignment: .top, spacing: 9) {
+                            Image(systemName: model.phpCatalog == nil ? (model.phpCatalogReadPending || model.isServiceReadPending("PHP") ? "clock" : "exclamationmark.circle") : "info.circle").foregroundStyle(model.phpCatalog == nil && !model.phpCatalogReadPending && !model.isServiceReadPending("PHP") ? Color.orange : Color.accentColor)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(model.phpCatalog == nil ? (model.phpCatalogReadPending || model.isServiceReadPending("PHP") ? "Checking optional PHP setup" : "PHP setup unavailable") : "No managed PHP runtime is installed").font(.subheadline.weight(.medium))
+                                        Text("PHP is optional. Install it when a project needs a managed runtime; other Vaelen features remain available.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    Spacer(minLength: 6)
+                                    Button("Choose PHP") { selection = .php }.controlSize(.small)
+                                }
+                            }
                         }
                     }
-                    Spacer()
-                    Button(selected == nil ? "Choose…" : "Change…", systemImage: "app.badge") { chooseEditor() }
-                    if selected != nil {
-                        Button("Clear") { clearEditor() }
+                    SettingsInsetCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Code editor").font(.headline)
+                            HStack(spacing: 10) {
+                                Image(systemName: "curlybraces").font(.title3).foregroundStyle(Color.accentColor).frame(width: 36, height: 36).background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(editor?.bundleIdentifier ?? "No editor selected").font(.subheadline.weight(.medium))
+                                    if let path = editor?.applicationPath { Text(path).font(.caption2.monospaced()).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled) }
+                                }
+                                Spacer(minLength: 8)
+                                Button(editor == nil ? "Choose…" : "Change…", systemImage: "app.badge") { chooseEditor() }
+                                if editor != nil { Button("Clear") { clearEditor() }.buttonStyle(.borderless) }
+                            }
+                            Text("Used by val edit and each project’s Open in Editor action. Vaelen opens the selected folder directly in this installed application.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            if let editorStatus { Label(editorStatus, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary) }
+                        }
                     }
+                    Text("Appearance follows macOS Light or Dark mode. Service and project state is shared with the menu bar and CLI.")
+                        .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 2)
                 }
-                if let editorStatus { Text(editorStatus).font(.caption).foregroundStyle(.secondary) }
+                .frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity, alignment: .topLeading).padding(22)
             }
         }
     }
@@ -233,161 +216,306 @@ struct GeneralSettingsView: View {
 
 struct PHPSettingsView: View {
     let model: AppModel
+    @State private var selectedItem = "shared"
+    @State private var removalVersion: String?
+    @State private var didSelectInitialRuntime = false
+
+    private var catalog: PHPRuntimeCatalog? { model.phpCatalog }
+    private var installed: [PHPRuntimeVersion] { catalog?.installedVersions ?? [] }
+    private var available: [String] {
+        guard let catalog else { return [] }
+        let installedVersions = Set(catalog.installedVersions.map(\.version))
+        return catalog.availableVersions.filter { !installedVersions.contains($0) }
+    }
+    private var coreConnected: Bool {
+        if case .running = model.state { return model.refreshError == nil }
+        return false
+    }
+    private var selectedVersion: String? {
+        guard !selectedItem.hasPrefix("available:") else { return String(selectedItem.dropFirst("available:".count)) }
+        return selectedItem == "shared" ? nil : selectedItem
+    }
 
     var body: some View {
-        SettingsContent(title: "PHP", subtitle: "Manage PHP runtimes installed by Vaelen.") {
-            if let catalog = model.phpCatalog {
-                SettingsGroup(title: "Default Runtime", footer: "Used when a project does not select another PHP runtime.") {
-                    if let version = catalog.defaultVersion {
-                        HStack(spacing: VaelenUI.spacing8) {
-                            PHPDefaultMenu(catalog: catalog, model: model)
+        VStack(spacing: 0) {
+            SettingsPageHeader("PHP", subtitle: "Choose runtimes and tune the values your projects use.") {
+                Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Refresh PHP runtime status")
+            }
+            HStack(spacing: 0) {
+                runtimeList.frame(width: 238).background(Color(nsColor: .controlBackgroundColor).opacity(0.32))
+                Divider()
+                ScrollView { runtimeDetail.frame(maxWidth: 650, alignment: .leading).frame(maxWidth: .infinity, alignment: .topLeading).padding(22) }
+            }
+        }
+        .task {
+            if model.phpConfiguration == nil { await model.refreshPHPConfiguration() }
+            selectInitialRuntime()
+        }
+        .onChange(of: model.phpCatalog?.defaultVersion) { _, _ in selectInitialRuntime() }
+        .onChange(of: model.phpCatalog?.installedVersions.map(\.version)) { _, _ in
+            if selectedItem != "shared", !selectedItem.hasPrefix("available:"), !installed.contains(where: { $0.version == selectedItem }) { selectedItem = "shared" }
+        }
+        .confirmationDialog("Remove PHP \(removalVersion ?? "runtime")?", isPresented: Binding(get: { removalVersion != nil }, set: { if !$0 { removalVersion = nil } }), titleVisibility: .visible) {
+            if let removalVersion {
+                Button("Remove", role: .destructive) { Task { await model.removePHP(removalVersion) }; self.removalVersion = nil }
+                Button("Cancel", role: .cancel) { self.removalVersion = nil }
+            }
+        } message: { Text("This removes the Vaelen-managed PHP runtime from this Mac. Project files are not changed.") }
+    }
+
+    private var runtimeList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("INSTALLED").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 5)
+                runtimeRow("shared", title: "Shared defaults", subtitle: catalog?.defaultVersion.map { "PHP \($0) · new projects" } ?? "Default unavailable", state: !coreConnected ? (phpChecking ? .pending : .neutral) : catalog?.defaultVersion == nil ? .attention : .healthy)
+                if installed.isEmpty {
+                    Text(catalog == nil ? "Waiting for a confirmed runtime catalog." : "No managed PHP runtimes installed.")
+                        .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
+                }
+                ForEach(installed, id: \.version) { runtime in
+                    runtimeRow(runtime.version, title: "PHP \(runtime.version)", subtitle: runtimeSubtitle(runtime), state: runtimeTone(runtime))
+                }
+                Divider().padding(.horizontal, 12).padding(.vertical, 7)
+                Text("AVAILABLE").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.bottom, 5)
+                if catalog == nil {
+                    Text(phpChecking ? "Checking available runtimes…" : "Available versions unavailable")
+                        .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
+                } else if !catalog!.availableVersionsKnown {
+                    Text("Available versions could not be refreshed.").font(.caption).foregroundStyle(.orange).padding(.horizontal, 14).padding(.vertical, 9)
+                } else if available.isEmpty {
+                    Text("No additional versions available.").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
+                } else {
+                    ForEach(available, id: \.self) { version in
+                        runtimeRow("available:\(version)", title: "PHP \(version)", subtitle: PHPSeriesLabel.series(for: version), state: .pending)
+                    }
+                }
+            }.padding(.bottom, 14)
+        }
+    }
+
+    private var runtimeDetail: some View {
+        VStack(alignment: .leading, spacing: 17) {
+            if let error = model.refreshError {
+                Label("Showing last confirmed PHP state · \(error)", systemImage: "clock.arrow.circlepath")
+                    .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if let operationTarget = model.phpRequestTarget {
+                Label(phpOperationDescription(target: operationTarget, operation: model.phpOperation), systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let error = model.phpError ?? model.phpConfigurationError {
+                Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                Button("Retry", systemImage: "arrow.clockwise") { Task { await model.refreshPHPConfiguration(); await model.refresh() } }
+            }
+            if selectedItem == "shared" { sharedDefaultsDetail }
+            else if selectedItem.hasPrefix("available:") { availableRuntimeDetail }
+            else if let runtime = installed.first(where: { $0.version == selectedItem }) { installedRuntimeDetail(runtime) }
+            else if catalog == nil { unavailableCatalogDetail }
+            else { sharedDefaultsDetail }
+        }
+    }
+
+    private var sharedDefaultsDetail: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Shared defaults").font(.title2.weight(.semibold))
+                    Text("Inherited only by projects without a PHP override.").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if phpChecking { SettingsStateBadge(title: "Checking", tone: .pending) }
+                else if !coreConnected { SettingsStateBadge(title: "Unavailable", tone: .attention) }
+                else if let version = catalog?.defaultVersion { SettingsStateBadge(title: "PHP \(version) · Default", tone: .healthy) }
+                else { SettingsStateBadge(title: "Default unavailable", tone: .attention) }
+            }
+            if let version = catalog?.defaultVersion {
+                SettingsInsetCard {
+                    HStack { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green); Text("PHP \(version) is the shared default").font(.subheadline.weight(.medium)); Spacer(); Text("New projects").font(.caption).foregroundStyle(.secondary) }
+                }
+            }
+            configurationEditor(version: nil)
+            Text("Upload and POST size affect web requests. Memory and input-variable limits apply to web and CLI PHP. Execution time limits web requests; managed CLI PHP remains unlimited.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            configLocations
+        }
+    }
+
+    @ViewBuilder private func installedRuntimeDetail(_ runtime: PHPRuntimeVersion) -> some View {
+        let config = model.phpConfiguration?.versions.first { $0.version == runtime.version }
+        VStack(alignment: .leading, spacing: 15) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "curlybraces").font(.title2).foregroundStyle(Color.accentColor).frame(width: 36, height: 36).background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("PHP \(runtime.version)").font(.title2.weight(.semibold))
+                    Text(runtime.series.map { "\($0) series · Managed by Vaelen" } ?? "Managed by Vaelen").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                SettingsStateBadge(title: runtimeStateTitle(runtime), tone: runtimeTone(runtime))
+            }
+            HStack(spacing: 8) {
+                if runtime.isDefault { SettingsStateBadge(title: "Shared default", tone: coreConnected ? .healthy : .neutral) }
+                if runtime.usedByProjectCount > 0 { Text("Used by \(runtime.usedByProjectCount) projects").font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                PHPDefaultMenu(catalog: catalog!, model: model, canManage: coreConnected && !phpChecking)
+            }
+            if let config {
+                SettingsInsetCard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("PHP \(runtime.version) settings").font(.headline)
+                                Text(config.inheritsDefault ? "Inherits shared values; edit only to create version-specific settings." : "These values override shared defaults for this version.").font(.caption).foregroundStyle(.secondary)
+                            }
                             Spacer()
-                            Text(PHPSeriesLabel.series(for: version))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        VaelenStatusLabel("Default runtime unavailable", systemImage: "questionmark.circle", tint: .secondary)
-                    }
-                }
-
-                SettingsGroup(title: "PHP Configuration", footer: "These settings are stored under Vaelen’s Application Support folder. Upload and POST size affect web requests; memory and input-variable limits apply to both web and CLI PHP. Execution time controls web requests; managed CLI PHP remains unlimited.") {
-                    if let configuration = model.phpConfiguration {
-                        VStack(alignment: .leading, spacing: VaelenUI.spacing12) {
-                            PHPSettingsEditor(settings: configuration.defaultSettings, title: "Shared Default", saveTitle: "Save Shared Default", saving: model.phpConfigurationSaving) { settings in
-                                Task { await model.savePHPConfiguration(version: nil, settings: settings) }
-                            }
-                            ForEach(configuration.versions, id: \.version) { version in
-                                Divider().opacity(0.5)
-                                VStack(alignment: .leading, spacing: VaelenUI.spacing8) {
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("PHP \(version.version)").font(.subheadline.weight(.medium))
-                                            Text(version.inheritsDefault ? "Inherits the shared default" : "Version-specific override")
-                                                .font(.caption).foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                        if !version.inheritsDefault {
-                                            Button("Use Shared Default") {
-                                                Task { await model.savePHPConfiguration(version: version.version, settings: nil) }
-                                            }
-                                            .disabled(model.phpConfigurationSaving)
-                                        }
-                                    }
-                                    PHPSettingsEditor(settings: version.settings, title: "PHP \(version.version)", saveTitle: "Save PHP \(version.version)", saving: model.phpConfigurationSaving) { settings in
-                                        Task { await model.savePHPConfiguration(version: version.version, settings: settings) }
-                                    }
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text("FPM uses \(version.fpmIniPath)")
-                                        Text("Managed CLI uses \(version.cliIniPath)")
-                                        Text("FPM pool config (generated): \(version.fpmConfigurationPath)")
-                                    }
-                                    .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                                    if version.fpmRunning {
-                                        Label("PHP-FPM is running with these settings.", systemImage: "checkmark.circle.fill")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                    } else {
-                                        Label("Settings will be used the next time PHP-FPM starts.", systemImage: "info.circle")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                            Button("Open Configuration Files…", systemImage: "folder") {
-                                Task { await model.openPHPConfigurationFiles() }
-                            }
-                            .padding(.top, VaelenUI.spacing6)
-                        }
-                    } else {
-                        HStack(spacing: VaelenUI.spacing8) {
-                            ProgressView().controlSize(.small)
-                            Text(model.phpConfigurationError ?? "Loading managed PHP configuration…")
-                                .font(.caption).foregroundStyle(model.phpConfigurationError == nil ? Color.secondary : Color.red)
-                            if model.phpConfigurationError != nil {
-                                Button("Retry") { Task { await model.refreshPHPConfiguration() } }
+                            if !config.inheritsDefault {
+                                Button("Use Shared Default") { Task { await model.savePHPConfiguration(version: runtime.version, settings: nil) } }.disabled(model.phpConfigurationSaving || !coreConnected || phpChecking)
                             }
                         }
-                    }
-                    if let error = model.phpConfigurationError, model.phpConfiguration != nil {
-                        VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red)
-                            .font(.caption).fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-
-                SettingsGroup(title: "Installed Versions") {
-                    if catalog.installedVersions.isEmpty {
-                        VaelenEmptyState(title: "No Installed PHP", systemImage: "shippingbox", message: "Vaelen has no managed PHP runtimes to show.")
-                            .padding(.vertical, VaelenUI.spacing8)
-                    } else {
-                        ForEach(catalog.installedVersions, id: \.version) { runtime in
-                            PHPVersionRow(runtime: runtime, model: model)
+                        Divider()
+                        PHPSettingsEditor(settings: config.settings, title: "PHP \(runtime.version)", saveTitle: "Save PHP \(runtime.version)", saving: model.phpConfigurationSaving || !coreConnected || phpChecking) { settings in
+                            Task { await model.savePHPConfiguration(version: runtime.version, settings: settings) }
                         }
-                    }
-                }
-
-                SettingsGroup(title: "Available Versions") {
-                    let installed = Set(catalog.installedVersions.map(\.version))
-                    let available = catalog.availableVersions.filter { !installed.contains($0) }
-                    if !catalog.availableVersionsKnown {
-                        Text("Available versions could not be refreshed. Installed runtimes remain available.")
-                            .font(.subheadline)
-                            .foregroundStyle(.orange)
-                            .padding(.vertical, VaelenUI.spacing8)
-                    } else if available.isEmpty {
-                        Text("No additional PHP versions are currently available.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .padding(.vertical, VaelenUI.spacing8)
-                    } else {
-                        ForEach(available, id: \.self) { version in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("PHP \(version)")
-                                    Text(PHPSeriesLabel.series(for: version))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Button("Install", systemImage: "arrow.down.circle") {
-                                    Task { await model.installPHP(version) }
-                                }
-                                .labelStyle(.titleAndIcon)
-                                .accessibilityLabel("Install PHP \(version)")
-                                .disabled(model.phpRequestInFlight)
-                            }
-                            .padding(.vertical, VaelenUI.spacing8)
-                            .overlay(alignment: .bottom) { Divider().opacity(0.45) }
-                        }
+                        Text(config.fpmRunning ? "FPM is running; saved values apply on its next start." : "Settings will be used the next time PHP-FPM starts.").font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             } else {
-                HStack(spacing: VaelenUI.spacing8) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading PHP runtime state…")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, VaelenUI.spacing12)
+                Label(model.phpConfigurationReadPending ? "Loading version-specific settings…" : "Version settings unavailable", systemImage: model.phpConfigurationReadPending ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle")
+                    .font(.subheadline).foregroundStyle(model.phpConfigurationReadPending ? Color.secondary : Color.orange)
             }
+            configLocations
+            runtimeActions(runtime)
+        }
+    }
 
-            if let target = model.phpRequestTarget {
-                HStack(spacing: VaelenUI.spacing8) {
-                    ProgressView().controlSize(.small)
-                    Text(phpOperationDescription(target: target, operation: model.phpOperation))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, VaelenUI.spacing6)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("PHP operation in progress for \(target)")
+    private var availableRuntimeDetail: some View {
+        let version = selectedVersion ?? ""
+        return VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) { Text("PHP \(version)").font(.title2.weight(.semibold)); Text(PHPSeriesLabel.series(for: version)).font(.caption).foregroundStyle(.secondary) }
+                Spacer(); SettingsStateBadge(title: "Available", tone: .pending)
             }
-            if let error = model.phpError {
-                VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red)
-                    .font(.caption)
-                    .padding(.top, VaelenUI.spacing6)
-                    .fixedSize(horizontal: false, vertical: true)
+            Text("Install this managed PHP runtime for projects that require it. Installing does not change the shared default.").font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            SettingsInsetCard { VStack(alignment: .leading, spacing: 8) { Text("Package").font(.headline); Text("Verified package · managed by Vaelen").font(.caption).foregroundStyle(.secondary); Text("Data and configuration are preserved independently of package installation.").font(.caption).foregroundStyle(.secondary) } }
+            Button("Install PHP \(version)", systemImage: "arrow.down.circle.fill") { Task { await model.installPHP(version) } }
+            .buttonStyle(.borderedProminent).disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+            if !coreConnected || phpChecking { Text(phpChecking ? "Checking Core before enabling package actions…" : "Core must confirm current runtime state before installation.").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private var unavailableCatalogDetail: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(phpChecking ? "Checking PHP runtime state…" : "PHP runtime state unavailable", systemImage: phpChecking ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle")
+                .font(.title3.weight(.semibold)).foregroundStyle(phpChecking ? Color.secondary : Color.orange)
+            Text(phpChecking ? "Waiting for Core to confirm installed versions and running state." : "Core did not provide an authoritative PHP catalog. No runtime status is inferred.")
+                .font(.subheadline).foregroundStyle(.secondary)
+            if phpChecking { ProgressView().controlSize(.small) }
+            else { Button("Retry PHP Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } } }
+        }.padding(.top, 8)
+    }
+
+    private var configLocations: some View {
+        DisclosureGroup("Configuration locations") {
+            if let config = model.phpConfiguration {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Directory: \(config.directory)")
+                    ForEach(config.versions, id: \.version) { item in
+                        Text("PHP \(item.version) · FPM \(item.fpmIniPath)")
+                        Text("Managed CLI · \(item.cliIniPath)")
+                    }
+                    Button("Open Configuration Files…", systemImage: "folder") { Task { await model.openPHPConfigurationFiles() } }
+                        .disabled(!coreConnected || phpChecking)
+                }.font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).padding(.top, 8)
+            } else if model.phpConfigurationReadPending {
+                HStack { ProgressView().controlSize(.small); Text("Checking configuration paths…").font(.caption).foregroundStyle(.secondary) }.padding(.top, 8)
+            } else {
+                HStack { Text("Configuration locations unavailable.").font(.caption).foregroundStyle(.secondary); Button("Retry") { Task { await model.refreshPHPConfiguration() } } }.padding(.top, 8)
             }
         }
-        .task { if model.phpConfiguration == nil { await model.refreshPHPConfiguration() } }
+        .font(.subheadline.weight(.semibold)).padding(13)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func configurationEditor(version: String?) -> some View {
+        Group {
+            if let configuration = model.phpConfiguration {
+                SettingsInsetCard {
+                    PHPSettingsEditor(
+                        settings: version.flatMap { v in configuration.versions.first { $0.version == v }?.settings } ?? configuration.defaultSettings,
+                        title: version.map { "PHP \($0) Settings" } ?? "Shared Default Settings",
+                        saveTitle: version.map { "Save PHP \($0)" } ?? "Save Shared Default",
+                        saving: model.phpConfigurationSaving || !coreConnected || phpChecking
+                    ) { settings in Task { await model.savePHPConfiguration(version: version, settings: settings) } }
+                }
+            } else if model.phpConfigurationReadPending {
+                SettingsInsetCard { HStack { ProgressView().controlSize(.small); Text("Checking PHP configuration…").font(.subheadline).foregroundStyle(.secondary) } }
+            } else {
+                SettingsInsetCard { VStack(alignment: .leading, spacing: 8) { Text("Shared PHP settings unavailable").font(.headline); Text(model.phpConfigurationError ?? "Core did not provide configuration values.").font(.caption).foregroundStyle(.secondary); Button("Retry Settings", systemImage: "arrow.clockwise") { Task { await model.refreshPHPConfiguration() } } } }
+            }
+        }
+    }
+
+    private func runtimeActions(_ runtime: PHPRuntimeVersion) -> some View {
+        HStack {
+            if runtime.updateAvailable == true, let latest = runtime.latestVersion {
+                Button("Update to \(latest)", systemImage: "arrow.triangle.2.circlepath") { Task { await model.updatePHP(latest) } }.disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+            }
+            if runtime.running == false && !runtime.isDefault {
+                Button("Remove Runtime…", systemImage: "trash", role: .destructive) { removalVersion = runtime.version }
+                    .disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+            }
+            Spacer()
+        }
+    }
+
+    private var phpChecking: Bool {
+        if case .connecting = model.state { return true }
+        return model.phpCatalogReadPending || model.isServiceReadPending("PHP") || model.phpConfigurationReadPending
+    }
+
+    private func selectInitialRuntime() {
+        guard !didSelectInitialRuntime, let catalog else { return }
+        selectedItem = catalog.defaultVersion ?? catalog.installedVersions.first?.version ?? "shared"
+        didSelectInitialRuntime = true
+    }
+
+    private func runtimeRow(_ key: String, title: String, subtitle: String, state: SettingsStateBadge.Tone) -> some View {
+        Button { selectedItem = key } label: {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) { Text(title).font(.subheadline.weight(.medium)).foregroundStyle(.primary); Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(2) }
+                Spacer(minLength: 2)
+                SettingsStateDot(title: "", tone: state)
+                if key == selectedItem { Image(systemName: "checkmark").font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor) }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 9)
+            .background(selectedItem == key ? Color.accentColor.opacity(0.11) : .clear, in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+        }.buttonStyle(.plain).padding(.horizontal, 7)
+            .accessibilityAddTraits(selectedItem == key ? .isSelected : [])
+    }
+
+    private func runtimeSubtitle(_ runtime: PHPRuntimeVersion) -> String {
+        var parts: [String] = []
+        if runtime.isDefault { parts.append("Shared default") }
+        if runtime.usedByProjectCount > 0 { parts.append("\(runtime.usedByProjectCount) projects") }
+        parts.append(runtimeStateTitle(runtime))
+        return parts.joined(separator: " · ")
+    }
+
+    private func runtimeStateTitle(_ runtime: PHPRuntimeVersion) -> String {
+        if phpChecking { return "Checking status…" }
+        guard coreConnected else { return phpChecking ? "Checking status…" : "Last confirmed · unavailable" }
+        if runtime.running == true { return "Running" }
+        if runtime.running == false { return "Stopped" }
+        return "Status unavailable"
+    }
+
+    private func runtimeTone(_ runtime: PHPRuntimeVersion) -> SettingsStateBadge.Tone {
+        if phpChecking { return .pending }
+        guard coreConnected else { return phpChecking ? .pending : .neutral }
+        if runtime.running == true { return .healthy }
+        if runtime.running == false { return .neutral }
+        return .attention
     }
 
     private func phpOperationDescription(target: String, operation: PHPOperationState?) -> String {
@@ -472,6 +600,7 @@ private struct PHPSettingsEditor: View {
 private struct PHPDefaultMenu: View {
     let catalog: PHPRuntimeCatalog
     let model: AppModel
+    let canManage: Bool
 
     var body: some View {
         Menu {
@@ -494,7 +623,7 @@ private struct PHPDefaultMenu: View {
         .menuStyle(.borderlessButton)
         .accessibilityLabel("Default PHP runtime")
         .accessibilityValue(catalog.defaultVersion.map { "PHP \($0)" } ?? "Unavailable")
-        .disabled(model.phpRequestInFlight)
+        .disabled(model.phpRequestInFlight || !canManage)
     }
 }
 
@@ -531,7 +660,7 @@ private struct PHPVersionRow: View {
                     .font(.caption)
             }
             if runtime.running == true {
-                VaelenStatusLabel("Running", systemImage: "circle.fill", tint: .secondary)
+                VaelenStatusLabel("Running", systemImage: "circle.fill", tint: .green)
                     .font(.caption)
             }
             if isWorking {
@@ -584,55 +713,212 @@ private enum PHPSeriesLabel {
 
 struct ProjectSettingsView: View {
     let model: AppModel
+    @State private var selectedPath: String?
+    private var coreHasSnapshot: Bool { if case .running = model.state { true } else { false } }
+    private var coreConnecting: Bool { if case .connecting = model.state { true } else { false } }
+    private var selectedProject: ProjectWire? { model.linkedProjects.first { $0.path == selectedPath } }
 
     var body: some View {
-        SettingsContent(title: "Projects", subtitle: "Choose which workspace folders Vaelen discovers and which projects you manage explicitly.") {
-            if let refreshError = model.refreshError {
-                VaelenStatusLabel("Showing last known project state", systemImage: "clock.arrow.circlepath", tint: .orange)
-                    .font(.caption)
-                    .help(refreshError)
-            }
-            SettingsGroup(title: "Workspace Folders", footer: "Projects found in these folders appear in the menu bar without changing their files.") {
-                if model.parkedFolders.isEmpty {
-                    VaelenEmptyState(title: "No Workspace Folders", systemImage: "folder", message: "Add a folder to discover projects.").padding(.vertical, VaelenUI.spacing8)
-                } else {
-                    ForEach(model.parkedFolders, id: \.id) { folder in
-                        WorkspaceFolderRow(folder: folder, discoveredCount: discoveredCount(in: folder, from: model.projects), model: model)
-                    }
-                }
-                Button("Add Workspace Folder…", systemImage: "plus") {
+        VStack(spacing: 0) {
+            SettingsPageHeader("Projects", subtitle: "Your workspaces, runtime choices, and local sites.") {
+                Button("Add Folder…", systemImage: "plus") {
                     guard let path = chooseDirectory(title: "Choose a Workspace Folder", prompt: "Add Workspace Folder") else { return }
                     Task { await model.parkFolder(at: path) }
-                }
-                .disabled(model.relationshipMutationInFlight)
-                .padding(.top, VaelenUI.spacing8)
-            }
-            SettingsGroup(title: "Linked Projects", footer: "Linked projects can receive project-specific configuration.") {
-                if model.linkedProjects.isEmpty {
-                    VaelenEmptyState(title: "No Linked Projects", systemImage: "shippingbox", message: "Link a project to manage it directly.").padding(.vertical, VaelenUI.spacing8)
-                } else {
-                    ForEach(model.linkedProjects, id: \.path) { project in
-                        ExplicitProjectRow(project: project, model: model)
-                    }
-                }
+                }.disabled(model.relationshipMutationInFlight)
                 Button("Link Project…", systemImage: "link") {
                     guard let path = chooseDirectory(title: "Choose a Project to Link", prompt: "Link Project") else { return }
                     Task { await model.linkProject(at: path) }
+                }.buttonStyle(.borderedProminent).disabled(model.relationshipMutationInFlight)
+            }
+            HStack(spacing: 0) {
+                projectList.frame(width: 250).background(Color(nsColor: .controlBackgroundColor).opacity(0.32))
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !coreHasSnapshot {
+                            SettingsInsetCard {
+                                HStack(alignment: .top, spacing: 9) {
+                                    Image(systemName: coreConnecting ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle.fill").foregroundStyle(coreConnecting ? Color.accentColor : Color.orange)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(coreConnecting ? "Checking project state…" : "Project state unavailable").font(.subheadline.weight(.semibold))
+                                        Text("Workspace and linked-project state is not confirmed. Empty inventories are not inferred.").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                     Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh(); await model.refreshProjectRelationshipsIfVisible() } }
+                                }
+                            }
+                        } else if let error = model.refreshError {
+                            Label("Showing last confirmed project state · \(error)", systemImage: "clock.arrow.circlepath").font(.caption).foregroundStyle(.orange)
+                        }
+                        if let selectedProject {
+                            ProjectSelectedDetail(project: selectedProject, model: model)
+                        } else if coreHasSnapshot {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Select a linked project").font(.title3.weight(.semibold))
+                                Text("Choose a project from the list, or link a project folder to manage its local site and runtime.").font(.subheadline).foregroundStyle(.secondary)
+                                VaelenEmptyState(title: "No Linked Projects", systemImage: "shippingbox", message: "Link a project to manage it directly.")
+                            }
+                            .padding(.top, 8)
+                        } else {
+                            Text(coreConnecting ? "Waiting for the first project inventory…" : "Reconnect to Core to load projects.")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
+                        if let operation = model.relationshipOperation { HStack { ProgressView().controlSize(.small); Text(operation).font(.caption).foregroundStyle(.secondary) } }
+                        if let error = model.relationshipError { VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red).font(.caption) }
+                        if let error = model.projectRelationshipsRefreshError { VaelenStatusLabel("Workspace and linked project state may be stale: \(error)", systemImage: "arrow.clockwise.circle", tint: .orange).font(.caption) }
+                    }
+                    .frame(maxWidth: 700, alignment: .leading).frame(maxWidth: .infinity, alignment: .topLeading).padding(22)
                 }
-                .disabled(model.relationshipMutationInFlight)
-                .padding(.top, VaelenUI.spacing8)
-            }
-            if let operation = model.relationshipOperation {
-                HStack(spacing: VaelenUI.spacing8) { ProgressView().controlSize(.small); Text(operation).font(.caption).foregroundStyle(.secondary) }
-            }
-            if let error = model.relationshipError {
-                VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red).font(.caption)
-            }
-            if let error = model.projectRelationshipsRefreshError {
-                VaelenStatusLabel("Workspace and linked project state may be stale: \(error)", systemImage: "arrow.clockwise.circle", tint: .orange)
-                    .font(.caption)
             }
         }
+        .task { selectFirstProjectIfNeeded() }
+        .onChange(of: model.linkedProjects.map(\.path)) { _, _ in selectFirstProjectIfNeeded() }
+    }
+
+    private var projectList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("WORKSPACE FOLDERS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
+                if model.parkedFolders.isEmpty {
+                    Text(coreHasSnapshot ? "No folders added" : "Checking folders…").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 13).padding(.vertical, 8)
+                }
+                ForEach(model.parkedFolders, id: \.id) { folder in
+                    HStack(spacing: 7) {
+                        Image(systemName: "folder").foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(displayPath(folder.path)).font(.caption.weight(.medium)).lineLimit(1)
+                            Text("\(discoveredCount(in: folder, from: model.projects)) discovered projects").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Menu {
+                            Button("Remove Workspace Folder…", systemImage: "minus.circle") { Task { await model.removeParkedFolder(folder) } }
+                                .disabled(model.relationshipMutationInFlight)
+                        } label: { Image(systemName: "ellipsis").foregroundStyle(.secondary) }.menuStyle(.borderlessButton)
+                            .accessibilityLabel("Actions for \(displayPath(folder.path))")
+                    }
+                    .padding(.horizontal, 11).padding(.vertical, 7)
+                }
+                Text("LINKED PROJECTS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
+                if model.linkedProjects.isEmpty {
+                    Text(coreHasSnapshot ? "No linked projects" : "Waiting for Core").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 13).padding(.vertical, 8)
+                }
+                ForEach(model.linkedProjects, id: \.path) { project in
+                    Button { selectedPath = project.path } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(project.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(1)
+                            Text([project.detectedFramework, displayPath(project.path)].compactMap { $0 }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                        .background(selectedPath == project.path ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                        .contentShape(Rectangle())
+                    }.buttonStyle(.plain).padding(.horizontal, 7)
+                        .accessibilityAddTraits(selectedPath == project.path ? .isSelected : [])
+                }
+            }.padding(.bottom, 14)
+        }
+    }
+
+    private func selectFirstProjectIfNeeded() {
+        if !model.linkedProjects.contains(where: { $0.path == selectedPath }) { selectedPath = model.linkedProjects.first?.path }
+    }
+}
+
+private struct ProjectSelectedDetail: View {
+    let project: ProjectWire
+    let model: AppModel
+    @State private var confirmUnlink = false
+
+    private var report: ProjectEnvironmentReport? { model.projectReports.first { $0.identity.path == project.path } }
+    private var routes: [RouteIntent]? { routesForProject(project, report: report, configured: model.configuredRoutes) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 17) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(project.name).font(.title2.weight(.semibold))
+                    Text(displayPath(project.path)).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Spacer()
+                Menu {
+                    Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { confirmUnlink = true }
+                        .disabled(model.relationshipMutationInFlight)
+                } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }.menuStyle(.borderlessButton).accessibilityLabel("Project actions")
+                Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }.disabled(!model.canOpenProjectFolder(project))
+            }
+            HStack(spacing: 10) {
+                projectMetric("Runtime", projectPHPText, report == nil ? "Checking with Core" : (model.phpCatalogReadPending ? "Checking runtime catalog" : projectPHPMode))
+                projectMetric("Site", projectRouteValue, projectRouteDetail)
+                projectMetric("Database", report?.observed.mysql?.selectedVersion.map { "MySQL \($0)" } ?? "MySQL", report?.observed.mysql?.state.rawValue ?? "Checking")
+            }
+            SettingsInsetCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Project actions").font(.headline)
+                    HStack(spacing: 8) {
+                        if let routes, routes.count == 1, let route = routes.first {
+                            Button("Open Site", systemImage: "safari") { model.openProjectRoute(route) }.disabled(route.route.hostname.isEmpty)
+                        } else if let routes, routes.count > 1 {
+                            Menu {
+                                ForEach(Array(routes.enumerated()), id: \.element.route.id) { _, item in
+                                    Button(item.route.hostname, systemImage: item.route.tls == .local ? "lock.fill" : "globe") { model.openProjectRoute(item) }
+                                }
+                            } label: { Label("Open Site", systemImage: "safari") }
+                        }
+                        Button("Open in Editor", systemImage: "curlybraces") { model.openProjectInEditor(project) }.disabled(!model.canOpenProjectFolder(project))
+                        if let report {
+                            let action = model.tablePlusAction(report)
+                            Button("Open Database", systemImage: "cylinder.split.1x2") { model.openProjectDatabaseInTablePlus(report) }.disabled(!action.isEnabled).help(action.reason)
+                        }
+                        Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
+                    }.buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+            VStack(alignment: .leading, spacing: 9) {
+                HStack { Text("Project PHP").font(.headline); Spacer(); ProjectPHPMenu(project: project, report: report, model: model) }
+                Text("This runtime choice applies to this project only. Other projects keep their own override or inherit the shared default.").font(.caption).foregroundStyle(.secondary)
+            }.padding(.vertical, 3)
+            if let report {
+                SettingsInsetCard {
+                    VStack(alignment: .leading, spacing: 9) {
+                        Text("Project environment").font(.headline)
+                        projectFact("Framework", project.detectedFramework ?? "Not detected")
+                        projectFact("Availability", project.availability)
+                        projectFact("PHP", projectPHPText)
+                        projectFact("MySQL", report.observed.mysql.map { "\($0.state.rawValue) · \($0.selectedVersion ?? "version unavailable")" } ?? "Status unavailable")
+                        if let routeError = model.configuredRoutesError { projectFact("Routes", "Unavailable · \(routeError)") }
+                        else { projectFact("Routes", routes?.map { $0.route.hostname }.joined(separator: ", ") ?? "No configured route") }
+                    }
+                }
+            } else {
+                HStack(spacing: 8) { ProgressView().controlSize(.small); Text(model.projectReportErrors[project.path] ?? "Checking project details with Core…").font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+        .confirmationDialog("Unlink \(project.name)?", isPresented: $confirmUnlink, titleVisibility: .visible) {
+            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }
+            Button("Cancel", role: .cancel) { }
+        } message: { Text("This removes Vaelen’s link only. The project folder, files, databases, and services are not deleted.") }
+    }
+
+    private var projectPHPText: String {
+        guard let php = report?.observed.php else { return "Checking" }
+        if let version = php.resolvedVersion { return "PHP \(version)" }
+        if let override = php.overrideVersion { return "PHP \(override) unavailable" }
+        return "Unavailable"
+    }
+    private var projectPHPMode: String { report?.observed.php.overrideVersion == nil ? "Uses shared default" : "Project override" }
+    private var projectRouteValue: String {
+        guard let routes else { return model.configuredRoutesError == nil ? "Checking" : "Unavailable" }
+        return routes.first?.route.hostname ?? "No route"
+    }
+    private var projectRouteDetail: String {
+        guard let routes else { return model.configuredRoutesError == nil ? "Checking routes" : "Route state unavailable" }
+        return routes.isEmpty ? "Not configured" : "Local route"
+    }
+    private func projectMetric(_ title: String, _ value: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) { Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary); Text(value).font(.subheadline.weight(.medium)).lineLimit(1); Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+            .frame(maxWidth: .infinity, alignment: .leading).padding(12).background(Color(nsColor: .controlBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+    }
+    private func projectFact(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) { Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 92, alignment: .leading); Text(value).font(.caption).textSelection(.enabled); Spacer(minLength: 0) }
     }
 }
 
@@ -655,6 +941,7 @@ private struct SettingsContent<Content: View>: View {
                 content
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 32)
             .padding(24)
         }
     }
@@ -678,6 +965,8 @@ private struct SettingsGroup<Content: View>: View {
             if let footer { Text(footer).font(.caption).foregroundStyle(.secondary).padding(.top, VaelenUI.spacing6) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -712,6 +1001,7 @@ private struct WorkspaceFolderRow: View {
 private struct ExplicitProjectRow: View {
     let project: ProjectWire
     let model: AppModel
+    @State private var showUnlinkConfirmation = false
 
     var body: some View {
         let report = model.projectReports.first { $0.identity.path == project.path }
@@ -735,11 +1025,33 @@ private struct ExplicitProjectRow: View {
                         .help(model.configuredRoutesError ?? "Vaelen could not read configured routes.")
                 }
                 projectPHPSummary(report)
+                HStack(spacing: 12) {
+                    if let routes, routes.count == 1, let route = routes.first {
+                        Button("Open Site", systemImage: "safari") { model.openProjectRoute(route) }.buttonStyle(.borderless)
+                    } else if let routes, routes.count > 1 {
+                        Menu {
+                            ForEach(Array(routes.enumerated()), id: \.element.route.id) { _, route in
+                                Button(route.route.hostname, systemImage: route.route.tls == .local ? "lock.fill" : "globe") { model.openProjectRoute(route) }
+                            }
+                        } label: { Label("Open Site", systemImage: "safari") }.menuStyle(.borderlessButton)
+                    }
+                    Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }
+                        .disabled(!model.canOpenProjectFolder(project))
+                    Button("Open in Editor", systemImage: "curlybraces") { model.openProjectInEditor(project) }
+                        .disabled(!model.canOpenProjectFolder(project))
+                    if let report {
+                        let action = model.tablePlusAction(report)
+                        Button("TablePlus", systemImage: "cylinder.split.1x2") { model.openProjectDatabaseInTablePlus(report) }
+                            .disabled(!action.isEnabled).help(action.reason)
+                    }
+                    Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
+                }
+                .buttonStyle(.borderless).controlSize(.small)
             }
             Spacer()
             ProjectPHPMenu(project: project, report: report, model: model)
             Menu {
-                Button("Unlink Project", systemImage: "link.badge.minus") { Task { await model.unlinkProject(project) } }
+                Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { showUnlinkConfirmation = true }
                     .disabled(model.relationshipMutationInFlight)
             } label: {
                 Image(systemName: "ellipsis").frame(width: 24, height: 24)
@@ -749,6 +1061,12 @@ private struct ExplicitProjectRow: View {
         }
         .padding(.vertical, VaelenUI.spacing6)
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+        .confirmationDialog("Unlink \(project.name)?", isPresented: $showUnlinkConfirmation, titleVisibility: .visible) {
+            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This removes Vaelen’s link only. The project folder, files, databases, and services are not deleted.")
+        }
     }
 
     @ViewBuilder

@@ -25,8 +25,10 @@ final class AppModel {
     private(set) var projectReportErrors: [String: String] = [:]
     private(set) var projectStartupMilestones: [String: TimeInterval] = [:]
     private(set) var phpCatalog: PHPRuntimeCatalog?
+    private(set) var phpCatalogReadPending = false
     private(set) var phpConfiguration: PHPConfigurationResult?
     private(set) var phpConfigurationError: String?
+    private(set) var phpConfigurationReadPending = false
     private(set) var phpConfigurationSaving = false
     private(set) var phpOperation: PHPOperationState?
     private(set) var phpError: String?
@@ -58,8 +60,8 @@ final class AppModel {
     private var pendingServiceReads = Set<String>()
     private var projectReportsTask: Task<Void, Never>?
     private var projectSettingsVisible = false
-    private var projectSettingsRefreshTask: Task<Void, Never>?
     private var projectRelationshipsRefreshInFlight = false
+    private var projectRelationshipsRefreshRequested = false
     private(set) var projectRelationshipsRefreshError: String?
 
     var savedServiceIntents: Set<String>? {
@@ -91,6 +93,7 @@ final class AppModel {
         refreshInFlight = true
         defer {
             refreshInFlight = false
+            phpCatalogReadPending = false
             if refreshRequested {
                 refreshRequested = false
                 Task { @MainActor [weak self] in await self?.refresh() }
@@ -191,6 +194,8 @@ final class AppModel {
             }
             // Core connectivity itself is enough to leave Connecting. Service
             // probes and all project/catalog work may finish afterward.
+            pendingServiceReads.formUnion(["PHP", "routing", "DNS", "TLS", "standard-ports", "MySQL", "Mailpit"])
+            phpCatalogReadPending = true
             state = .running(status, projects, cachedPHP, cachedRouting, cachedDNS, cachedTLS, cachedPorts, cachedMySQL, cachedMailpit)
 
             // Service reads use independent IPC connections; each connection
@@ -225,6 +230,7 @@ final class AppModel {
                 configuredRoutesError = error.localizedDescription
             }
             let phpCatalog = try? await client.phpCatalog()
+            phpCatalogReadPending = false
             let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
             self.configuredRoutes = configuredRoutes
@@ -238,6 +244,7 @@ final class AppModel {
             self.phpOperation = phpOperation
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
             refreshError = nil
+            if self.phpConfiguration == nil { await refreshPHPConfiguration() }
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
@@ -562,9 +569,11 @@ final class AppModel {
     func installMySQL() async { await performServiceCommand("Installing MySQL…") { client in _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion) } }
     func startMySQL() async { await performServiceCommand("Starting MySQL…") { client in let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart() } }
     func stopMySQL() async { await performServiceCommand("Stopping MySQL…") { client in _ = try await client.mysqlStop() } }
+    func removeMySQL(_ version: String) async { await performServiceCommand("Removing MySQL package…") { client in _ = try await client.mysqlRemove(version) } }
     func installMailpit() async { await performServiceCommand("Installing Mailpit…") { client in _ = try await client.mailpitInstall(MailpitModule.defaultVersion) } }
     func startMailpit() async { await performServiceCommand("Starting Mailpit…") { client in _ = try await client.mailpitStart() } }
     func stopMailpit() async { await performServiceCommand("Stopping Mailpit…") { client in _ = try await client.mailpitStop() } }
+    func removeMailpit(_ version: String) async { await performServiceCommand("Removing Mailpit package…") { client in _ = try await client.mailpitRemove(version) } }
     func openMailpit() async { guard beginServiceOperation("Opening Mailpit…"), let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
     func startRouting() async { await performServiceCommand("Starting Caddy…") { client in _ = try await client.routingStart() } }
     func stopRouting() async { await performServiceCommand("Stopping Caddy…") { client in _ = try await client.routingStop() } }
@@ -586,7 +595,18 @@ final class AppModel {
     }
 
     func refreshPHPConfiguration() async {
-        guard let client else { phpConfigurationError = "Vaelen Core is not connected."; return }
+        guard let client else {
+            if case .connecting = state {
+                phpConfigurationReadPending = true
+                phpConfigurationError = nil
+            } else {
+                phpConfigurationReadPending = false
+                phpConfigurationError = "Vaelen Core is not connected."
+            }
+            return
+        }
+        phpConfigurationReadPending = true
+        defer { phpConfigurationReadPending = false }
         do { phpConfiguration = try await client.phpConfiguration(); phpConfigurationError = nil }
         catch { phpConfigurationError = error.localizedDescription }
     }
@@ -725,45 +745,65 @@ final class AppModel {
     }
 
     func parkFolder(at path: String) async {
-        guard beginRelationshipMutation("Adding workspace folder…"), let client else { return }
+        guard beginRelationshipMutation("Adding workspace folder…") else { return }
+        let commandClient = makeCoreClient()
         do {
-            _ = try await client.park(path: path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            try await commandClient.connect()
+            _ = try await commandClient.park(path: path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            try await reconcileProjectRelationships(using: commandClient)
+            await commandClient.disconnect()
             finishRelationshipMutation()
-            await refresh()
+            Task { await refresh() }
         } catch {
+            await commandClient.disconnect()
             finishRelationshipMutation(error: error)
         }
     }
 
     func removeParkedFolder(_ folder: ParkedPathWire) async {
-        guard beginRelationshipMutation("Removing workspace folder…"), let client else { return }
+        guard beginRelationshipMutation("Removing workspace folder…") else { return }
+        let commandClient = makeCoreClient()
         do {
-            try await client.unpark(path: folder.path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            try await commandClient.connect()
+            try await commandClient.unpark(path: folder.path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            try await reconcileProjectRelationships(using: commandClient)
+            await commandClient.disconnect()
             finishRelationshipMutation()
-            await refresh()
+            Task { await refresh() }
         } catch {
+            await commandClient.disconnect()
             finishRelationshipMutation(error: error)
         }
     }
 
     func linkProject(at path: String) async {
-        guard beginRelationshipMutation("Linking project…"), let client else { return }
+        guard beginRelationshipMutation("Linking project…") else { return }
+        let commandClient = makeCoreClient()
         do {
-            _ = try await client.link(path: path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path, name: nil)
+            try await commandClient.connect()
+            _ = try await commandClient.link(path: path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path, name: nil)
+            try await reconcileProjectRelationships(using: commandClient)
+            await commandClient.disconnect()
             finishRelationshipMutation()
-            await refresh()
+            Task { await refresh() }
         } catch {
+            await commandClient.disconnect()
             finishRelationshipMutation(error: error)
         }
     }
 
     func unlinkProject(_ project: ProjectWire) async {
-        guard beginRelationshipMutation("Unlinking project…"), let client else { return }
+        guard beginRelationshipMutation("Unlinking project…") else { return }
+        let commandClient = makeCoreClient()
         do {
-            try await client.unlink(path: project.path, name: nil, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            try await commandClient.connect()
+            try await commandClient.unlink(path: project.path, name: nil, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            try await reconcileProjectRelationships(using: commandClient)
+            await commandClient.disconnect()
             finishRelationshipMutation()
-            await refresh()
+            Task { await refresh() }
         } catch {
+            await commandClient.disconnect()
             finishRelationshipMutation(error: error)
         }
     }
@@ -784,39 +824,46 @@ final class AppModel {
     func setProjectSettingsVisible(_ visible: Bool) {
         guard projectSettingsVisible != visible else { return }
         projectSettingsVisible = visible
-        if !visible {
+        if visible { Task { await refreshProjectRelationships() } }
+        else {
             relationshipSnapshotGeneration += 1
-            projectSettingsRefreshTask?.cancel()
-            projectSettingsRefreshTask = nil
-            return
-        }
-
-        projectSettingsRefreshTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled && self.projectSettingsVisible {
-                await self.refreshProjectRelationships()
-                do { try await Task.sleep(for: .seconds(3)) }
-                catch { return }
-            }
+            projectRelationshipsRefreshRequested = false
         }
     }
 
+    func refreshProjectRelationshipsIfVisible() async {
+        guard projectSettingsVisible else { return }
+        await refreshProjectRelationships()
+    }
+
     private func refreshProjectRelationships() async {
-        guard projectSettingsVisible, !relationshipMutationInFlight,
-              !projectRelationshipsRefreshInFlight else { return }
+        guard !relationshipMutationInFlight else { return }
+        if projectRelationshipsRefreshInFlight {
+            projectRelationshipsRefreshRequested = true
+            return
+        }
         projectRelationshipsRefreshInFlight = true
+        defer {
+            projectRelationshipsRefreshInFlight = false
+            if projectRelationshipsRefreshRequested && projectSettingsVisible {
+                projectRelationshipsRefreshRequested = false
+                Task { await refreshProjectRelationships() }
+            }
+        }
         relationshipSnapshotGeneration += 1
         let generation = relationshipSnapshotGeneration
         let refreshClient = makeCoreClient()
         do {
             try await refreshClient.connect()
+            let projects = try await refreshClient.projectList()
             let linked = try await refreshClient.linkedProjects()
             let parked = try await refreshClient.parkedPaths()
-            guard generation == relationshipSnapshotGeneration,
-                  projectSettingsVisible, !relationshipMutationInFlight else {
+            guard generation == relationshipSnapshotGeneration, !relationshipMutationInFlight else {
                 await refreshClient.disconnect()
-                projectRelationshipsRefreshInFlight = false
                 return
+            }
+            if case .running(let status, _, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state {
+                state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
             }
             linkedProjects = linked
             parkedFolders = parked
@@ -824,11 +871,23 @@ final class AppModel {
             await refreshClient.disconnect()
         } catch {
             await refreshClient.disconnect()
-            if generation == relationshipSnapshotGeneration && projectSettingsVisible {
+            if generation == relationshipSnapshotGeneration {
                 projectRelationshipsRefreshError = error.localizedDescription
             }
         }
-        projectRelationshipsRefreshInFlight = false
+    }
+
+    private func reconcileProjectRelationships(using client: VaelenCoreClient) async throws {
+        let projects = try await client.projectList()
+        let linked = try await client.linkedProjects()
+        let parked = try await client.parkedPaths()
+        relationshipSnapshotGeneration += 1
+        linkedProjects = linked
+        parkedFolders = parked
+        projectRelationshipsRefreshError = nil
+        if case .running(let status, _, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state {
+            state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
+        }
     }
 
     func quitVaelen() async {
@@ -908,14 +967,6 @@ final class AppModel {
 
     private func beginRelationshipMutation(_ operation: String) -> Bool {
         guard !relationshipMutationInFlight else { return false }
-        guard !refreshInFlight else {
-            relationshipError = "Please wait for Vaelen to finish refreshing."
-            return false
-        }
-        guard client != nil else {
-            relationshipError = "Vaelen Core is unavailable."
-            return false
-        }
         relationshipError = nil
         relationshipSnapshotGeneration += 1
         relationshipOperation = operation

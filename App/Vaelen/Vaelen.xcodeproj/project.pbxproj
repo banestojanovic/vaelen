@@ -20,6 +20,8 @@
 		A00000000000000000000026 /* ProjectsViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000027 /* ProjectsViews.swift */; };
 		A00000000000000000000028 /* ServicesViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000029 /* ServicesViews.swift */; };
 		A0000000000000000000002A /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002B /* AppModel.swift */; };
+		B00000000000000000000001 /* SettingsNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* SettingsNavigation.swift */; };
+		B00000000000000000000005 /* ServiceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000006 /* ServiceSettingsView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +38,8 @@
 		A00000000000000000000027 /* ProjectsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectsViews.swift; sourceTree = "<group>"; };
 		A00000000000000000000029 /* ServicesViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServicesViews.swift; sourceTree = "<group>"; };
 		A0000000000000000000002B /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		B00000000000000000000002 /* SettingsNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsNavigation.swift; sourceTree = "<group>"; };
+		B00000000000000000000006 /* ServiceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceSettingsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -66,6 +70,8 @@
 				A00000000000000000000027 /* ProjectsViews.swift */,
 				A00000000000000000000029 /* ServicesViews.swift */,
 				A0000000000000000000002B /* AppModel.swift */,
+				B00000000000000000000002 /* SettingsNavigation.swift */,
+				B00000000000000000000006 /* ServiceSettingsView.swift */,
 				A00000000000000000000018 /* CoreProcessManager.swift */,
 				A00000000000000000000043 /* Brand */,
 				A00000000000000000000017 /* Assets.xcassets */,
@@ -198,7 +204,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A00000000000000000000030 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ( A00000000000000000000001 /* VaelenApp.swift in Sources */, A00000000000000000000008 /* CoreProcessManager.swift in Sources */, A00000000000000000000024 /* PopoverViews.swift in Sources */, A00000000000000000000026 /* ProjectsViews.swift in Sources */, A00000000000000000000028 /* ServicesViews.swift in Sources */, A0000000000000000000002A /* AppModel.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000030 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ( A00000000000000000000001 /* VaelenApp.swift in Sources */, A00000000000000000000008 /* CoreProcessManager.swift in Sources */, A00000000000000000000024 /* PopoverViews.swift in Sources */, A00000000000000000000026 /* ProjectsViews.swift in Sources */, A00000000000000000000028 /* ServicesViews.swift in Sources */, A0000000000000000000002A /* AppModel.swift in Sources */, B00000000000000000000001 /* SettingsNavigation.swift in Sources */, B00000000000000000000005 /* ServiceSettingsView.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
