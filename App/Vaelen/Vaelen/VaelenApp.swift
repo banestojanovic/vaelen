@@ -9,7 +9,7 @@ import VaelenCore
 
 @main
 struct VaelenApp: App {
-    @State private var model = AppModel()
+    @State private var model = AppModel.modelForApplicationLaunch(arguments: ProcessInfo.processInfo.arguments)
     @NSApplicationDelegateAdaptor(VaelenAppDelegate.self) private var appDelegate
 
     var body: some Scene {
@@ -19,14 +19,15 @@ struct VaelenApp: App {
             Image(nsImage: VaelenBrand.menuBarImage)
                 .accessibilityLabel("Vaelen")
                 .onAppear {
-                    model.startMonitoring()
+                    if !model.isSettingsFixture { model.startMonitoring() }
                     appDelegate.requestQuit = { Task { await model.quitVaelen() } }
                 }
         }
         .menuBarExtraStyle(.window)
 
         Window("Settings", id: "settings") {
-            SettingsView(model: model)
+            SettingsView(model: model, initialPage: model.settingsFixturePage ?? .services)
+                .preferredColorScheme(model.settingsFixtureDark ? .dark : model.settingsFixtureLight ? .light : nil)
         }
         .defaultSize(width: 1_060, height: 720)
         .windowResizability(.contentMinSize)
@@ -225,7 +226,7 @@ struct PHPSettingsView: View {
     private var catalog: PHPRuntimeCatalog? { model.phpCatalog }
     private var installed: [PHPRuntimeVersion] { catalog?.installedVersions ?? [] }
     private var available: [String] {
-        guard let catalog else { return [] }
+        guard let catalog, catalog.availableVersionsKnown else { return [] }
         let installedVersions = Set(catalog.installedVersions.map(\.version))
         return catalog.availableVersions.filter { !installedVersions.contains($0) }
     }
@@ -254,13 +255,10 @@ struct PHPSettingsView: View {
             if model.phpConfiguration == nil { await model.refreshPHPConfiguration() }
             selectInitialRuntime()
         }
-        .onChange(of: model.phpCatalog?.defaultVersion) { _, _ in selectInitialRuntime() }
-        .onChange(of: model.phpCatalog?.installedVersions.map(\.version)) { _, _ in
-            if selectedItem != "shared", !selectedItem.hasPrefix("available:"), !installed.contains(where: { $0.version == selectedItem }) { selectedItem = "shared" }
-        }
+        .onChange(of: model.phpCatalog) { _, _ in catalogDidChange() }
         .confirmationDialog("Remove PHP \(removalVersion ?? "runtime")?", isPresented: Binding(get: { removalVersion != nil }, set: { if !$0 { removalVersion = nil } }), titleVisibility: .visible) {
             if let removalVersion {
-                Button("Remove", role: .destructive) { Task { await model.removePHP(removalVersion) }; self.removalVersion = nil }
+                Button("Remove", role: .destructive) { Task { await model.removePHP(removalVersion) }; self.removalVersion = nil }.settingsDestructiveTint()
                 Button("Cancel", role: .cancel) { self.removalVersion = nil }
             }
         } message: { Text("This removes the Vaelen-managed PHP runtime from this Mac. Project files are not changed.") }
@@ -269,17 +267,20 @@ struct PHPSettingsView: View {
     private var runtimeList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 3) {
-                Text("INSTALLED").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 5)
+                Text("CONFIGURATION").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 5)
                 runtimeRow("shared", title: "Shared defaults", subtitle: catalog?.defaultVersion.map { "PHP \($0) · new projects" } ?? "Default unavailable", state: !coreConnected ? (phpChecking ? .pending : .neutral) : catalog?.defaultVersion == nil ? .attention : .healthy)
+                Text(inventoryHeading("INSTALLED", count: catalog.map { $0.installedVersions.count }))
+                    .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 12).padding(.bottom, 5)
                 if installed.isEmpty {
-                    Text(catalog == nil ? "Waiting for a confirmed runtime catalog." : "No managed PHP runtimes installed.")
+                    Text(catalog == nil ? (phpChecking ? "Checking installed PHP runtimes…" : "Installed PHP runtimes unavailable.") : "No managed PHP runtimes installed.")
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
                 }
                 ForEach(installed, id: \.version) { runtime in
                     runtimeRow(runtime.version, title: "PHP \(runtime.version)", subtitle: runtimeSubtitle(runtime), state: runtimeTone(runtime))
                 }
                 Divider().padding(.horizontal, 12).padding(.vertical, 7)
-                Text("AVAILABLE").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.bottom, 5)
+                Text(inventoryHeading("AVAILABLE", count: catalog?.availableVersionsKnown == true ? available.count : nil))
+                    .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.bottom, 5)
                 if catalog == nil {
                     Text(phpChecking ? "Checking available runtimes…" : "Available versions unavailable")
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
@@ -311,7 +312,8 @@ struct PHPSettingsView: View {
                 Button("Retry", systemImage: "arrow.clockwise") { Task { await model.refreshPHPConfiguration(); await model.refresh() } }
             }
             if selectedItem == "shared" { sharedDefaultsDetail }
-            else if selectedItem.hasPrefix("available:") { availableRuntimeDetail }
+            else if selectedItem.hasPrefix("available:"), available.contains(selectedVersion ?? "") { availableRuntimeDetail }
+            else if selectedItem.hasPrefix("available:") { unavailableAvailableSelectionDetail }
             else if let runtime = installed.first(where: { $0.version == selectedItem }) { installedRuntimeDetail(runtime) }
             else if catalog == nil { unavailableCatalogDetail }
             else { sharedDefaultsDetail }
@@ -400,7 +402,7 @@ struct PHPSettingsView: View {
             Text("Install this managed PHP runtime for projects that require it. Installing does not change the shared default.").font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             SettingsInsetCard { VStack(alignment: .leading, spacing: 8) { Text("Package").font(.headline); Text("Verified package · managed by Vaelen").font(.caption).foregroundStyle(.secondary); Text("Data and configuration are preserved independently of package installation.").font(.caption).foregroundStyle(.secondary) } }
             Button("Install PHP \(version)", systemImage: "arrow.down.circle.fill") { Task { await model.installPHP(version) } }
-            .buttonStyle(.borderedProminent).disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+            .buttonStyle(.borderedProminent).tint(.accentColor).disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
             if !coreConnected || phpChecking { Text(phpChecking ? "Checking Core before enabling package actions…" : "Core must confirm current runtime state before installation.").font(.caption).foregroundStyle(.secondary) }
         }
     }
@@ -413,6 +415,17 @@ struct PHPSettingsView: View {
                 .font(.subheadline).foregroundStyle(.secondary)
             if phpChecking { ProgressView().controlSize(.small) }
             else { Button("Retry PHP Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } } }
+        }.padding(.top, 8)
+    }
+
+    private var unavailableAvailableSelectionDetail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(catalog?.availableVersionsKnown == false || phpChecking ? "Checking available PHP versions…" : "Available PHP versions unavailable", systemImage: phpChecking ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle")
+                .font(.title3.weight(.semibold)).foregroundStyle(phpChecking ? Color.secondary : Color.orange)
+            Text("Core has not confirmed this version as installable. No package action is offered until the catalog is refreshed.")
+                .font(.subheadline).foregroundStyle(.secondary)
+            if phpChecking { ProgressView().controlSize(.small) }
+            else { Button("Refresh PHP Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } } }
         }.padding(.top, 8)
     }
 
@@ -464,7 +477,7 @@ struct PHPSettingsView: View {
             }
             if runtime.running == false && !runtime.isDefault {
                 Button("Remove Runtime…", systemImage: "trash", role: .destructive) { removalVersion = runtime.version }
-                    .disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+                    .settingsDestructiveTint().disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
             }
             Spacer()
         }
@@ -479,6 +492,34 @@ struct PHPSettingsView: View {
         guard !didSelectInitialRuntime, let catalog else { return }
         selectedItem = catalog.defaultVersion ?? catalog.installedVersions.first?.version ?? "shared"
         didSelectInitialRuntime = true
+    }
+
+    private func catalogDidChange() {
+        guard let catalog else { return }
+        if !didSelectInitialRuntime {
+            selectInitialRuntime()
+            return
+        }
+        if selectedItem == "shared" { return }
+        if selectedItem.hasPrefix("available:") {
+            let version = String(selectedItem.dropFirst("available:".count))
+            if installed.contains(where: { $0.version == version }) { selectedItem = version }
+            else if catalog.availableVersionsKnown && !available.contains(version) { selectedItem = "shared" }
+        } else if !installed.contains(where: { $0.version == selectedItem }) {
+            if available.contains(selectedItem) { selectedItem = "available:\(selectedItem)" }
+            else if catalog.availableVersionsKnown { selectedItem = "shared" }
+        }
+    }
+
+    private func inventoryHeading(_ title: String, count: Int?) -> String {
+        if phpInventoryPending { return "\(title) (Checking…)" }
+        if let count { return "\(title) (\(count))" }
+        return "\(title) (Unknown)"
+    }
+
+    private var phpInventoryPending: Bool {
+        if case .connecting = model.state { return true }
+        return model.phpCatalogReadPending || model.isServiceReadPending("PHP")
     }
 
     private func runtimeRow(_ key: String, title: String, subtitle: String, state: SettingsStateBadge.Tone) -> some View {
@@ -680,6 +721,7 @@ private struct PHPVersionRow: View {
                     Button("Remove PHP \(runtime.version)", systemImage: "trash", role: .destructive) {
                         showRemovalConfirmation = true
                     }
+                    .settingsDestructiveTint()
                     .accessibilityLabel("Remove PHP \(runtime.version)")
                 } label: {
                     Image(systemName: "ellipsis")
@@ -696,7 +738,7 @@ private struct PHPVersionRow: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("PHP \(runtime.version)")
         .confirmationDialog("Remove PHP \(runtime.version)?", isPresented: $showRemovalConfirmation, titleVisibility: .visible) {
-            Button("Remove", role: .destructive) { Task { await model.removePHP(runtime.version) } }
+            Button("Remove", role: .destructive) { Task { await model.removePHP(runtime.version) } }.settingsDestructiveTint()
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("This removes the Vaelen-managed PHP runtime from this Mac. Project files are not changed.")
@@ -782,7 +824,8 @@ struct ProjectSettingsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("WORKSPACE FOLDERS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
                 if model.parkedFolders.isEmpty {
-                    Text(coreHasSnapshot ? "No folders added" : "Checking folders…").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 13).padding(.vertical, 8)
+                    Text(coreHasSnapshot ? "No folders added" : coreConnecting ? "Checking folders…" : "Workspace folders unavailable")
+                        .font(.caption).foregroundStyle(coreHasSnapshot || coreConnecting ? Color.secondary : Color.orange).padding(.horizontal, 13).padding(.vertical, 8)
                 }
                 ForEach(model.parkedFolders, id: \.id) { folder in
                     HStack(spacing: 7) {
@@ -793,8 +836,8 @@ struct ProjectSettingsView: View {
                         }
                         Spacer(minLength: 0)
                         Menu {
-                            Button("Remove Workspace Folder…", systemImage: "minus.circle") { Task { await model.removeParkedFolder(folder) } }
-                                .disabled(model.relationshipMutationInFlight)
+                            Button("Remove Workspace Folder…", systemImage: "minus.circle", role: .destructive) { Task { await model.removeParkedFolder(folder) } }
+                                .settingsDestructiveTint().disabled(model.relationshipMutationInFlight)
                         } label: { Image(systemName: "ellipsis").foregroundStyle(.secondary) }.menuStyle(.borderlessButton)
                             .accessibilityLabel("Actions for \(displayPath(folder.path))")
                     }
@@ -802,7 +845,8 @@ struct ProjectSettingsView: View {
                 }
                 Text("LINKED PROJECTS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
                 if model.linkedProjects.isEmpty {
-                    Text(coreHasSnapshot ? "No linked projects" : "Waiting for Core").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 13).padding(.vertical, 8)
+                    Text(coreHasSnapshot ? "No linked projects" : coreConnecting ? "Waiting for Core…" : "Linked project state unavailable")
+                        .font(.caption).foregroundStyle(coreHasSnapshot || coreConnecting ? Color.secondary : Color.orange).padding(.horizontal, 13).padding(.vertical, 8)
                 }
                 ForEach(model.linkedProjects, id: \.path) { project in
                     Button { selectedPath = project.path } label: {
@@ -842,7 +886,7 @@ private struct ProjectSelectedDetail: View {
                 }
                 Spacer()
                 Menu {
-                    Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { confirmUnlink = true }
+                    Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { confirmUnlink = true }.settingsDestructiveTint()
                         .disabled(model.relationshipMutationInFlight)
                 } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }.menuStyle(.borderlessButton).accessibilityLabel("Project actions")
                 Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }.disabled(!model.canOpenProjectFolder(project))
@@ -895,7 +939,7 @@ private struct ProjectSelectedDetail: View {
             }
         }
         .confirmationDialog("Unlink \(project.name)?", isPresented: $confirmUnlink, titleVisibility: .visible) {
-            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }
+            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint()
             Button("Cancel", role: .cancel) { }
         } message: { Text("This removes Vaelen’s link only. The project folder, files, databases, and services are not deleted.") }
     }
@@ -987,8 +1031,8 @@ private struct WorkspaceFolderRow: View {
             }
             Spacer()
             Menu {
-                Button("Remove Workspace Folder", systemImage: "minus.circle") { Task { await model.removeParkedFolder(folder) } }
-                    .disabled(model.relationshipMutationInFlight)
+                Button("Remove Workspace Folder", systemImage: "minus.circle", role: .destructive) { Task { await model.removeParkedFolder(folder) } }
+                    .settingsDestructiveTint().disabled(model.relationshipMutationInFlight)
             } label: {
                 Image(systemName: "ellipsis").frame(width: 24, height: 24)
             }
@@ -1053,7 +1097,7 @@ private struct ExplicitProjectRow: View {
             Spacer()
             ProjectPHPMenu(project: project, report: report, model: model)
             Menu {
-                Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { showUnlinkConfirmation = true }
+                Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { showUnlinkConfirmation = true }.settingsDestructiveTint()
                     .disabled(model.relationshipMutationInFlight)
             } label: {
                 Image(systemName: "ellipsis").frame(width: 24, height: 24)
@@ -1064,7 +1108,7 @@ private struct ExplicitProjectRow: View {
         .padding(.vertical, VaelenUI.spacing6)
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
         .confirmationDialog("Unlink \(project.name)?", isPresented: $showUnlinkConfirmation, titleVisibility: .visible) {
-            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }
+            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint()
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("This removes Vaelen’s link only. The project folder, files, databases, and services are not deleted.")

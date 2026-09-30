@@ -41,20 +41,28 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 1_000, idealWidth: 1_060, minHeight: 640, idealHeight: 720)
+        .overlay(alignment: .bottomTrailing) {
+            if let fixture = model.settingsFixtureMode {
+                Text("UI fixture · \(fixture)").font(.caption2.weight(.medium)).padding(6)
+                    .background(.ultraThinMaterial, in: Capsule()).padding(10).accessibilityIdentifier("settings-fixture-indicator")
+            }
+        }
         .onAppear {
-            model.startMonitoring()
-            model.setProjectSettingsVisible(true)
+            if !model.isSettingsFixture {
+                model.startMonitoring()
+                model.setProjectSettingsVisible(true)
+            }
             DispatchQueue.main.async { SettingsWindowActivation.bringForward() }
         }
         .onDisappear {
-            model.setProjectSettingsVisible(false)
+            if !model.isSettingsFixture { model.setProjectSettingsVisible(false) }
             SettingsWindowActivation.restoreMenuBarOnlyActivation()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window.isVisible,
                   (window.title.localizedCaseInsensitiveContains("Settings") || window.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true) else { return }
-            Task { await model.refreshProjectRelationshipsIfVisible() }
+            if !model.isSettingsFixture { Task { await model.refreshProjectRelationshipsIfVisible() } }
         }
     }
 
@@ -129,6 +137,16 @@ struct SettingsStateDot: View {
         case .neutral: Color.secondary.opacity(0.7)
         }
     }
+}
+
+/// Explicit red tint keeps native button roles and disabled/accessibility
+/// behavior while making destructive Settings actions visible in macOS.
+struct SettingsDestructiveTint: ViewModifier {
+    func body(content: Content) -> some View { content.tint(.red) }
+}
+
+extension View {
+    func settingsDestructiveTint() -> some View { modifier(SettingsDestructiveTint()) }
 }
 
 struct SettingsInsetCard<Content: View>: View {

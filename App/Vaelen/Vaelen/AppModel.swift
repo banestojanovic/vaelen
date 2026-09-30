@@ -63,6 +63,81 @@ final class AppModel {
     private var projectRelationshipsRefreshInFlight = false
     private var projectRelationshipsRefreshRequested = false
     private(set) var projectRelationshipsRefreshError: String?
+    private(set) var isSettingsFixture = false
+    private(set) var settingsFixtureDark = false
+    private(set) var settingsFixtureLight = false
+    private(set) var settingsFixtureMode: String?
+    private(set) var settingsFixturePage: SettingsPage?
+    private(set) var settingsFixtureOperationFailure = false
+
+    static func modelForApplicationLaunch(arguments: [String]) -> AppModel {
+        #if VAELEN_SETTINGS_FIXTURES
+        if let argument = arguments.first(where: { $0.hasPrefix("--settings-fixture=") }) {
+            let mode = String(argument.dropFirst("--settings-fixture=".count))
+            let model = AppModel()
+            model.isSettingsFixture = true
+            model.settingsFixtureMode = mode
+            model.settingsFixtureDark = arguments.contains("--settings-fixture-dark")
+            model.settingsFixtureLight = arguments.contains("--settings-fixture-light")
+            if let pageArgument = arguments.first(where: { $0.hasPrefix("--settings-page=") }) {
+                model.settingsFixturePage = SettingsPage(rawValue: String(pageArgument.dropFirst("--settings-page=".count)))
+            }
+            switch mode {
+            case "pending":
+                model.state = .connecting
+                model.pendingServiceReads = ["PHP", "routing", "DNS", "TLS", "standard-ports", "MySQL", "Mailpit"]
+                model.phpCatalogReadPending = true
+                model.phpConfigurationReadPending = true
+            case "unavailable":
+                model.state = .unavailable
+                model.coreLaunchError = "Fixture: Core observations are unavailable."
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed":
+                model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
+                let mysqlState: MySQLState = mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
+                let mysqlVersion = (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
+                let mysql = MySQLStatus(
+                    state: mysqlState,
+                    health: mysqlState == .unhealthy ? "identity-unverified" : mysqlState == .stopped ? "stopped" : "not-installed",
+                    installedVersion: mysqlVersion,
+                    selectedVersion: nil,
+                    pid: mysqlState == .unhealthy ? 4242 : nil,
+                    port: 3306,
+                    socket: "/fixture/mysql.sock",
+                    datadir: "/fixture/mysql-data",
+                    executablePath: "/fixture/mysqld"
+                )
+                let mailpitInstalled = mode == "all-installed"
+                let mailpit = MailpitStatus(
+                    state: mailpitInstalled ? .installed : .notInstalled,
+                    health: mailpitInstalled ? "stopped" : "not-installed",
+                    installedVersion: mailpitInstalled ? MailpitModule.defaultVersion : nil,
+                    pid: nil,
+                    smtpPort: 1025,
+                    httpPort: 8025,
+                    database: "/fixture/mailpit.db",
+                    uiEndpoint: "http://127.0.0.1:8025",
+                    executablePath: "/fixture/mailpit"
+                )
+                let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
+                model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
+                let runtime = PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)
+                model.phpCatalog = PHPRuntimeCatalog(
+                    availableVersions: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
+                    installedVersions: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? [runtime] : [],
+                    defaultVersion: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
+                    runningVersions: [],
+                    availableVersionsKnown: true
+                )
+                model.phpConfigurationReadPending = true
+            default:
+                model.isSettingsFixture = false
+                model.settingsFixtureMode = nil
+            }
+            return model
+        }
+        #endif
+        return AppModel()
+    }
 
     var savedServiceIntents: Set<String>? {
         guard case .running(let status, _, _, _, _, _, _, _, _) = state else { return nil }
@@ -71,6 +146,12 @@ final class AppModel {
 
     func startupIssue(for service: String) -> String? { startupServiceIssues[service] }
     func isServiceReadPending(_ service: String) -> Bool { pendingServiceReads.contains(service) }
+
+    private func updateFixturePackages(mysql: MySQLStatus? = nil, mailpit: MailpitStatus? = nil) {
+        guard isSettingsFixture,
+              case .running(let status, let projects, let php, let routing, let dns, let tls, let ports, let oldMySQL, let oldMailpit) = state else { return }
+        state = .running(status, projects, php, routing, dns, tls, ports, mysql ?? oldMySQL, mailpit ?? oldMailpit)
+    }
 
     func notePopoverPresented() {
         let count = earlyProjectList?.count ?? {
@@ -566,14 +647,46 @@ final class AppModel {
         await performServiceCommand("Stopping DNS…", service: "dns") { client in _ = try await client.dnsRemove() }
     }
 
-    func installMySQL() async { await performServiceCommand("Installing MySQL…") { client in _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion) } }
+    func installMySQL() async {
+        if isSettingsFixture {
+            if settingsFixtureOperationFailure { serviceError = "Fixture: install failed; Core inventory is unchanged."; return }
+            serviceError = nil
+            updateFixturePackages(mysql: MySQLStatus(state: .installed, health: "not-initialized", installedVersion: MySQLModule.defaultVersion, selectedVersion: nil, pid: nil, port: 3306, socket: "/fixture/mysql.sock", datadir: "/fixture/mysql-data", executablePath: "/fixture/mysqld"))
+            return
+        }
+        await performServiceCommand("Installing MySQL…") { client in _ = try await client.mysqlInstall(MySQLModule.defaultVersion); _ = try await client.mysqlUse(MySQLModule.defaultVersion) }
+    }
     func startMySQL() async { await performServiceCommand("Starting MySQL…") { client in let status = try await client.mysqlStatus(); if status.health == "not-initialized" { _ = try await client.mysqlInitialize() }; _ = try await client.mysqlStart() } }
     func stopMySQL() async { await performServiceCommand("Stopping MySQL…") { client in _ = try await client.mysqlStop() } }
-    func removeMySQL(_ version: String) async { await performServiceCommand("Removing MySQL package…") { client in _ = try await client.mysqlRemove(version) } }
-    func installMailpit() async { await performServiceCommand("Installing Mailpit…") { client in _ = try await client.mailpitInstall(MailpitModule.defaultVersion) } }
+    func removeMySQL(_ version: String) async {
+        if isSettingsFixture {
+            if settingsFixtureOperationFailure { serviceError = "Fixture: removal failed; Core inventory is unchanged."; return }
+            serviceError = nil
+            updateFixturePackages(mysql: MySQLStatus(state: .notInstalled, health: "not-installed", installedVersion: nil, selectedVersion: nil, pid: nil, port: 3306, socket: "/fixture/mysql.sock", datadir: "/fixture/mysql-data", executablePath: "/fixture/mysqld"))
+            return
+        }
+        await performServiceCommand("Removing MySQL package…") { client in _ = try await client.mysqlRemove(version) }
+    }
+    func installMailpit() async {
+        if isSettingsFixture {
+            if settingsFixtureOperationFailure { serviceError = "Fixture: install failed; Core inventory is unchanged."; return }
+            serviceError = nil
+            updateFixturePackages(mailpit: MailpitStatus(state: .installed, health: "stopped", installedVersion: MailpitModule.defaultVersion, pid: nil, smtpPort: 1025, httpPort: 8025, database: "/fixture/mailpit.db", uiEndpoint: "http://127.0.0.1:8025", executablePath: "/fixture/mailpit"))
+            return
+        }
+        await performServiceCommand("Installing Mailpit…") { client in _ = try await client.mailpitInstall(MailpitModule.defaultVersion) }
+    }
     func startMailpit() async { await performServiceCommand("Starting Mailpit…") { client in _ = try await client.mailpitStart() } }
     func stopMailpit() async { await performServiceCommand("Stopping Mailpit…") { client in _ = try await client.mailpitStop() } }
-    func removeMailpit(_ version: String) async { await performServiceCommand("Removing Mailpit package…") { client in _ = try await client.mailpitRemove(version) } }
+    func removeMailpit(_ version: String) async {
+        if isSettingsFixture {
+            if settingsFixtureOperationFailure { serviceError = "Fixture: removal failed; Core inventory is unchanged."; return }
+            serviceError = nil
+            updateFixturePackages(mailpit: MailpitStatus(state: .notInstalled, health: "not-installed", installedVersion: nil, pid: nil, smtpPort: 1025, httpPort: 8025, database: "/fixture/mailpit.db", uiEndpoint: "http://127.0.0.1:8025", executablePath: "/fixture/mailpit"))
+            return
+        }
+        await performServiceCommand("Removing Mailpit package…") { client in _ = try await client.mailpitRemove(version) }
+    }
     func openMailpit() async { guard beginServiceOperation("Opening Mailpit…"), let client else { return }; do { let status = try await client.mailpitStatus(); guard status.state == .running else { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mailpit is not healthy; start it before opening the UI."]) }; NSWorkspace.shared.open(URL(string: status.uiEndpoint)!); finishServiceOperation() } catch { finishServiceOperation(error: error.localizedDescription) } }
     func startRouting() async { await performServiceCommand("Starting Caddy…") { client in _ = try await client.routingStart() } }
     func stopRouting() async { await performServiceCommand("Stopping Caddy…") { client in _ = try await client.routingStop() } }
@@ -817,11 +930,13 @@ final class AppModel {
     }
 
     func startMonitoring() {
+        guard !isSettingsFixture else { return }
         guard monitorTask == nil else { return }
         monitorTask = Task { [weak self] in await self?.monitor() }
     }
 
     func setProjectSettingsVisible(_ visible: Bool) {
+        guard !isSettingsFixture else { return }
         guard projectSettingsVisible != visible else { return }
         projectSettingsVisible = visible
         if visible { Task { await refreshProjectRelationships() } }
@@ -837,6 +952,7 @@ final class AppModel {
     }
 
     private func refreshProjectRelationships() async {
+        guard !isSettingsFixture else { return }
         guard !relationshipMutationInFlight else { return }
         if projectRelationshipsRefreshInFlight {
             projectRelationshipsRefreshRequested = true
@@ -892,6 +1008,11 @@ final class AppModel {
 
     func quitVaelen() async {
         guard !isQuitting else { return }
+        if isSettingsFixture {
+            isQuitting = true
+            VaelenAppDelegate.shared?.terminateAfterCleanQuit()
+            return
+        }
         // These flags cover only live request/reply operations now; the slow
         // project/catalog reconciliation is not part of their lifetime.
         guard !serviceOperationIsBusy, !phpRequestInFlight, !relationshipMutationInFlight else {
@@ -975,6 +1096,11 @@ final class AppModel {
     }
 
     private func beginServiceOperation(_ operation: String) -> Bool {
+        guard !isSettingsFixture else {
+            serviceError = "This isolated Settings fixture cannot operate Vaelen Core."
+            trustError = serviceError
+            return false
+        }
         guard serviceOperation == nil else { return false }
         guard client != nil else {
             serviceError = "Vaelen Core is unavailable."
@@ -1068,6 +1194,7 @@ final class AppModel {
     }
 
     private func beginPHPRequest(version: String) -> Bool {
+        guard !isSettingsFixture else { phpError = "This isolated Settings fixture cannot operate Vaelen Core."; return false }
         guard !phpRequestInFlight else { return false }
         guard client != nil else { phpError = "Vaelen Core is unavailable."; return false }
         phpError = nil
