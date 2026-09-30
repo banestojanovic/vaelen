@@ -24,9 +24,30 @@ inventory fixtures. Install success/failure and removal success/confirmation
 were exercised in the isolated fixture. The rendered failed-removal error
 state remains **unverified**; do not claim that visual check passed.
 
-On 2026-09-30, the focused inventory suite passed (5 tests), and the full Swift
-suite completed with 0 failures and 4 skipped tests (194 cases reported across
-the Core, DNS, and CLI test targets). The integrated `dev` build passed
-`./Scripts/vaelen-dev-update` and `./Scripts/vaelen-dev smoke`; the signed
-installed embedded Core is schema 7. The failed-removal error banner remains
-unverified visually, despite fixture/test coverage of failed-operation state.
+On 2026-09-30, focused inventory tests passed: 5 XCTest methods, 0 failures.
+The complete invocation `swift test --package-path .` exited 0 after the final
+fixture-isolation commit `d26c3aa` (start 12:38:37, finish 12:41:40). Its
+per-target results, counting skipped tests separately, were:
+
+| Test target | Executed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| VaelenCoreTests | 279 | 0 | 4 |
+| VaelenIPCTests | 95 | 0 | 0 |
+| VaelenDNSTests | 6 | 0 | 0 |
+| VaelenCLITests | 93 | 0 | 0 |
+| **Total** | **473** | **0** | **4** |
+
+The earlier 194 aggregate was erroneous: it added IPC (95), DNS (6), and CLI
+(93), omitting the Core target. The preceding full-suite total of 472 included
+278 Core test outcomes (274 executed, 4 skipped); the final run has five more
+Core test outcomes because it includes `SettingsInventoryPresentationTests`.
+The final inventory class has five XCTest methods, confirmed by both focused
+logs and the full log. The earlier “six tests” figure was a count error; a
+method's multiple classification assertions are not separate XCTest methods.
+
+The four final skips were the Caddy official artifact/cosign integration, two
+MySQL lifecycle acceptance tests requiring canonical ports/processes to be
+inactive, and the PHP-FPM isolation regression requiring normal PHP-FPM to be
+stopped. The integrated `dev` build passed `./Scripts/vaelen-dev-update` and
+`./Scripts/vaelen-dev smoke`; its signed installed embedded Core is schema 7.
+The rendered failed-removal error banner remains unverified visually.
