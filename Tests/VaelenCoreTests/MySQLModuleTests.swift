@@ -135,6 +135,70 @@ final class MySQLModuleTests: XCTestCase {
         XCTAssertEqual(MySQLModule.defaultPort, 3306)
     }
 
+    func testDebugPruningRejectsSymlinkedPackageBoundariesWithoutTouchingTargets() throws {
+        enum Boundary: CaseIterable { case packagesParent, packages, package, bin }
+        for boundary in Boundary.allCases {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mysql-link-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let layout = VaelenFilesystemLayout(rootURL: root)
+            let version = MySQLManifest.official8_4_11.version
+            let packages = layout.mysqlPackagesDirectoryURL
+            let outside = root.appendingPathComponent("outside", isDirectory: true)
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+
+            let actualPackage: URL
+            switch boundary {
+            case .packagesParent:
+                try FileManager.default.createSymbolicLink(at: layout.packagesDirectoryURL, withDestinationURL: outside)
+                actualPackage = outside.appendingPathComponent("mysql/\(version)", isDirectory: true)
+            case .packages:
+                try FileManager.default.createDirectory(at: layout.packagesDirectoryURL, withIntermediateDirectories: true)
+                actualPackage = outside.appendingPathComponent(version, isDirectory: true)
+                try FileManager.default.createSymbolicLink(at: packages, withDestinationURL: outside)
+            case .package:
+                try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true)
+                actualPackage = outside.appendingPathComponent(version, isDirectory: true)
+                try FileManager.default.createSymbolicLink(at: packages.appendingPathComponent(version), withDestinationURL: actualPackage)
+            case .bin:
+                try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: packages.appendingPathComponent(version).appendingPathComponent("bin"), withIntermediateDirectories: true)
+                actualPackage = packages.appendingPathComponent(version)
+                let outsideBin = outside.appendingPathComponent("bin", isDirectory: true)
+                try FileManager.default.createDirectory(at: outsideBin, withIntermediateDirectories: true)
+                try FileManager.default.removeItem(at: actualPackage.appendingPathComponent("bin"))
+                try FileManager.default.createSymbolicLink(at: actualPackage.appendingPathComponent("bin"), withDestinationURL: outsideBin)
+            }
+            if boundary != .bin { try FileManager.default.createDirectory(at: actualPackage.appendingPathComponent("bin"), withIntermediateDirectories: true) }
+            let bin = boundary == .bin ? outside.appendingPathComponent("bin") : actualPackage.appendingPathComponent("bin")
+            for name in ["mysqld", "mysql", "mysqladmin"] {
+                let file = bin.appendingPathComponent(name)
+                try Data("fixture".utf8).write(to: file)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+            }
+            let debug = bin.appendingPathComponent("mysqld-debug")
+            try Data("external-debug".utf8).write(to: debug)
+            try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: debug.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o750], ofItemAtPath: bin.path)
+            try FileManager.default.createDirectory(at: layout.mysqlInstancesDirectoryURL, withIntermediateDirectories: true)
+            let sentinel = layout.mysqlInstancesDirectoryURL.appendingPathComponent("data-sentinel")
+            try Data("preserve-instance".utf8).write(to: sentinel)
+            let package = MySQLPackage(version: version, architecture: "arm64", packagePath: packages.appendingPathComponent(version).path,
+                serverPath: packages.appendingPathComponent("\(version)/bin/mysqld").path,
+                clientPath: packages.appendingPathComponent("\(version)/bin/mysql").path,
+                adminPath: packages.appendingPathComponent("\(version)/bin/mysqladmin").path,
+                source: MySQLManifest.official8_4_11.artifactURL.absoluteString,
+                artifactSHA256: MySQLManifest.official8_4_11.artifactSHA256,
+                signatureURL: MySQLManifest.official8_4_11.signatureURL.absoluteString, license: "GPL-2.0", installedAt: Date())
+            try JSONEncoder().encode(package).write(to: actualPackage.appendingPathComponent(".vaelen-package.json"))
+            let module = MySQLModule(layout: layout)
+            XCTAssertThrowsError(try module.install(requestedVersion: version), "boundary: \(boundary)")
+            XCTAssertEqual(try Data(contentsOf: debug), Data("external-debug".utf8), "boundary: \(boundary)")
+            XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: debug.path)[.posixPermissions] as? NSNumber)?.intValue, 0o640)
+            XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: bin.path)[.posixPermissions] as? NSNumber)?.intValue, 0o750)
+            XCTAssertEqual(try Data(contentsOf: sentinel), Data("preserve-instance".utf8))
+        }
+    }
+
     func testOfficialArchiveInitializesPersistsAndStopsCleanly() throws {
         let archive = URL(fileURLWithPath: "/var/folders/9b/1f1sf2v51_36ys9ngvlqzc8c0000gn/T/opencode/mysql-8.4.11-macos15-arm64.tar.gz")
         guard FileManager.default.fileExists(atPath: archive.path) else { throw XCTSkip("M5 artifact fixture is not available") }

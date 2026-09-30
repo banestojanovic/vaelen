@@ -583,10 +583,17 @@ public final class MySQLModule: @unchecked Sendable {
     /// manifest-verified Vaelen package, and only while MySQL is stopped.
     private func removeUnusedDebugServer(from package: MySQLPackage) throws {
         let root = layout.mysqlPackagesDirectoryURL.appendingPathComponent(package.version, isDirectory: true).standardizedFileURL
+        let packages = layout.mysqlPackagesDirectoryURL.standardizedFileURL
+        let packagesParent = layout.packagesDirectoryURL.standardizedFileURL
+        let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
         guard package.packagePath == root.path,
               package.serverPath == root.appendingPathComponent("bin/mysqld").path,
               package.clientPath == root.appendingPathComponent("bin/mysql").path,
-              package.adminPath == root.appendingPathComponent("bin/mysqladmin").path else {
+              package.adminPath == root.appendingPathComponent("bin/mysqladmin").path,
+              (try packagesParent.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true,
+              (try packages.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true,
+              (try root.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true,
+              (try binDirectory.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else {
             throw MySQLModuleError.validationFailed("MySQL package ownership could not be verified; debug binary was left intact")
         }
         let observation = status()
@@ -595,7 +602,6 @@ public final class MySQLModule: @unchecked Sendable {
         let binary = root.appendingPathComponent("bin/mysqld-debug")
         guard manager.fileExists(atPath: binary.path) else { return }
         let file = try binary.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
         guard file.isRegularFile == true, file.isSymbolicLink != true,
               binary.deletingLastPathComponent().standardizedFileURL == binDirectory.standardizedFileURL else {
             throw MySQLModuleError.validationFailed("MySQL debug binary ownership could not be verified; file was left intact")
