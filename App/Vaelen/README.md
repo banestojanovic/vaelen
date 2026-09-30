@@ -1,12 +1,25 @@
 # Vaelen.app
 
-This directory contains the native SwiftUI menu-bar application target. It is
-kept outside the Swift package executable targets because the app must be
-bundled and signed by Xcode. The app imports the local `VaelenIPC` package and
-does not own Core state. Its build phase also builds and embeds the matching
-`vaelend` executable. When Core IPC is unavailable, the app starts that
-executable, retries IPC for up to two seconds, and terminates only a Core
-process it started when the app quits.
+This directory contains Vaelen's native SwiftUI macOS menu-bar application.
+Build and sign it with the Xcode project and `Vaelen` scheme; the target
+requires macOS 14 or newer and embeds the matching `vaelend` Core. Use
+[`../../README.md`](../../README.md) for build commands, current compatibility
+versions, development install paths, harness boundaries, and the latest test
+result.
 
-Build requirements and the Xcode project are documented in the repository
-README once full Xcode is available for validation.
+The compact popover provides quick project and service operations. Deeper
+project and service configuration belongs in the native Settings window. The
+app does not own managed runtime state: Core is authoritative, and the app and
+CLI use its typed IPC (protocol v1, compatibility schema 6; SQLite schema 7).
+
+At launch, the app reuses a compatible running Core or starts its embedded
+Core when IPC is unavailable. On quit it stops only the Core process it
+started; it does not stop a Core owned by another launcher. Project and service
+state remains in Vaelen's per-user support directory across app updates.
+
+On current `dev`, an installed signed app update uses `./Scripts/vaelen-dev-update`
+from the repository root; a CLI-only update uses `./Scripts/install-cli.sh`.
+These are distinct from the historical golden-checkout-only
+`./Scripts/vaelen-dev clean-install` path. The M12 acceptance record and the
+`v0.0.14-m13-golden` runtime baseline remain historical evidence, not a
+declaration that current `dev` is frozen.
