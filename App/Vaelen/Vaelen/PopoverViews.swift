@@ -143,7 +143,8 @@ private struct HeaderServiceStatus: View {
         .font(.system(size: 11, weight: .medium))
         .lineLimit(1)
         .minimumScaleFactor(0.85)
-        .frame(width: 132, alignment: .trailing)
+        .fixedSize()
+        .frame(maxWidth: .infinity, alignment: .trailing)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -184,21 +185,9 @@ struct StatusView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .center, spacing: 8) {
-                Image(nsImage: VaelenBrand.headerMarkBlue)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 28, height: 20)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Vaelen").font(.system(.headline, weight: .bold))
-                    Text("The developer control center for macOS")
-                        .font(.system(size: 9, weight: .semibold))
-                        .tracking(0.15)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
+                sectionPicker
                 coreStatus
             }
             switch model.state {
@@ -242,27 +231,6 @@ struct StatusView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                HStack(spacing: 2) {
-                    sectionButton(.projects, title: "Projects", symbol: "folder.fill")
-                    sectionButton(.services, title: "Services", symbol: "gearshape.2.fill")
-                }
-                .padding(2)
-                .background {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(colorScheme == .light ? Color(hex: 0xF4F6F8).opacity(0.86) : Color(hex: 0x45474D).opacity(0.92))
-                        }
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.15), lineWidth: 0.7)
-                        }
-                        .shadow(color: Color.black.opacity(colorScheme == .light ? 0.035 : 0.09), radius: 2, x: 0, y: 1)
-                }
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Vaelen section")
-
                 switch selectedSection {
                 case .projects:
                     ProjectsView(projects: projects, reports: model.projectReports, model: model)
@@ -340,6 +308,30 @@ struct StatusView: View {
         }
     }
 
+    private var sectionPicker: some View {
+        HStack(spacing: 2) {
+            sectionButton(.projects, title: "Projects", symbol: "folder.fill")
+            sectionButton(.services, title: "Services", symbol: "gearshape.2.fill")
+        }
+        .padding(2)
+        .fixedSize()
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(colorScheme == .light ? Color(hex: 0xF4F6F8).opacity(0.86) : Color(hex: 0x45474D).opacity(0.92))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.15), lineWidth: 0.7)
+                }
+                .shadow(color: Color.black.opacity(colorScheme == .light ? 0.035 : 0.09), radius: 2, x: 0, y: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Vaelen section")
+    }
+
     private var popoverHeight: CGFloat {
         let visibleHeight = NSScreen.main?.visibleFrame.height ?? 900
         if needsCompactConnectionLayout {
@@ -379,9 +371,8 @@ struct StatusView: View {
         return Button { selectedSection = section } label: {
             Label(title, systemImage: symbol)
                 .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
-                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .padding(.vertical, 7)
                 .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -419,7 +410,7 @@ struct StatusView: View {
         case .connecting:
             if model.earlyProjectList == nil {
                 VaelenStatusLabel("Connecting", systemImage: "circle.dotted", tint: .secondary)
-                    .frame(width: 132, alignment: .trailing)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             } else {
                 HeaderServiceStatus(readiness: model.serviceReadiness)
             }
@@ -427,10 +418,10 @@ struct StatusView: View {
             HeaderServiceStatus(readiness: model.serviceReadiness)
         case .unavailable:
             VaelenStatusLabel("Core Unavailable", systemImage: "circle", tint: .secondary)
-                .frame(width: 132, alignment: .trailing)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         case .incompatible:
             VaelenStatusLabel("Core Incompatible", systemImage: "exclamationmark.circle", tint: .orange)
-                .frame(width: 132, alignment: .trailing)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 }
@@ -546,7 +537,7 @@ struct PopoverSectionHeading: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 11, weight: .regular))
+            .font(.system(size: 10, weight: .regular))
             .foregroundStyle(.secondary)
             .textCase(.uppercase)
             .tracking(0.45)

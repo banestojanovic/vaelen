@@ -71,7 +71,7 @@ enum VaelenBrand {
               let image = NSImage(contentsOf: url) else {
             return NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: "Vaelen") ?? NSImage()
         }
-        image.size = NSSize(width: 15.5, height: 12.5)
+        image.size = NSSize(width: 21, height: 16.8)
         image.isTemplate = true
         return image
     }()

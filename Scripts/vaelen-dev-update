@@ -51,6 +51,15 @@ process_pid_for_command() {
 [[ "$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)" == 7 ]] || die "candidate source does not declare schema v7"
 codesign --verify --deep --strict "$CANONICAL" || die "current installed app signature is invalid"
 
+# The post-update status check is part of the acceptance path. Prove the
+# currently installed stable CLI is the guarded, owned CLI before asking the
+# GUI/Core to quit; otherwise an updater failure would strand the running app.
+CLI="$SUPPORT/bin/val"
+CLI_OWNER="$SUPPORT/bin/.val.sha256"
+CLI_LINK="$HOME/.local/bin/val"
+source "$ROOT/Scripts/vaelen-dev-update-cli-preflight.sh"
+vaelen_update_cli_preflight "$CLI" "$CLI_OWNER" "$CLI_LINK" || exit 1
+
 mkdir -p "$ARTIFACTS"
 chmod 700 "$ARTIFACTS"
 mkdir "$RUN" || die "update evidence path already exists: $RUN"
