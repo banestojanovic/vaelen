@@ -163,6 +163,7 @@ final class AppModel {
     }
 
     func refresh() async {
+        guard !isSettingsFixture else { return }
         guard !relationshipMutationInFlight else {
             refreshRequested = true
             return
