@@ -24,8 +24,9 @@ inventory fixtures. Install success/failure and removal success/confirmation
 were exercised in the isolated fixture. The rendered failed-removal error
 state remains **unverified**; do not claim that visual check passed.
 
-The accepted signed candidate passed `./Scripts/vaelen-dev-update` and
-`./Scripts/vaelen-dev smoke` on 2026-09-30. Any subsequent fixture-safety source
-changes require focused and full Swift tests; if they change installed product
-content, rebuild/update/sign and smoke the integrated candidate before claiming
-the installed app matches it.
+On 2026-09-30, the focused inventory suite passed (5 tests), and the full Swift
+suite completed with 0 failures and 4 skipped tests (194 cases reported across
+the Core, DNS, and CLI test targets). The integrated `dev` build passed
+`./Scripts/vaelen-dev-update` and `./Scripts/vaelen-dev smoke`; the signed
+installed embedded Core is schema 7. The failed-removal error banner remains
+unverified visually, despite fixture/test coverage of failed-operation state.
