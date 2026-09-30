@@ -136,6 +136,13 @@ private actor ShutdownTestResponder: DNSResponderControlling {
     func stopCount() -> Int { stops }
 }
 
+private struct MissingShutdownTestResponder: DNSResponderControlling {
+    func validateExecutable() async throws { throw DNSCapabilityError.processFailed("DNS responder executable is unavailable") }
+    func status() async -> DNSResponderStatus { .init(state: .stopped) }
+    func start() async throws -> DNSResponderIdentity { throw DNSCapabilityError.processFailed("DNS responder executable is unavailable") }
+    func stop(expected: DNSResponderIdentity, timeout: TimeInterval) async throws -> DNSResponderStatus { .init(state: .exited, pid: expected.pid, identity: expected) }
+}
+
 private struct MutableShutdownDNSHelper: PrivilegedDNSHelper {
     let path: String
     func inspectTestResolver() async throws -> ResolverInspection {
@@ -738,7 +745,7 @@ final class DispatcherTests: XCTestCase {
         let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
         let registry = ProjectRegistry(store: store)
         let firstRouter = ShutdownTestRouter()
-        let first = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: firstRouter, serviceIntents: intents)
+        let first = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: firstRouter, dns: isolatedTestDNS(), serviceIntents: intents)
 
         _ = await first.dispatch(IPCRequest(method: .routingStart), handshaken: true)
         XCTAssertEqual(try intents.enabledServices(), ["caddy"])
@@ -746,7 +753,7 @@ final class DispatcherTests: XCTestCase {
         XCTAssertTrue(quit.completed)
 
         let relaunchedRouter = ShutdownTestRouter()
-        let relaunched = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 2), registry: registry, router: relaunchedRouter, serviceIntents: ServiceIntentStore(url: root.appendingPathComponent("service-intents.json")))
+        let relaunched = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 2), registry: registry, router: relaunchedRouter, dns: isolatedTestDNS(), serviceIntents: ServiceIntentStore(url: root.appendingPathComponent("service-intents.json")))
         await relaunched.restoreServicesOnStartup()
         for _ in 0..<100 {
             if await relaunchedRouter.startCount() > 0 { break }
@@ -758,7 +765,7 @@ final class DispatcherTests: XCTestCase {
         _ = await relaunched.dispatch(IPCRequest(method: .routingStop), handshaken: true)
         XCTAssertTrue(try intents.enabledServices().isEmpty)
         let stoppedRouter = ShutdownTestRouter()
-        let stoppedLaunch = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 3), registry: registry, router: stoppedRouter, serviceIntents: intents)
+        let stoppedLaunch = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 3), registry: registry, router: stoppedRouter, dns: isolatedTestDNS(), serviceIntents: intents)
         await stoppedLaunch.restoreServicesOnStartup()
         try await Task.sleep(for: .milliseconds(50))
         let stoppedStarts = await stoppedRouter.startCount()
@@ -841,7 +848,7 @@ final class DispatcherTests: XCTestCase {
         let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
         let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
         try intents.set("dns", enabled: true)
-        let dns = DNSCapability(helper: ShutdownTestDNSHelper(path: resolver.path), ledger: SystemModificationLedger(store: store))
+        let dns = DNSCapability(helper: ShutdownTestDNSHelper(path: resolver.path), responder: MissingShutdownTestResponder(), ledger: SystemModificationLedger(store: store))
         let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), dns: dns, serviceIntents: intents)
 
         await dispatcher.restoreServicesOnStartup()
@@ -874,7 +881,7 @@ final class DispatcherTests: XCTestCase {
         try ledger.saveResolverOwnershipRecord(.init(phase: .resolverRestored, previous: baseline, intendedBytes: Data("nameserver 127.0.0.1\nport 53535\n".utf8), written: nil))
         let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
         try intents.set("dns", enabled: true)
-        let dns = DNSCapability(helper: ShutdownTestDNSHelper(path: resolver.path), ledger: ledger)
+        let dns = DNSCapability(helper: ShutdownTestDNSHelper(path: resolver.path), responder: ShutdownTestResponder(), ledger: ledger)
         let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), dns: dns, serviceIntents: intents)
 
         await dispatcher.restoreServicesOnStartup()
@@ -902,7 +909,7 @@ final class DispatcherTests: XCTestCase {
         let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
         try intents.set("standard-ports", enabled: true)
         let ports = StandardPortsCapability(privileged: BlockedShutdownPortsFake(), paths: paths, ledger: SystemModificationLedger(store: store), portOccupied: { _ in false }, backendHealthy: { true })
-        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), ports: ports, serviceIntents: intents)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), dns: isolatedTestDNS(), ports: ports, serviceIntents: intents)
 
         await dispatcher.restoreServicesOnStartup()
         try await Task.sleep(for: .milliseconds(100))
@@ -931,6 +938,7 @@ final class DispatcherTests: XCTestCase {
         let dispatcher = try CoreRequestDispatcher(
             runtime: CoreRuntime(version: "test", pid: getpid()),
             registry: ProjectRegistry(store: store),
+            dns: isolatedTestDNS(),
             ports: capability,
             serviceIntents: intents
         )
@@ -962,7 +970,7 @@ final class DispatcherTests: XCTestCase {
         let removals = ShutdownRemovalCounter()
         let privileged = ShutdownPortsFake(inspection: .init(anchorContent: anchor, pfConfContent: references), removals: removals)
         let ports = StandardPortsCapability(privileged: privileged, paths: paths, ledger: ledger, portOccupied: { _ in false }, backendHealthy: { false })
-        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), ports: ports, serviceIntents: intents)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), dns: isolatedTestDNS(), ports: ports, serviceIntents: intents)
 
         let shutdown = await dispatcher.shutdownForParentExit()
         XCTAssertTrue(shutdown.completed, "Quit must release recorded PF state: \(shutdown.components)")
@@ -998,7 +1006,7 @@ final class DispatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
         let ports = StandardPortsCapability(privileged: ShutdownPortsFake(inspection: .init(anchorContent: nil, pfConfContent: nil), removals: ShutdownRemovalCounter()), paths: .init(anchorPath: root.appendingPathComponent("anchor").path, pfConfPath: root.appendingPathComponent("pf.conf").path), ledger: SystemModificationLedger(store: store), portOccupied: { _ in false }, backendHealthy: { false })
-        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: getpid()), registry: ProjectRegistry(store: store), dns: DNSCapability(helper: ShutdownTestDNSHelper(path: root.appendingPathComponent("resolver/test").path), ledger: SystemModificationLedger(store: store)), ports: ports)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: getpid()), registry: ProjectRegistry(store: store), dns: DNSCapability(helper: ShutdownTestDNSHelper(path: root.appendingPathComponent("resolver/test").path), responder: ShutdownTestResponder(), ledger: SystemModificationLedger(store: store)), ports: ports)
         let paths = CoreEndpointPaths(root: root.appendingPathComponent("core-runtime", isDirectory: true))
         let server = DaemonServer(paths: paths, dispatcher: dispatcher)
         let serverTask = Task.detached { try server.run() }
@@ -1133,7 +1141,7 @@ final class DispatcherTests: XCTestCase {
         let removals = ShutdownRemovalCounter()
         let observed = StandardPortsInspection(anchorContent: StandardPortsForwardingPolicy.anchorRules(), pfConfContent: StandardPortsForwardingPolicy.pfConfReferenceLines().joined(separator: "\n"))
         let ports = StandardPortsCapability(privileged: ShutdownPortsFake(inspection: observed, removals: removals), paths: .init(anchorPath: root.appendingPathComponent("anchor").path, pfConfPath: root.appendingPathComponent("pf.conf").path), ledger: SystemModificationLedger(store: store), portOccupied: { _ in false }, backendHealthy: { false })
-        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: ProjectRegistry(store: store), ports: ports)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: ProjectRegistry(store: store), dns: isolatedTestDNS(), ports: ports)
         let resultResponse = await dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
         guard case .shutdown(let result) = resultResponse.response.result else { return XCTFail("missing shutdown response") }
         XCTAssertTrue(result.completed, "unowned historical PF files are not a cleanup obligation: \(result.components)")
@@ -1254,6 +1262,11 @@ final class DispatcherTests: XCTestCase {
         let root: URL
     }
 
+    private func isolatedTestDNS() -> DNSCapability {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("dispatcher-dns-\(UUID().uuidString)/resolver/test").path
+        return DNSCapability(helper: ShutdownTestDNSHelper(path: path), responder: ShutdownTestResponder(), port: 49173)
+    }
+
     private func makeShutdownDispatcher(root: URL? = nil, router: any Router = InMemoryRouter(), mailpit: MailpitModule? = nil) throws -> ShutdownFixture {
         let root = root ?? FileManager.default.temporaryDirectory.appendingPathComponent("quit-core-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1261,7 +1274,7 @@ final class DispatcherTests: XCTestCase {
         let counter = ShutdownRemovalCounter()
         let ports = StandardPortsCapability(privileged: ShutdownPortsFake(inspection: .init(anchorContent: nil, pfConfContent: nil), removals: counter), paths: .init(anchorPath: root.appendingPathComponent("anchor").path, pfConfPath: root.appendingPathComponent("pf.conf").path), ledger: SystemModificationLedger(store: store), portOccupied: { _ in false }, backendHealthy: { false })
         let dnsPath = root.appendingPathComponent("resolver/test").path
-        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: ProjectRegistry(store: store), mailpit: mailpit, router: router, dns: DNSCapability(helper: ShutdownTestDNSHelper(path: dnsPath), ledger: SystemModificationLedger(store: store)), ports: ports)
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version, pid: 1), registry: ProjectRegistry(store: store), mailpit: mailpit, router: router, dns: DNSCapability(helper: ShutdownTestDNSHelper(path: dnsPath), responder: ShutdownTestResponder(), ledger: SystemModificationLedger(store: store)), ports: ports)
         return ShutdownFixture(dispatcher: dispatcher, root: root)
     }
 
