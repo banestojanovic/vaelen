@@ -16,7 +16,6 @@ CANONICAL_APP="/Applications/Vaelen.app"
 MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
 EXPECTED_LABEL="dev.vaelen.vaelend"
 EXPECTED_PARENT="dev.vaelen.app"
-EXPECTED_TEAM="TFKZJV643G"
 EXPECTED_BTM_UUID="C398D678-2DA1-4B8B-B304-DBDADBE36ACD"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -81,7 +80,7 @@ syncproof_db_auth() {
 }
 
 select_signing_identity() {
-  local run="$1" probe_root="$1/signing-probes" line hash name probe details team identifier selected=""
+  local run="$1" expected_team="$2" probe_root="$1/signing-probes" line hash name probe details team identifier selected="" selected_team=""
   mkdir -p "$probe_root"
   : > "$run/signing-probe-evidence.txt"
   while IFS=$'\t' read -r hash name; do
@@ -97,15 +96,15 @@ PLIST
       team="$(printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p')"
       identifier="$(printf '%s\n' "$details" | sed -n 's/^Identifier=//p')"
       printf 'hash=%s display=%s team=%s identifier=%s\n' "$hash" "$name" "${team:-<none>}" "${identifier:-<none>}" >> "$run/signing-probe-evidence.txt"
-      if [[ "$team" == "$EXPECTED_TEAM" && "$identifier" == "$EXPECTED_PARENT" ]]; then selected="$hash"; fi
+      if [[ "$team" == "$expected_team" && "$identifier" == "$EXPECTED_PARENT" ]]; then selected="$hash"; selected_team="$team"; fi
     else
       printf 'hash=%s display=%s sign=failed\n' "$hash" "$name" >> "$run/signing-probe-evidence.txt"
     fi
     rm -rf "$probe"
   done < <(security find-identity -v -p codesigning | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-F]*\) "\(.*\)"$/\1\t\2/p')
   rm -rf "$probe_root"
-  [[ -n "$selected" ]] || die "no signing identity produced TeamIdentifier $EXPECTED_TEAM and bundle ID $EXPECTED_PARENT (see $run/signing-probe-evidence.txt)"
-  printf '%s\n' "$selected"
+  [[ -n "$selected" ]] || die "no valid signing identity for Team ID $expected_team produced bundle ID $EXPECTED_PARENT (see $run/signing-probe-evidence.txt)"
+  printf '%s\t%s\n' "$selected" "$selected_team"
 }
 
 verify_preservation() {
@@ -424,17 +423,22 @@ clean_rollback() {
 }
 
 clean_preflight() {
-  local run="$1" btm
+  local run="$1" btm signing_identity signing_team configured_team
   stage preflight "clean-install identities and preservation"
   [[ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" == "restored-m13-product" ]] || die "wrong branch"
   [[ "$(git -C "$ROOT" rev-parse HEAD)" == "328e2f1efc74dab9c41f411e914afe015a22d009" ]] || die "wrong golden HEAD"
   [[ -d "$SUPPORT" && -d "$SUPPORT/config" && -d "$SUPPORT/instances" && -d "$SUPPORT/packages" && -d "$SUPPORT/state" && -d "$SUPPORT/tls" ]] || die "durable Vaelen support root incomplete"
   [[ -f "$SUPPORT/state/vaelen.sqlite" ]] || die "registry database missing"
+  configured_team="$(xcodebuild -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release -showBuildSettings 2>/dev/null | awk '/^[[:space:]]*DEVELOPMENT_TEAM = / { print $3; exit }')"
+  [[ -n "$configured_team" ]] || die "Release DEVELOPMENT_TEAM is not configured"
+  select_signing_identity "$run" "$configured_team" > "$run/signing-identity.txt"
+  IFS=$'\t' read -r signing_identity signing_team < "$run/signing-identity.txt"
+  [[ -n "$configured_team" && "$signing_team" == "$configured_team" ]] || die "selected signing identity team does not match the Xcode Release DEVELOPMENT_TEAM setting"
   btm="$run/btm-before.txt"
   sfltool dumpbtm > "$btm" 2>&1 || die "could not capture BTM evidence"
   grep -q "Identifier: 8.$EXPECTED_LABEL" "$btm" || die "exact BTM agent registration missing"
   grep -q "Parent Identifier: 2.$EXPECTED_PARENT" "$btm" || die "BTM parent mismatch"
-  grep -q "Team Identifier: $EXPECTED_TEAM" "$btm" || die "BTM team mismatch"
+  grep -q "Team Identifier: $signing_team" "$btm" || die "BTM team differs from selected signing identity"
   grep -q "UUID: $EXPECTED_BTM_UUID" "$btm" || die "BTM UUID mismatch"
   if launchctl print "gui/$(id -u)/$EXPECTED_LABEL" > "$run/launchctl-before.txt" 2>&1; then
     grep -q "BTM uuid = $EXPECTED_BTM_UUID" "$run/launchctl-before.txt" || die "launchd BTM UUID mismatch"
@@ -442,7 +446,6 @@ clean_preflight() {
   else
     printf 'historical/inactive launchd job already absent\n' > "$run/launchctl-before.txt"
   fi
-  select_signing_identity "$run" > "$run/signing-identity.txt"
   [[ ! -e "$CANONICAL_APP" ]] || { codesign --verify --deep --strict "$CANONICAL_APP" || die "existing app failed signature validation"; }
   syncproof_db_auth || die "Syncproof DB preflight authentication failed"
   mkdir -p "$run/system-before"
@@ -485,13 +488,13 @@ SWIFT
 }
 
 clean_install() {
-  local run="$ARTIFACTS/clean-install-$STAMP" snapshot_dir app identity
+  local run="$ARTIFACTS/clean-install-$STAMP" snapshot_dir app identity signing_team
   mkdir -p "$run"
   clean_preflight "$run"
   snapshot_dir="$(snapshot "clean-install-$STAMP")"
   CLEAN_RUN="$run"; trap clean_rollback EXIT
   cp -R "$snapshot_dir" "$run/preservation-snapshot"
-  identity="$(cat "$run/signing-identity.txt")"
+  IFS=$'\t' read -r identity signing_team < "$run/signing-identity.txt"
   "$VAL" routing stop >/dev/null || true; "$VAL" php stop 8.4.23 >/dev/null || true; "$VAL" mysql stop >/dev/null || true
   stop_owned || die "could not stop exact owned runtime"
   clear_ephemeral || die "could not clear verified ephemeral runtime"
@@ -502,13 +505,13 @@ clean_install() {
   mkdir -p "$SUPPORT"
   for path in config instances packages state tls; do gzip -dc "$snapshot_dir/$path.tar.gz" | tar -xf - -C "$SUPPORT"; done
   swift build --configuration release >/dev/null || die "release runtime build failed"
-  xcodebuild -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release -derivedDataPath "$run/deriveddata" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$identity" DEVELOPMENT_TEAM="$EXPECTED_TEAM" build 2>&1 | tee "$run/release-build.log"
+  xcodebuild -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release -derivedDataPath "$run/deriveddata" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$identity" DEVELOPMENT_TEAM="$signing_team" build 2>&1 | tee "$run/release-build.log"
   [[ "${PIPESTATUS[0]}" == 0 ]] || die "release GUI build failed"
   app="$run/deriveddata/Build/Products/Release/Vaelen.app"
   codesign --verify --deep --strict "$app" || die "release GUI signature invalid"
   codesign -dvv --verbose=4 "$app" > "$run/app-provenance.txt" 2>&1 || die "release GUI provenance capture failed"
   printf 'source-tree-sha256=%s\n' "$(tree_hash "$app")" >> "$run/app-provenance.txt"
-  [[ "$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$EXPECTED_TEAM" ]] || die "release GUI Team ID mismatch"
+  [[ "$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$signing_team" ]] || die "release GUI Team ID mismatch"
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" == "$EXPECTED_PARENT" ]] || die "release GUI bundle ID mismatch"
   osascript - "$app" "$CANONICAL_APP" <<'APPLESCRIPT' || die "canonical app install authorization/install failed"
 on run argv
@@ -519,7 +522,7 @@ end run
 APPLESCRIPT
   diff -qr "$app" "$CANONICAL_APP" >/dev/null || die "installed canonical app differs byte-for-byte from verified source"
   codesign --verify --deep --strict "$CANONICAL_APP" || die "installed canonical app signature invalid"
-  [[ "$(codesign -dv --verbose=4 "$CANONICAL_APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$EXPECTED_TEAM" ]] || die "installed canonical app Team ID mismatch"
+  [[ "$(codesign -dv --verbose=4 "$CANONICAL_APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$signing_team" ]] || die "installed canonical app Team ID mismatch"
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CANONICAL_APP/Contents/Info.plist")" == "$EXPECTED_PARENT" ]] || die "installed canonical app bundle ID mismatch"
   CORE="$ROOT/.build/release/vaelend"; DNS="$ROOT/.build/release/vaelendns"; VAL="$ROOT/.build/release/val"; MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
   start_runtime || die "fresh M13 runtime start failed"
