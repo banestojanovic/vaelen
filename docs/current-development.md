@@ -1,5 +1,34 @@
 # Current development notes
 
+## PHP Settings
+
+Accepted and integrated into `dev` on 2026-10-01. Shared and version-specific
+PHP settings now use reusable grouped forms with inline numeric validation,
+save/reset feedback, and expandable directive details. Runtime lists sort
+numerically newest first; default stars and update indicators are distinct
+from selection highlighting.
+
+Trusted catalog checks run when due every 12 hours, with a manual Check for
+Updates action, persisted check/error state, and last-valid-cache preservation.
+Separate operation polling stays responsive during package work. Downloads
+report measured incremental bytes across both CLI and FPM archives. Unknown
+totals show bytes, not fabricated percentages; verification and installation
+are separate phases, not download completion.
+
+The final 2026-09-30 suite had **484 outcomes: 482 passed, 0 failed, 2 skipped**
+(Core 288, IPC 97, DNS 6, CLI 93, including skips). Focused PHP and dispatcher
+runs passed 23 and 53 tests respectively. Coverage includes production local
+HTTP transfers with known/unknown lengths, aggregation, transfer failure and
+cleanup, and progress over a separate Unix IPC client. The final signed
+candidate passed installed smoke, including PHP/FPM, MySQL, routing, DNS,
+ports 80/443, and trusted HTTPS. These results are reused: the committed diff
+exactly matches the reviewed final diff and integration changed no product
+content; the installed signed app/Core hashes still match that candidate.
+
+No live PHP packages were installed, updated, or removed for acceptance.
+**Successful live PHP package updating was not exercised.** Captures and bulk
+evidence remain outside the source commits.
+
 ## Settings usability
 
 Settings Services now distinguishes confirmed package installs, confirmed
