@@ -1,14 +1,37 @@
 import Foundation
 import Darwin
 
+/// Explicit developer-only state isolation hook. The two-part opt-in prevents
+/// an incidental inherited path variable from redirecting normal product
+/// state. Production runtime launches leave both variables unset.
+public enum VaelenTestRuntimePaths {
+    public static func isolatedSupportRoot(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
+        guard environment["VAELEN_TEST_SUPPORT_ROOT_ENABLED"] == "1",
+              let path = environment["VAELEN_TEST_SUPPORT_ROOT"],
+              path.hasPrefix("/"), path != "/" else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
+}
+
 public struct VaelenFilesystemLayout: Sendable {
     public let rootURL: URL
     private let explicitLogsDirectoryURL: URL?
+    private let usesRootLocalDirectories: Bool
 
     public init(rootURL: URL? = nil, fileManager: FileManager = .default, logsDirectoryURL: URL? = nil) {
-        self.rootURL = (rootURL ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Vaelen", isDirectory: true)).standardizedFileURL
+        let root: URL
+        if let rootURL {
+            root = rootURL
+        } else {
+            if let isolatedRoot = VaelenTestRuntimePaths.isolatedSupportRoot() {
+                root = isolatedRoot
+            } else {
+                root = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Vaelen", isDirectory: true)
+            }
+        }
+        self.rootURL = root.standardizedFileURL
         self.explicitLogsDirectoryURL = logsDirectoryURL?.standardizedFileURL
+        self.usesRootLocalDirectories = rootURL != nil || VaelenTestRuntimePaths.isolatedSupportRoot() != nil
     }
 
     public var stateDirectoryURL: URL { rootURL.appendingPathComponent("state", isDirectory: true) }
@@ -26,10 +49,17 @@ public struct VaelenFilesystemLayout: Sendable {
     public var configurationDirectoryURL: URL { rootURL.appendingPathComponent("config", isDirectory: true) }
     public var routingConfigurationDirectoryURL: URL { configurationDirectoryURL.appendingPathComponent("routing", isDirectory: true) }
     public var routingRuntimeDirectoryURL: URL { rootURL.appendingPathComponent("runtime/routing", isDirectory: true) }
-    public var cacheDirectoryURL: URL { FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Vaelen", isDirectory: true) }
+    public var cacheDirectoryURL: URL {
+        if usesRootLocalDirectories { return rootURL.appendingPathComponent("cache", isDirectory: true) }
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Vaelen", isDirectory: true)
+    }
     public var downloadsDirectoryURL: URL { cacheDirectoryURL.appendingPathComponent("downloads", isDirectory: true) }
     public var stagingDirectoryURL: URL { cacheDirectoryURL.appendingPathComponent("staging", isDirectory: true) }
-    public var logsDirectoryURL: URL { explicitLogsDirectoryURL ?? FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true) }
+    public var logsDirectoryURL: URL {
+        if let explicitLogsDirectoryURL { return explicitLogsDirectoryURL }
+        if usesRootLocalDirectories { return rootURL.appendingPathComponent("logs", isDirectory: true) }
+        return FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/Vaelen", isDirectory: true)
+    }
     public var phpLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/php", isDirectory: true) }
     public var caddyLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
     public var mysqlLogsDirectoryURL: URL { logsDirectoryURL.appendingPathComponent("modules/mysql", isDirectory: true) }

@@ -218,6 +218,7 @@ public actor CoreRequestDispatcher {
                     guard observation?.eligibility == .eligible, observation?.package != nil else { throw IPCErrorPayload(code: .invalidRequest, message: "PHP \(version) is not an installed eligible managed runtime.") }
                 }
                 let mutating = params.version != nil || params.useDefault
+                if mutating && phpPackageOperationsInFlight > 0 { throw PHPModuleError.operationInProgress("Finish the current PHP operation before changing a project's PHP selection") }
                 if mutating { try await registry.setPHPOverride(params.version, for: projectID) }
                 if !mutating { return (.init(id: request.id, result: .projectPHP(try await projectPHPSelection(project))), true) }
                 do {
@@ -251,11 +252,12 @@ public actor CoreRequestDispatcher {
                 let module = try phpModule(); return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpCatalog:
                 let module = try phpModule(); _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
+            case .phpCatalogSnapshot:
+                return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(phpModule())))), true)
             case .phpCatalogCheck:
                 let module = try phpModule(); try await Task.detached { try module.checkCatalogNow() }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
             case .phpInstall:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try await withPHPPackageOperation {
-                    _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value
                     return try await Task.detached { try module.install(requestedVersion: params.version) }.value
                 }; return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpUpdate:
@@ -268,22 +270,29 @@ public actor CoreRequestDispatcher {
                 var dependencies = [String]()
                 for project in try await registry.linkedProjects() { if let id = project.id, try await registry.phpOverride(for: id) == params.version { dependencies.append(project.name) } }
                 if !dependencies.isEmpty { throw IPCErrorPayload(code: .invalidRequest, message: "PHP \(params.version) is required by linked project(s): \(dependencies.joined(separator: ", ")). Clear those project overrides first.") }
-                try serviceIntents.set("php:\(params.version)", enabled: false); try module.remove(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                try await withPHPPackageOperation { try await Task.detached { try module.remove(requestedVersion: params.version) }.value }
+                try serviceIntents.set("php:\(params.version)", enabled: false)
+                return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpOperation:
                 let module = try phpModule(); return (.init(id: request.id, result: .phpOperation(.init(operation: module.operationState()))), true)
             case .phpDefaultSet:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); let catalog = try module.selectDefault(requestedVersion: params.version); for project in try await registry.linkedProjects() { if let id = project.id, try await registry.phpOverride(for: id) == nil { _ = try? await activate(project: project) } }; return (.init(id: request.id, result: .phpCatalog(.init(catalog: catalog))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }()
+                let result = try await withPHPPackageOperation { try await self.selectDefaultAndReconcile(module: module, version: params.version) }
+                return (.init(id: request.id, result: .phpDefaultSelection(result)), true)
             case .phpUse:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.selectDefault(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: try module.availableVersions(), installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }()
+                let exact = try module.resolveEligible(params.version).version
+                _ = try await withPHPPackageOperation { try await self.selectDefaultAndReconcile(module: module, version: exact) }
+                return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpExec:
                 let module = try phpModule(); let params = try request.params?.decode(PHPExecRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP execution parameters are required.") }(); let result = try module.exec(requestedVersion: params.version, workingDirectory: params.workingDirectory, arguments: params.arguments); return (.init(id: request.id, result: .phpExec(.init(exitStatus: result.status, output: result.output))), true)
             case .phpResolve:
                 let params = try request.params?.decode(PHPResolveRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP resolution requires the current working directory.") }()
                 return (.init(id: request.id, result: .phpResolve(try await phpExecutableResolution(workingDirectory: params.workingDirectory))), true)
             case .phpStart:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); try serviceIntents.set("php:\(params.version)", enabled: true); return (.init(id: request.id, result: .phpStatus(.init(status: try module.start(requestedVersion: params.version)))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); let status = try module.start(requestedVersion: params.version); if status.state == .running { try serviceIntents.set("php:\(params.version)", enabled: true) }; return (.init(id: request.id, result: .phpStatus(.init(status: status))), true)
             case .phpStop:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); try serviceIntents.set("php:\(params.version)", enabled: false); return (.init(id: request.id, result: .phpStatus(.init(status: try module.stop(requestedVersion: params.version)))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); let status = try module.stop(requestedVersion: params.version); if status.state == .stopped { try serviceIntents.set("php:\(params.version)", enabled: false) }; return (.init(id: request.id, result: .phpStatus(.init(status: status))), true)
             case .phpStatus:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); return (.init(id: request.id, result: .phpStatus(.init(status: try module.status(requestedVersion: params.version)))), true)
             case .phpConfiguration:
@@ -459,6 +468,76 @@ public actor CoreRequestDispatcher {
         phpPackageOperationsInFlight += 1
         defer { phpPackageOperationsInFlight -= 1 }
         return try await body()
+    }
+
+    private(set) var lastPHPDefaultSwitchTimings: [String: Double] = [:]
+
+    private func selectDefaultAndReconcile(module: PHPModule, version: String) async throws -> PHPDefaultSelectionResult {
+        // Provider validation/startup is synchronous. Detach it so this actor
+        // can continue serving status, progress and Quit. Keep the operation
+        // reservation through routing reconciliation so Quit waits safely.
+        let catalog = try await Task.detached { try module.selectDefault(requestedVersion: version) }.value
+        try serviceIntents.set("php:\(version)", enabled: true)
+        let reconcileStarted = ContinuousClock.now
+        var failures = [String]()
+        let projects = try await registry.linkedProjects()
+        let overrides = try await registry.phpOverrides()
+        let inheritedProjects = projects.filter { $0.id.map { overrides[$0] == nil } == true }
+        let scanFinished = ContinuousClock.now
+        // A default change only converges inherited FastCGI targets. Running
+        // full project activation repeatedly re-observed every service and
+        // reloaded the entire Caddy configuration for each individual route.
+        // Take one planning observation, preserve transition provenance, then
+        // apply and verify the complete route set once.
+        let observations = try await collectProjectReportObservations()
+        var changed = [(Project, RouteID)]()
+        for project in inheritedProjects {
+            guard let id = project.id else { continue }
+            let report = try await projectEnvironmentReport(for: project, observations: observations)
+            guard try await registry.phpOverride(for: id) == nil,
+                  try await registry.linkedProject(id: id) != nil else { continue }
+            for target in report.routeTargets where target.disposition != .satisfied {
+                guard target.disposition == .actionable || target.disposition == .pending,
+                      let socket = target.desiredSocket, let repository = routeRepository else {
+                    failures.append("\(project.name): \(target.reason ?? "PHP route target cannot be reconciled")")
+                    continue
+                }
+                do {
+                    if target.persistedSocket != socket {
+                        let transition = try repository.persistFastCGITargetTransition(id: target.routeID, projectID: id.rawValue, expectedSocket: target.persistedSocket, desiredSocket: socket)
+                        routeIntents[target.routeID] = transition.intent
+                    }
+                    changed.append((project, target.routeID))
+                } catch { failures.append("\(project.name): \(error.localizedDescription)") }
+            }
+        }
+        let planned = ContinuousClock.now
+        if !changed.isEmpty {
+            var routingFailed = false
+            do { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
+            catch { failures.append("Routing: \(error.localizedDescription)"); routingFailed = true }
+            let verifiedObservations = try await collectProjectReportObservations()
+            for project in inheritedProjects where !routingFailed && changed.contains(where: { $0.0.id == project.id }) {
+                let report = try await projectEnvironmentReport(for: project, observations: verifiedObservations)
+                for (owner, routeID) in changed where owner.id == project.id {
+                    if report.routeTargets.first(where: { $0.routeID == routeID })?.disposition != .satisfied {
+                        failures.append("\(project.name): route \(routeID) is still pending; retry after resolving routing health")
+                    }
+                }
+            }
+        }
+        let reconciliationFinished = ContinuousClock.now
+        lastPHPDefaultSwitchTimings = module.defaultSwitchTimings().merging(["project_scan_ms": timingMilliseconds(reconcileStarted.duration(to: scanFinished)), "planning_ms": timingMilliseconds(scanFinished.duration(to: planned)), "apply_verify_ms": timingMilliseconds(planned.duration(to: reconciliationFinished))]) { _, new in new }
+        logger.info("PHP default switch inherited-state version=\(version, privacy: .public) linked-project-scan_ms=\(self.timingMilliseconds(reconcileStarted.duration(to: scanFinished)), privacy: .public) routing-reconciliation_ms=\(self.timingMilliseconds(scanFinished.duration(to: reconciliationFinished)), privacy: .public) projects=\(inheritedProjects.count, privacy: .public) failures=\(failures.count, privacy: .public)")
+        let issues = inheritedProjects.filter { project in failures.contains(where: { $0.hasPrefix("\(project.name):") }) }.map { project in
+            PHPDefaultProjectIssue(projectName: project.name, message: failures.filter { $0.hasPrefix("\(project.name):") }.joined(separator: "; "))
+        }
+        return PHPDefaultSelectionResult(catalog: catalog, projectIssues: issues, routingIssues: failures.filter { $0.hasPrefix("Routing:") })
+    }
+
+    private func timingMilliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1_000 + Double(components.attoseconds) / 1_000_000_000_000_000
     }
 
     public func reconcilePersistedRoutesOnStartup() async throws {
@@ -910,6 +989,8 @@ public actor CoreRequestDispatcher {
             return .init(code: .invalidRequest, message: "PHP package could not be verified. Existing PHP runtimes were not changed.")
         case .manifestUnavailable:
             return .init(code: .invalidRequest, message: "PHP package metadata is unavailable. Installed runtimes remain usable.")
+        case .catalogUnavailable(let reason):
+            return .init(code: .invalidRequest, message: reason)
         case .invalidManifest:
             return .init(code: .invalidRequest, message: "PHP package metadata is invalid and cannot be installed.")
         case .validationFailed(let detail):

@@ -28,8 +28,8 @@ trap 'rm -f "$temporary"' EXIT
 jq -n \
   --arg manifestPath "$manifest" \
   --arg artifactBasePath "$release_root" \
-  --arg catalogURL "${VAELEN_PHP_CATALOG_URL:-}" \
-  '{manifestPath: $manifestPath, artifactBasePath: $artifactBasePath} + (if $catalogURL == "" then {} else {catalogURL: $catalogURL} end)' > "$temporary"
+  --arg catalogURL "${VAELEN_PHP_CATALOG_URL:-https://github.com/banestojanovic/vaelen/releases/download/php-catalog/php-catalog.json}" \
+  '{manifestPath: $manifestPath, artifactBasePath: $artifactBasePath, catalogURL: $catalogURL}' > "$temporary"
 mv "$temporary" "$configuration"
 chmod 600 "$configuration"
 

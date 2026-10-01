@@ -12,6 +12,32 @@ private final class ArtifactProgressSamples: @unchecked Sendable {
 }
 
 final class PHPModuleTests: XCTestCase {
+    func testSuccessfulValidationCacheInvalidatesExecutableAndMetadataChanges() throws {
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+        let directory = URL(fileURLWithPath: fixture.package.packagePath)
+        let cli = directory.appendingPathComponent("php-copy")
+        try FileManager.default.copyItem(atPath: fixture.package.cliPath, toPath: cli.path)
+        let package = PHPPackage(version: fixture.package.version, architecture: fixture.package.architecture, packagePath: directory.path, cliPath: cli.path, fpmPath: fixture.package.fpmPath, source: fixture.package.source, cliSHA256: fixture.package.cliSHA256, fpmSHA256: fixture.package.fpmSHA256, installedAt: fixture.package.installedAt)
+        let metadata = directory.appendingPathComponent(".vaelen-package.json")
+        let data = try JSONEncoder().encode(package)
+        try data.write(to: metadata)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .eligible)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .eligible)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cli.path)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .invalid)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cli.path)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .eligible)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: cli)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .invalid, "Changed executable must not inherit a prior validation")
+        try FileManager.default.removeItem(at: cli)
+        try FileManager.default.copyItem(atPath: fixture.package.cliPath, toPath: cli.path)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .eligible)
+        try Data("invalid metadata".utf8).write(to: metadata)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .invalid)
+        try data.write(to: metadata)
+        XCTAssertEqual(fixture.module.packageObservations().first?.eligibility, .eligible)
+    }
     func testRuntimeCatalogKeepsInstalledDefaultAndRunningIndependent() {
         let first = PHPPackage(version: "8.4.23", architecture: "arm64", packagePath: "/php/8.4.23", cliPath: "/php/8.4.23/php", fpmPath: "/php/8.4.23/php-fpm", source: "fixture", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())
         let second = PHPPackage(version: "8.3.30", architecture: "arm64", packagePath: "/php/8.3.30", cliPath: "/php/8.3.30/php", fpmPath: "/php/8.3.30/php-fpm", source: "fixture", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())
@@ -52,12 +78,134 @@ final class PHPModuleTests: XCTestCase {
 
         XCTAssertThrowsError(try location.refreshCatalogIfNeeded())
         let firstStatus = location.catalogCheckStatus()
-        XCTAssertNotNil(firstStatus.0)
+        XCTAssertEqual(firstStatus.0, now.addingTimeInterval(-13 * 60 * 60), "A failed attempt must not advance the last successful check date.")
         XCTAssertNotNil(firstStatus.1)
-        XCTAssertEqual(firstStatus.0, now)
         XCTAssertEqual(try location.manifests(), [manifest])
         XCTAssertNoThrow(try location.refreshCatalogIfNeeded(), "A failed check is persisted and must not immediately retry.")
         XCTAssertEqual(location.catalogCheckStatus().0, firstStatus.0)
+        XCTAssertTrue(String(describing: try XCTUnwrap(firstStatus.1)).contains("could not be reached"))
+        XCTAssertThrowsError(try location.checkCatalogNow()) { error in
+            guard case PHPModuleError.catalogUnavailable(let message) = error else { return XCTFail("feed failure must retain its catalog-specific cause: \(error)") }
+            XCTAssertTrue(message.contains("could not be reached"))
+        }
+    }
+
+    func testHTTPAndInvalidCatalogFailuresPreserveLastValidCache() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-catalog-failure-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.26", platform: "macos", architecture: "arm64", artifacts: [
+            "cli": PHPArtifact(file: "cli.tar.gz", url: "https://example.test/cli.tar.gz", sha256: String(repeating: "a", count: 64)),
+            "fpm": PHPArtifact(file: "fpm.tar.gz", url: "https://example.test/fpm.tar.gz", sha256: String(repeating: "b", count: 64))
+        ], verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"))
+        let cacheURL = root.appendingPathComponent("php-catalog.json")
+        let originalCache = try JSONEncoder().encode(PHPManifestCatalog(manifests: [manifest]))
+        try originalCache.write(to: cacheURL)
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let stateURL = root.appendingPathComponent("php-catalog-check.json")
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+
+        for (status, responseBody, expectedCause) in [
+            (503, Data("temporarily unavailable".utf8), "HTTP 503"),
+            (200, Data("not-json".utf8), "not valid JSON"),
+            (200, Data(#"{"manifests":[]}"#.utf8), "not valid JSON"),
+            (200, Data(#"{"schemaVersion":2,"module":"other","manifests":[]}"#.utf8), "contains no valid")
+        ] {
+            let (server, endpoint) = try startCatalogHTTPServer(root: root, body: responseBody, status: status)
+            defer {
+                server.terminate()
+                server.waitUntilExit()
+                XCTAssertNotEqual(server.terminationStatus, 0, "test server must be explicitly terminated")
+            }
+            let location = FilePHPManifestLocation(manifestURL: manifestURL, catalogURL: endpoint, now: { now })
+            XCTAssertThrowsError(try location.checkCatalogNow()) { error in
+                guard case PHPModuleError.catalogUnavailable(let message) = error else { return XCTFail("expected catalog-specific failure: \(error)") }
+                XCTAssertTrue(message.contains(expectedCause), message)
+            }
+            XCTAssertEqual(try Data(contentsOf: cacheURL), originalCache, "failed refresh must preserve last valid catalog bytes")
+            XCTAssertEqual(try JSONDecoder().decode(PHPManifestCatalog.self, from: Data(contentsOf: cacheURL)).manifests, [manifest])
+            XCTAssertEqual(location.catalogCheckStatus().0, nil, "failed refresh is not a successful catalog check")
+            XCTAssertNotNil(location.catalogCheckStatus().1)
+            XCTAssertNoThrow(try FileManager.default.removeItem(at: stateURL))
+        }
+    }
+
+    func testSuccessfulHTTPCatalogRefreshDiscoversPublishedSameSeriesPatch() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-catalog-success-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        func releaseManifest(_ version: String) -> PHPManifest {
+            let root = "https://github.com/banestojanovic/vaelen/releases/download/php-v\(version)"
+            let artifacts = ["cli": PHPArtifact(file: "php-\(version)-cli-macos-arm64.tar.gz", url: "\(root)/php-\(version)-cli-macos-arm64.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "php-\(version)-fpm-macos-arm64.tar.gz", url: "\(root)/php-\(version)-fpm-macos-arm64.tar.gz", sha256: String(repeating: "b", count: 64))]
+            return PHPManifest(schemaVersion: 1, module: "php", phpVersion: version, platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"), release: .init(tag: "php-v\(version)", url: root))
+        }
+        let current = releaseManifest("8.4.26")
+        let newer = releaseManifest("8.4.27")
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(current).write(to: manifestURL)
+        let body = try JSONEncoder().encode(PHPManifestCatalog(manifests: [current, newer]))
+        let (server, endpoint) = try startCatalogHTTPServer(root: root, body: body, status: 200)
+        defer { server.terminate(); server.waitUntilExit() }
+        let now = Date(timeIntervalSince1970: 2_000_000_100)
+        let location = FilePHPManifestLocation(manifestURL: manifestURL, catalogURL: endpoint, now: { now })
+        try location.checkCatalogNow()
+        XCTAssertEqual(try location.manifests(), [current, newer])
+        XCTAssertEqual(location.catalogCheckStatus().0, now)
+        XCTAssertNil(location.catalogCheckStatus().1)
+        XCTAssertEqual(PHPUpdateObservation(installedVersion: "8.4.26", latestVersion: try XCTUnwrap(location.manifests().map(\.phpVersion).max())).updateAvailable, true)
+    }
+
+    func testMissingCatalogURLIsAVisibleRetryableErrorNotUpToDate() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: .init(algorithm: "sha256", authenticity: "local"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let location = FilePHPManifestLocation(manifestURL: manifestURL)
+        XCTAssertNoThrow(try location.refreshCatalogIfNeeded())
+        XCTAssertNil(location.catalogCheckStatus().0)
+        XCTAssertEqual(location.catalogCheckStatus().1, "No PHP update catalog is configured for this Vaelen distribution.")
+        XCTAssertThrowsError(try location.checkCatalogNow()) { error in
+            guard case PHPModuleError.catalogUnavailable(let message) = error else { return XCTFail("missing feed must not be reported as invalid package metadata: \(error)") }
+            XCTAssertEqual(message, "No PHP update catalog is configured for this Vaelen distribution.")
+        }
+        XCTAssertNil(location.catalogCheckStatus().0)
+    }
+
+    func testNonHTTPSRemoteCatalogIsRejectedBeforeNetworkAccess() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-insecure-feed-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(PHPManifestCatalog(manifests: [])).write(to: root.appendingPathComponent("php-catalog.json"))
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: .init(algorithm: "sha256", authenticity: "bootstrap-local-machine"))
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let location = FilePHPManifestLocation(manifestURL: manifestURL, catalogURL: URL(string: "http://example.test/php-catalog.json")!)
+        XCTAssertThrowsError(try location.checkCatalogNow()) { error in
+            guard case PHPModuleError.catalogUnavailable(let message) = error else { return XCTFail("HTTP catalog must be rejected as a transport policy failure: \(error)") }
+            XCTAssertEqual(message, "The PHP update catalog must use HTTPS.")
+        }
+        XCTAssertEqual(location.catalogCheckStatus().1, "The PHP update catalog must use HTTPS.")
+    }
+
+    func testConfiguredFeedDoesNotHonorThrottleFromLegacyMissingURLError() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-feed-upgrade-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: [:], verification: .init(algorithm: "sha256", authenticity: "bootstrap-local-machine"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let now = Date(timeIntervalSince1970: 2_000_000_200)
+        let oldState = TestCatalogCheckState(checkedAt: now.addingTimeInterval(-60), error: "This PHP distribution has no update-feed URL. Configure a trusted catalog URL in the distribution manifest.")
+        try JSONEncoder().encode(oldState).write(to: root.appendingPathComponent("php-catalog-check.json"))
+        let (server, endpoint) = try startCatalogHTTPServer(root: root, body: Data("not-json".utf8), status: 200)
+        defer { server.terminate(); server.waitUntilExit() }
+        let location = FilePHPManifestLocation(manifestURL: manifestURL, catalogURL: endpoint, now: { now })
+        XCTAssertThrowsError(try location.refreshCatalogIfNeeded(), "A newly configured feed must be checked immediately instead of retaining the old missing-feed error for twelve hours.")
+        XCTAssertTrue(location.catalogCheckStatus().1?.contains("not valid JSON") == true)
+        XCTAssertNoThrow(try location.refreshCatalogIfNeeded(), "The actual failed request is then throttled normally.")
     }
 
     func testPHPUpdateObservationDistinguishesSameSeriesPatchAndUnknownMetadata() {
@@ -73,9 +221,10 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.4.23" }?.series, "8.4")
     }
 
-    func testBundledCuratedCatalogExposesTheSecondSupportedRuntime() throws {
-        guard let module = PHPModule.development() else { throw XCTSkip("development PHP manifest unavailable") }
-        XCTAssertTrue(try module.availableVersions().contains("8.3.29"))
+    func testBundledCatalogDoesNotAdvertiseUnpublishedPlaceholderReleases() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "php-catalog", withExtension: "json"))
+        let bundled = try JSONDecoder().decode(PHPManifestCatalog.self, from: Data(contentsOf: url))
+        XCTAssertTrue(bundled.manifests.isEmpty, "Only trusted catalog entries whose immutable CLI/FPM assets have been verified are advertised.")
     }
 
     func testCatalogFixtureCanDescribeMultipleAvailableReleasesWithoutNetwork() throws {
@@ -216,6 +365,25 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertThrowsError(try fixture.module.updateConfiguration(version: nil, settings: invalid))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.layout.configurationDirectoryURL.appendingPathComponent("php/settings.json").path))
         XCTAssertEqual(try fixture.module.configuration().defaultSettings.uploadLimitMB, 2)
+    }
+
+    func testConfigurationSaveAndResetRestartAffectedRunningFPMOnlyInIsolatedState() throws {
+        let fixture = try isolatedFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.module.configuration()
+        let started = try fixture.module.start(requestedVersion: fixture.package.version)
+        XCTAssertEqual(started.state, .running)
+        let override = PHPManagedSettings(uploadLimitMB: 32, memoryLimitMB: 512, maxExecutionTimeSeconds: 60, maxInputVariables: 4000, postLimitMB: 33)
+        let saved = try fixture.module.updateConfiguration(version: fixture.package.version, settings: override)
+        XCTAssertEqual(saved.affectedVersions, [fixture.package.version])
+        XCTAssertTrue(try XCTUnwrap(saved.versions.first).fpmRunning)
+        XCTAssertFalse(try XCTUnwrap(saved.versions.first).inheritsDefault)
+        XCTAssertEqual(try fixture.module.status(requestedVersion: fixture.package.version).state, .running)
+        let reset = try fixture.module.updateConfiguration(version: fixture.package.version, settings: nil)
+        XCTAssertEqual(reset.affectedVersions, [fixture.package.version])
+        XCTAssertTrue(try XCTUnwrap(reset.versions.first).inheritsDefault)
+        XCTAssertTrue(try XCTUnwrap(reset.versions.first).fpmRunning)
+        XCTAssertEqual(try fixture.module.configuration().defaultSettings, reset.defaultSettings)
     }
 
     private func isolatedFixture() throws -> IsolatedPHPFixture {
@@ -411,6 +579,43 @@ server.serve_forever()
             Thread.sleep(forTimeInterval: 0.01)
         }
         process.terminate(); process.waitUntilExit()
+        throw PHPModuleError.manifestUnavailable
+    }
+
+    private func startCatalogHTTPServer(root: URL, body: Data, status: Int) throws -> (Process, URL) {
+        let portFile = root.appendingPathComponent("catalog-port-\(UUID().uuidString).txt")
+        let bodyFile = root.appendingPathComponent("catalog-body-\(UUID().uuidString).bin")
+        try body.write(to: bodyFile)
+        let script = #"""
+import http.server, sys
+body = open(sys.argv[1], 'rb').read()
+status = int(sys.argv[3])
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(status)
+  self.send_header('Content-Length', str(len(body)))
+  self.end_headers()
+  self.wfile.write(body)
+ def log_message(self, *args): pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+open(sys.argv[2], 'w').write(str(server.server_port))
+server.serve_forever()
+"""#
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-u", "-c", script, bodyFile.path, portFile.path, "\(status)"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        for _ in 0..<200 {
+            if let raw = try? String(contentsOf: portFile, encoding: .utf8), let port = Int(raw) {
+                return (process, URL(string: "http://127.0.0.1:\(port)/php-catalog.json")!)
+            }
+            guard process.isRunning else { throw PHPModuleError.manifestUnavailable }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        process.terminate()
+        process.waitUntilExit()
         throw PHPModuleError.manifestUnavailable
     }
 

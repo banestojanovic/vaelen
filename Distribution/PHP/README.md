@@ -24,26 +24,43 @@ than republishing its hosted unsigned PHP archives.
 
 ## Curated Runtime Catalog
 
-Each supported PHP version has a checked-in build configuration such as
-`php-8.4.23.json`. The configuration pins the static-php-cli source revision,
+Each supported PHP patch line has a checked-in build configuration. Current
+patches follow PHP's official release announcements: PHP 8.4.26 (released
+2026-09-24) and PHP 8.3.33 (released 2026-07-30). Sources:
+<https://www.php.net/releases/index.php> and
+<https://www.php.net/supported-versions.php>. 8.4 remains actively supported;
+8.3 receives security support through 2027-12-31. These are the two existing
+Vaelen-supported minor lines; 8.5 is not added to this candidate.
+
+The configurations `php-8.4.26.json` and `php-8.3.33.json` pin the static-php-cli source revision,
 the exact PHP source version, extensions, and Vaelen's `cli`/`fpm` artifact
 names. `Scripts/build-php.sh` emits a manifest containing the artifact URLs and
 SHA-256 values after validating both executables.
 
-When multiple Vaelen manifests are available, create the catalog shipped beside
-the primary manifest with:
+The stable production catalog URL is
+`https://github.com/banestojanovic/vaelen/releases/download/php-catalog/php-catalog.json`.
+The product and local distribution setup use this URL by default; users do not
+enter it. The `php-catalog` release asset is updated by the trusted tagged
+workflow. Runtime packages remain at immutable `php-v<version>` release URLs.
+
+When multiple validated Vaelen manifests are available, create a catalog with:
 
 ```text
 Scripts/create-php-catalog.sh php-catalog.json \
-  release/vaelen-php-manifest-8.4.23.json \
-  release/vaelen-php-manifest-8.3.29.json
+  release/vaelen-php-manifest-8.4.26.json \
+  release/vaelen-php-manifest-8.3.33.json
 ```
 
-The catalog contains only complete macOS arm64 PHP manifests. Vaelen reads the
-local catalog immediately and keeps installed runtime truth independent of its
-availability. Release publication should upload the catalog beside the
-versioned artifacts; no PHP version is advertised until its manifest and both
-validated artifacts are published.
+The catalog generator requires trusted manifests, exact version-derived release
+tags, HTTPS asset URLs, and SHA-256 CLI/FPM checksums. The release workflow also
+downloads each prior pair and checks its bytes against the manifest before
+including that entry. A version is omitted unless its pair is present and
+verified. Hosted publication is still subject to explicit approval.
+
+The bundled bootstrap catalog is intentionally empty until those release pairs
+exist. It no longer advertises the former localhost or missing-release assets;
+installed runtimes remain visible and usable, and update availability is
+visibly marked unconfirmed/failed until the HTTPS catalog can be refreshed.
 
 ## Local M2 Bootstrap
 

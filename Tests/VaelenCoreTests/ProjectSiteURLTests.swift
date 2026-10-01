@@ -6,6 +6,27 @@ import XCTest
 /// enables Open Site only from an authoritative usable route. These tests pin
 /// the route-action gating predicate and the deterministic unified ordering.
 final class ProjectSiteURLTests: XCTestCase {
+    func testValidatedDocumentRootUsesProjectRootForEmptySuggestion() {
+        let inspector = ProjectEnvironmentInspector()
+        let project = URL(fileURLWithPath: "/tmp/site/./")
+        XCTAssertEqual(inspector.validatedDocumentRoot(projectRoot: project, suggested: ""), "/tmp/site")
+        XCTAssertEqual(inspector.validatedDocumentRoot(projectRoot: project, suggested: nil), "/tmp/site")
+    }
+
+    func testValidatedDocumentRootTrimsTrailingSeparatorsAndCanonicalizesPaths() {
+        let inspector = ProjectEnvironmentInspector()
+        let project = URL(fileURLWithPath: "/tmp/site")
+        XCTAssertEqual(inspector.validatedDocumentRoot(projectRoot: project, suggested: "public///"), "/tmp/site/public")
+        XCTAssertEqual(inspector.normalizedDocumentRoot("/tmp/site/public/"), "/tmp/site/public")
+    }
+
+    func testValidatedDocumentRootKeepsGenuinelyDifferentRootsDifferent() {
+        let inspector = ProjectEnvironmentInspector()
+        let project = URL(fileURLWithPath: "/tmp/site")
+        XCTAssertNotEqual(inspector.validatedDocumentRoot(projectRoot: project, suggested: "public"), inspector.normalizedDocumentRoot("/tmp/site"))
+        XCTAssertEqual(inspector.validatedDocumentRoot(projectRoot: project, suggested: "public"), inspector.normalizedDocumentRoot("/tmp/site/public"))
+    }
+
     private func report(
         intentExists: Bool = true,
         hostname: String? = "syncproof.test",

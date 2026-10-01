@@ -26,7 +26,7 @@ fpm_hash=$(shasum -a 256 "$artifact_dir/$fpm_name" | cut -d ' ' -f 1)
 jq -n \
   --arg releaseTag "$release_tag" \
   --arg releaseURL "$release_base_url" \
-  --arg catalogURL "$release_base_url/php-catalog.json" \
+  --arg catalogURL "${VAELEN_PHP_CATALOG_URL:-https://github.com/banestojanovic/vaelen/releases/download/php-catalog/php-catalog.json}" \
   --arg manifestTrust "$manifest_trust" \
   --arg module "php" \
   --arg version "$version" \

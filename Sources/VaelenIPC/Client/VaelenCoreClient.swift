@@ -202,6 +202,10 @@ public actor VaelenCoreClient {
     public func phpCatalog() async throws -> PHPRuntimeCatalog {
         guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpCatalog))) else { throw CoreClientError.invalidResponse }; return result.catalog
     }
+    /// Local inventory only: completing an install/remove must not wait for a remote feed.
+    public func phpCatalogSnapshot() async throws -> PHPRuntimeCatalog {
+        guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpCatalogSnapshot))) else { throw CoreClientError.invalidResponse }; return result.catalog
+    }
     public func checkPHPUpdates() async throws -> PHPRuntimeCatalog {
         guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpCatalogCheck))) else { throw CoreClientError.invalidResponse }; return result.catalog
     }
@@ -218,7 +222,14 @@ public actor VaelenCoreClient {
         guard case .phpOperation(let result) = try result(from: await send(IPCRequest(method: .phpOperation))) else { throw CoreClientError.invalidResponse }; return result.operation
     }
     public func phpDefaultSet(_ version: String) async throws -> PHPRuntimeCatalog {
-        guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpDefaultSet, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result.catalog
+        switch try result(from: await send(IPCRequest(method: .phpDefaultSet, params: .phpVersion(.init(version: version))))) {
+        case .phpDefaultSelection(let result): return result.catalog
+        case .phpCatalog(let result): return result.catalog // compatibility with older Core responses
+        default: throw CoreClientError.invalidResponse
+        }
+    }
+    public func phpDefaultSelect(_ version: String) async throws -> PHPDefaultSelectionResult {
+        guard case .phpDefaultSelection(let result) = try result(from: await send(IPCRequest(method: .phpDefaultSet, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result
     }
     public func phpUse(_ version: String) async throws -> PHPPackageWire {
         guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpUse, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let resolved = PHPVersionResolver.resolve(version, versionStrings: result.installed.map(\.version)), let package = result.installed.first(where: { $0.version == resolved }) else { throw CoreClientError.invalidResponse }; return package

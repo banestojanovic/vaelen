@@ -26,14 +26,27 @@ final class AppModel {
     private(set) var projectStartupMilestones: [String: TimeInterval] = [:]
     private(set) var phpCatalog: PHPRuntimeCatalog?
     private(set) var phpCatalogReadPending = false
-    private(set) var phpConfiguration: PHPConfigurationResult?
-    private(set) var phpConfigurationError: String?
-    private(set) var phpConfigurationReadPending = false
+    let phpSettings = PHPConfigurationEditor()
+    private(set) var phpConfiguration: PHPConfigurationResult? {
+        get { phpSettings.snapshot }
+        set { phpSettings.snapshot = newValue }
+    }
+    private(set) var phpConfigurationError: String? {
+        get { phpSettings.readError }
+        set { phpSettings.readError = newValue }
+    }
+    private(set) var phpConfigurationReadPending: Bool {
+        get { phpSettings.readPending }
+        set { phpSettings.readPending = newValue }
+    }
     private(set) var phpConfigurationSaving = false
     private(set) var phpOperation: PHPOperationState?
+    private(set) var phpCompletionMessage: String?
     private(set) var phpCatalogCheckPending = false
     private(set) var phpCatalogCheckError: String?
     private(set) var phpError: String?
+    private(set) var phpDefaultProjectIssues: [PHPDefaultProjectIssue] = []
+    private(set) var phpDefaultRoutingIssues: [String] = []
     private(set) var phpRequestInFlight = false
     private(set) var phpRequestTarget: String?
     private(set) var parkedFolders: [ParkedPathWire] = []
@@ -365,11 +378,14 @@ final class AppModel {
                 projectRelationshipsRefreshError = nil
             }
             self.phpCatalog = phpCatalog
-            if let phpCatalog { lastAutomaticPHPCheckRequestAt = phpCatalog.catalogCheckedAt ?? Date() }
+            if let phpCatalog {
+                lastAutomaticPHPCheckRequestAt = phpCatalog.catalogCheckedAt ?? Date()
+                phpCatalogCheckError = phpCatalog.catalogCheckError
+            }
             self.phpOperation = phpOperation
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
             refreshError = nil
-            if self.phpConfiguration == nil { await refreshPHPConfiguration() }
+            await refreshPHPConfiguration()
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
@@ -736,7 +752,7 @@ final class AppModel {
     func stopRouting() async { await performServiceCommand("Stopping Caddy…") { client in _ = try await client.routingStop() } }
 
     func installPHP(_ version: String) async {
-        await performPHPCommand(version) { _ = try await $0.phpInstall(version) }
+        await performPHPCommand(version, kind: .install) { _ = try await $0.phpInstall(version) }
     }
 
     func updatePHP(_ version: String) async {
@@ -744,7 +760,7 @@ final class AppModel {
             await performPHPUpdateFixture(version)
             return
         }
-        await performPHPCommand(version) { _ = try await $0.phpUpdate(version) }
+        await performPHPCommand(version, kind: .update) { _ = try await $0.phpUpdate(version) }
     }
 
     private func performPHPUpdateFixture(_ version: String) async {
@@ -778,7 +794,7 @@ final class AppModel {
     }
 
     func checkPHPUpdates() async {
-        guard !isSettingsFixture, !phpCatalogCheckPending, let client else {
+        guard !isSettingsFixture, !phpCatalogCheckPending else {
             if isSettingsFixture { phpCatalogCheckError = "Update checks are disabled in isolated Settings fixtures." }
             return
         }
@@ -786,16 +802,71 @@ final class AppModel {
         phpCatalogCheckError = nil
         defer { phpCatalogCheckPending = false }
         do {
-            phpCatalog = try await client.checkPHPUpdates()
-            lastAutomaticPHPCheckRequestAt = phpCatalog?.catalogCheckedAt ?? Date()
+            let checkClient = makeCoreClient()
+            try await checkClient.connect()
+            defer { Task { await checkClient.disconnect() } }
+            phpCatalog = try await checkClient.checkPHPUpdates()
+            lastAutomaticPHPCheckRequestAt = phpCatalog?.catalogCheckedAt
             phpCatalogCheckError = nil
         } catch {
-            phpCatalogCheckError = error.localizedDescription
+            phpCatalogCheckError = phpErrorMessage(error)
         }
     }
 
     func removePHP(_ version: String) async {
-        await performPHPCommand(version) { _ = try await $0.phpRemove(version) }
+        await performPHPCommand(version, kind: .remove) { _ = try await $0.phpRemove(version) }
+    }
+
+    func startPHPRuntime(_ version: String) async {
+        await performPHPCommand(version, kind: .start) { _ = try await $0.phpStart(version) }
+    }
+
+    func stopPHPRuntime(_ version: String) async {
+        await performPHPCommand(version, kind: .stop) { _ = try await $0.phpStop(version) }
+    }
+
+    func retryPHPProjectReconciliation(_ projectName: String) async {
+        guard !phpRequestInFlight, !phpConfigurationSaving else { return }
+        phpRequestInFlight = true
+        phpRequestTarget = "project:\(projectName)"
+        defer {
+            phpRequestInFlight = false
+            if phpRequestTarget == "project:\(projectName)" { phpRequestTarget = nil }
+        }
+        let retryClient = makeCoreClient()
+        do {
+            try await retryClient.connect()
+            let execution = try await retryClient.projectActivate(selector: projectName, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+            await retryClient.disconnect()
+            if execution.state == .succeeded || execution.state == .partial {
+                let verificationClient = makeCoreClient()
+                let report: ProjectEnvironmentReport
+                do {
+                    try await verificationClient.connect()
+                    report = try await verificationClient.projectInspect(selector: projectName, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+                    await verificationClient.disconnect()
+                } catch {
+                    await verificationClient.disconnect()
+                    throw error
+                }
+                guard report.routeTargets.allSatisfy({ $0.disposition == .satisfied }) else {
+                    throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: "Project routing has not yet passed authoritative verification."])
+                }
+                phpDefaultProjectIssues.removeAll { $0.projectName == projectName }
+                projectReportErrors[projectName] = nil
+            } else {
+                let explanation = execution.operations.compactMap(\.message).joined(separator: "; ")
+                if let index = phpDefaultProjectIssues.firstIndex(where: { $0.projectName == projectName }) {
+                    phpDefaultProjectIssues[index] = PHPDefaultProjectIssue(projectName: projectName, message: explanation.isEmpty ? "The project still needs attention." : explanation)
+                }
+            }
+            await refreshAuthoritativeServiceState()
+        } catch {
+            await retryClient.disconnect()
+            if let index = phpDefaultProjectIssues.firstIndex(where: { $0.projectName == projectName }) {
+                phpDefaultProjectIssues[index] = PHPDefaultProjectIssue(projectName: projectName, message: phpErrorMessage(error))
+            }
+        }
     }
 
     func setDefaultPHP(_ version: String) async {
@@ -806,10 +877,17 @@ final class AppModel {
             phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: versions, defaultVersion: version, runningVersions: catalog.runningVersions, availableVersionsKnown: catalog.availableVersionsKnown)
             return
         }
-        await performPHPCommand(version) { _ = try await $0.phpDefaultSet(version) }
+        phpDefaultProjectIssues = []
+        phpDefaultRoutingIssues = []
+        await performPHPCommand(version, kind: .defaultSelection) { [weak self] client in
+            let response = try await client.phpDefaultSelect(version)
+            self?.phpDefaultProjectIssues = response.projectIssues
+            self?.phpDefaultRoutingIssues = response.routingIssues
+        }
     }
 
     func refreshPHPConfiguration() async {
+        guard !isSettingsFixture, !phpRequestInFlight else { return }
         guard let client else {
             if case .connecting = state {
                 phpConfigurationReadPending = true
@@ -820,10 +898,7 @@ final class AppModel {
             }
             return
         }
-        phpConfigurationReadPending = true
-        defer { phpConfigurationReadPending = false }
-        do { phpConfiguration = try await client.phpConfiguration(); phpConfigurationError = nil }
-        catch { phpConfigurationError = error.localizedDescription }
+        await phpSettings.refresh { try await client.phpConfiguration() }
     }
 
     func savePHPConfiguration(version: String?, settings: PHPSettingsValues?) async {
@@ -850,25 +925,27 @@ final class AppModel {
             phpConfigurationError = nil
             return
         }
-        guard let client, !phpConfigurationSaving else { return }
+        guard !phpConfigurationSaving, !phpRequestInFlight else { return }
+        let context = PHPSettingsContext(version: version)
         phpConfigurationSaving = true
         defer { phpConfigurationSaving = false }
-        do {
-            phpConfiguration = try await client.updatePHPConfiguration(version: version, settings: settings)
-            phpConfigurationError = nil
-            await refresh()
-            await refreshPHPConfiguration()
-        } catch {
-            phpConfigurationError = error.localizedDescription
-            await refreshPHPConfiguration()
+        await phpSettings.save(context: context, settings: settings) {
+            guard let client = self.client else { throw CoreClientError.coreUnavailable }
+            return try await client.updatePHPConfiguration(version: version, settings: settings)
         }
+        await refreshPHPConfiguration()
+        await refreshAuthoritativeServiceState()
     }
 
-    func openPHPConfigurationFiles() async {
-        guard let client else { phpConfigurationError = "Vaelen Core is not connected."; return }
+    func openPHPConfigurationFiles(version: String? = nil) async {
+        guard !isSettingsFixture else { return }
         do {
-            let configuration = try await client.phpConfiguration()
-            let url = URL(fileURLWithPath: configuration.directory, isDirectory: true)
+            guard let configuration = phpConfiguration else { throw CoreClientError.invalidResponse }
+            let url: URL
+            if let version {
+                guard let item = configuration.versions.first(where: { $0.version == version }) else { throw CoreClientError.invalidResponse }
+                url = URL(fileURLWithPath: item.fpmIniPath).deletingLastPathComponent()
+            } else { url = URL(fileURLWithPath: configuration.directory, isDirectory: true) }
             guard NSWorkspace.shared.open(url) else { throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: url.path]) }
             phpConfigurationError = nil
         } catch { phpConfigurationError = "Could not open Vaelen PHP configuration files: \(error.localizedDescription)" }
@@ -1140,7 +1217,7 @@ final class AppModel {
         }
         // These flags cover only live request/reply operations now; the slow
         // project/catalog reconciliation is not part of their lifetime.
-        guard !serviceOperationIsBusy, !phpRequestInFlight, !relationshipMutationInFlight else {
+        guard !serviceOperationIsBusy, !relationshipMutationInFlight else {
             serviceError = "Vaelen is finishing the current operation. Try Quit again when it completes."
             return
         }
@@ -1200,16 +1277,18 @@ final class AppModel {
 
     private func checkPHPUpdatesIfDue() async {
         guard !isQuitting, !isSettingsFixture, !phpCatalogCheckPending,
-              Date().timeIntervalSince(lastAutomaticPHPCheckRequestAt ?? .distantPast) >= 12 * 60 * 60,
-              let client else { return }
-        lastAutomaticPHPCheckRequestAt = Date()
+              Date().timeIntervalSince(lastAutomaticPHPCheckRequestAt ?? .distantPast) >= 12 * 60 * 60 else { return }
         phpCatalogCheckPending = true
         defer { phpCatalogCheckPending = false }
         do {
-            phpCatalog = try await client.phpCatalog()
-            phpCatalogCheckError = nil
+            let checkClient = makeCoreClient()
+            try await checkClient.connect()
+            defer { Task { await checkClient.disconnect() } }
+            phpCatalog = try await checkClient.phpCatalog()
+            lastAutomaticPHPCheckRequestAt = Date()
+            phpCatalogCheckError = phpCatalog?.catalogCheckError
         } catch {
-            phpCatalogCheckError = error.localizedDescription
+            phpCatalogCheckError = phpErrorMessage(error)
         }
     }
 
@@ -1336,27 +1415,54 @@ final class AppModel {
 
     private func beginPHPRequest(version: String) -> Bool {
         guard !isSettingsFixture else { phpError = "This isolated Settings fixture cannot operate Vaelen Core."; return false }
-        guard !phpRequestInFlight else { return false }
+        guard !phpRequestInFlight, !phpConfigurationSaving else { return false }
         guard client != nil else { phpError = "Vaelen Core is unavailable."; return false }
         phpError = nil
+        phpCompletionMessage = nil
         phpRequestInFlight = true
         phpRequestTarget = version
         return true
     }
 
     private func finishPHPRequest(error: String? = nil) async {
-        await refreshAuthoritativeServiceState()
-        if let catalog = try? await client?.phpCatalog() {
-            phpCatalog = catalog
-            lastAutomaticPHPCheckRequestAt = catalog.catalogCheckedAt ?? Date()
-        }
+        refreshGeneration += 1 // an older full snapshot must not overwrite this completion
         phpRequestInFlight = false
         phpRequestTarget = nil
         phpError = error
+        await refreshPHPSettings()
     }
 
-    private func performPHPCommand(_ version: String, command: @MainActor (VaelenCoreClient) async throws -> Void) async {
+    func refreshPHPSettings() async {
+        guard !isSettingsFixture, !phpRequestInFlight else { return }
+        let readClient = makeCoreClient()
+        phpCatalogReadPending = true
+        defer { phpCatalogReadPending = false }
+        do {
+            try await readClient.connect()
+            phpCatalog = try await readClient.phpCatalogSnapshot()
+            await phpSettings.refresh { try await readClient.phpConfiguration() }
+            for issue in phpDefaultProjectIssues {
+                if let report = try? await readClient.projectInspect(selector: issue.projectName, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path),
+                   report.routeTargets.allSatisfy({ $0.disposition == .satisfied }) {
+                    phpDefaultProjectIssues.removeAll { $0.projectName == issue.projectName }
+                }
+            }
+            await readClient.disconnect()
+        } catch {
+            await readClient.disconnect()
+            phpConfigurationError = "Could not refresh PHP runtime inventory: \(phpErrorMessage(error)). Showing last confirmed values."
+        }
+    }
+
+    private func performPHPCommand(_ version: String, kind: PHPOperationKind, command: @MainActor (VaelenCoreClient) async throws -> Void) async {
         guard beginPHPRequest(version: version) else { return }
+        let initialPhase: PHPOperationPhase = switch kind {
+        case .defaultSelection, .start: .starting
+        case .stop, .remove: .removing
+        default: .downloading
+        }
+        phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: initialPhase)
+        phpSettings.invalidateReads()
         let commandClient = makeCoreClient()
         do {
             try await commandClient.connect()
@@ -1365,7 +1471,9 @@ final class AppModel {
             phpOperationPollTask?.cancel()
             phpOperationPollTask = Task { [weak self] in
                 while !Task.isCancelled {
-                    if let operation = try? await progressClient.phpOperation() { self?.phpOperation = operation }
+                    if let operation = try? await progressClient.phpOperation(), !Task.isCancelled,
+                       operation.kind == kind, operation.targetVersion == version,
+                       operation.phase != .ready && operation.phase != .failed { self?.phpOperation = operation }
                     do { try await Task.sleep(for: .milliseconds(500)) } catch { break }
                 }
                 await progressClient.disconnect()
@@ -1374,11 +1482,23 @@ final class AppModel {
             await commandClient.disconnect()
             phpOperationPollTask?.cancel()
             phpOperationPollTask = nil
+            phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: .ready)
+            phpCompletionMessage = switch kind {
+            case .install: "PHP \(version) installed. It remains stopped until you choose Start."
+            case .update: "PHP \(version) update completed."
+            case .remove: "PHP \(version) removed. Saved settings and verified downloads are kept."
+            case .defaultSelection: "PHP \(version) is now the default."
+            case .start: "PHP \(version) started; saved default unchanged."
+            case .stop: "PHP \(version) stopped; saved default unchanged."
+            case .configurationUpdate: "PHP settings updated."
+            }
             await finishPHPRequest()
         } catch {
             await commandClient.disconnect()
             phpOperationPollTask?.cancel()
             phpOperationPollTask = nil
+            phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: .failed, message: phpErrorMessage(error))
+            phpCompletionMessage = "PHP \(version) operation failed: \(phpErrorMessage(error))"
             await finishPHPRequest(error: phpErrorMessage(error))
         }
     }

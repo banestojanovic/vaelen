@@ -1,12 +1,19 @@
 name: Build Vaelen PHP
 
+# Keep every release run queued rather than replacing an older pending run.
+# Catalog promotion reads and merges the current feed only while owning this
+# repository-wide release lane.
+concurrency:
+  group: vaelen-php-release-catalog
+  queue: max
+
 on:
   workflow_dispatch:
     inputs:
       php_build_config:
         description: "Vaelen PHP build configuration"
         required: true
-        default: "Distribution/PHP/php-8.4.23.json"
+        default: "Distribution/PHP/php-8.4.26.json"
   push:
     tags:
       - 'php-v*'
@@ -32,7 +39,11 @@ jobs:
           fi
           test -f "$config"
           echo "path=$config" >> "$GITHUB_OUTPUT"
-          echo "php-version=$(jq -r '.phpVersion' "$config")" >> "$GITHUB_OUTPUT"
+          version=$(jq -r '.phpVersion' "$config")
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "php-v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match configured PHP $version" >&2; exit 1
+          fi
+          echo "php-version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up build PHP
         uses: shivammathur/setup-php@v2
@@ -45,53 +56,37 @@ jobs:
 
       - name: Build, validate, package, and manifest PHP
         run: |
-          release_tag="${GITHUB_REF_NAME:-php-v${{ steps.config.outputs.php-version }}}"
+          # Manual dispatches may originate from any branch. The artifact URLs
+          # always point at the immutable, version-derived package release tag.
+          release_tag="php-v${{ steps.config.outputs.php-version }}"
           release_base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}"
           PHP_BUILD_CONFIG="${{ steps.config.outputs.path }}"
+          VAELEN_BUILD_ROOT="$GITHUB_WORKSPACE/.build/php" \
           VAELEN_RELEASE_TAG="$release_tag" \
           VAELEN_RELEASE_BASE_URL="$release_base_url" \
-          VAELEN_MANIFEST_TRUST=trusted-vaelen-release-manifest \
+          VAELEN_PHP_CATALOG_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/php-catalog/php-catalog.json" \
+          VAELEN_MANIFEST_TRUST="${{ startsWith(github.ref, 'refs/tags/') && 'trusted-vaelen-release-manifest' || 'unreleased-workflow-build' }}" \
             Scripts/build-php.sh "$PHP_BUILD_CONFIG"
-
-      - name: Prepare curated PHP catalog
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          catalog_dir="$RUNNER_TEMP/php-catalog"
-          mkdir -p "$catalog_dir"
-          current_version="${{ steps.config.outputs.php-version }}"
-          cp .build/release/vaelen-php-manifest.json "$catalog_dir/vaelen-php-manifest-$current_version.json"
-          for config in Distribution/PHP/php-*.json; do
-            version=$(jq -r '.phpVersion' "$config")
-            [ "$version" = "$current_version" ] && continue
-            gh release download "php-v$version" \
-              --pattern vaelen-php-manifest.json \
-              --dir "$catalog_dir" --clobber 2>/dev/null || true
-            if [ -f "$catalog_dir/vaelen-php-manifest.json" ]; then
-              cli=$(jq -r '.artifacts.cli.file' "$catalog_dir/vaelen-php-manifest.json")
-              fpm=$(jq -r '.artifacts.fpm.file' "$catalog_dir/vaelen-php-manifest.json")
-              assets=$(gh release view "php-v$version" --json assets --jq '.assets[].name' 2>/dev/null || true)
-              if printf '%s\n' "$assets" | grep -Fxq "$cli" && printf '%s\n' "$assets" | grep -Fxq "$fpm"; then
-                mv "$catalog_dir/vaelen-php-manifest.json" "$catalog_dir/vaelen-php-manifest-$version.json"
-              else
-                rm -f "$catalog_dir/vaelen-php-manifest.json"
-              fi
-            fi
-          done
-          Scripts/create-php-catalog.sh .build/release/php-catalog.json "$catalog_dir"/*.json
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vaelen-php-${{ steps.config.outputs.php-version }}-arm64
-          path: .build/release/*
+          path: .build/php/release/*
 
       - name: Publish trusted Vaelen release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing versioned PHP release $GITHUB_REF_NAME" >&2; exit 1
+          fi
+          manifest=.build/php/release/vaelen-php-manifest.json
+          cli=$(jq -r '.artifacts.cli.file' "$manifest")
+          fpm=$(jq -r '.artifacts.fpm.file' "$manifest")
           gh release create "$GITHUB_REF_NAME" \
             --title "Vaelen PHP ${{ steps.config.outputs.php-version }}" \
             --notes "Vaelen-controlled PHP arm64 distribution built from pinned static-php-cli sources. SHA-256 values are integrity checks against the attached Vaelen manifest; authenticity derives from the trusted Vaelen release and workflow." \
-            .build/release/*
+            ".build/php/release/$cli" ".build/php/release/$fpm" "$manifest"
+          Scripts/promote-php-catalog.sh "$GITHUB_REF_NAME" "$manifest"

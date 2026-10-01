@@ -105,7 +105,7 @@ public final class MySQLModule: @unchecked Sendable {
     private let instanceName: String
     private let tcpEnabled: Bool
     private let packageOverride: MySQLPackage?
-    private let clientCommandTimeout: TimeInterval
+    var clientCommandTimeout: TimeInterval
     var shutdownTimeout: TimeInterval
     private let manager = FileManager.default
     private let lock = NSLock()

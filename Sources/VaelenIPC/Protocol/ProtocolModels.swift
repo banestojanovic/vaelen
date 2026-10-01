@@ -76,6 +76,7 @@ public enum CoreMethod: String, Sendable {
     case pathList = "path.list"
     case phpVersions = "php.versions"
     case phpCatalog = "php.catalog"
+    case phpCatalogSnapshot = "php.catalog.snapshot"
     case phpCatalogCheck = "php.catalog.check"
     case phpInstall = "php.install"
     case phpUpdate = "php.update"
@@ -422,6 +423,17 @@ public struct PHPResolveResult: Codable, Equatable, Sendable { public let versio
 public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
 public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
 public struct PHPRuntimeCatalogResult: Codable, Equatable, Sendable { public let catalog: PHPRuntimeCatalog; public init(catalog: PHPRuntimeCatalog) { self.catalog = catalog } }
+public struct PHPDefaultProjectIssue: Codable, Equatable, Sendable {
+    public let projectName: String
+    public let message: String
+    public init(projectName: String, message: String) { self.projectName = projectName; self.message = message }
+}
+public struct PHPDefaultSelectionResult: Codable, Equatable, Sendable {
+    public let catalog: PHPRuntimeCatalog
+    public let projectIssues: [PHPDefaultProjectIssue]
+    public let routingIssues: [String]
+    public init(catalog: PHPRuntimeCatalog, projectIssues: [PHPDefaultProjectIssue], routingIssues: [String] = []) { self.catalog = catalog; self.projectIssues = projectIssues; self.routingIssues = routingIssues }
+}
 public struct PHPOperationResult: Codable, Equatable, Sendable {
     public let operation: PHPOperationState?
     public init(operation: PHPOperationState?) { self.operation = operation }
@@ -480,6 +492,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
     case phpCatalog(PHPRuntimeCatalogResult)
+    case phpDefaultSelection(PHPDefaultSelectionResult)
     case phpOperation(PHPOperationResult)
     case phpStatus(PHPStatusResult)
     case phpConfiguration(PHPConfigurationResult)
@@ -517,6 +530,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
         case .phpCatalog(let value): try value.encode(to: encoder)
+        case .phpDefaultSelection(let value): try value.encode(to: encoder)
         case .phpOperation(let value): try value.encode(to: encoder)
         case .phpStatus(let value): try value.encode(to: encoder)
         case .phpConfiguration(let value): try value.encode(to: encoder)
@@ -560,6 +574,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["mysql"] != nil, let result = try? IPCCodec.decode(MySQLStatusResult.self, from: data) { self = .mysqlStatus(result) }
         else if fields["mailpit"] != nil, let result = try? IPCCodec.decode(MailpitVersionsResult.self, from: data) { self = .mailpitVersions(result) }
         else if fields["mailpit"] != nil, let result = try? IPCCodec.decode(MailpitStatusResult.self, from: data) { self = .mailpitStatus(result) }
+        else if fields["projectIssues"] != nil, let result = try? IPCCodec.decode(PHPDefaultSelectionResult.self, from: data) { self = .phpDefaultSelection(result) }
         else if fields["catalog"] != nil, let result = try? IPCCodec.decode(PHPRuntimeCatalogResult.self, from: data) { self = .phpCatalog(result) }
         else if fields["operation"] != nil, let result = try? IPCCodec.decode(PHPOperationResult.self, from: data) { self = .phpOperation(result) }
         else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import VaelenCore
 import VaelenIPC
 
 @MainActor
@@ -107,7 +108,10 @@ final class VaelenAppDelegate: NSObject, NSApplicationDelegate {
 
 enum VaelenActivitySignal {
     static var url: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let isolatedRoot = VaelenTestRuntimePaths.isolatedSupportRoot() {
+            return isolatedRoot.appendingPathComponent("state/activity")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Vaelen/state/activity")
     }
 

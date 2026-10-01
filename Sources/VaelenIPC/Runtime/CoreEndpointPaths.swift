@@ -9,9 +9,18 @@ public struct CoreEndpointPaths: Sendable {
     public let lock: URL
 
     public init(root: URL? = nil) {
-        let base = root ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Vaelen", isDirectory: true)
-            .appendingPathComponent("runtime", isDirectory: true)
+        let base: URL
+        if let root {
+            base = root
+        } else {
+            if let isolatedRoot = VaelenTestRuntimePaths.isolatedSupportRoot() {
+                base = isolatedRoot.appendingPathComponent("runtime", isDirectory: true)
+            } else {
+                base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("Vaelen", isDirectory: true)
+                    .appendingPathComponent("runtime", isDirectory: true)
+            }
+        }
         self.root = base
         self.sockets = base.appendingPathComponent("sockets", isDirectory: true)
         self.locks = base.appendingPathComponent("locks", isDirectory: true)

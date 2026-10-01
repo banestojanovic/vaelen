@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import os
 
 public struct PHPVersion: Codable, Comparable, Hashable, Sendable, CustomStringConvertible {
     public let major: Int
@@ -94,6 +95,12 @@ public struct PHPArtifact: Codable, Equatable, Sendable {
     public let sha256: String
 }
 
+public struct PHPReleaseReference: Codable, Equatable, Sendable {
+    public let tag: String
+    public let url: String
+    public init(tag: String, url: String) { self.tag = tag; self.url = url }
+}
+
 public struct PHPManifest: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let module: String
@@ -104,8 +111,9 @@ public struct PHPManifest: Codable, Equatable, Sendable {
     public let artifacts: [String: PHPArtifact]
     public let verification: PHPVerification
     public let catalogURL: String?
+    public let release: PHPReleaseReference?
 
-    public init(schemaVersion: Int, module: String, phpVersion: String, platform: String, architecture: String, build: PHPBuildConfiguration? = nil, artifacts: [String: PHPArtifact], verification: PHPVerification, catalogURL: String? = nil) {
+    public init(schemaVersion: Int, module: String, phpVersion: String, platform: String, architecture: String, build: PHPBuildConfiguration? = nil, artifacts: [String: PHPArtifact], verification: PHPVerification, catalogURL: String? = nil, release: PHPReleaseReference? = nil) {
         self.schemaVersion = schemaVersion
         self.module = module
         self.phpVersion = phpVersion
@@ -115,6 +123,7 @@ public struct PHPManifest: Codable, Equatable, Sendable {
         self.artifacts = artifacts
         self.verification = verification
         self.catalogURL = catalogURL
+        self.release = release
     }
 }
 
@@ -150,11 +159,27 @@ public extension PHPManifestLocation {
 }
 
 public struct PHPManifestCatalog: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let module: String
     public let manifests: [PHPManifest]
-    public init(manifests: [PHPManifest]) { self.manifests = manifests }
+    public init(manifests: [PHPManifest], schemaVersion: Int = 1, module: String = "php") { self.schemaVersion = schemaVersion; self.module = module; self.manifests = manifests }
+    private enum CodingKeys: String, CodingKey { case schemaVersion, module, manifests }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        module = try values.decode(String.self, forKey: .module)
+        manifests = try values.decode([PHPManifest].self, forKey: .manifests)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schemaVersion, forKey: .schemaVersion)
+        try values.encode(module, forKey: .module)
+        try values.encode(manifests, forKey: .manifests)
+    }
 }
 
 public struct FilePHPManifestLocation: PHPManifestLocation {
+    public static let defaultCatalogURL = URL(string: "https://github.com/banestojanovic/vaelen/releases/download/php-catalog/php-catalog.json")!
     private static let refreshGate = PHPCatalogRefreshGate()
     public let manifestURL: URL
     public let baseURL: URL?
@@ -171,42 +196,122 @@ public struct FilePHPManifestLocation: PHPManifestLocation {
     public func checkCatalogNow() throws { try refreshCatalog(force: true) }
     private func refreshCatalog(force: Bool) throws {
         guard let catalogURL else {
-            if force { throw PHPModuleError.manifestUnavailable }
+            let directory = manifestURL.deletingLastPathComponent()
+            let stateURL = directory.appendingPathComponent("php-catalog-check.json")
+            Self.refreshGate.lock.lock()
+            let previous = try? JSONDecoder().decode(PHPCatalogCheckState.self, from: Data(contentsOf: stateURL))
+            let lastAttempt = [previous?.lastAttemptAt, Self.refreshGate.lastAttemptByStateFile[stateURL.path]].compactMap { $0 }.max()
+            if !force, let lastAttempt, now().timeIntervalSince(lastAttempt) < 12 * 60 * 60 {
+                Self.refreshGate.lock.unlock()
+                return
+            }
+            let attempt = now()
+            Self.refreshGate.lastAttemptByStateFile[stateURL.path] = attempt
+            let message = "No PHP update catalog is configured for this Vaelen distribution."
+            try? JSONEncoder().encode(PHPCatalogCheckState(lastAttemptAt: attempt, lastSuccessfulAt: previous?.lastSuccessfulAt, error: message)).write(to: stateURL, options: .atomic)
+            Self.refreshGate.lock.unlock()
+            if force { throw PHPModuleError.catalogUnavailable(message) }
             return
         }
         let directory = manifestURL.deletingLastPathComponent()
         let cacheURL = directory.appendingPathComponent("php-catalog.json")
         let stateURL = directory.appendingPathComponent("php-catalog-check.json")
         Self.refreshGate.lock.lock()
-        defer { Self.refreshGate.lock.unlock() }
         let prior = try? JSONDecoder().decode(PHPCatalogCheckState.self, from: Data(contentsOf: stateURL))
-        let previousAttempt = [prior?.checkedAt, Self.refreshGate.lastAttemptByStateFile[stateURL.path]].compactMap { $0 }.max()
-        if !force, let previousAttempt, now().timeIntervalSince(previousAttempt) < 12 * 60 * 60 { return }
+        let previousAttempt = [prior?.lastAttemptAt, Self.refreshGate.lastAttemptByStateFile[stateURL.path]].compactMap { $0 }.max()
+        let staleMissingFeedError = prior?.error?.contains("no update-feed URL") == true
+        if !force, !staleMissingFeedError, let previousAttempt, now().timeIntervalSince(previousAttempt) < 12 * 60 * 60 { Self.refreshGate.lock.unlock(); return }
+        guard !Self.refreshGate.inFlightStateFiles.contains(stateURL.path) else {
+            Self.refreshGate.lock.unlock()
+            if force { throw PHPModuleError.operationInProgress("a PHP catalog check is already in progress") }
+            return
+        }
+        Self.refreshGate.inFlightStateFiles.insert(stateURL.path)
         let attemptDate = now()
         Self.refreshGate.lastAttemptByStateFile[stateURL.path] = attemptDate
-        try JSONEncoder().encode(PHPCatalogCheckState(checkedAt: attemptDate, error: nil)).write(to: stateURL, options: .atomic)
+        do {
+            try JSONEncoder().encode(PHPCatalogCheckState(lastAttemptAt: attemptDate, lastSuccessfulAt: prior?.lastSuccessfulAt, error: nil)).write(to: stateURL, options: .atomic)
+        } catch {
+            Self.refreshGate.inFlightStateFiles.remove(stateURL.path)
+            Self.refreshGate.lock.unlock()
+            throw error
+        }
+        Self.refreshGate.lock.unlock()
+        defer {
+            Self.refreshGate.lock.lock()
+            Self.refreshGate.inFlightStateFiles.remove(stateURL.path)
+            Self.refreshGate.lock.unlock()
+        }
+        let scheme = catalogURL.scheme?.lowercased()
+        let host = catalogURL.host?.lowercased()
+        let isLocalTestEndpoint = scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host ?? "")
+        guard scheme == "https" || isLocalTestEndpoint else {
+            let message = "The PHP update catalog must use HTTPS."
+            try? JSONEncoder().encode(PHPCatalogCheckState(lastAttemptAt: attemptDate, lastSuccessfulAt: prior?.lastSuccessfulAt, error: message)).write(to: stateURL, options: .atomic)
+            throw PHPModuleError.catalogUnavailable(message)
+        }
         var request = URLRequest(url: catalogURL)
         request.timeoutInterval = 10
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         let semaphore = DispatchSemaphore(value: 0)
         let result = PHPRemoteResultBox()
-        URLSession.shared.dataTask(with: request) { data, _, error in
-            if let data { result.set(.success(data)) }
-            else { result.set(.failure(error ?? PHPModuleError.manifestUnavailable)) }
+        let session = URLSession(configuration: .ephemeral)
+        session.dataTask(with: request) { data, response, error in
+            if let data { result.set(.success((data, response as? HTTPURLResponse))) }
+            else { result.set(.failure(error ?? PHPModuleError.catalogUnavailable("The PHP update catalog could not be reached."))) }
             semaphore.signal()
         }.resume()
         semaphore.wait()
+        session.finishTasksAndInvalidate()
         let data: Data
         do {
-            data = try result.get()!.get()
-            let catalog = try JSONDecoder().decode(PHPManifestCatalog.self, from: data)
-            guard !catalog.manifests.isEmpty, catalog.manifests.allSatisfy({ $0.verification.authenticity == "trusted-vaelen-release-manifest" }) else {
-            throw PHPModuleError.invalidManifest("catalog is not a trusted Vaelen release catalog")
+            let (responseData, response): (Data, HTTPURLResponse?)
+            do { (responseData, response) = try result.get()!.get() }
+            catch {
+                let cause = error as NSError
+                throw PHPModuleError.catalogUnavailable("The PHP update catalog could not be reached (network error \(cause.code)).")
             }
+            data = responseData
+            // URLSession returns bodies for 404/500 too. Never accept a stale
+            // or error document as a successful catalog response.
+            guard let response, (200..<300).contains(response.statusCode) else {
+                throw PHPModuleError.catalogUnavailable(response.map { "The PHP update catalog returned HTTP \($0.statusCode)." } ?? "The PHP update catalog returned no HTTP response.")
+            }
+            let catalog: PHPManifestCatalog
+            do { catalog = try JSONDecoder().decode(PHPManifestCatalog.self, from: data) }
+            catch { throw PHPModuleError.catalogUnavailable("The PHP update catalog response is not valid JSON.") }
+            guard Self.isValidRemoteCatalog(catalog) else { throw PHPModuleError.catalogUnavailable("The PHP update catalog contains no valid, checksum-verified Vaelen PHP releases.") }
             try data.write(to: cacheURL, options: .atomic)
-            try JSONEncoder().encode(PHPCatalogCheckState(checkedAt: attemptDate, error: nil)).write(to: stateURL, options: .atomic)
+            try JSONEncoder().encode(PHPCatalogCheckState(lastAttemptAt: attemptDate, lastSuccessfulAt: attemptDate, error: nil)).write(to: stateURL, options: .atomic)
         } catch {
-            try? JSONEncoder().encode(PHPCatalogCheckState(checkedAt: attemptDate, error: String(describing: error))).write(to: stateURL, options: .atomic)
+            let message: String
+            if case PHPModuleError.catalogUnavailable(let cause) = error { message = cause }
+            else { message = String(describing: error) }
+            try? JSONEncoder().encode(PHPCatalogCheckState(lastAttemptAt: attemptDate, lastSuccessfulAt: prior?.lastSuccessfulAt, error: message)).write(to: stateURL, options: .atomic)
             throw error
+        }
+    }
+
+    private static func isValidRemoteCatalog(_ catalog: PHPManifestCatalog) -> Bool {
+        catalog.schemaVersion == 1 && catalog.module == "php" && !catalog.manifests.isEmpty && catalog.manifests.allSatisfy { manifest in
+            guard manifest.module == "php", manifest.schemaVersion == 1,
+                  manifest.platform == "macos", manifest.architecture == "arm64",
+                  manifest.verification.algorithm.lowercased() == "sha256",
+                  manifest.verification.authenticity == "trusted-vaelen-release-manifest",
+                  PHPVersion(manifest.phpVersion)?.isStable == true,
+                  let version = PHPVersion(manifest.phpVersion)?.description,
+                  let release = manifest.release,
+                  release.tag == "php-v\(version)",
+                  release.url == "https://github.com/banestojanovic/vaelen/releases/download/php-v\(version)",
+                  let cli = manifest.artifacts["cli"], let fpm = manifest.artifacts["fpm"] else { return false }
+            return [("cli", cli), ("fpm", fpm)].allSatisfy { kind, artifact in
+                artifact.file == "php-\(version)-\(kind)-macos-arm64.tar.gz" &&
+                URL(string: artifact.url)?.absoluteString == "\(release.url)/\(artifact.file)" &&
+                URL(string: artifact.url)?.scheme?.lowercased() == "https" &&
+                artifact.sha256.count == 64 && artifact.sha256.allSatisfy(\.isHexDigit) &&
+                !artifact.file.isEmpty
+            }
         }
     }
     public func manifests() throws -> [PHPManifest] {
@@ -217,18 +322,39 @@ public struct FilePHPManifestLocation: PHPManifestLocation {
     public func catalogCheckStatus() -> (Date?, String?) {
         let url = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog-check.json")
         guard let state = try? JSONDecoder().decode(PHPCatalogCheckState.self, from: Data(contentsOf: url)) else { return (nil, nil) }
-        return (state.checkedAt, state.error)
+        return (state.lastSuccessfulAt, state.error)
     }
 }
 
-private struct PHPCatalogCheckState: Codable { let checkedAt: Date; let error: String? }
+private struct PHPCatalogCheckState: Codable {
+    let lastAttemptAt: Date
+    let lastSuccessfulAt: Date?
+    let error: String?
+    private enum CodingKeys: String, CodingKey { case lastAttemptAt, lastSuccessfulAt, checkedAt, error }
+    init(lastAttemptAt: Date, lastSuccessfulAt: Date?, error: String?) { self.lastAttemptAt = lastAttemptAt; self.lastSuccessfulAt = lastSuccessfulAt; self.error = error }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let old = try container.decodeIfPresent(Date.self, forKey: .checkedAt)
+        lastAttemptAt = try container.decodeIfPresent(Date.self, forKey: .lastAttemptAt) ?? old ?? .distantPast
+        lastSuccessfulAt = try container.decodeIfPresent(Date.self, forKey: .lastSuccessfulAt) ?? (try container.decodeIfPresent(String.self, forKey: .error) == nil ? old : nil)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(lastAttemptAt, forKey: .lastAttemptAt)
+        try container.encodeIfPresent(lastSuccessfulAt, forKey: .lastSuccessfulAt)
+        try container.encodeIfPresent(error, forKey: .error)
+    }
+}
 private final class PHPCatalogRefreshGate: @unchecked Sendable {
     let lock = NSLock()
     var lastAttemptByStateFile: [String: Date] = [:]
+    var inFlightStateFiles = Set<String>()
 }
 
 public enum PHPModuleError: Error, Equatable, Sendable {
     case manifestUnavailable
+    case catalogUnavailable(String)
     case invalidManifest(String)
     case unsupportedVersion(String)
     case unsupportedArchitecture(String)
@@ -417,7 +543,7 @@ public struct PHPProjectUsage: Codable, Equatable, Sendable {
     public init(version: String, explicit: Int = 0, inherited: Int = 0) { self.version = version; self.explicit = explicit; self.inherited = inherited }
 }
 
-public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove, defaultSelection, configurationUpdate }
+public enum PHPOperationKind: String, Codable, Sendable { case install, update, remove, defaultSelection, configurationUpdate, start, stop }
 public enum PHPOperationPhase: String, Codable, Sendable { case starting, downloading, verifying, installing, ready, removing, removed, failed }
 public struct PHPOperationState: Codable, Equatable, Sendable {
     public let kind: PHPOperationKind
@@ -429,10 +555,12 @@ public struct PHPOperationState: Codable, Equatable, Sendable {
     public let artifactName: String?
     public let artifactIndex: Int?
     public let artifactCount: Int?
+    public let usingVerifiedCachedDownloads: Bool?
 
-    public init(kind: PHPOperationKind, targetVersion: String, phase: PHPOperationPhase, message: String? = nil, bytesTransferred: Int64? = nil, totalBytes: Int64? = nil, artifactName: String? = nil, artifactIndex: Int? = nil, artifactCount: Int? = nil) {
+    public init(kind: PHPOperationKind, targetVersion: String, phase: PHPOperationPhase, message: String? = nil, bytesTransferred: Int64? = nil, totalBytes: Int64? = nil, artifactName: String? = nil, artifactIndex: Int? = nil, artifactCount: Int? = nil, usingVerifiedCachedDownloads: Bool? = nil) {
         self.kind = kind; self.targetVersion = targetVersion; self.phase = phase; self.message = message
         self.bytesTransferred = bytesTransferred; self.totalBytes = totalBytes; self.artifactName = artifactName; self.artifactIndex = artifactIndex; self.artifactCount = artifactCount
+        self.usingVerifiedCachedDownloads = usingVerifiedCachedDownloads
     }
 }
 
@@ -461,9 +589,9 @@ private struct PHPConfigurationStoreRecord: Codable {
 
 private final class PHPRemoteResultBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var value: Result<Data, Error>?
-    func set(_ value: Result<Data, Error>) { lock.lock(); self.value = value; lock.unlock() }
-    func get() -> Result<Data, Error>? { lock.lock(); defer { lock.unlock() }; return value }
+    private var value: Result<(Data, HTTPURLResponse?), Error>?
+    func set(_ value: Result<(Data, HTTPURLResponse?), Error>) { lock.lock(); self.value = value; lock.unlock() }
+    func get() -> Result<(Data, HTTPURLResponse?), Error>? { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 private final class PHPArtifactTransferDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
@@ -541,12 +669,38 @@ final class PHPArtifactProgressTracker: @unchecked Sendable {
 }
 
 public final class PHPModule: @unchecked Sendable {
+    private static let switchLogger = Logger(subsystem: "dev.vaelen.core", category: "php-default-switch")
     private let layout: VaelenFilesystemLayout
     private let location: any PHPManifestLocation
     private let includesBundledCatalog: Bool
     private let artifactTransfer: @Sendable (URL, URL, PHPArtifactProgressSink) throws -> Void
     private let manager = FileManager.default
     private let lock = NSLock()
+    private let ownedProcessesLock = NSLock()
+    private let validationLock = NSLock()
+    private struct ExecutableIdentity: Equatable {
+        let device: UInt64
+        let inode: UInt64
+        let size: Int64
+        let mode: UInt16
+        let modified: timespec
+        let changed: timespec
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.device == rhs.device && lhs.inode == rhs.inode && lhs.size == rhs.size && lhs.mode == rhs.mode &&
+            lhs.modified.tv_sec == rhs.modified.tv_sec && lhs.modified.tv_nsec == rhs.modified.tv_nsec &&
+            lhs.changed.tv_sec == rhs.changed.tv_sec && lhs.changed.tv_nsec == rhs.changed.tv_nsec
+        }
+    }
+    private struct ValidatedPackage {
+        let metadata: Data
+        let cli: ExecutableIdentity
+        let fpm: ExecutableIdentity
+    }
+    private var validatedPackages: [String: ValidatedPackage] = [:]
+    private var switchTimings: [String: Double] = [:]
+    public func defaultSwitchTimings() -> [String: Double] {
+        lock.lock(); defer { lock.unlock() }; return switchTimings
+    }
     private var activeOperation: PHPOperationState?
     private var lastOperation: PHPOperationState?
     private var ownedFPMProcesses: [String: OwnedChildProcess] = [:]
@@ -569,8 +723,8 @@ public final class PHPModule: @unchecked Sendable {
         let basePath = environment["VAELEN_PHP_ARTIFACT_BASE"] ?? configuration?.artifactBasePath
         let base = basePath.map { URL(fileURLWithPath: $0, isDirectory: true) }
         let manifestMetadata = try? JSONDecoder().decode(PHPManifest.self, from: Data(contentsOf: URL(fileURLWithPath: manifest)))
-        let catalog = environment["VAELEN_PHP_CATALOG_URL"] ?? configuration?.catalogURL ?? manifestMetadata?.catalogURL
-        return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base, catalogURL: catalog.flatMap(URL.init(string:))), includesBundledCatalog: true)
+        let catalog = environment["VAELEN_PHP_CATALOG_URL"] ?? configuration?.catalogURL ?? manifestMetadata?.catalogURL ?? FilePHPManifestLocation.defaultCatalogURL.absoluteString
+        return PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: URL(fileURLWithPath: manifest), baseURL: base, catalogURL: URL(string: catalog)), includesBundledCatalog: true)
     }
 
     public func availableVersions() throws -> [String] {
@@ -659,17 +813,32 @@ public final class PHPModule: @unchecked Sendable {
 
     public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog {
         try executeOperation(kind: .defaultSelection, targetVersion: requestedVersion) {
+            let started = ContinuousClock.now
             let package = try self.resolveExactEligible(requestedVersion)
+            let validated = ContinuousClock.now
             var status = try self.status(requestedVersion: package.version)
             if status.state != .running || status.health != "healthy" {
                 status = try self.start(requestedVersion: package.version)
             }
+            let startedRuntime = ContinuousClock.now
             guard status.state == .running, status.health == "healthy" else {
                 throw PHPModuleError.processFailed("PHP-FPM did not become healthy for PHP \(package.version)")
             }
             _ = try self.setDefaultUnlocked(requestedVersion: package.version)
-            return try self.runtimeCatalog()
+            let persisted = ContinuousClock.now
+            let catalog = try self.runtimeCatalog()
+            let finished = ContinuousClock.now
+            self.lock.lock()
+            self.switchTimings = ["validation_ms": Self.milliseconds(started.duration(to: validated)), "fpm_ms": Self.milliseconds(validated.duration(to: startedRuntime)), "persistence_ms": Self.milliseconds(startedRuntime.duration(to: persisted)), "catalog_ms": Self.milliseconds(persisted.duration(to: finished))]
+            self.lock.unlock()
+            Self.switchLogger.info("PHP default timing version=\(package.version, privacy: .public) validation_ms=\(Self.milliseconds(started.duration(to: validated)), privacy: .public) fpm_ms=\(Self.milliseconds(validated.duration(to: startedRuntime)), privacy: .public) persistence_ms=\(Self.milliseconds(startedRuntime.duration(to: persisted)), privacy: .public) catalog_ms=\(Self.milliseconds(persisted.duration(to: finished)), privacy: .public) total_ms=\(Self.milliseconds(started.duration(to: finished)), privacy: .public)")
+            return catalog
         }
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1_000 + Double(components.attoseconds) / 1_000_000_000_000_000
     }
 
     public func remove(requestedVersion: String) throws {
@@ -696,7 +865,13 @@ public final class PHPModule: @unchecked Sendable {
         guard let cli = manifest.artifacts["cli"], let fpm = manifest.artifacts["fpm"] else { throw PHPModuleError.invalidManifest("CLI and FPM artifacts are required") }
         let version = manifest.phpVersion
         let final = layout.phpPackagesDirectoryURL.appendingPathComponent(version, isDirectory: true)
-        if let existing = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: final.appendingPathComponent(".vaelen-package.json"))) { return existing }
+        if manager.fileExists(atPath: final.path) {
+            let observation = observePackage(at: final)
+            guard observation.eligibility == .eligible, let existing = observation.package else {
+                throw PHPModuleError.validationFailed("Existing PHP \(version) package is invalid; installation did not replace it.")
+            }
+            return existing
+        }
         let tracker = PHPArtifactProgressTracker(artifactCount: 2) { [weak self] bytes, total, name, index, count in
             self?.setOperationDownloadProgress(bytes: bytes, total: total, artifactName: name, artifactIndex: index, artifactCount: count)
         }
@@ -704,6 +879,10 @@ public final class PHPModule: @unchecked Sendable {
         let staging = layout.stagingDirectoryURL.appendingPathComponent("php-\(version)-\(operation)", isDirectory: true)
         try makeDirectories([layout.downloadsDirectoryURL, layout.stagingDirectoryURL, layout.phpPackagesDirectoryURL, staging])
         defer { try? manager.removeItem(at: staging) }
+        setOperationUsingVerifiedCache(
+            manager.fileExists(atPath: layout.downloadsDirectoryURL.appendingPathComponent(cli.file).path) && sha256(layout.downloadsDirectoryURL.appendingPathComponent(cli.file)) == cli.sha256.lowercased() &&
+            manager.fileExists(atPath: layout.downloadsDirectoryURL.appendingPathComponent(fpm.file).path) && sha256(layout.downloadsDirectoryURL.appendingPathComponent(fpm.file)) == fpm.sha256.lowercased(),
+            artifactName: "CLI and FPM", index: 1)
         let cliURL = try acquire(cli, name: "CLI", index: 1, base: location.artifactBaseURL(), progress: tracker)
         let fpmURL = try acquire(fpm, name: "FPM", index: 2, base: location.artifactBaseURL(), progress: tracker)
         setOperationPhase(.verifying)
@@ -784,14 +963,14 @@ public final class PHPModule: @unchecked Sendable {
             let result = try body()
             lock.lock()
             let progress = activeOperation
-            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: kind == .remove ? .removed : .ready, bytesTransferred: progress?.bytesTransferred, totalBytes: progress?.totalBytes, artifactName: progress?.artifactName, artifactIndex: progress?.artifactIndex, artifactCount: progress?.artifactCount)
+            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: kind == .remove ? .removed : .ready, bytesTransferred: progress?.bytesTransferred, totalBytes: progress?.totalBytes, artifactName: progress?.artifactName, artifactIndex: progress?.artifactIndex, artifactCount: progress?.artifactCount, usingVerifiedCachedDownloads: progress?.usingVerifiedCachedDownloads)
             activeOperation = nil
             lock.unlock()
             return result
         } catch {
             lock.lock()
             let progress = activeOperation
-            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: .failed, message: String(describing: error), bytesTransferred: progress?.bytesTransferred, totalBytes: progress?.totalBytes, artifactName: progress?.artifactName, artifactIndex: progress?.artifactIndex, artifactCount: progress?.artifactCount)
+            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: .failed, message: String(describing: error), bytesTransferred: progress?.bytesTransferred, totalBytes: progress?.totalBytes, artifactName: progress?.artifactName, artifactIndex: progress?.artifactIndex, artifactCount: progress?.artifactCount, usingVerifiedCachedDownloads: progress?.usingVerifiedCachedDownloads)
             activeOperation = nil
             lock.unlock()
             throw error
@@ -801,13 +980,19 @@ public final class PHPModule: @unchecked Sendable {
     private func setOperationPhase(_ phase: PHPOperationPhase) {
         lock.lock(); defer { lock.unlock() }
         guard let current = activeOperation else { return }
-        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: phase, message: current.message, bytesTransferred: current.bytesTransferred, totalBytes: current.totalBytes, artifactName: current.artifactName, artifactIndex: current.artifactIndex, artifactCount: current.artifactCount)
+        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: phase, message: current.message, bytesTransferred: current.bytesTransferred, totalBytes: current.totalBytes, artifactName: current.artifactName, artifactIndex: current.artifactIndex, artifactCount: current.artifactCount, usingVerifiedCachedDownloads: current.usingVerifiedCachedDownloads)
+    }
+
+    private func setOperationUsingVerifiedCache(_ cached: Bool, artifactName: String, index: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = activeOperation else { return }
+        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: current.phase, message: current.message, bytesTransferred: current.bytesTransferred, totalBytes: current.totalBytes, artifactName: artifactName, artifactIndex: index, artifactCount: 2, usingVerifiedCachedDownloads: cached)
     }
 
     private func setOperationDownloadProgress(bytes: Int64, total: Int64?, artifactName: String, artifactIndex: Int, artifactCount: Int) {
         lock.lock(); defer { lock.unlock() }
         guard let current = activeOperation else { return }
-        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: .downloading, message: nil, bytesTransferred: bytes, totalBytes: total, artifactName: artifactName, artifactIndex: artifactIndex, artifactCount: artifactCount)
+        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: .downloading, message: nil, bytesTransferred: bytes, totalBytes: total, artifactName: artifactName, artifactIndex: artifactIndex, artifactCount: artifactCount, usingVerifiedCachedDownloads: false)
     }
 
     public func setDefault(requestedVersion: String) throws -> PHPPackage {
@@ -971,12 +1156,12 @@ public final class PHPModule: @unchecked Sendable {
         let package = try? resolveInstalled(requestedVersion); let version = package?.version ?? requestedVersion
         let socket = socketPath(version); let record = processRecord(version)
         guard let record else { return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version) }
-        if let child = ownedFPMProcesses[version], child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
+        if let child = ownedProcess(for: version), child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
             if child.hasLiveOwnedDescendants {
                 return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "master-exited-workers-running", isDefault: defaultVersion() == version)
             }
             clearExitedFPMRecord(record, version: version)
-            ownedFPMProcesses.removeValue(forKey: version)
+            removeOwnedProcess(for: version)
             return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version)
         }
         guard processMatches(record) else {
@@ -987,7 +1172,7 @@ public final class PHPModule: @unchecked Sendable {
             return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "identity-unverified", isDefault: defaultVersion() == version)
         }
         let healthy = manager.fileExists(atPath: socket) && isSocket(socket) && isSocketReady(socket)
-        if let child = ownedFPMProcesses[version] { _ = child.isRunningAndReapedIfExited() }
+        if let child = ownedProcess(for: version) { _ = child.isRunningAndReapedIfExited() }
         if healthy, record.socketDevice == nil || record.socketInode == nil {
             var info = stat()
             if lstat(socket, &info) == 0, var updated = processRecord(version) {
@@ -1018,7 +1203,7 @@ public final class PHPModule: @unchecked Sendable {
         let process = Process(); process.executableURL = URL(fileURLWithPath: package.fpmPath); process.arguments = ["-c", ini.fpm.path, "-y", config.path, "-F"]; process.environment = ProcessInfo.processInfo.environment.merging(["PHP_INI_SCAN_DIR": ""]) { _, managed in managed }; process.standardOutput = try FileHandle(forWritingTo: log); process.standardError = process.standardOutput
         try process.run()
         let child = OwnedChildProcess(process: process, label: "PHP-FPM \(package.version)")
-        ownedFPMProcesses[package.version] = child
+        setOwnedProcess(child, for: package.version)
         let record = PHPProcessRecord(pid: process.processIdentifier, version: package.version, executable: package.fpmPath, arguments: process.arguments ?? [], configPath: config.path, socketPath: socket, startedAt: processStartIdentity(process.processIdentifier), socketDevice: nil, socketInode: nil)
         try atomicWrite(record, to: processRecordURL(package.version));
         var lastObservation: PHPStatus?
@@ -1031,7 +1216,7 @@ public final class PHPModule: @unchecked Sendable {
         guard child.terminateAndWait(timeout: 3, signal: SIGQUIT, waitForDescendants: true) else {
             throw PHPModuleError.processFailed("PHP-FPM \(package.version) PID \(record.pid) did not stop cleanly after startup timeout; process record retained")
         }
-        ownedFPMProcesses.removeValue(forKey: package.version)
+        removeOwnedProcess(for: package.version)
         try? manager.removeItem(at: processRecordURL(package.version))
         removeOwnedSocket(record)
         let detail = (try? String(contentsOf: log, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1042,14 +1227,14 @@ public final class PHPModule: @unchecked Sendable {
         let version = try resolveInstalled(requestedVersion).version
         let observed = try status(requestedVersion: version)
         guard let record = processRecord(version) else { return observed }
-        let child = ownedFPMProcesses[version]
+        let child = ownedProcess(for: version)
         guard processExists(record.pid), processMatches(record) else {
             // A dead PID or a live process that no longer matches this record
             // is not authority to signal anything. Drop only Vaelen's stale
             // bookkeeping; do not remove sockets that may now belong to others.
             if !processExists(record.pid) { removeOwnedSocket(record) }
             try? manager.removeItem(at: processRecordURL(version))
-            ownedFPMProcesses.removeValue(forKey: version)
+            removeOwnedProcess(for: version)
             return PHPStatus(version: version, package: observed.package, state: .stopped, pid: nil, socket: record.socketPath, health: "stopped", isDefault: defaultVersion() == version)
         }
         let stopped: Bool
@@ -1064,7 +1249,7 @@ public final class PHPModule: @unchecked Sendable {
         guard stopped else {
             throw PHPModuleError.processFailed("PHP-FPM \(version) PID \(record.pid) or one of its workers remains after the graceful shutdown timeout; process record retained")
         }
-        ownedFPMProcesses.removeValue(forKey: version)
+        removeOwnedProcess(for: version)
         removeOwnedSocket(record)
         try manager.removeItem(at: processRecordURL(version))
         let final = try status(requestedVersion: version)
@@ -1097,13 +1282,36 @@ public final class PHPModule: @unchecked Sendable {
         guard URL(fileURLWithPath: package.packagePath).standardizedFileURL == directory.standardizedFileURL,
               directory.lastPathComponent == package.version else { return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package metadata does not match its package directory.") }
         guard package.architecture == "arm64" else { return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package architecture is incompatible.") }
+        // `file` and PHP's `-v` are package validation, not a runtime health
+        // probe. Reuse only a successful validation of these exact unchanged
+        // files; replacement, writes, chmod or metadata changes invalidate it.
+        guard let cli = executableIdentity(package.cliPath), let fpm = executableIdentity(package.fpmPath) else {
+            return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package executables are missing.")
+        }
+        validationLock.lock()
+        let cached = validatedPackages[directory.path]
+        validationLock.unlock()
+        if cached?.metadata == data, cached?.cli == cli, cached?.fpm == fpm {
+            return .init(package: package, version: package.version, eligibility: .eligible)
+        }
         do {
             try validateInstalledExecutable(package.cliPath, expected: package.version, name: "php")
             try validateInstalledExecutable(package.fpmPath, expected: package.version, name: "php-fpm")
         } catch {
             return .init(package: package, version: package.version, eligibility: .invalid, reason: "Package executable validation failed.")
         }
+        if executableIdentity(package.cliPath) == cli, executableIdentity(package.fpmPath) == fpm {
+            validationLock.lock()
+            validatedPackages[directory.path] = ValidatedPackage(metadata: data, cli: cli, fpm: fpm)
+            validationLock.unlock()
+        }
         return .init(package: package, version: package.version, eligibility: .eligible)
+    }
+
+    private func executableIdentity(_ path: String) -> ExecutableIdentity? {
+        var info = stat()
+        guard stat(path, &info) == 0, manager.isExecutableFile(atPath: path) else { return nil }
+        return .init(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), size: info.st_size, mode: info.st_mode, modified: info.st_mtimespec, changed: info.st_ctimespec)
     }
 
     private func validateInstalledExecutable(_ path: String, expected: String, name: String) throws {
@@ -1120,6 +1328,7 @@ public final class PHPModule: @unchecked Sendable {
             if sha256(destination) == artifact.sha256.lowercased() {
                 let length = ((try? manager.attributesOfItem(atPath: destination.path)[.size]) as? NSNumber)?.int64Value
                 progress.update(name: name, index: index, bytes: length ?? 0, total: length)
+                setOperationUsingVerifiedCache(true, artifactName: name, index: index)
                 setOperationPhase(.verifying)
                 return destination
             }
@@ -1188,6 +1397,18 @@ public final class PHPModule: @unchecked Sendable {
     private func socketPath(_ version: String) -> String { layout.rootURL.appendingPathComponent("runtime/sockets/php/php-\(version).sock").path }
     private func processRecordURL(_ version: String) -> URL { layout.phpInstancesDirectoryURL.appendingPathComponent(version).appendingPathComponent("process.json") }
     private func processRecord(_ version: String) -> PHPProcessRecord? { try? JSONDecoder().decode(PHPProcessRecord.self, from: Data(contentsOf: processRecordURL(version))) }
+    private func ownedProcess(for version: String) -> OwnedChildProcess? {
+        ownedProcessesLock.lock(); defer { ownedProcessesLock.unlock() }
+        return ownedFPMProcesses[version]
+    }
+    private func setOwnedProcess(_ process: OwnedChildProcess, for version: String) {
+        ownedProcessesLock.lock(); defer { ownedProcessesLock.unlock() }
+        ownedFPMProcesses[version] = process
+    }
+    private func removeOwnedProcess(for version: String) {
+        ownedProcessesLock.lock(); defer { ownedProcessesLock.unlock() }
+        ownedFPMProcesses.removeValue(forKey: version)
+    }
     private func clearExitedFPMRecord(_ record: PHPProcessRecord, version: String) {
         try? manager.removeItem(at: processRecordURL(version))
         removeOwnedSocket(record)
@@ -1201,7 +1422,7 @@ public final class PHPModule: @unchecked Sendable {
     }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
     private func processMatches(_ record: PHPProcessRecord) -> Bool {
-        if let child = ownedFPMProcesses[record.version], child.processIdentifier == record.pid {
+        if let child = ownedProcess(for: record.version), child.processIdentifier == record.pid {
             return child.isRunningAndReapedIfExited()
                 && child.executablePath == URL(fileURLWithPath: record.executable).standardizedFileURL.path
                 && child.arguments == record.arguments

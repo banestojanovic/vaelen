@@ -62,7 +62,12 @@ struct SettingsView: View {
             guard let window = notification.object as? NSWindow,
                   window.isVisible,
                   (window.title.localizedCaseInsensitiveContains("Settings") || window.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true) else { return }
-            if !model.isSettingsFixture { Task { await model.refreshProjectRelationshipsIfVisible() } }
+            if !model.isSettingsFixture {
+                Task {
+                    if selection == .php { await model.refreshPHPConfiguration() }
+                    await model.refreshProjectRelationshipsIfVisible()
+                }
+            }
         }
     }
 

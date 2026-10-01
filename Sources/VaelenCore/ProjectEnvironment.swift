@@ -342,6 +342,7 @@ public enum ProjectEnvironmentInspectionError: Error, Equatable, Sendable {
 
 public struct ProjectEnvironmentInspector: Sendable {
     private let frameworkDetector: ProjectFrameworkDetector
+    private let paths = CanonicalPathService()
 
     public init(frameworkDetector: ProjectFrameworkDetector = .init()) {
         self.frameworkDetector = frameworkDetector
@@ -372,7 +373,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         let dbEndpoint = endpointObservation(host: env.dbHost, port: env.dbPort, expectedHost: "127.0.0.1", expectedPort: mysql?.port, matches: endpointMatches(host: env.dbHost, port: env.dbPort, expectedPort: mysql?.port))
         let mailEndpoint = endpointObservation(host: env.mailHost, port: env.mailPort, expectedHost: "127.0.0.1", expectedPort: mailpit?.smtpPort, matches: endpointMatches(host: env.mailHost, port: env.mailPort, expectedPort: mailpit?.smtpPort))
         let mailAuthentication = mailAuthentication(env: env, mailpit: mailpit, endpointMatches: mailEndpoint.matches)
-        let routeRootMatch = framework.suggestedDocumentRoot.map { root.appendingPathComponent($0).path } == route.documentRoot
+        let routeRootMatch = route.documentRoot.map { path in framework.suggestedDocumentRoot.map { validatedDocumentRoot(projectRoot: root, suggested: $0) == normalizedDocumentRoot(path) } ?? false } ?? false
         let routeTargetMatchesPHP: Bool?
         if let resolvedStatus, let routeIntent = routes.first(where: { $0.route.hostname == route.hostname }), case .fastCGI(let socket, _) = routeIntent.route.target {
             routeTargetMatchesPHP = socket == resolvedStatus.socket
@@ -485,7 +486,7 @@ public struct ProjectEnvironmentInspector: Sendable {
             else if runtime == nil { providerAgreement = .missing }
             else if runtimeFastCGI?.socket == persistedSocket, runtimeFastCGI?.root == persistedRoot, runtime?.tls == intent.route.tls { providerAgreement = .agreed }
             else { providerAgreement = .diverged }
-            let rootMatches = framework.suggestedDocumentRoot.map { project.rootPath.string + "/" + $0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) } == persistedRoot
+            let rootMatches = framework.suggestedDocumentRoot.map { validatedDocumentRoot(projectRoot: URL(fileURLWithPath: project.rootPath.string), suggested: $0) == normalizedDocumentRoot(persistedRoot) } ?? false
             let transition = pendingTransitions.first { $0.routeID == intent.route.id }
             let transitionMatchesPersisted = transition.map { $0.projectID == projectID && $0.desiredRoute == intent.route && $0.desiredSocket == persistedSocket } ?? false
             let transitionMatchesProvider = transition.flatMap { transition in runtime.flatMap { try? routeProviderFingerprint($0) == transition.previousProviderFingerprint } } ?? false
@@ -494,8 +495,8 @@ public struct ProjectEnvironmentInspector: Sendable {
             let transitionValid = transition?.projectID == projectID && transitionMatchesPersisted && transitionMatchesProvider && transitionMatchesDesiredPHP && intent.projectID == projectID
             let disposition: ProjectReconciliationDisposition
             let reason: String?
-            if association.state != .durable { disposition = .blocked; reason = "The route does not have durable ProjectID mutation authority." }
-            else if !rootMatches { disposition = .blocked; reason = "The persisted document root does not match the validated project document root." }
+            if intent.projectID == projectID && !rootMatches { disposition = .blocked; reason = "The persisted document root does not match the validated project document root." }
+            else if association.state != .durable { disposition = .blocked; reason = "The route does not have durable ProjectID mutation authority." }
             else if transition != nil && transition?.projectID == projectID && transitionMatchesDesiredProvider && persistedSocket == desiredSocket && transitionMatchesPersisted && transitionMatchesDesiredPHP { disposition = .satisfied; reason = nil }
             else if transition != nil && !transitionValid { disposition = .blocked; reason = "The durable route-target transition no longer matches the project, persisted route, provider route, or desired PHP state." }
             else if transitionValid && providerAgreement == .diverged { disposition = .pending; reason = "The desired target is persisted and the provider is behind after a known M12 apply failure." }
@@ -509,6 +510,19 @@ public struct ProjectEnvironmentInspector: Sendable {
             else { disposition = .actionable; reason = "The route targets a different proven Vaelen PHP runtime." }
             return ProjectPHPRouteTargetObservation(projectID: projectID, routeID: intent.route.id, hostname: intent.route.hostname, persistedDocumentRoot: persistedRoot, observedDocumentRoot: runtimeFastCGI?.root, persistedTLS: intent.route.tls, observedTLS: runtime?.tls, persistedSocket: persistedSocket, observedSocket: runtimeFastCGI?.socket, currentPHPVersion: currentStatus?.version, desiredPHPDeclaration: desiredPHP, resolvedPHPVersion: resolvedPHP, desiredSocket: desiredSocket, associationAuthority: association.mutationAuthority, currentTargetOwnership: currentOwnership, desiredTargetOwnership: desiredOwnership, providerAgreement: providerAgreement, disposition: disposition, reason: reason)
         }
+    }
+
+    /// Empty framework suggestions (WordPress, generic root-served sites) mean
+    /// the project root itself. Normalize only filesystem identity; never
+    /// replace the user's persisted route target.
+    func validatedDocumentRoot(projectRoot: URL, suggested: String?) -> String? {
+        let root = paths.canonicalize(projectRoot.path)
+        guard let suggestion = suggested?.trimmingCharacters(in: .whitespacesAndNewlines), !suggestion.isEmpty else { return root.string }
+        return paths.canonicalize(root.url.appendingPathComponent(suggestion.trimmingCharacters(in: CharacterSet(charactersIn: "/"))).path).string
+    }
+
+    func normalizedDocumentRoot(_ path: String) -> String {
+        paths.canonicalize(path).string
     }
 
     private func resolvePHP(family: String?, packages: [PHPPackage]) -> String? {

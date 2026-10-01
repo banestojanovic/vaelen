@@ -187,6 +187,7 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
             // shutdown request, then prove the same provider can retry.
             try Data("real".utf8).write(to: modeFile, options: .atomic)
             module.shutdownTimeout = 5
+            module.clientCommandTimeout = 10
             XCTAssertEqual(try module.stop().state, .stopped)
             XCTAssertProcessGone(pid)
             XCTAssertFalse(FileManager.default.fileExists(atPath: started.socket))
