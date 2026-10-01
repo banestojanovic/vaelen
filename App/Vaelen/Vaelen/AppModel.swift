@@ -146,12 +146,12 @@ final class AppModel {
                 if mode == "php-update-progress" {
                     model.phpRequestInFlight = true
                     model.phpRequestTarget = "8.4.25"
-                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .downloading)
+                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .downloading, bytesTransferred: 760_000, totalBytes: 2_500_000, artifactName: "FPM", artifactIndex: 2, artifactCount: 2)
                 }
                 if mode == "php-update-unknown-total" {
                     model.phpRequestInFlight = true
                     model.phpRequestTarget = "8.4.25"
-                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .downloading)
+                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .downloading, bytesTransferred: 760_000, totalBytes: nil, artifactName: "FPM", artifactIndex: 2, artifactCount: 2)
                 }
                 if mode == "php-update-success" {
                     model.phpRequestInFlight = true
@@ -753,7 +753,7 @@ final class AppModel {
         phpRequestInFlight = true
         phpRequestTarget = version
         for bytes in [Int64(180_000), 760_000, 1_250_000] {
-            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .downloading)
+            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .downloading, bytesTransferred: bytes, totalBytes: 2_500_000, artifactName: "FPM", artifactIndex: 2, artifactCount: 2)
             try? await Task.sleep(for: .milliseconds(650))
         }
         for phase in [PHPOperationPhase.verifying, .installing] {

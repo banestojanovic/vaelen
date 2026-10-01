@@ -424,9 +424,15 @@ public struct PHPOperationState: Codable, Equatable, Sendable {
     public let targetVersion: String
     public let phase: PHPOperationPhase
     public let message: String?
+    public let bytesTransferred: Int64?
+    public let totalBytes: Int64?
+    public let artifactName: String?
+    public let artifactIndex: Int?
+    public let artifactCount: Int?
 
-    public init(kind: PHPOperationKind, targetVersion: String, phase: PHPOperationPhase, message: String? = nil) {
+    public init(kind: PHPOperationKind, targetVersion: String, phase: PHPOperationPhase, message: String? = nil, bytesTransferred: Int64? = nil, totalBytes: Int64? = nil, artifactName: String? = nil, artifactIndex: Int? = nil, artifactCount: Int? = nil) {
         self.kind = kind; self.targetVersion = targetVersion; self.phase = phase; self.message = message
+        self.bytesTransferred = bytesTransferred; self.totalBytes = totalBytes; self.artifactName = artifactName; self.artifactIndex = artifactIndex; self.artifactCount = artifactCount
     }
 }
 
@@ -460,10 +466,85 @@ private final class PHPRemoteResultBox: @unchecked Sendable {
     func get() -> Result<Data, Error>? { lock.lock(); defer { lock.unlock() }; return value }
 }
 
+private final class PHPArtifactTransferDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let destination: URL
+    private let progress: PHPArtifactProgressSink
+    private let finished = DispatchSemaphore(value: 0)
+    private var handle: FileHandle?
+    private var transferred: Int64 = 0
+    private var totalBytes: Int64?
+    private var failure: Error?
+
+    init(destination: URL, progress: PHPArtifactProgressSink) { self.destination = destination; self.progress = progress }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            failure = URLError(.badServerResponse); completionHandler(.cancel); return
+        }
+        let expected = response.expectedContentLength
+        totalBytes = expected > 0 ? expected : nil
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            failure = PHPModuleError.manifestUnavailable; completionHandler(.cancel); return
+        }
+        do { handle = try FileHandle(forWritingTo: destination); progress.report(0, totalBytes); completionHandler(.allow) }
+        catch { failure = error; completionHandler(.cancel) }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        do {
+            guard let handle else { throw PHPModuleError.manifestUnavailable }
+            try handle.write(contentsOf: data)
+            transferred += Int64(data.count)
+            progress.report(transferred, totalBytes)
+        } catch { failure = error; dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error, failure == nil { failure = error }
+        try? handle?.close(); handle = nil
+        finished.signal()
+    }
+
+    func wait() throws {
+        finished.wait()
+        if let failure { throw failure }
+    }
+}
+
+final class PHPArtifactProgressSink: @unchecked Sendable {
+    private let callback: @Sendable (Int64, Int64?) -> Void
+    init(_ callback: @escaping @Sendable (Int64, Int64?) -> Void) { self.callback = callback }
+    func report(_ bytes: Int64, _ total: Int64?) { callback(bytes, total) }
+}
+
+final class PHPArtifactProgressTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private let artifactCount: Int
+    private let report: @Sendable (Int64, Int64?, String, Int, Int) -> Void
+    private var transferred = [Int64]()
+    private var totals: [Int64?]
+    init(artifactCount: Int, report: @escaping @Sendable (Int64, Int64?, String, Int, Int) -> Void) {
+        self.artifactCount = artifactCount; self.report = report; self.totals = Array(repeating: nil, count: artifactCount); self.transferred = Array(repeating: 0, count: artifactCount)
+    }
+    func update(name: String, index: Int, bytes: Int64, total: Int64?) {
+        lock.lock()
+        let slot = index - 1
+        guard transferred.indices.contains(slot) else { lock.unlock(); return }
+        transferred[slot] = max(0, bytes)
+        if let total, total > 0 { totals[slot] = total }
+        let sumTransferred = transferred.reduce(0, +)
+        let allTotalsKnown = totals.allSatisfy { $0 != nil }
+        let sumTotal = allTotalsKnown ? totals.compactMap { $0 }.reduce(0, +) : nil
+        lock.unlock()
+        report(sumTransferred, sumTotal, name, index, artifactCount)
+    }
+}
+
 public final class PHPModule: @unchecked Sendable {
     private let layout: VaelenFilesystemLayout
     private let location: any PHPManifestLocation
     private let includesBundledCatalog: Bool
+    private let artifactTransfer: @Sendable (URL, URL, PHPArtifactProgressSink) throws -> Void
     private let manager = FileManager.default
     private let lock = NSLock()
     private var activeOperation: PHPOperationState?
@@ -473,6 +554,11 @@ public final class PHPModule: @unchecked Sendable {
 
     public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false) {
         self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog
+        self.artifactTransfer = { source, destination, progress in try Self.transferArtifact(source: source, destination: destination, progress: progress) }
+    }
+
+    init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false, artifactTransfer: @escaping @Sendable (URL, URL, PHPArtifactProgressSink) throws -> Void) {
+        self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog; self.artifactTransfer = artifactTransfer
     }
 
     public static func development(layout: VaelenFilesystemLayout = .init()) -> PHPModule? {
@@ -611,14 +697,16 @@ public final class PHPModule: @unchecked Sendable {
         let version = manifest.phpVersion
         let final = layout.phpPackagesDirectoryURL.appendingPathComponent(version, isDirectory: true)
         if let existing = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: final.appendingPathComponent(".vaelen-package.json"))) { return existing }
-        setOperationPhase(.downloading)
+        let tracker = PHPArtifactProgressTracker(artifactCount: 2) { [weak self] bytes, total, name, index, count in
+            self?.setOperationDownloadProgress(bytes: bytes, total: total, artifactName: name, artifactIndex: index, artifactCount: count)
+        }
         let operation = UUID().uuidString
         let staging = layout.stagingDirectoryURL.appendingPathComponent("php-\(version)-\(operation)", isDirectory: true)
         try makeDirectories([layout.downloadsDirectoryURL, layout.stagingDirectoryURL, layout.phpPackagesDirectoryURL, staging])
         defer { try? manager.removeItem(at: staging) }
+        let cliURL = try acquire(cli, name: "CLI", index: 1, base: location.artifactBaseURL(), progress: tracker)
+        let fpmURL = try acquire(fpm, name: "FPM", index: 2, base: location.artifactBaseURL(), progress: tracker)
         setOperationPhase(.verifying)
-        let cliURL = try acquire(cli, base: location.artifactBaseURL())
-        let fpmURL = try acquire(fpm, base: location.artifactBaseURL())
         setOperationPhase(.installing)
         try extract(cliURL, to: staging); try extract(fpmURL, to: staging)
         let cliPath = staging.appendingPathComponent("php").path
@@ -695,13 +783,15 @@ public final class PHPModule: @unchecked Sendable {
         do {
             let result = try body()
             lock.lock()
-            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: kind == .remove ? .removed : .ready)
+            let progress = activeOperation
+            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: kind == .remove ? .removed : .ready, bytesTransferred: progress?.bytesTransferred, totalBytes: progress?.totalBytes, artifactName: progress?.artifactName, artifactIndex: progress?.artifactIndex, artifactCount: progress?.artifactCount)
             activeOperation = nil
             lock.unlock()
             return result
         } catch {
             lock.lock()
-            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: .failed, message: String(describing: error))
+            let progress = activeOperation
+            lastOperation = PHPOperationState(kind: kind, targetVersion: targetVersion, phase: .failed, message: String(describing: error), bytesTransferred: progress?.bytesTransferred, totalBytes: progress?.totalBytes, artifactName: progress?.artifactName, artifactIndex: progress?.artifactIndex, artifactCount: progress?.artifactCount)
             activeOperation = nil
             lock.unlock()
             throw error
@@ -711,7 +801,13 @@ public final class PHPModule: @unchecked Sendable {
     private func setOperationPhase(_ phase: PHPOperationPhase) {
         lock.lock(); defer { lock.unlock() }
         guard let current = activeOperation else { return }
-        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: phase, message: current.message)
+        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: phase, message: current.message, bytesTransferred: current.bytesTransferred, totalBytes: current.totalBytes, artifactName: current.artifactName, artifactIndex: current.artifactIndex, artifactCount: current.artifactCount)
+    }
+
+    private func setOperationDownloadProgress(bytes: Int64, total: Int64?, artifactName: String, artifactIndex: Int, artifactCount: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = activeOperation else { return }
+        activeOperation = PHPOperationState(kind: current.kind, targetVersion: current.targetVersion, phase: .downloading, message: nil, bytesTransferred: bytes, totalBytes: total, artifactName: artifactName, artifactIndex: artifactIndex, artifactCount: artifactCount)
     }
 
     public func setDefault(requestedVersion: String) throws -> PHPPackage {
@@ -1017,11 +1113,16 @@ public final class PHPModule: @unchecked Sendable {
         let output = try command(path, ["-v"])
         guard output.contains(expected) else { throw PHPModuleError.validationFailed("unexpected \(name) version") }
     }
-    private func acquire(_ artifact: PHPArtifact, base: URL?) throws -> URL {
+    private func acquire(_ artifact: PHPArtifact, name: String, index: Int, base: URL?, progress: PHPArtifactProgressTracker) throws -> URL {
         let destination = layout.downloadsDirectoryURL.appendingPathComponent(artifact.file)
         try makeDirectories([layout.downloadsDirectoryURL])
         if manager.fileExists(atPath: destination.path) {
-            if sha256(destination) == artifact.sha256.lowercased() { return destination }
+            if sha256(destination) == artifact.sha256.lowercased() {
+                let length = ((try? manager.attributesOfItem(atPath: destination.path)[.size]) as? NSNumber)?.int64Value
+                progress.update(name: name, index: index, bytes: length ?? 0, total: length)
+                setOperationPhase(.verifying)
+                return destination
+            }
             try? manager.removeItem(at: destination)
         }
         let source: URL
@@ -1034,10 +1135,38 @@ public final class PHPModule: @unchecked Sendable {
         } else {
             throw PHPModuleError.manifestUnavailable
         }
-        let data = try Data(contentsOf: source)
-        try data.write(to: destination, options: .atomic)
+        setOperationDownloadProgress(bytes: 0, total: nil, artifactName: name, artifactIndex: index, artifactCount: 2)
+        let progressSink = PHPArtifactProgressSink { bytes, total in progress.update(name: name, index: index, bytes: bytes, total: total) }
+        do { try artifactTransfer(source, destination, progressSink) }
+        catch { try? manager.removeItem(at: destination); throw error }
+        setOperationPhase(.verifying)
         guard sha256(destination) == artifact.sha256.lowercased() else { try? manager.removeItem(at: destination); throw PHPModuleError.verificationFailed(artifact.file) }
         return destination
+    }
+
+    static func transferArtifact(source: URL, destination: URL, progress: PHPArtifactProgressSink) throws {
+        if source.isFileURL {
+            let sourceHandle = try FileHandle(forReadingFrom: source)
+            defer { try? sourceHandle.close() }
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard FileManager.default.createFile(atPath: destination.path, contents: nil) else { throw PHPModuleError.manifestUnavailable }
+            let target = try FileHandle(forWritingTo: destination)
+            defer { try? target.close() }
+            let total = ((try? FileManager.default.attributesOfItem(atPath: source.path)[.size]) as? NSNumber)?.int64Value
+            var transferred: Int64 = 0
+            progress.report(0, total)
+            while let chunk = try sourceHandle.read(upToCount: 256 * 1024), !chunk.isEmpty {
+                try target.write(contentsOf: chunk)
+                transferred += Int64(chunk.count)
+                progress.report(transferred, total)
+            }
+            return
+        }
+        let delegate = PHPArtifactTransferDelegate(destination: destination, progress: progress)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        session.dataTask(with: source).resume()
+        try delegate.wait()
     }
     private func extract(_ archive: URL, to directory: URL) throws { let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/tar"); process.arguments = ["-xzf", archive.path, "-C", directory.path]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw PHPModuleError.validationFailed("archive extraction failed") } }
     private func validateExecutable(_ path: String, expected: String, name: String, build: PHPBuildConfiguration? = nil) throws {

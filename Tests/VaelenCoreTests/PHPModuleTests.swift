@@ -1,7 +1,15 @@
 import XCTest
+import CryptoKit
 @testable import VaelenCore
 
 private struct TestCatalogCheckState: Codable { let checkedAt: Date; let error: String? }
+
+private final class ArtifactProgressSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values = [(Int64, Int64?)]()
+    func append(_ bytes: Int64, _ total: Int64?) { lock.lock(); values.append((bytes, total)); lock.unlock() }
+    func snapshot() -> [(Int64, Int64?)] { lock.lock(); defer { lock.unlock() }; return values }
+}
 
 final class PHPModuleTests: XCTestCase {
     func testRuntimeCatalogKeepsInstalledDefaultAndRunningIndependent() {
@@ -272,6 +280,138 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertThrowsError(try module.install(requestedVersion: "8.4"))
         XCTAssertTrue(module.installedVersions().isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: layout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23").path))
+    }
+
+    func testLocalArtifactTransferReportsIncrementalBytesAndAggregatesBothArchives() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-local-transfer-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x5a, count: 900_000)
+        let source = root.appendingPathComponent("source.tar.gz")
+        let destination = root.appendingPathComponent("downloaded.tar.gz")
+        try payload.write(to: source)
+        let samples = ArtifactProgressSamples()
+        try PHPModule.transferArtifact(source: source, destination: destination, progress: PHPArtifactProgressSink { samples.append($0, $1) })
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        let updates = samples.snapshot()
+        XCTAssertGreaterThan(updates.count, 2, "copy should report incremental chunks")
+        XCTAssertEqual(updates.last?.0, Int64(payload.count))
+        XCTAssertEqual(updates.last?.1, Int64(payload.count))
+
+        let aggregate = ArtifactProgressSamples()
+        let tracker = PHPArtifactProgressTracker(artifactCount: 2) { bytes, total, _, _, _ in aggregate.append(bytes, total) }
+        tracker.update(name: "CLI", index: 1, bytes: 400, total: 400)
+        XCTAssertNil(aggregate.snapshot().last?.1, "one complete archive must not appear as 100% of the package")
+        tracker.update(name: "FPM", index: 2, bytes: 200, total: 600)
+        XCTAssertEqual(aggregate.snapshot().last?.0, 600)
+        XCTAssertEqual(aggregate.snapshot().last?.1, 1_000)
+        tracker.update(name: "FPM", index: 2, bytes: 600, total: 600)
+        XCTAssertEqual(aggregate.snapshot().last?.0, 1_000)
+        XCTAssertEqual(aggregate.snapshot().last?.1, 1_000)
+    }
+
+    func testLocalInstallDownloadNeverReportsCLIAsCompletePackageAndKeepsFailedProgress() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-two-archive-install-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let release = root.appendingPathComponent("release")
+        try FileManager.default.createDirectory(at: release, withIntermediateDirectories: true)
+        var artifacts = [String: PHPArtifact]()
+        var byteCount: Int64 = 0
+        for name in ["cli", "fpm"] {
+            let content = release.appendingPathComponent("content-\(name)")
+            try FileManager.default.createDirectory(at: content, withIntermediateDirectories: true)
+            try Data("fixture \(name) payload".utf8).write(to: content.appendingPathComponent("payload.txt"))
+            let archive = release.appendingPathComponent("\(name).tar.gz")
+            let tar = Process(); tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar"); tar.arguments = ["-czf", archive.path, "-C", content.path, "."]
+            try tar.run(); tar.waitUntilExit(); XCTAssertEqual(tar.terminationStatus, 0)
+            let bytes = try Data(contentsOf: archive)
+            byteCount += Int64(bytes.count)
+            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            artifacts[name] = PHPArtifact(file: archive.lastPathComponent, url: "https://example.test/\(archive.lastPathComponent)", sha256: digest)
+        }
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "isolated-progress-test"))
+        let manifestURL = release.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"))
+        let module = PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: manifestURL, baseURL: release))
+
+        XCTAssertThrowsError(try module.install(requestedVersion: "8.4.23"), "empty PHP archives should fail validation after both downloads")
+        let failed = try XCTUnwrap(module.operationState())
+        XCTAssertEqual(failed.phase, .failed)
+        XCTAssertEqual(failed.bytesTransferred, byteCount)
+        XCTAssertEqual(failed.totalBytes, byteCount, "denominator must include both CLI and FPM archives")
+        XCTAssertEqual(failed.artifactIndex, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23").path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: layout.stagingDirectoryURL.path), [])
+    }
+
+    func testProductionHTTPTransferReportsKnownAndUnknownLengthsAndRejectsFailure() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-http-transfer-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x31, count: 1_100_000)
+
+        for chunked in [false, true] {
+            let (server, endpoint) = try startTransferHTTPServer(root: root, payload: payload, chunked: chunked, status: 200)
+            defer { server.terminate(); server.waitUntilExit() }
+            let destination = root.appendingPathComponent(chunked ? "unknown.bin" : "known.bin")
+            let samples = ArtifactProgressSamples()
+            try PHPModule.transferArtifact(source: endpoint, destination: destination, progress: PHPArtifactProgressSink { samples.append($0, $1) })
+            XCTAssertEqual(try Data(contentsOf: destination), payload)
+            let updates = samples.snapshot()
+            XCTAssertGreaterThan(updates.count, 2)
+            XCTAssertEqual(updates.last?.0, Int64(payload.count))
+            if chunked { XCTAssertTrue(updates.allSatisfy { $0.1 == nil }, "chunked responses without a length must remain unknown") }
+            else { XCTAssertTrue(updates.contains { $0.0 > 0 && $0.0 < Int64(payload.count) }); XCTAssertEqual(updates.last?.1, Int64(payload.count)) }
+            server.terminate(); server.waitUntilExit()
+        }
+
+        let (failingServer, failingEndpoint) = try startTransferHTTPServer(root: root, payload: payload, chunked: false, status: 503)
+        defer { failingServer.terminate(); failingServer.waitUntilExit() }
+        XCTAssertThrowsError(try PHPModule.transferArtifact(source: failingEndpoint, destination: root.appendingPathComponent("failed.bin"), progress: PHPArtifactProgressSink { _, _ in }))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("failed.bin").path))
+    }
+
+    private func startTransferHTTPServer(root: URL, payload: Data, chunked: Bool, status: Int) throws -> (Process, URL) {
+        let portFile = root.appendingPathComponent("port-\(UUID().uuidString).txt")
+        let bodyFile = root.appendingPathComponent("body-\(UUID().uuidString).bin")
+        try payload.write(to: bodyFile)
+        let script = #"""
+import http.server, sys
+body = open(sys.argv[1], 'rb').read()
+chunked = sys.argv[3] == '1'
+status = int(sys.argv[4])
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(status)
+  if chunked:
+   self.send_header('Transfer-Encoding', 'chunked')
+  else:
+   self.send_header('Content-Length', str(len(body)))
+  self.end_headers()
+  if status == 200:
+   for i in range(0, len(body), 32768):
+    part = body[i:i+32768]
+    if chunked: self.wfile.write(('%x\r\n' % len(part)).encode() + part + b'\r\n')
+    else: self.wfile.write(part)
+   if chunked: self.wfile.write(b'0\r\n\r\n')
+ def log_message(self, *args): pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+open(sys.argv[2], 'w').write(str(server.server_port))
+server.serve_forever()
+"""#
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-u", "-c", script, bodyFile.path, portFile.path, chunked ? "1" : "0", "\(status)"]
+        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+        try process.run()
+        for _ in 0..<200 {
+            if let raw = try? String(contentsOf: portFile, encoding: .utf8), let port = Int(raw) { return (process, URL(string: "http://127.0.0.1:\(port)/artifact")!) }
+            if !process.isRunning { throw PHPModuleError.manifestUnavailable }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        process.terminate(); process.waitUntilExit()
+        throw PHPModuleError.manifestUnavailable
     }
 
     func testExecUsesCallerWorkingDirectoryAndPreservesArguments() throws {

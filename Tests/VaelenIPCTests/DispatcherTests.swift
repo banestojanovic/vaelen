@@ -13,6 +13,35 @@ private final class DispatcherTrustFake: @unchecked Sendable, TLSTrustBoundary {
     func removeTrust(certificateData: Data) throws { trusted = false }
 }
 
+private final class PausedPHPDownloader: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var entered = false
+    private var released = false
+    func transfer(_ url: URL, destination: URL, progress: PHPArtifactProgressSink) throws {
+        progress.report(0, 100)
+        condition.lock(); entered = true; condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock()
+        throw PHPModuleError.manifestUnavailable
+    }
+    func waitUntilEntered() async -> Bool {
+        for _ in 0..<200 {
+            if hasEntered() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+    private func hasEntered() -> Bool { condition.lock(); defer { condition.unlock() }; return entered }
+    func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+
+private final class CompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    func markCompleted() { lock.lock(); completed = true; lock.unlock() }
+    func isCompleted() -> Bool { lock.lock(); defer { lock.unlock() }; return completed }
+}
+
 private actor ShutdownTestRouter: Router {
     private var running = false
     private var stopFailures = 0
@@ -808,6 +837,114 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNil(retry.response.error)
         let attemptsAfterRetry = await router.attemptCount()
         XCTAssertEqual(attemptsAfterRetry, 2)
+    }
+
+    func testPHPInstallProgressIsObservableAndShutdownWaitsForPackageCleanup() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-dispatch-progress-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"), logsDirectoryURL: root.appendingPathComponent("logs"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "https://example.test/cli.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "https://example.test/fpm.tar.gz", sha256: String(repeating: "b", count: 64))]
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"))
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let gate = PausedPHPDownloader()
+        let module = PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: manifestURL), artifactTransfer: { try gate.transfer($0, destination: $1, progress: $2) })
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), php: module)
+        let installRequest = IPCRequest(method: .phpInstall, params: .phpVersion(PHPVersionRequest(version: "8.4.23")))
+        let installTask = Task { await dispatcher.dispatch(installRequest, handshaken: true) }
+        let downloaderPaused = await gate.waitUntilEntered()
+        XCTAssertTrue(downloaderPaused, "injected downloader should pause within install")
+
+        let progress = await dispatcher.dispatch(IPCRequest(method: .phpOperation), handshaken: true)
+        XCTAssertNil(progress.response.error)
+        guard case .phpOperation(let observed) = progress.response.result else { return XCTFail("missing operation state") }
+        XCTAssertEqual(observed.operation?.phase, .downloading)
+
+        let duplicate = await dispatcher.dispatch(IPCRequest(method: .phpUpdate, params: .phpVersion(PHPVersionRequest(version: "8.4.23"))), handshaken: true)
+        XCTAssertNotNil(duplicate.response.error, "duplicate package operation must be rejected")
+
+        let shutdownFinished = CompletionFlag()
+        let shutdownTask = Task {
+            let result = await dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
+            shutdownFinished.markCompleted()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        let duringShutdown = await dispatcher.dispatch(IPCRequest(method: .phpOperation), handshaken: true)
+        guard case .phpOperation(let shutdownProgress) = duringShutdown.response.result else { return XCTFail("progress observation must remain available during shutdown") }
+        XCTAssertEqual(shutdownProgress.operation?.phase, .downloading)
+        XCTAssertFalse(shutdownFinished.isCompleted(), "shutdown must await the active package operation")
+        gate.release()
+
+        let finished = await installTask.value
+        XCTAssertNotNil(finished.response.error, "controlled downloader failure should be reported")
+        let finalState = await dispatcher.dispatch(IPCRequest(method: .phpOperation), handshaken: true)
+        guard case .phpOperation(let failed) = finalState.response.result else { return XCTFail("missing completed operation state") }
+        XCTAssertEqual(failed.operation?.phase, .failed)
+        _ = await shutdownTask.value
+        XCTAssertEqual(module.operationState()?.phase, .failed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.stagingDirectoryURL.path) && ((try? FileManager.default.contentsOfDirectory(atPath: layout.stagingDirectoryURL.path).isEmpty) == false), "staging artifacts must be cleaned")
+    }
+
+    func testPHPInstallProgressTravelsOverSeparateUnixIPCClient() async throws {
+        let root = URL(fileURLWithPath: "/tmp/php-ipc-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"), logsDirectoryURL: root.appendingPathComponent("logs"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "https://example.test/cli.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "https://example.test/fpm.tar.gz", sha256: String(repeating: "b", count: 64))]
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"))
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let gate = PausedPHPDownloader()
+        defer { gate.release() }
+        let module = PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: manifestURL), artifactTransfer: { try gate.transfer($0, destination: $1, progress: $2) })
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))), php: module)
+        let paths = CoreEndpointPaths(layout: layout)
+        let server = DaemonServer(paths: paths, dispatcher: dispatcher)
+        let serverTask = Task.detached { try server.run() }
+        for _ in 0..<200 where !FileManager.default.fileExists(atPath: paths.socketPath) { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.socketPath))
+
+        func client(_ label: String) -> VaelenCoreClient {
+            VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: ClientIdentity(name: label, version: VaelenBuildInfo.version))
+        }
+        let installer = client("php-install-test")
+        let observer = client("php-progress-observer")
+        let duplicate = client("php-duplicate-test")
+        let shutdown = client("php-shutdown-test")
+        try await installer.connect(); try await observer.connect(); try await duplicate.connect(); try await shutdown.connect()
+        let installTask = Task { try await installer.phpInstall("8.4.23") }
+        let isPaused = await gate.waitUntilEntered()
+        XCTAssertTrue(isPaused)
+        let progress = try await observer.phpOperation()
+        XCTAssertEqual(progress?.phase, .downloading)
+        XCTAssertEqual(progress?.bytesTransferred, 0)
+        XCTAssertEqual(progress?.totalBytes, nil, "CLI alone must not be exposed as the full two-artifact total")
+        XCTAssertEqual(progress?.artifactIndex, 1)
+        XCTAssertEqual(progress?.artifactCount, 2)
+
+        do { _ = try await duplicate.phpUpdate("8.4.23"); XCTFail("duplicate package request should be rejected") }
+        catch { }
+
+        let shutdownFinished = CompletionFlag()
+        let shutdownTask = Task {
+            let result = try await shutdown.shutdown()
+            shutdownFinished.markCompleted()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(shutdownFinished.isCompleted())
+        let duringShutdown = try await observer.phpOperation()
+        XCTAssertEqual(duringShutdown?.phase, .downloading)
+        gate.release()
+        do { _ = try await installTask.value; XCTFail("controlled transfer failure should reach installer") } catch { }
+        let failed = try await observer.phpOperation()
+        XCTAssertEqual(failed?.phase, .failed)
+        _ = try await shutdownTask.value
+        try await installer.disconnect(); try await observer.disconnect(); try await duplicate.disconnect(); try await shutdown.disconnect()
+        try await serverTask.value
     }
 
     func testInstalledPHPWithoutSavedStartChoiceStaysStoppedOnLaunch() async throws {

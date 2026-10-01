@@ -319,8 +319,7 @@ struct PHPSettingsView: View {
                     .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let operationTarget = model.phpRequestTarget {
-                Label(phpOperationDescription(target: operationTarget, operation: model.phpOperation), systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption).foregroundStyle(.secondary)
+                phpOperationProgress(target: operationTarget, operation: model.phpOperation)
             }
             if let error = model.phpError {
                 Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
@@ -574,14 +573,49 @@ struct PHPSettingsView: View {
         return .attention
     }
 
+    @ViewBuilder private func phpOperationProgress(target: String, operation: PHPOperationState?) -> some View {
+        let matching = operation?.targetVersion == target ? operation : nil
+        Label(phpOperationDescription(target: target, operation: matching), systemImage: "arrow.triangle.2.circlepath")
+            .font(.caption).foregroundStyle(.secondary)
+        if let matching, matching.kind == .install || matching.kind == .update {
+            switch matching.phase {
+            case .downloading:
+                if let bytes = matching.bytesTransferred, let total = matching.totalBytes, total > 0 {
+                    let fraction = min(1, max(0, Double(bytes) / Double(total)))
+                    ProgressView(value: Double(bytes), total: Double(total)).progressViewStyle(.linear).frame(maxWidth: 260)
+                    Text("\(Int((fraction * 100).rounded()))% · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))")
+                        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                } else {
+                    Text("\(ByteCountFormatter.string(fromByteCount: matching.bytesTransferred ?? 0, countStyle: .file)) transferred · Total size unknown")
+                        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                }
+            case .verifying:
+                Text("Verifying downloaded PHP archives…").font(.caption2).foregroundStyle(.secondary)
+            case .installing:
+                Text("Installing and validating PHP \(target)…").font(.caption2).foregroundStyle(.secondary)
+            case .ready:
+                EmptyView()
+            case .failed:
+                EmptyView()
+            default:
+                EmptyView()
+            }
+        }
+    }
+
     private func phpOperationDescription(target: String, operation: PHPOperationState?) -> String {
-        guard let operation, operation.targetVersion == target else { return "Working on PHP \(target)…" }
+        guard let operation, operation.targetVersion == target else { return "Preparing PHP \(target)…" }
         switch operation.phase {
-        case .starting: return "Starting PHP \(target)…"
-        case .downloading: return "Downloading PHP \(target)…"
+        case .starting: return "Preparing PHP \(target)…"
+        case .downloading:
+            let artifact = operation.artifactName.map { " · \($0) archive" } ?? ""
+            let position = if let index = operation.artifactIndex, let count = operation.artifactCount { " (\(index) of \(count))" } else { "" }
+            return "Downloading PHP \(target)\(artifact)\(position)…"
         case .verifying: return "Verifying PHP \(target)…"
         case .installing: return "Installing PHP \(target)…"
         case .removing: return "Removing PHP \(target)…"
+        case .ready: return "PHP \(target) installed successfully."
+        case .failed: return "PHP \(target) operation failed."
         default: return "Working on PHP \(target)…"
         }
     }
