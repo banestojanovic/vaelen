@@ -202,6 +202,9 @@ public actor VaelenCoreClient {
     public func phpCatalog() async throws -> PHPRuntimeCatalog {
         guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpCatalog))) else { throw CoreClientError.invalidResponse }; return result.catalog
     }
+    public func checkPHPUpdates() async throws -> PHPRuntimeCatalog {
+        guard case .phpCatalog(let result) = try result(from: await send(IPCRequest(method: .phpCatalogCheck))) else { throw CoreClientError.invalidResponse }; return result.catalog
+    }
     public func phpInstall(_ version: String) async throws -> PHPPackageWire {
         guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpInstall, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version }) ?? result.installed.last else { throw CoreClientError.invalidResponse }; return package
     }

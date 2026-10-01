@@ -55,6 +55,7 @@ public actor CoreRequestDispatcher {
     private var shutdownBegun = false
     private var shutdownTask: Task<CoreShutdownResponse, Never>?
     private var shutdownRunInFlight = false
+    private var phpPackageOperationsInFlight = 0
     private var projectObservationSnapshots: [UUID: (createdAt: Date, observations: ProjectReportObservations)] = [:]
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
@@ -74,7 +75,7 @@ public actor CoreRequestDispatcher {
             shutdownBegun = true
             return (.init(id: request.id, result: .shutdown(await performShutdownOnce())), true)
         }
-        if shutdownBegun && request.knownMethod != .status && request.knownMethod != .handshake {
+        if shutdownBegun && request.knownMethod != .status && request.knownMethod != .handshake && request.knownMethod != .phpOperation {
             return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Core shutdown is in progress. Retry after cleanup completes.")), handshaken)
         }
         return await dispatchRequest(request, handshaken: handshaken)
@@ -249,11 +250,19 @@ public actor CoreRequestDispatcher {
             case .phpVersions:
                 let module = try phpModule(); return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpCatalog:
-                let module = try phpModule(); try? module.refreshCatalogIfNeeded(); return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
+                let module = try phpModule(); _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
+            case .phpCatalogCheck:
+                let module = try phpModule(); try await Task.detached { try module.checkCatalogNow() }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
             case .phpInstall:
-                let module = try phpModule(); try? module.refreshCatalogIfNeeded(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.install(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try await withPHPPackageOperation {
+                    _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value
+                    return try await Task.detached { try module.install(requestedVersion: params.version) }.value
+                }; return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpUpdate:
-                let module = try phpModule(); try? module.refreshCatalogIfNeeded(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try module.update(requestedVersion: params.version); return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try await withPHPPackageOperation {
+                    _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value
+                    return try await Task.detached { try module.update(requestedVersion: params.version) }.value
+                }; return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpRemove:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }();
                 var dependencies = [String]()
@@ -442,6 +451,14 @@ public actor CoreRequestDispatcher {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
             return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
         }
+    }
+
+    private func withPHPPackageOperation<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+        guard phpPackageOperationsInFlight == 0 else { throw PHPModuleError.operationInProgress("another PHP package operation is active") }
+        guard !shutdownBegun else { throw PHPModuleError.operationInProgress("Core shutdown is in progress") }
+        phpPackageOperationsInFlight += 1
+        defer { phpPackageOperationsInFlight -= 1 }
+        return try await body()
     }
 
     public func reconcilePersistedRoutesOnStartup() async throws {
@@ -782,6 +799,10 @@ public actor CoreRequestDispatcher {
 
     private func performShutdown() async -> CoreShutdownResponse {
         logShutdownTiming("shutdown begin")
+        while phpPackageOperationsInFlight > 0 {
+            logShutdownTiming("waiting for PHP package operation")
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
+        }
         parkRouteMonitorTask?.cancel()
         if let parkRouteMonitorTask { await parkRouteMonitorTask.value }
         parkRouteMonitorTask = nil

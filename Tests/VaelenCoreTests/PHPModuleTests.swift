@@ -1,6 +1,8 @@
 import XCTest
 @testable import VaelenCore
 
+private struct TestCatalogCheckState: Codable { let checkedAt: Date; let error: String? }
+
 final class PHPModuleTests: XCTestCase {
     func testRuntimeCatalogKeepsInstalledDefaultAndRunningIndependent() {
         let first = PHPPackage(version: "8.4.23", architecture: "arm64", packagePath: "/php/8.4.23", cliPath: "/php/8.4.23/php", fpmPath: "/php/8.4.23/php-fpm", source: "fixture", cliSHA256: "cli", fpmSHA256: "fpm", installedAt: Date())
@@ -23,6 +25,31 @@ final class PHPModuleTests: XCTestCase {
         let catalog = PHPRuntimeCatalog(availableVersions: versions, installedVersions: versions.map { .init(version: $0) }, defaultVersion: nil, runningVersions: [])
         XCTAssertEqual(catalog.availableVersions, ["8.5.0", "8.4.23", "8.4.9", "8.3.29"])
         XCTAssertEqual(catalog.installedVersions.map(\.version), ["8.5.0", "8.4.23", "8.4.9", "8.3.29"])
+    }
+
+    func testCatalogRefreshPersistsAttemptTimeThrottlesFailureAndKeepsLastValidCache() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let artifacts = ["cli": PHPArtifact(file: "cli", url: "https://example.test/cli", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm", url: "https://example.test/fpm", sha256: String(repeating: "b", count: 64))]
+        let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"))
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        try JSONEncoder().encode(PHPManifestCatalog(manifests: [manifest])).write(to: root.appendingPathComponent("php-catalog.json"))
+        let stateURL = root.appendingPathComponent("php-catalog-check.json")
+        let oldEncoder = JSONEncoder()
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        try oldEncoder.encode(TestCatalogCheckState(checkedAt: now.addingTimeInterval(-13 * 60 * 60), error: nil)).write(to: stateURL)
+        let location = FilePHPManifestLocation(manifestURL: manifestURL, catalogURL: URL(string: "http://127.0.0.1:1/unreachable")!, now: { now })
+
+        XCTAssertThrowsError(try location.refreshCatalogIfNeeded())
+        let firstStatus = location.catalogCheckStatus()
+        XCTAssertNotNil(firstStatus.0)
+        XCTAssertNotNil(firstStatus.1)
+        XCTAssertEqual(firstStatus.0, now)
+        XCTAssertEqual(try location.manifests(), [manifest])
+        XCTAssertNoThrow(try location.refreshCatalogIfNeeded(), "A failed check is persisted and must not immediately retry.")
+        XCTAssertEqual(location.catalogCheckStatus().0, firstStatus.0)
     }
 
     func testPHPUpdateObservationDistinguishesSameSeriesPatchAndUnknownMetadata() {

@@ -31,6 +31,8 @@ final class AppModel {
     private(set) var phpConfigurationReadPending = false
     private(set) var phpConfigurationSaving = false
     private(set) var phpOperation: PHPOperationState?
+    private(set) var phpCatalogCheckPending = false
+    private(set) var phpCatalogCheckError: String?
     private(set) var phpError: String?
     private(set) var phpRequestInFlight = false
     private(set) var phpRequestTarget: String?
@@ -55,6 +57,8 @@ final class AppModel {
     private var refreshInFlight = false
     private var refreshRequested = false
     private var monitorTask: Task<Void, Never>?
+    private var phpOperationPollTask: Task<Void, Never>?
+    private var lastAutomaticPHPCheckRequestAt: Date?
     private var serviceCheckTimeoutTask: Task<Void, Never>?
     private var serviceCheckStartedAt: ContinuousClock.Instant?
     private var pendingServiceReads = Set<String>()
@@ -95,7 +99,7 @@ final class AppModel {
             case "unavailable":
                 model.state = .unavailable
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
-            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving":
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
                 let mysqlState: MySQLState = mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
                 let mysqlVersion = (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
@@ -124,17 +128,38 @@ final class AppModel {
                 )
                 let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
-                let phpSettingsFixture = mode.hasPrefix("php-settings")
+                let phpUpdateFixture = mode.hasPrefix("php-update")
+                let phpUpdateSuccess = mode == "php-update-success"
+                let phpSettingsFixture = mode.hasPrefix("php-settings") || phpUpdateFixture
                 let fixtureVersions = phpSettingsFixture
-                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: "8.4.23", running: true, isDefault: mode != "php-settings-no-default"), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)]
-                    : [PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)]
+                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: "8.4.23", running: true, isDefault: mode != "php-settings-no-default" && !phpUpdateSuccess, updateAvailable: phpUpdateFixture && !phpUpdateSuccess ? true : nil, latestVersion: phpUpdateFixture && !phpUpdateSuccess ? "8.4.25" : nil), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)] + (phpUpdateFixture ? [PHPRuntimeVersion(version: "8.4.9", running: false), PHPRuntimeVersion(version: "8.3.29", running: false)] : []) + (phpUpdateSuccess ? [PHPRuntimeVersion(version: "8.4.25", running: false, isDefault: true)] : [])
+                : [PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)]
                 model.phpCatalog = PHPRuntimeCatalog(
-                    availableVersions: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
+                    availableVersions: phpUpdateFixture ? (phpUpdateSuccess ? ["8.5.1"] : ["8.4.25", "8.5.1"]) : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
                     installedVersions: phpSettingsFixture ? fixtureVersions : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? fixtureVersions : [],
-                    defaultVersion: phpSettingsFixture && mode != "php-settings-no-default" ? "8.4.23" : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
+                    defaultVersion: phpUpdateSuccess ? "8.4.25" : phpSettingsFixture && mode != "php-settings-no-default" ? "8.4.23" : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
                     runningVersions: phpSettingsFixture ? ["8.4.23"] : [],
-                    availableVersionsKnown: true
+                    availableVersionsKnown: true,
+                    catalogCheckedAt: phpUpdateFixture ? Date(timeIntervalSinceNow: -3_600) : nil,
+                    catalogCheckError: mode == "php-update-check-failed" ? "The catalog could not be reached; showing the last verified versions." : nil
                 )
+                if mode == "php-update-progress" {
+                    model.phpRequestInFlight = true
+                    model.phpRequestTarget = "8.4.25"
+                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .downloading)
+                }
+                if mode == "php-update-unknown-total" {
+                    model.phpRequestInFlight = true
+                    model.phpRequestTarget = "8.4.25"
+                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .downloading)
+                }
+                if mode == "php-update-success" {
+                    model.phpRequestInFlight = true
+                    model.phpRequestTarget = "8.4.25"
+                    model.phpOperation = PHPOperationState(kind: .update, targetVersion: "8.4.25", phase: .ready)
+                }
+                if mode == "php-update-checking" { model.phpCatalogCheckPending = true }
+                if mode == "php-update-failed" { model.phpError = "Fixture update failed while verifying PHP 8.4.25. Your existing PHP 8.4.23 package and settings remain unchanged. Retry the update when the catalog or network is available." }
                 if phpSettingsFixture {
                     let shared = PHPSettingsValues(uploadLimitMB: 64, memoryLimitMB: 256, maxExecutionTimeSeconds: 30, maxInputVariables: 2_000, postLimitMB: 65)
                     let overridden = PHPSettingsValues(uploadLimitMB: 128, memoryLimitMB: 512, maxExecutionTimeSeconds: 0, maxInputVariables: 4_000, postLimitMB: 129)
@@ -340,6 +365,7 @@ final class AppModel {
                 projectRelationshipsRefreshError = nil
             }
             self.phpCatalog = phpCatalog
+            if let phpCatalog { lastAutomaticPHPCheckRequestAt = phpCatalog.catalogCheckedAt ?? Date() }
             self.phpOperation = phpOperation
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
             refreshError = nil
@@ -714,7 +740,58 @@ final class AppModel {
     }
 
     func updatePHP(_ version: String) async {
+        if isSettingsFixture, settingsFixtureMode?.hasPrefix("php-update") == true {
+            await performPHPUpdateFixture(version)
+            return
+        }
         await performPHPCommand(version) { _ = try await $0.phpUpdate(version) }
+    }
+
+    private func performPHPUpdateFixture(_ version: String) async {
+        guard !phpRequestInFlight else { return }
+        phpError = nil
+        phpRequestInFlight = true
+        phpRequestTarget = version
+        for bytes in [Int64(180_000), 760_000, 1_250_000] {
+            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .downloading)
+            try? await Task.sleep(for: .milliseconds(650))
+        }
+        for phase in [PHPOperationPhase.verifying, .installing] {
+            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: phase)
+            try? await Task.sleep(for: .milliseconds(700))
+        }
+        if settingsFixtureMode == "php-update-failed" {
+            let message = "Fixture update failed while verifying PHP \(version). The existing package and settings remain unchanged. Retry the update when the catalog or network is available."
+            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .failed, message: message)
+            phpError = message
+        } else if let catalog = phpCatalog,
+                  let old = catalog.installedVersions.first(where: { $0.isDefault && PHPVersion($0.version)?.family == PHPVersion(version)?.family }) {
+            let upgraded = PHPRuntimeVersion(version: version, running: false, isDefault: true, updateAvailable: false, latestVersion: version, usedByProjectCount: old.usedByProjectCount, explicitProjectCount: old.explicitProjectCount, inheritedProjectCount: old.inheritedProjectCount)
+            let versions = catalog.installedVersions.map { runtime in
+                runtime.version == old.version ? PHPRuntimeVersion(version: runtime.version, running: runtime.running, isDefault: false, updateAvailable: false, latestVersion: version, usedByProjectCount: runtime.usedByProjectCount, explicitProjectCount: runtime.explicitProjectCount, inheritedProjectCount: runtime.inheritedProjectCount) : runtime
+            } + [upgraded]
+            phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions.filter { $0 != version }, installedVersions: versions, defaultVersion: version, runningVersions: catalog.runningVersions, availableVersionsKnown: catalog.availableVersionsKnown, catalogCheckedAt: catalog.catalogCheckedAt)
+            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .ready)
+        }
+        phpRequestInFlight = false
+        phpRequestTarget = nil
+    }
+
+    func checkPHPUpdates() async {
+        guard !isSettingsFixture, !phpCatalogCheckPending, let client else {
+            if isSettingsFixture { phpCatalogCheckError = "Update checks are disabled in isolated Settings fixtures." }
+            return
+        }
+        phpCatalogCheckPending = true
+        phpCatalogCheckError = nil
+        defer { phpCatalogCheckPending = false }
+        do {
+            phpCatalog = try await client.checkPHPUpdates()
+            lastAutomaticPHPCheckRequestAt = phpCatalog?.catalogCheckedAt ?? Date()
+            phpCatalogCheckError = nil
+        } catch {
+            phpCatalogCheckError = error.localizedDescription
+        }
     }
 
     func removePHP(_ version: String) async {
@@ -1112,11 +1189,27 @@ final class AppModel {
             guard !Task.isCancelled else { return }
             if isShowingRunningSnapshot { await refreshAuthoritativeServiceState() }
             else { await refresh() }
+            await checkPHPUpdatesIfDue()
             // Background reconciliation catches changes Vaelen did not
             // initiate. Explicit commands use request/reply plus an immediate
             // authoritative service snapshot and never wait for this timer.
             // Keep projects and the remote PHP catalog out of the periodic
             // path so those diagnostics cannot queue behind lifecycle calls.
+        }
+    }
+
+    private func checkPHPUpdatesIfDue() async {
+        guard !isQuitting, !isSettingsFixture, !phpCatalogCheckPending,
+              Date().timeIntervalSince(lastAutomaticPHPCheckRequestAt ?? .distantPast) >= 12 * 60 * 60,
+              let client else { return }
+        lastAutomaticPHPCheckRequestAt = Date()
+        phpCatalogCheckPending = true
+        defer { phpCatalogCheckPending = false }
+        do {
+            phpCatalog = try await client.phpCatalog()
+            phpCatalogCheckError = nil
+        } catch {
+            phpCatalogCheckError = error.localizedDescription
         }
     }
 
@@ -1253,6 +1346,10 @@ final class AppModel {
 
     private func finishPHPRequest(error: String? = nil) async {
         await refreshAuthoritativeServiceState()
+        if let catalog = try? await client?.phpCatalog() {
+            phpCatalog = catalog
+            lastAutomaticPHPCheckRequestAt = catalog.catalogCheckedAt ?? Date()
+        }
         phpRequestInFlight = false
         phpRequestTarget = nil
         phpError = error
@@ -1263,11 +1360,25 @@ final class AppModel {
         let commandClient = makeCoreClient()
         do {
             try await commandClient.connect()
+            let progressClient = makeCoreClient()
+            try? await progressClient.connect()
+            phpOperationPollTask?.cancel()
+            phpOperationPollTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    if let operation = try? await progressClient.phpOperation() { self?.phpOperation = operation }
+                    do { try await Task.sleep(for: .milliseconds(500)) } catch { break }
+                }
+                await progressClient.disconnect()
+            }
             try await command(commandClient)
             await commandClient.disconnect()
+            phpOperationPollTask?.cancel()
+            phpOperationPollTask = nil
             await finishPHPRequest()
         } catch {
             await commandClient.disconnect()
+            phpOperationPollTask?.cancel()
+            phpOperationPollTask = nil
             await finishPHPRequest(error: phpErrorMessage(error))
         }
     }

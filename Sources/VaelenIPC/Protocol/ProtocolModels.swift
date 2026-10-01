@@ -76,6 +76,7 @@ public enum CoreMethod: String, Sendable {
     case pathList = "path.list"
     case phpVersions = "php.versions"
     case phpCatalog = "php.catalog"
+    case phpCatalogCheck = "php.catalog.check"
     case phpInstall = "php.install"
     case phpUpdate = "php.update"
     case phpRemove = "php.remove"

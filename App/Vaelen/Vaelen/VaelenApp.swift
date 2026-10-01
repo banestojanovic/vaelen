@@ -281,8 +281,21 @@ struct PHPSettingsView: View {
                     runtimeRow(runtime.version, title: "PHP \(runtime.version)", subtitle: runtimeSubtitle(runtime), state: runtimeTone(runtime), isDefault: runtime.isDefault, updateAvailable: runtime.updateAvailable == true ? runtime.latestVersion : nil)
                 }
                 Divider().padding(.horizontal, 12).padding(.vertical, 7)
-                Text(inventoryHeading("AVAILABLE", count: catalog?.availableVersionsKnown == true ? available.count : nil))
-                    .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.bottom, 5)
+                HStack {
+                    Text(inventoryHeading("AVAILABLE", count: catalog?.availableVersionsKnown == true ? available.count : nil))
+                        .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).lineLimit(1).minimumScaleFactor(0.8)
+                    Spacer(minLength: 2)
+                    Button("Check for Updates", systemImage: "arrow.clockwise") { Task { await model.checkPHPUpdates() } }
+                        .buttonStyle(.borderless).font(.system(size: 9)).help("Check Vaelen's trusted PHP catalog for updates").accessibilityLabel("Check for PHP updates")
+                        .disabled(model.phpCatalogCheckPending || !coreConnected || phpChecking)
+                }.padding(.horizontal, 13).padding(.bottom, 5)
+                if model.phpCatalogCheckPending {
+                    HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Checking the trusted PHP catalog…").font(.caption2).foregroundStyle(.secondary) }.padding(.horizontal, 14).padding(.bottom, 5)
+                } else if let error = model.phpCatalogCheckError ?? catalog?.catalogCheckError {
+                    Text("Update check failed: \(error)").font(.caption2).foregroundStyle(.orange).lineLimit(3).padding(.horizontal, 14).padding(.bottom, 5)
+                } else if let checkedAt = catalog?.catalogCheckedAt {
+                    Text("Checked \(checkedAt.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.tertiary).padding(.horizontal, 14).padding(.bottom, 5)
+                }
                 if catalog == nil {
                     Text(phpChecking ? "Checking available runtimes…" : "Available versions unavailable")
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)

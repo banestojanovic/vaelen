@@ -138,11 +138,15 @@ public protocol PHPManifestLocation: Sendable {
     func artifactBaseURL() -> URL?
     func manifests() throws -> [PHPManifest]
     func refreshCatalogIfNeeded() throws
+    func checkCatalogNow() throws
+    func catalogCheckStatus() -> (Date?, String?)
 }
 
 public extension PHPManifestLocation {
     func manifests() throws -> [PHPManifest] { [try manifest()] }
     func refreshCatalogIfNeeded() throws {}
+    func checkCatalogNow() throws { try refreshCatalogIfNeeded() }
+    func catalogCheckStatus() -> (Date?, String?) { (nil, nil) }
 }
 
 public struct PHPManifestCatalog: Codable, Equatable, Sendable {
@@ -151,19 +155,36 @@ public struct PHPManifestCatalog: Codable, Equatable, Sendable {
 }
 
 public struct FilePHPManifestLocation: PHPManifestLocation {
+    private static let refreshGate = PHPCatalogRefreshGate()
     public let manifestURL: URL
     public let baseURL: URL?
     public let catalogURL: URL?
-    public init(manifestURL: URL, baseURL: URL? = nil, catalogURL: URL? = nil) { self.manifestURL = manifestURL; self.baseURL = baseURL; self.catalogURL = catalogURL }
+    private let now: @Sendable () -> Date
+    public init(manifestURL: URL, baseURL: URL? = nil, catalogURL: URL? = nil, now: @escaping @Sendable () -> Date = { Date() }) { self.manifestURL = manifestURL; self.baseURL = baseURL; self.catalogURL = catalogURL; self.now = now }
     public func manifest() throws -> PHPManifest {
         try JSONDecoder().decode(PHPManifest.self, from: Data(contentsOf: manifestURL))
     }
     public func artifactBaseURL() -> URL? { baseURL ?? manifestURL.deletingLastPathComponent() }
     public func refreshCatalogIfNeeded() throws {
-        guard let catalogURL else { return }
-        let cacheURL = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog.json")
-        if let modified = try? FileManager.default.attributesOfItem(atPath: cacheURL.path)[.modificationDate] as? Date,
-           Date().timeIntervalSince(modified) < 900 { return }
+        try refreshCatalog(force: false)
+    }
+    public func checkCatalogNow() throws { try refreshCatalog(force: true) }
+    private func refreshCatalog(force: Bool) throws {
+        guard let catalogURL else {
+            if force { throw PHPModuleError.manifestUnavailable }
+            return
+        }
+        let directory = manifestURL.deletingLastPathComponent()
+        let cacheURL = directory.appendingPathComponent("php-catalog.json")
+        let stateURL = directory.appendingPathComponent("php-catalog-check.json")
+        Self.refreshGate.lock.lock()
+        defer { Self.refreshGate.lock.unlock() }
+        let prior = try? JSONDecoder().decode(PHPCatalogCheckState.self, from: Data(contentsOf: stateURL))
+        let previousAttempt = [prior?.checkedAt, Self.refreshGate.lastAttemptByStateFile[stateURL.path]].compactMap { $0 }.max()
+        if !force, let previousAttempt, now().timeIntervalSince(previousAttempt) < 12 * 60 * 60 { return }
+        let attemptDate = now()
+        Self.refreshGate.lastAttemptByStateFile[stateURL.path] = attemptDate
+        try JSONEncoder().encode(PHPCatalogCheckState(checkedAt: attemptDate, error: nil)).write(to: stateURL, options: .atomic)
         var request = URLRequest(url: catalogURL)
         request.timeoutInterval = 10
         let semaphore = DispatchSemaphore(value: 0)
@@ -174,18 +195,36 @@ public struct FilePHPManifestLocation: PHPManifestLocation {
             semaphore.signal()
         }.resume()
         semaphore.wait()
-        let data = try result.get()!.get()
-        let catalog = try JSONDecoder().decode(PHPManifestCatalog.self, from: data)
-        guard catalog.manifests.allSatisfy({ $0.verification.authenticity == "trusted-vaelen-release-manifest" }) else {
+        let data: Data
+        do {
+            data = try result.get()!.get()
+            let catalog = try JSONDecoder().decode(PHPManifestCatalog.self, from: data)
+            guard !catalog.manifests.isEmpty, catalog.manifests.allSatisfy({ $0.verification.authenticity == "trusted-vaelen-release-manifest" }) else {
             throw PHPModuleError.invalidManifest("catalog is not a trusted Vaelen release catalog")
+            }
+            try data.write(to: cacheURL, options: .atomic)
+            try JSONEncoder().encode(PHPCatalogCheckState(checkedAt: attemptDate, error: nil)).write(to: stateURL, options: .atomic)
+        } catch {
+            try? JSONEncoder().encode(PHPCatalogCheckState(checkedAt: attemptDate, error: String(describing: error))).write(to: stateURL, options: .atomic)
+            throw error
         }
-        try data.write(to: cacheURL, options: .atomic)
     }
     public func manifests() throws -> [PHPManifest] {
         let catalogURL = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog.json")
         guard let data = try? Data(contentsOf: catalogURL) else { return [try manifest()] }
         return try JSONDecoder().decode(PHPManifestCatalog.self, from: data).manifests
     }
+    public func catalogCheckStatus() -> (Date?, String?) {
+        let url = manifestURL.deletingLastPathComponent().appendingPathComponent("php-catalog-check.json")
+        guard let state = try? JSONDecoder().decode(PHPCatalogCheckState.self, from: Data(contentsOf: url)) else { return (nil, nil) }
+        return (state.checkedAt, state.error)
+    }
+}
+
+private struct PHPCatalogCheckState: Codable { let checkedAt: Date; let error: String? }
+private final class PHPCatalogRefreshGate: @unchecked Sendable {
+    let lock = NSLock()
+    var lastAttemptByStateFile: [String: Date] = [:]
 }
 
 public enum PHPModuleError: Error, Equatable, Sendable {
@@ -311,8 +350,10 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
     public let defaultVersion: String?
     public let runningVersions: [String]
     public let availableVersionsKnown: Bool
+    public let catalogCheckedAt: Date?
+    public let catalogCheckError: String?
 
-    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String], availableVersionsKnown: Bool = true) {
+    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String], availableVersionsKnown: Bool = true, catalogCheckedAt: Date? = nil, catalogCheckError: String? = nil) {
         self.availableVersions = Self.sortedUnique(availableVersions).sorted { Self.versionSort($1, $0) }
         self.installedVersions = installedVersions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
             guard result[value.version] == nil else { return }
@@ -321,6 +362,8 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
         self.defaultVersion = defaultVersion
         self.runningVersions = Self.sortedUnique(runningVersions)
         self.availableVersionsKnown = availableVersionsKnown
+        self.catalogCheckedAt = catalogCheckedAt
+        self.catalogCheckError = catalogCheckError
     }
 
     public func withProjectUsage(_ usage: [PHPProjectUsage]) -> PHPRuntimeCatalog {
@@ -329,7 +372,7 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
             let value = byVersion[runtime.version]
             return PHPRuntimeVersion(version: runtime.version, series: runtime.series, running: runtime.running, isDefault: runtime.isDefault, updateAvailable: runtime.updateAvailable, latestVersion: runtime.latestVersion, usedByProjectCount: value?.total ?? 0, explicitProjectCount: value?.explicit ?? 0, inheritedProjectCount: value?.inherited ?? 0)
         }
-        return PHPRuntimeCatalog(availableVersions: availableVersions, installedVersions: updated, defaultVersion: defaultVersion, runningVersions: runningVersions, availableVersionsKnown: availableVersionsKnown)
+        return PHPRuntimeCatalog(availableVersions: availableVersions, installedVersions: updated, defaultVersion: defaultVersion, runningVersions: runningVersions, availableVersionsKnown: availableVersionsKnown, catalogCheckedAt: catalogCheckedAt, catalogCheckError: catalogCheckError)
     }
 
     public init(availableVersions: [String], packages: [PHPPackage], statuses: [PHPStatus], defaultVersion: String?, updates: [PHPUpdateObservation] = []) {
@@ -352,6 +395,8 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
         self.defaultVersion = defaultVersion
         self.runningVersions = Self.sortedUnique(statuses.filter { $0.state == .running }.map(\.version))
         self.availableVersionsKnown = true
+        self.catalogCheckedAt = nil
+        self.catalogCheckError = nil
     }
 
     private static func sortedUnique(_ values: [String]) -> [String] {
@@ -456,11 +501,13 @@ public final class PHPModule: @unchecked Sendable {
             return PHPUpdateObservation(installedVersion: package.version, latestVersion: latest.description)
         } : updates
         let catalog = PHPRuntimeCatalog(availableVersions: available, packages: packages, statuses: statuses, defaultVersion: defaultVersion(), updates: effectiveUpdates)
-        if case .failure = availableResult { return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: false) }
-        return catalog
+        let check = location.catalogCheckStatus()
+        if case .failure = availableResult { return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: false, catalogCheckedAt: check.0, catalogCheckError: check.1) }
+        return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: true, catalogCheckedAt: check.0, catalogCheckError: check.1)
     }
 
     public func refreshCatalogIfNeeded() throws { try location.refreshCatalogIfNeeded() }
+    public func checkCatalogNow() throws { try location.checkCatalogNow() }
 
     public func operationState() -> PHPOperationState? {
         lock.lock(); defer { lock.unlock() }; return activeOperation ?? lastOperation
