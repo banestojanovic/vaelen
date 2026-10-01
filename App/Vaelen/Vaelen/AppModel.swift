@@ -67,6 +67,7 @@ final class AppModel {
     private(set) var settingsFixtureDark = false
     private(set) var settingsFixtureLight = false
     private(set) var settingsFixtureMode: String?
+    private(set) var settingsFixturePHPSelection: String?
     private(set) var settingsFixturePage: SettingsPage?
     private(set) var settingsFixtureOperationFailure = false
 
@@ -82,6 +83,9 @@ final class AppModel {
             if let pageArgument = arguments.first(where: { $0.hasPrefix("--settings-page=") }) {
                 model.settingsFixturePage = SettingsPage(rawValue: String(pageArgument.dropFirst("--settings-page=".count)))
             }
+            if let selectionArgument = arguments.first(where: { $0.hasPrefix("--settings-fixture-php-selection=") }) {
+                model.settingsFixturePHPSelection = String(selectionArgument.dropFirst("--settings-fixture-php-selection=".count))
+            }
             switch mode {
             case "pending":
                 model.state = .connecting
@@ -91,7 +95,7 @@ final class AppModel {
             case "unavailable":
                 model.state = .unavailable
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
-            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed":
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
                 let mysqlState: MySQLState = mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
                 let mysqlVersion = (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
@@ -120,15 +124,28 @@ final class AppModel {
                 )
                 let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
-                let runtime = PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)
+                let phpSettingsFixture = mode.hasPrefix("php-settings")
+                let fixtureVersions = phpSettingsFixture
+                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: "8.4.23", running: true, isDefault: mode != "php-settings-no-default"), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)]
+                    : [PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)]
                 model.phpCatalog = PHPRuntimeCatalog(
                     availableVersions: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
-                    installedVersions: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? [runtime] : [],
-                    defaultVersion: mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
-                    runningVersions: [],
+                    installedVersions: phpSettingsFixture ? fixtureVersions : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? fixtureVersions : [],
+                    defaultVersion: phpSettingsFixture && mode != "php-settings-no-default" ? "8.4.23" : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
+                    runningVersions: phpSettingsFixture ? ["8.4.23"] : [],
                     availableVersionsKnown: true
                 )
-                model.phpConfigurationReadPending = true
+                if phpSettingsFixture {
+                    let shared = PHPSettingsValues(uploadLimitMB: 64, memoryLimitMB: 256, maxExecutionTimeSeconds: 30, maxInputVariables: 2_000, postLimitMB: 65)
+                    let overridden = PHPSettingsValues(uploadLimitMB: 128, memoryLimitMB: 512, maxExecutionTimeSeconds: 0, maxInputVariables: 4_000, postLimitMB: 129)
+                    model.phpConfiguration = PHPConfigurationResult(defaultSettings: shared, versions: [
+                        PHPVersionConfiguration(version: "8.3.22", settings: shared, inheritsDefault: true, cliIniPath: "/fixture/php/8.3.22/cli.ini", fpmIniPath: "/fixture/php/8.3.22/fpm.ini", fpmConfigurationPath: "/fixture/php/8.3.22/php-fpm.conf", fpmRunning: false),
+                        PHPVersionConfiguration(version: "8.4.23", settings: overridden, inheritsDefault: false, cliIniPath: "/fixture/php/8.4.23/cli.ini", fpmIniPath: "/fixture/php/8.4.23/fpm.ini", fpmConfigurationPath: "/fixture/php/8.4.23/php-fpm.conf", fpmRunning: true),
+                        PHPVersionConfiguration(version: "8.5.0", settings: shared, inheritsDefault: true, cliIniPath: "/fixture/php/8.5.0/cli.ini", fpmIniPath: "/fixture/php/8.5.0/fpm.ini", fpmConfigurationPath: "/fixture/php/8.5.0/php-fpm.conf", fpmRunning: false)
+                    ], directory: "/fixture/php")
+                    model.phpConfigurationError = mode == "php-settings-error" ? "Fixture: configuration save failed." : nil
+                    model.phpConfigurationSaving = mode == "php-settings-saving"
+                } else { model.phpConfigurationReadPending = true }
             default:
                 model.isSettingsFixture = false
                 model.settingsFixtureMode = nil
@@ -705,6 +722,13 @@ final class AppModel {
     }
 
     func setDefaultPHP(_ version: String) async {
+        if isSettingsFixture, let catalog = phpCatalog, catalog.installedVersions.contains(where: { $0.version == version }) {
+            let versions = catalog.installedVersions.map { runtime in
+                PHPRuntimeVersion(version: runtime.version, series: runtime.series, running: runtime.running, isDefault: runtime.version == version, updateAvailable: runtime.updateAvailable, latestVersion: runtime.latestVersion, usedByProjectCount: runtime.usedByProjectCount)
+            }
+            phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: versions, defaultVersion: version, runningVersions: catalog.runningVersions, availableVersionsKnown: catalog.availableVersionsKnown)
+            return
+        }
         await performPHPCommand(version) { _ = try await $0.phpDefaultSet(version) }
     }
 
@@ -726,6 +750,29 @@ final class AppModel {
     }
 
     func savePHPConfiguration(version: String?, settings: PHPSettingsValues?) async {
+        if isSettingsFixture {
+            phpConfigurationSaving = true
+            defer { phpConfigurationSaving = false }
+            if settingsFixtureMode == "php-settings-error" {
+                phpConfigurationError = "Fixture: could not save PHP configuration."
+                return
+            }
+            guard let current = phpConfiguration else { phpConfigurationError = "Fixture: configuration unavailable."; return }
+            if let version {
+                let values = settings ?? current.defaultSettings
+                let versions = current.versions.map { item in
+                    item.version == version ? PHPVersionConfiguration(version: item.version, settings: values, inheritsDefault: settings == nil, cliIniPath: item.cliIniPath, fpmIniPath: item.fpmIniPath, fpmConfigurationPath: item.fpmConfigurationPath, fpmRunning: item.fpmRunning) : item
+                }
+                phpConfiguration = PHPConfigurationResult(defaultSettings: current.defaultSettings, versions: versions, directory: current.directory)
+            } else if let settings {
+                let versions = current.versions.map { item in
+                    item.inheritsDefault ? PHPVersionConfiguration(version: item.version, settings: settings, inheritsDefault: true, cliIniPath: item.cliIniPath, fpmIniPath: item.fpmIniPath, fpmConfigurationPath: item.fpmConfigurationPath, fpmRunning: item.fpmRunning) : item
+                }
+                phpConfiguration = PHPConfigurationResult(defaultSettings: settings, versions: versions, directory: current.directory)
+            }
+            phpConfigurationError = nil
+            return
+        }
         guard let client, !phpConfigurationSaving else { return }
         phpConfigurationSaving = true
         defer { phpConfigurationSaving = false }

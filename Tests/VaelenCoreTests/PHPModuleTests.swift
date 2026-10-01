@@ -10,12 +10,19 @@ final class PHPModuleTests: XCTestCase {
 
         let catalog = PHPRuntimeCatalog(availableVersions: ["8.5.0", "8.4.23", "8.4.23"], packages: [second, first, first], statuses: [stopped, running], defaultVersion: "8.4.23", updates: [PHPUpdateObservation(installedVersion: "8.4.23", latestVersion: "8.4.25")])
 
-        XCTAssertEqual(catalog.availableVersions, ["8.4.23", "8.5.0"])
-        XCTAssertEqual(catalog.installedVersions.map(\.version), ["8.3.30", "8.4.23"])
+        XCTAssertEqual(catalog.availableVersions, ["8.5.0", "8.4.23"])
+        XCTAssertEqual(catalog.installedVersions.map(\.version), ["8.4.23", "8.3.30"])
         XCTAssertEqual(catalog.defaultVersion, "8.4.23")
         XCTAssertEqual(catalog.runningVersions, ["8.4.23"])
         XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.3.30" }?.running, false)
         XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.4.23" }?.updateAvailable, true)
+    }
+
+    func testRuntimeCatalogOrdersVersionsNumericallyNewestFirst() {
+        let versions = ["8.4.9", "8.3.29", "8.5.0", "8.4.23"]
+        let catalog = PHPRuntimeCatalog(availableVersions: versions, installedVersions: versions.map { .init(version: $0) }, defaultVersion: nil, runningVersions: [])
+        XCTAssertEqual(catalog.availableVersions, ["8.5.0", "8.4.23", "8.4.9", "8.3.29"])
+        XCTAssertEqual(catalog.installedVersions.map(\.version), ["8.5.0", "8.4.23", "8.4.9", "8.3.29"])
     }
 
     func testPHPUpdateObservationDistinguishesSameSeriesPatchAndUnknownMetadata() {

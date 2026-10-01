@@ -10,6 +10,7 @@ import VaelenCore
 @main
 struct VaelenApp: App {
     @State private var model = AppModel.modelForApplicationLaunch(arguments: ProcessInfo.processInfo.arguments)
+    @Environment(\.openWindow) private var openWindow
     @NSApplicationDelegateAdaptor(VaelenAppDelegate.self) private var appDelegate
 
     var body: some Scene {
@@ -21,6 +22,7 @@ struct VaelenApp: App {
                 .onAppear {
                     if !model.isSettingsFixture { model.startMonitoring() }
                     appDelegate.requestQuit = { Task { await model.quitVaelen() } }
+                    if model.isSettingsFixture { openWindow(id: "settings") }
                 }
         }
         .menuBarExtraStyle(.window)
@@ -224,11 +226,11 @@ struct PHPSettingsView: View {
     @State private var didSelectInitialRuntime = false
 
     private var catalog: PHPRuntimeCatalog? { model.phpCatalog }
-    private var installed: [PHPRuntimeVersion] { catalog?.installedVersions ?? [] }
+    private var installed: [PHPRuntimeVersion] { (catalog?.installedVersions ?? []).sorted { phpVersionDescending($0.version, $1.version) } }
     private var available: [String] {
         guard let catalog, catalog.availableVersionsKnown else { return [] }
         let installedVersions = Set(catalog.installedVersions.map(\.version))
-        return catalog.availableVersions.filter { !installedVersions.contains($0) }
+        return catalog.availableVersions.filter { !installedVersions.contains($0) }.sorted(by: phpVersionDescending)
     }
     private var coreConnected: Bool {
         if case .running = model.state { return model.refreshError == nil }
@@ -276,7 +278,7 @@ struct PHPSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
                 }
                 ForEach(installed, id: \.version) { runtime in
-                    runtimeRow(runtime.version, title: "PHP \(runtime.version)", subtitle: runtimeSubtitle(runtime), state: runtimeTone(runtime))
+                    runtimeRow(runtime.version, title: "PHP \(runtime.version)", subtitle: runtimeSubtitle(runtime), state: runtimeTone(runtime), isDefault: runtime.isDefault, updateAvailable: runtime.updateAvailable == true ? runtime.latestVersion : nil)
                 }
                 Divider().padding(.horizontal, 12).padding(.vertical, 7)
                 Text(inventoryHeading("AVAILABLE", count: catalog?.availableVersionsKnown == true ? available.count : nil))
@@ -307,9 +309,13 @@ struct PHPSettingsView: View {
                 Label(phpOperationDescription(target: operationTarget, operation: model.phpOperation), systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if let error = model.phpError ?? model.phpConfigurationError {
+            if let error = model.phpError {
                 Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-                Button("Retry", systemImage: "arrow.clockwise") { Task { await model.refreshPHPConfiguration(); await model.refresh() } }
+                if let runtime = installed.first(where: { $0.version == selectedItem }), runtime.updateAvailable == true, let target = runtime.latestVersion {
+                    Button("Retry Update to PHP \(target)", systemImage: "arrow.clockwise") { Task { await model.updatePHP(target) } }.disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+                } else {
+                    Button("Retry", systemImage: "arrow.clockwise") { Task { await model.refreshPHPConfiguration(); await model.refresh() } }
+                }
             }
             if selectedItem == "shared" { sharedDefaultsDetail }
             else if selectedItem.hasPrefix("available:"), available.contains(selectedVersion ?? "") { availableRuntimeDetail }
@@ -330,17 +336,16 @@ struct PHPSettingsView: View {
                 Spacer()
                 if phpChecking { SettingsStateBadge(title: "Checking", tone: .pending) }
                 else if !coreConnected { SettingsStateBadge(title: "Unavailable", tone: .attention) }
-                else if let version = catalog?.defaultVersion { SettingsStateBadge(title: "PHP \(version) · Default", tone: .healthy) }
+                else if let version = catalog?.defaultVersion {
+                    HStack(spacing: 4) {
+                        Image(systemName: "star.fill").font(.caption2).foregroundStyle(.secondary)
+                        SettingsStateBadge(title: "PHP \(version) · Default", tone: .healthy)
+                    }
+                    .help("Shared default runtime").accessibilityElement(children: .combine).accessibilityLabel("Shared default runtime: PHP \(version)")
+                }
                 else { SettingsStateBadge(title: "Default unavailable", tone: .attention) }
             }
-            if let version = catalog?.defaultVersion {
-                SettingsInsetCard {
-                    HStack { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green); Text("PHP \(version) is the shared default").font(.subheadline.weight(.medium)); Spacer(); Text("New projects").font(.caption).foregroundStyle(.secondary) }
-                }
-            }
-            configurationEditor(version: nil)
-            Text("Upload and POST size affect web requests. Memory and input-variable limits apply to web and CLI PHP. Execution time limits web requests; managed CLI PHP remains unlimited.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            configurationEditor()
             configLocations
         }
     }
@@ -358,30 +363,19 @@ struct PHPSettingsView: View {
                 SettingsStateBadge(title: runtimeStateTitle(runtime), tone: runtimeTone(runtime))
             }
             HStack(spacing: 8) {
-                if runtime.isDefault { SettingsStateBadge(title: "Shared default", tone: coreConnected ? .healthy : .neutral) }
+                if runtime.isDefault { Label("Shared default runtime", systemImage: "star.fill").font(.caption).foregroundStyle(.secondary).help("Shared default runtime").accessibilityLabel("Shared default runtime") }
                 if runtime.usedByProjectCount > 0 { Text("Used by \(runtime.usedByProjectCount) projects").font(.caption).foregroundStyle(.secondary) }
                 Spacer()
                 PHPDefaultMenu(catalog: catalog!, model: model, canManage: coreConnected && !phpChecking)
             }
             if let config {
                 SettingsInsetCard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("PHP \(runtime.version) settings").font(.headline)
-                                Text(config.inheritsDefault ? "Inherits shared values; edit only to create version-specific settings." : "These values override shared defaults for this version.").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if !config.inheritsDefault {
-                                Button("Use Shared Default") { Task { await model.savePHPConfiguration(version: runtime.version, settings: nil) } }.disabled(model.phpConfigurationSaving || !coreConnected || phpChecking)
-                            }
-                        }
-                        Divider()
-                        PHPSettingsEditor(settings: config.settings, title: "PHP \(runtime.version)", saveTitle: "Save PHP \(runtime.version)", saving: model.phpConfigurationSaving || !coreConnected || phpChecking) { settings in
-                            Task { await model.savePHPConfiguration(version: runtime.version, settings: settings) }
-                        }
-                        Text(config.fpmRunning ? "FPM is running; saved values apply on its next start." : "Settings will be used the next time PHP-FPM starts.").font(.caption2).foregroundStyle(.secondary)
-                    }
+                    PHPConfigurationForm(settings: config.settings, mode: config.inheritsDefault ? .inherited : .override,
+                        saveTitle: "Save", saving: model.phpConfigurationSaving || !coreConnected || phpChecking,
+                        feedback: model.phpConfigurationSaving ? "Saving…" : model.phpConfigurationError,
+                        invalidDraftFixture: model.settingsFixtureMode == "php-settings-invalid",
+                        reset: config.inheritsDefault ? nil : { Task { await model.savePHPConfiguration(version: runtime.version, settings: nil) } },
+                        save: { settings in Task { await model.savePHPConfiguration(version: runtime.version, settings: settings) } })
                 }
             } else {
                 Label(model.phpConfigurationReadPending ? "Loading version-specific settings…" : "Version settings unavailable", systemImage: model.phpConfigurationReadPending ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle")
@@ -451,16 +445,15 @@ struct PHPSettingsView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 9))
     }
 
-    private func configurationEditor(version: String?) -> some View {
+    private func configurationEditor() -> some View {
         Group {
             if let configuration = model.phpConfiguration {
                 SettingsInsetCard {
-                    PHPSettingsEditor(
-                        settings: version.flatMap { v in configuration.versions.first { $0.version == v }?.settings } ?? configuration.defaultSettings,
-                        title: version.map { "PHP \($0) Settings" } ?? "Shared Default Settings",
-                        saveTitle: version.map { "Save PHP \($0)" } ?? "Save Shared Default",
-                        saving: model.phpConfigurationSaving || !coreConnected || phpChecking
-                    ) { settings in Task { await model.savePHPConfiguration(version: version, settings: settings) } }
+                    PHPConfigurationForm(settings: configuration.defaultSettings, mode: .shared,
+                        saveTitle: "Save", saving: model.phpConfigurationSaving || !coreConnected || phpChecking,
+                        feedback: model.phpConfigurationSaving ? "Saving…" : model.phpConfigurationError,
+                        invalidDraftFixture: model.settingsFixtureMode == "php-settings-invalid",
+                        save: { settings in Task { await model.savePHPConfiguration(version: nil, settings: settings) } })
                 }
             } else if model.phpConfigurationReadPending {
                 SettingsInsetCard { HStack { ProgressView().controlSize(.small); Text("Checking PHP configuration…").font(.subheadline).foregroundStyle(.secondary) } }
@@ -473,7 +466,7 @@ struct PHPSettingsView: View {
     private func runtimeActions(_ runtime: PHPRuntimeVersion) -> some View {
         HStack {
             if runtime.updateAvailable == true, let latest = runtime.latestVersion {
-                Button("Update to \(latest)", systemImage: "arrow.triangle.2.circlepath") { Task { await model.updatePHP(latest) } }.disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+                Button("Update to PHP \(latest)", systemImage: "arrow.triangle.2.circlepath") { Task { await model.updatePHP(latest) } }.disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
             }
             if runtime.running == false && !runtime.isDefault {
                 Button("Remove Runtime…", systemImage: "trash", role: .destructive) { removalVersion = runtime.version }
@@ -490,7 +483,7 @@ struct PHPSettingsView: View {
 
     private func selectInitialRuntime() {
         guard !didSelectInitialRuntime, let catalog else { return }
-        selectedItem = catalog.defaultVersion ?? catalog.installedVersions.first?.version ?? "shared"
+        selectedItem = model.settingsFixturePHPSelection ?? catalog.defaultVersion ?? catalog.installedVersions.first?.version ?? "shared"
         didSelectInitialRuntime = true
     }
 
@@ -522,13 +515,16 @@ struct PHPSettingsView: View {
         return model.phpCatalogReadPending || model.isServiceReadPending("PHP")
     }
 
-    private func runtimeRow(_ key: String, title: String, subtitle: String, state: SettingsStateBadge.Tone) -> some View {
+    private func runtimeRow(_ key: String, title: String, subtitle: String, state: SettingsStateBadge.Tone, isDefault: Bool = false, updateAvailable: String? = nil) -> some View {
         Button { selectedItem = key } label: {
             HStack(spacing: 8) {
+                Image(systemName: "star.fill").font(.system(size: 9, weight: .semibold)).foregroundStyle(.orange).frame(width: 12).opacity(isDefault ? 1 : 0).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) { Text(title).font(.subheadline.weight(.medium)).foregroundStyle(.primary); Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(2) }
                 Spacer(minLength: 2)
+                if let updateAvailable {
+                    Image(systemName: "arrow.down.circle.fill").font(.system(size: 12)).foregroundStyle(Color.accentColor).help("Update available: PHP \(updateAvailable)").accessibilityLabel("Update available: PHP \(updateAvailable)")
+                } else { Color.clear.frame(width: 12, height: 12).accessibilityHidden(true) }
                 SettingsStateDot(title: "", tone: state)
-                if key == selectedItem { Image(systemName: "checkmark").font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor) }
             }
             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 9)
             .background(selectedItem == key ? Color.accentColor.opacity(0.11) : .clear, in: RoundedRectangle(cornerRadius: 8))
@@ -537,9 +533,13 @@ struct PHPSettingsView: View {
             .accessibilityAddTraits(selectedItem == key ? .isSelected : [])
     }
 
+    private func phpVersionDescending(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = PHPVersion(lhs), let right = PHPVersion(rhs) else { return lhs > rhs }
+        return left > right
+    }
+
     private func runtimeSubtitle(_ runtime: PHPRuntimeVersion) -> String {
         var parts: [String] = []
-        if runtime.isDefault { parts.append("Shared default") }
         if runtime.usedByProjectCount > 0 { parts.append("\(runtime.usedByProjectCount) projects") }
         parts.append(runtimeStateTitle(runtime))
         return parts.joined(separator: " · ")
@@ -574,69 +574,129 @@ struct PHPSettingsView: View {
     }
 }
 
-private struct PHPSettingsEditor: View {
+private struct PHPConfigurationForm: View {
+    enum Mode { case shared, inherited, override }
     let settings: PHPSettingsValues
-    let title: String
+    let mode: Mode
     let saveTitle: String
     let saving: Bool
+    let feedback: String?
+    let invalidDraftFixture: Bool
+    var reset: (() -> Void)? = nil
     let save: (PHPSettingsValues) -> Void
-    @State private var uploadLimitMB: Int
-    @State private var memoryLimitMB: Int
-    @State private var maxExecutionTimeSeconds: Int
-    @State private var maxInputVariables: Int
+    @State private var upload = ""
+    @State private var memory = ""
+    @State private var execution = ""
+    @State private var variables = ""
 
-    init(settings: PHPSettingsValues, title: String, saveTitle: String, saving: Bool, save: @escaping (PHPSettingsValues) -> Void) {
-        self.settings = settings; self.title = title; self.saveTitle = saveTitle; self.saving = saving; self.save = save
-        _uploadLimitMB = State(initialValue: settings.uploadLimitMB)
-        _memoryLimitMB = State(initialValue: settings.memoryLimitMB)
-        _maxExecutionTimeSeconds = State(initialValue: settings.maxExecutionTimeSeconds)
-        _maxInputVariables = State(initialValue: settings.maxInputVariables)
+    init(settings: PHPSettingsValues, mode: Mode, saveTitle: String, saving: Bool, feedback: String?, invalidDraftFixture: Bool = false, reset: (() -> Void)? = nil, save: @escaping (PHPSettingsValues) -> Void) {
+        self.settings = settings; self.mode = mode; self.saveTitle = saveTitle; self.saving = saving; self.feedback = feedback; self.invalidDraftFixture = invalidDraftFixture; self.reset = reset; self.save = save
+        _upload = State(initialValue: invalidDraftFixture ? "3000" : String(settings.uploadLimitMB)); _memory = State(initialValue: String(settings.memoryLimitMB))
+        _execution = State(initialValue: String(settings.maxExecutionTimeSeconds)); _variables = State(initialValue: String(settings.maxInputVariables))
     }
 
-    private var postLimitMB: Int { max(settings.postLimitMB, uploadLimitMB + 1) }
-    private var valid: Bool { (1...2048).contains(uploadLimitMB) && (16...4096).contains(memoryLimitMB) && (0...86_400).contains(maxExecutionTimeSeconds) && (100...1_000_000).contains(maxInputVariables) && postLimitMB <= 2049 }
-    private var unchanged: Bool {
-        uploadLimitMB == settings.uploadLimitMB && memoryLimitMB == settings.memoryLimitMB && maxExecutionTimeSeconds == settings.maxExecutionTimeSeconds && maxInputVariables == settings.maxInputVariables && postLimitMB == settings.postLimitMB
+    private var uploadValue: Int? { Int(upload) }
+    private var memoryValue: Int? { Int(memory) }
+    private var executionValue: Int? { Int(execution) }
+    private var variablesValue: Int? { Int(variables) }
+    private var postLimitMB: Int { max(settings.postLimitMB, (uploadValue ?? settings.uploadLimitMB) + 1) }
+    private var valid: Bool {
+        guard let u = uploadValue, let m = memoryValue, let e = executionValue, let v = variablesValue else { return false }
+        return (1...2048).contains(u) && (16...4096).contains(m) && (0...86_400).contains(e) && (100...1_000_000).contains(v) && postLimitMB <= 2049
+    }
+    private var unchanged: Bool { uploadValue == settings.uploadLimitMB && memoryValue == settings.memoryLimitMB && executionValue == settings.maxExecutionTimeSeconds && variablesValue == settings.maxInputVariables }
+    private var values: PHPSettingsValues? {
+        guard valid, let u = uploadValue, let m = memoryValue, let e = executionValue, let v = variablesValue else { return nil }
+        return PHPSettingsValues(uploadLimitMB: u, memoryLimitMB: m, maxExecutionTimeSeconds: e, maxInputVariables: v, postLimitMB: postLimitMB)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: VaelenUI.spacing8) {
-            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            Grid(alignment: .leading, horizontalSpacing: VaelenUI.spacing8, verticalSpacing: VaelenUI.spacing8) {
-                settingRow("Maximum upload size", value: $uploadLimitMB, unit: "MB", accessibility: "Maximum upload size for \(title)")
-                GridRow {
-                    Text("POST body limit").foregroundStyle(.secondary)
-                    Text("\(postLimitMB) MB · managed automatically").gridCellColumns(2).foregroundStyle(.secondary)
-                }
-                settingRow("Memory limit", value: $memoryLimitMB, unit: "MB", accessibility: "PHP memory limit for \(title)")
-                settingRow("Maximum execution time", value: $maxExecutionTimeSeconds, unit: "seconds", accessibility: "PHP maximum execution time for \(title)")
-                settingRow("Maximum input variables", value: $maxInputVariables, unit: "variables", accessibility: "PHP maximum input variables for \(title)")
-            }
-            Text("Vaelen keeps post_max_size at least 1 MB above upload_max_filesize so multipart overhead cannot make the upload limit ineffective.")
-                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Text("Upload and POST size affect web requests. Memory and maximum input variables apply to web and CLI PHP. Maximum execution time controls FPM/web requests; managed CLI PHP remains unlimited.")
-                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            HStack {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text(mode == .shared ? "Shared values" : mode == .inherited ? "Using shared values" : "Version override")
+                    .font(.subheadline.weight(.medium))
+                if mode == .inherited { Text("Inherited").font(.caption2.weight(.medium)).foregroundStyle(.secondary).padding(.horizontal, 7).padding(.vertical, 3).background(.quaternary, in: Capsule()) }
                 Spacer()
-                Button(saveTitle) {
-                    save(PHPSettingsValues(uploadLimitMB: uploadLimitMB, memoryLimitMB: memoryLimitMB, maxExecutionTimeSeconds: maxExecutionTimeSeconds, maxInputVariables: maxInputVariables, postLimitMB: postLimitMB))
-                }
-                .disabled(saving || unchanged || !valid)
+                if let reset { Button("Reset to shared values", role: .destructive, action: reset).settingsDestructiveTint().disabled(saving) }
             }
+            PHPSettingsFormSection(title: "Uploads & requests") {
+                PHPNumericFieldRow(label: "Maximum upload size", text: $upload, unit: "MB", range: 1...2048, help: "Largest individual uploaded file.")
+                HStack(spacing: 6) {
+                    Text("POST body limit").foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(postLimitMB) + " MB").monospacedDigit()
+                    Text("Managed automatically").font(.caption).foregroundStyle(.secondary)
+                }.font(.callout).padding(.vertical, 5).accessibilityElement(children: .combine)
+            }
+            PHPSettingsFormSection(title: "Resource limits") {
+                PHPNumericFieldRow(label: "Memory limit", text: $memory, unit: "MB", range: 16...4096, help: "Maximum memory available to a PHP script.")
+                PHPNumericFieldRow(label: "Maximum execution time", text: $execution, unit: "seconds", range: 0...86_400, help: "0 means unlimited for web requests. Managed CLI PHP remains unlimited.")
+                PHPNumericFieldRow(label: "Maximum input variables", text: $variables, unit: "variables", range: 100...1_000_000, help: "Applies to web and CLI PHP.")
+            }
+            DisclosureGroup("PHP directive details") {
+                Text("Vaelen keeps post_max_size at least 1 MB above upload_max_filesize to allow for multipart request overhead. memory_limit and max_input_vars apply to web and CLI PHP; max_execution_time applies to FPM/web requests, while managed CLI PHP is unlimited.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, 5)
+            }.font(.caption)
+            PHPSettingsFormFooter(saveTitle: saveTitle, saving: saving, feedback: feedback, canSave: valid && !unchanged, save: { if let values { save(values) } })
         }
         .onChange(of: settings) { _, value in
-            uploadLimitMB = value.uploadLimitMB; memoryLimitMB = value.memoryLimitMB; maxExecutionTimeSeconds = value.maxExecutionTimeSeconds; maxInputVariables = value.maxInputVariables
+            upload = String(value.uploadLimitMB); memory = String(value.memoryLimitMB); execution = String(value.maxExecutionTimeSeconds); variables = String(value.maxInputVariables)
         }
     }
+}
 
-    private func settingRow(_ label: String, value: Binding<Int>, unit: String, accessibility: String) -> some View {
-        GridRow {
-            Text(label)
-            TextField(label, value: value, format: .number)
-                .labelsHidden().multilineTextAlignment(.trailing).frame(width: 78)
-                .accessibilityLabel(accessibility)
-            Text(unit).font(.caption).foregroundStyle(.secondary)
-        }
+private struct PHPSettingsFormSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) { content }
+        }.padding(.top, 2)
+    }
+}
+
+private struct PHPNumericFieldRow: View {
+    let label: String
+    @Binding var text: String
+    let unit: String
+    let range: ClosedRange<Int>
+    let help: String
+    private var parsed: Int? { Int(text) }
+    private var error: String? {
+        guard let value = parsed else { return text.isEmpty ? "Enter a value." : "Enter a whole number." }
+        guard range.contains(value) else { return "Use \(String(range.lowerBound))–\(String(range.upperBound))." }
+        return nil
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text(label).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                TextField(label, text: $text).textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing).frame(width: 92).monospacedDigit()
+                    .accessibilityLabel(label).accessibilityHint(help)
+                Text(unit).font(.caption).foregroundStyle(.secondary).frame(width: unit == "variables" ? 58 : 48, alignment: .leading)
+            }.frame(minHeight: 30)
+            if let error { Text(error).font(.caption2).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .trailing) }
+        }.help(help)
+    }
+}
+
+private struct PHPSettingsFormFooter: View {
+    let saveTitle: String
+    let saving: Bool
+    let feedback: String?
+    let canSave: Bool
+    let save: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Changes apply when PHP-FPM next starts.").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if saving { ProgressView().controlSize(.small) }
+                Button(saveTitle, action: save).buttonStyle(.borderedProminent).disabled(saving || !canSave)
+            }
+            if let feedback { Label(feedback, systemImage: saving ? "arrow.triangle.2.circlepath" : "exclamationmark.circle").font(.caption).foregroundStyle(saving ? Color.secondary : Color.red) }
+        }.padding(.top, 8).overlay(alignment: .top) { Divider() }
     }
 }
 
@@ -661,7 +721,8 @@ private struct PHPDefaultMenu: View {
                 .disabled(model.phpRequestInFlight || runtime.running == nil)
             }
         } label: {
-            Label("PHP \(catalog.defaultVersion ?? "Unavailable")", systemImage: "checkmark.circle")
+            if let version = catalog.defaultVersion { Label("PHP \(version)", systemImage: "star.fill") }
+            else { Label("Default unavailable", systemImage: "questionmark.circle") }
         }
         .menuStyle(.borderlessButton)
         .accessibilityLabel("Default PHP runtime")

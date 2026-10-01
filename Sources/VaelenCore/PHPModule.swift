@@ -313,11 +313,11 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
     public let availableVersionsKnown: Bool
 
     public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String], availableVersionsKnown: Bool = true) {
-        self.availableVersions = Self.sortedUnique(availableVersions)
+        self.availableVersions = Self.sortedUnique(availableVersions).sorted { Self.versionSort($1, $0) }
         self.installedVersions = installedVersions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
             guard result[value.version] == nil else { return }
             result[value.version] = value
-        }.values.sorted { Self.versionSort($0.version, $1.version) }
+        }.values.sorted { Self.versionSort($1.version, $0.version) }
         self.defaultVersion = defaultVersion
         self.runningVersions = Self.sortedUnique(runningVersions)
         self.availableVersionsKnown = availableVersionsKnown
@@ -344,11 +344,11 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
                                      updateAvailable: update?.updateAvailable,
                                      latestVersion: update?.latestVersion)
         }
-        self.availableVersions = Self.sortedUnique(availableVersions)
+        self.availableVersions = Self.sortedUnique(availableVersions).sorted { Self.versionSort($1, $0) }
         self.installedVersions = versions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
             guard result[value.version] == nil else { return }
             result[value.version] = value
-        }.values.sorted { Self.versionSort($0.version, $1.version) }
+        }.values.sorted { Self.versionSort($1.version, $0.version) }
         self.defaultVersion = defaultVersion
         self.runningVersions = Self.sortedUnique(statuses.filter { $0.state == .running }.map(\.version))
         self.availableVersionsKnown = true
