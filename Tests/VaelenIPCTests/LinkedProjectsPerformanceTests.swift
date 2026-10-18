@@ -38,6 +38,20 @@ private struct LinksBenchmarkTLSTrust: TLSTrustBoundary {
 }
 
 final class LinkedProjectsPerformanceTests: XCTestCase {
+    func testSubprocessTimeoutTerminatesOwnedChildAndPreservesRootIfUnreaped() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lb-timeout-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = root.appendingPathComponent("fixture.sh")
+        try "#!/bin/sh\nexec sleep 30\n".write(to: fixture, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        XCTAssertThrowsError(try Self.capture(fixture.path, arguments: [], timeout: .milliseconds(100), terminationGrace: .milliseconds(100))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("timed out"))
+            XCTAssertTrue(error.localizedDescription.contains("owned child was terminated"))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+    }
+
     func testHumanLinksEndToEndSixMinimalNoPHPProjects() async throws {
         let outcome = try await runScenario(includePHPSelection: false)
         XCTAssertTrue(outcome.samples.count == 5)
@@ -59,7 +73,7 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
 
     private func runScenario(includePHPSelection: Bool) async throws -> ScenarioOutcome {
         let fm = FileManager.default
-        let root = URL(fileURLWithPath: "/private/var/folders/9b/1f1sf2v51_36ys9ngvlqzc8c0000gn/T/lb-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        let root = fm.temporaryDirectory.appendingPathComponent("lb-\(UUID().uuidString.prefix(8))", isDirectory: true)
         let supportRoot = root.appendingPathComponent("s", isDirectory: true)
         let projectsRoot = root.appendingPathComponent("p", isDirectory: true)
         let socketRoot = supportRoot.appendingPathComponent("runtime", isDirectory: true)
@@ -229,12 +243,34 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
         return nil
     }
 
-    private static func capture(_ executable: String, arguments: [String]) throws -> String {
-        let process = Process(); let output = Pipe()
+    private static func capture(_ executable: String, arguments: [String], timeout: Duration = .seconds(10), terminationGrace: Duration = .seconds(1)) throws -> String {
+        let process = Process()
         process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
-        process.standardOutput = output; process.standardError = output
-        try process.run(); process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("lb-capture-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil) else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 9, userInfo: [NSLocalizedDescriptionKey: "could not create subprocess output file"]) }
+        let file = try FileHandle(forWritingTo: outputURL)
+        process.standardOutput = file; process.standardError = file
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        var didExit = exited.wait(timeout: .now() + seconds) == .success
+        let timedOut = !didExit
+        if !didExit {
+            process.terminate()
+            let grace = Double(terminationGrace.components.seconds) + Double(terminationGrace.components.attoseconds) / 1e18
+            didExit = exited.wait(timeout: .now() + grace) == .success
+        }
+        if !didExit { _ = kill(process.processIdentifier, SIGKILL); didExit = exited.wait(timeout: .now() + 1) == .success }
+        guard didExit else {
+            try? file.close()
+            throw NSError(domain: "LinkedProjectsPerformanceTests", code: 10, userInfo: [NSLocalizedDescriptionKey: "subprocess timed out and its exit could not be established; output preserved at \(outputURL.path)"])
+        }
+        process.waitUntilExit()
+        try file.close()
+        let data = try Data(contentsOf: outputURL)
+        try FileManager.default.removeItem(at: outputURL)
+        guard !timedOut else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 11, userInfo: [NSLocalizedDescriptionKey: "subprocess timed out and its owned child was terminated"]) }
         guard process.terminationStatus == 0 else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "local PHP version probe failed"]) }
         return String(decoding: data, as: UTF8.self)
     }
