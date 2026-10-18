@@ -51,7 +51,7 @@ enum CLICommand {
     case phpUse(String)
     case phpExec(version: String?, effective: Bool, arguments: [String])
     case phpResolvePath
-    case isolated
+    case isolated(json: Bool)
     case phpINI(version: String?)
     case shellStatus
     case shellInstall
@@ -342,8 +342,7 @@ struct VaelenCLIMain {
             guard args.count == 1 || args.count == 2 else { throw CLIError.commandUsage("unisolate") }
             return .projectPHP(selector: args.count == 2 ? args[1] : nil, version: nil, useDefault: true, json: false)
         case "isolated":
-            guard args.count == 1 else { throw CLIError.commandUsage("isolated") }
-            return .isolated
+            return .isolated(json: try optionalJSONOption(Array(args.dropFirst())))
         case "which-php":
             guard args.count == 1 else { throw CLIError.commandUsage("which-php") }
             return .phpResolvePath
@@ -647,35 +646,8 @@ struct VaelenCLIMain {
             print("Vaelen \(VaelenBuildInfo.version)")
         case .help(let path):
             print(helpText(for: path), terminator: "")
-        case .isolated:
-            let projects = try await client.linkedProjects()
-            let socketPath = CoreEndpointPaths().socket.path
-            let identity = ClientIdentity(name: "val", version: VaelenBuildInfo.version)
-            let overrides = await withTaskGroup(of: (String, ProjectPHPSelection?).self, returning: [(String, ProjectPHPSelection)].self) { group in
-                for project in projects where project.id != nil {
-                    group.addTask {
-                        let phpClient = VaelenCoreClient(transport: UnixSocketTransport(path: socketPath), identity: identity)
-                        do {
-                            try await phpClient.connect()
-                            let selection = try await phpClient.projectPHP(selector: project.id?.uuidString, workingDirectory: workingDirectory)
-                            await phpClient.disconnect()
-                            return (project.path, selection)
-                        } catch {
-                            await phpClient.disconnect()
-                            return (project.path, nil)
-                        }
-                    }
-                }
-                var values: [(String, ProjectPHPSelection)] = []
-                for await (path, selection) in group where selection?.overrideVersion != nil {
-                    if let selection { values.append((path, selection)) }
-                }
-                return values
-            }
-            let rows = overrides.sorted { $0.0.localizedStandardCompare($1.0) == .orderedAscending }.map { path, selection in
-                [selection.project.name, displayPath(path), selection.overrideVersion ?? "—", selection.effectiveVersion ?? "unavailable"]
-            }
-            print(HumanOutput.heading("Isolated projects") + "\n" + (rows.isEmpty ? "No project-specific PHP overrides." : HumanOutput.table(rows, headers: ["Project", "Path", "Override", "Effective"])))
+        case .isolated(let json):
+            print(try await isolatedProjectsOutput(client: client, json: json))
         case .doctor:
             break
         case .status(let json):
@@ -1208,6 +1180,24 @@ struct VaelenCLIMain {
         }
         lines.append(HumanOutput.table(rows, headers: ["Parked folder", "Availability"], width: width, color: color))
         return lines.joined(separator: "\n")
+    }
+
+    static func isolatedProjectsOutput(_ selections: [ProjectPHPSelection], json: Bool) throws -> String {
+        let overrides = selections
+            .filter { $0.overrideVersion != nil }
+            .sorted { $0.project.path.localizedStandardCompare($1.project.path) == .orderedAscending }
+        if json {
+            let result = ProjectPHPSelectionsResult(selections: overrides)
+            return String(decoding: try IPCCodec.encode(result), as: UTF8.self)
+        }
+        let rows = overrides.map { selection in
+            [selection.project.name, displayPath(selection.project.path), selection.overrideVersion ?? "—", selection.effectiveVersion ?? "unavailable"]
+        }
+        return HumanOutput.heading("Isolated projects") + "\n" + (rows.isEmpty ? "No project-specific PHP overrides." : HumanOutput.table(rows, headers: ["Project", "Path", "Override", "Effective"]))
+    }
+
+    static func isolatedProjectsOutput(client: VaelenCoreClient, json: Bool) async throws -> String {
+        try isolatedProjectsOutput(await client.projectPHPSelections(), json: json)
     }
 
     private static func effectivePHPByProject(client: VaelenCoreClient) async -> [String: String] {
