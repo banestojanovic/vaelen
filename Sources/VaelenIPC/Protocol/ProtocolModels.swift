@@ -71,6 +71,7 @@ public enum CoreMethod: String, Sendable {
     case projectPlan = "project.plan"
     case projectActivate = "project.activate"
     case projectPHP = "project.php"
+    case projectPHPSelections = "project.php.selections"
     case pathPark = "path.park"
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
@@ -272,6 +273,11 @@ public struct ProjectPHPSelection: Codable, Equatable, Sendable {
     public let observedVersion: String?
     public let available: Bool
     public init(project: ProjectWire, overrideVersion: String?, defaultVersion: String?, effectiveVersion: String?, observedVersion: String?, available: Bool) { self.project = project; self.overrideVersion = overrideVersion; self.defaultVersion = defaultVersion; self.effectiveVersion = effectiveVersion; self.observedVersion = observedVersion; self.available = available }
+}
+
+public struct ProjectPHPSelectionsResult: Codable, Equatable, Sendable {
+    public let selections: [ProjectPHPSelection]
+    public init(selections: [ProjectPHPSelection]) { self.selections = selections }
 }
 
 public struct ParkedPathWire: Codable, Equatable, Sendable {
@@ -520,6 +526,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectPlan(ProjectReconciliationPlanResult)
     case projectActivation(ProjectReconciliationExecutionResponse)
     case projectPHP(ProjectPHPSelection)
+    case projectPHPSelections(ProjectPHPSelectionsResult)
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
@@ -559,6 +566,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectPlan(let value): try value.encode(to: encoder)
         case .projectActivation(let value): try value.encode(to: encoder)
         case .projectPHP(let value): try value.encode(to: encoder)
+        case .projectPHPSelections(let value): try value.encode(to: encoder)
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
@@ -600,6 +608,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["snapshotID"] != nil, let result = try? IPCCodec.decode(ProjectObservationSnapshotResult.self, from: data) { self = .projectObservationSnapshot(result) }
         else if fields["plan"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationPlanResult.self, from: data) { self = .projectPlan(result) }
         else if fields["execution"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationExecutionResponse.self, from: data) { self = .projectActivation(result) }
+        else if fields["selections"] != nil, let result = try? IPCCodec.decode(ProjectPHPSelectionsResult.self, from: data) { self = .projectPHPSelections(result) }
         else if fields["overrideVersion"] != nil || fields["effectiveVersion"] != nil, let result = try? IPCCodec.decode(ProjectPHPSelection.self, from: data) { self = .projectPHP(result) }
         else if fields["project"] != nil, let result = try? IPCCodec.decode(ProjectMutationResult.self, from: data) { self = .projectMutation(result) }
         else if fields["paths"] != nil, let result = try? IPCCodec.decode(ParkedPathListResult.self, from: data) { self = .parkedPathList(result) }

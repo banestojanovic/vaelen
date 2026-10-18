@@ -920,6 +920,13 @@ public struct PHPStatus: Codable, Equatable, Sendable {
     public let isDefault: Bool
 }
 
+public struct PHPSelectionSnapshot: Sendable {
+    public let packages: [PHPPackage]
+    public let invalidVersions: [String]
+    public let statuses: [PHPStatus]
+    public let defaultVersion: String?
+}
+
 public struct PHPManagedSettings: Codable, Equatable, Sendable {
     public let uploadLimitMB: Int
     public let memoryLimitMB: Int
@@ -2073,10 +2080,26 @@ public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog 
     }
 
     public func defaultVersion() -> String? {
+        defaultVersion(packages: eligibleInstalledVersions())
+    }
+
+    private func defaultVersion(packages: @autoclosure () -> [PHPPackage]) -> String? {
         guard let persisted = try? String(contentsOf: layout.configurationDirectoryURL.appendingPathComponent("php-default.json"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
               !persisted.isEmpty,
-              eligibleInstalledVersions().contains(where: { $0.version == persisted }) else { return nil }
+              packages().contains(where: { $0.version == persisted }) else { return nil }
         return persisted
+    }
+
+    public func selectionSnapshot() -> PHPSelectionSnapshot {
+        let observations = packageObservations()
+        let packages = observations.filter { $0.eligibility == .eligible }.compactMap(\.package)
+        let selectedDefault = defaultVersion(packages: packages)
+        return PHPSelectionSnapshot(
+            packages: packages,
+            invalidVersions: observations.filter { $0.eligibility != .eligible }.compactMap(\.version),
+            statuses: packages.map { observeStatus(package: $0, version: $0.version, defaultVersion: selectedDefault, maintainRecords: false) },
+            defaultVersion: selectedDefault
+        )
     }
 
     public func configuration() throws -> PHPConfigurationSnapshot {
@@ -2217,34 +2240,40 @@ public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog 
     }
 
     public func status(requestedVersion: String) throws -> PHPStatus {
-        let package = try? resolveInstalled(requestedVersion); let version = package?.version ?? requestedVersion
+        let package = try? resolveInstalled(requestedVersion)
+        return observeStatus(package: package, version: package?.version ?? requestedVersion, defaultVersion: defaultVersion(), maintainRecords: true)
+    }
+
+    private func observeStatus(package: PHPPackage?, version: String, defaultVersion: String?, maintainRecords: Bool) -> PHPStatus {
         let socket = socketPath(version); let record = processRecord(version)
-        guard let record else { return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version) }
+        guard let record else { return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion == version) }
         if let child = ownedProcess(for: version), child.processIdentifier == record.pid, !child.isRunningAndReapedIfExited() {
             if child.hasLiveOwnedDescendants {
-                return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "master-exited-workers-running", isDefault: defaultVersion() == version)
+                return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "master-exited-workers-running", isDefault: defaultVersion == version)
             }
-            clearExitedFPMRecord(record, version: version)
-            removeOwnedProcess(for: version)
-            return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version)
+            if maintainRecords {
+                clearExitedFPMRecord(record, version: version)
+                removeOwnedProcess(for: version)
+            }
+            return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion == version)
         }
         guard processMatches(record) else {
             if !processExists(record.pid) {
-                clearExitedFPMRecord(record, version: version)
-                return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion() == version)
+                if maintainRecords { clearExitedFPMRecord(record, version: version) }
+                return PHPStatus(version: version, package: package, state: .stopped, pid: nil, socket: socket, health: "stopped", isDefault: defaultVersion == version)
             }
-            return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "identity-unverified", isDefault: defaultVersion() == version)
+            return PHPStatus(version: version, package: package, state: .degraded, pid: record.pid, socket: socket, health: "identity-unverified", isDefault: defaultVersion == version)
         }
         let healthy = manager.fileExists(atPath: socket) && isSocket(socket) && isSocketReady(socket)
         if let child = ownedProcess(for: version) { _ = child.isRunningAndReapedIfExited() }
-        if healthy, record.socketDevice == nil || record.socketInode == nil {
+        if maintainRecords, healthy, record.socketDevice == nil || record.socketInode == nil {
             var info = stat()
             if lstat(socket, &info) == 0, var updated = processRecord(version) {
                 updated = PHPProcessRecord(pid: updated.pid, version: updated.version, executable: updated.executable, arguments: updated.arguments, configPath: updated.configPath, socketPath: updated.socketPath, startedAt: updated.startedAt, socketDevice: Int64(info.st_dev), socketInode: Int64(info.st_ino))
                 try? atomicWrite(updated, to: processRecordURL(version))
             }
         }
-        return PHPStatus(version: version, package: package, state: healthy ? .running : .degraded, pid: record.pid, socket: socket, health: healthy ? "healthy" : "not-ready", isDefault: defaultVersion() == version)
+        return PHPStatus(version: version, package: package, state: healthy ? .running : .degraded, pid: record.pid, socket: socket, health: healthy ? "healthy" : "not-ready", isDefault: defaultVersion == version)
     }
 
     public func start(requestedVersion: String) throws -> PHPStatus {

@@ -43,6 +43,22 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(selection.overrideVersion, "8.4.23")
     }
 
+    func testProjectPHPSelectionsRoundTripsThroughJSON() throws {
+        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 6)
+        let request = IPCRequest(method: .projectPHPSelections)
+        let decodedRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(decodedRequest.knownMethod, .projectPHPSelections)
+        XCTAssertNil(decodedRequest.params)
+        let selections = ProjectPHPSelectionsResult(selections: [
+            .init(project: .init(id: nil, name: "defaulted", path: "/tmp/defaulted", registration: "linked", availability: "available"), overrideVersion: nil, defaultVersion: "8.4.23", effectiveVersion: "8.4.23", observedVersion: nil, available: true),
+            .init(project: .init(id: nil, name: "pinned", path: "/tmp/pinned", registration: "linked", availability: "available"), overrideVersion: "8.3.29", defaultVersion: "8.4.23", effectiveVersion: "8.3.29", observedVersion: nil, available: true),
+        ])
+        let response = IPCResponse(id: request.id, result: .projectPHPSelections(selections))
+        let restored = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .projectPHPSelections(let result)? = restored.result else { return XCTFail("project.php.selections response did not decode") }
+        XCTAssertEqual(result, selections)
+    }
+
     func testObservedRouteListDistinguishesObservedEmptyFromUnavailable() throws {
         let request = IPCRequest(method: .routeObservedList)
         XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request)).knownMethod, .routeObservedList)

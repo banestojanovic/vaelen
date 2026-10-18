@@ -81,18 +81,24 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
         XCTAssertTrue(outcome.samples.count == 5)
         XCTAssertEqual(outcome.projectNames.count, 6)
         XCTAssertNil(outcome.phpVersion)
+        XCTAssertEqual(outcome.providerStatusObservations, 6, "only the route observation request probes router status across six invocations")
+        XCTAssertEqual(outcome.providerRouteObservations, 0, "PHP selections do not probe router routes")
     }
 
     func testHumanLinksEndToEndSixProjectsWithSyntheticPHPSelection() async throws {
         let outcome = try await runScenario(includePHPSelection: true)
         XCTAssertEqual(outcome.projectNames.count, 6)
         XCTAssertNotNil(outcome.phpVersion)
+        XCTAssertEqual(outcome.providerStatusObservations, 6, "only the route observation request probes router status across six invocations")
+        XCTAssertEqual(outcome.providerRouteObservations, 0, "PHP selections do not probe router routes")
     }
 
     private struct ScenarioOutcome {
         let projectNames: [String]
         let samples: [Double]
         let phpVersion: String?
+        let providerStatusObservations: Int
+        let providerRouteObservations: Int
     }
 
     private func runScenario(includePHPSelection: Bool) async throws -> ScenarioOutcome {
@@ -172,7 +178,7 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
                 try Data(version.utf8).write(to: layout.configurationDirectoryURL.appendingPathComponent("php-default.json"))
                 phpModule = PHPModule(layout: layout, location: FilePHPManifestLocation(manifestURL: supportRoot.appendingPathComponent("synthetic-php-manifest.json")))
                 phpVersion = version
-                phpProvenance = "generated package metadata and default; no package archive or PHP-FPM bytes; local executable \(phpBinary) used for package observation only, not started"
+                phpProvenance = "generated package metadata and default; no package archive or PHP-FPM bytes; local executable \(phpBinary) used only for -v package validation; no PHP-FPM service started"
             }
             let dns = DNSCapability(layout: layout, helper: UnavailablePrivilegedDNSHelper(), responder: LinksBenchmarkDNSResponder())
             let tls = TLSCapability(layout: layout, store: store, keychain: LocalCAKeychain(tag: "dev.vaelen.links-benchmark"), trustBoundary: LinksBenchmarkTLSTrust())
@@ -256,9 +262,9 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
             let sorted = samples.sorted()
             let median = sorted[sorted.count / 2]
             try await cleanup()
-            let phpAccounting = includePHPSelection ? "PHP effectivePHPByProject: +6 fresh connections, +6 handshakes, +6 projectPHP selection requests per invocation; expected effective PHP=\(phpVersion ?? "unknown"); provider/package provenance=\(phpProvenance)" : "no PHP module/package/default; PHP effective selection/runtime resolution unavailable because Core has no PHP module; PHP effectivePHPByProject still opens +6 fresh connections, +6 handshakes, and sends +6 projectPHP selection requests per invocation"
-            print("[LinksBenchmark] scenario=\(includePHPSelection ? "six projects with synthetic PHP selection" : "six minimal/no-PHP directories (no index.php)") warmup=\(warmup.1)s endToEndCLIWarmRepeats=\(samples) median=\(median)s range=\(sorted.first!)...\(sorted.last!)s; output=all six project names validated; per invocation CLI client=1 connection+1 handshake, linkedProjects=1 request, routeList=1 request, routeObservedList=1 request; \(phpAccounting); measured simulated-router provider calls across warmup+timed runs(status=\(cliObservationCounts.status),observedRoutes=\(cliObservationCounts.routes)); no installed slowdown reproduced")
-            return ScenarioOutcome(projectNames: expectedNames, samples: samples, phpVersion: phpVersion)
+            let phpAccounting = includePHPSelection ? "PHP effectivePHPByProject: 0 extra PHP connections/handshakes, +1 project.php.selections request per invocation (Core-authoritative batch); expected effective PHP=\(phpVersion ?? "unknown"); provider/package provenance=\(phpProvenance)" : "no PHP module/package/default; PHP effective selection/runtime resolution unavailable because Core has no PHP module; PHP effectivePHPByProject uses +1 project.php.selections request per invocation with 0 extra PHP connections"
+            print("[LinksBenchmark] scenario=\(includePHPSelection ? "six projects with synthetic PHP selection" : "six minimal/no-PHP directories (no index.php)") warmup=\(warmup.1)s endToEndCLIWarmRepeats=\(samples) median=\(median)s range=\(sorted.first!)...\(sorted.last!)s; output=all six project names validated; inferred from CLI call path per invocation: CLI client=1 connection+1 handshake, linkedProjects=1 request, routeList=1 request, routeObservedList=1 request, project.php.selections=1 request; \(phpAccounting); measured simulated-router provider calls across warmup+timed runs(status=\(cliObservationCounts.status),observedRoutes=\(cliObservationCounts.routes)); no installed slowdown reproduced")
+            return ScenarioOutcome(projectNames: expectedNames, samples: samples, phpVersion: phpVersion, providerStatusObservations: cliObservationCounts.status, providerRouteObservations: cliObservationCounts.routes)
         } catch {
             do { try await cleanup() }
             catch {

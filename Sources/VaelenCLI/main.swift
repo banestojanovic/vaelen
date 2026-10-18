@@ -797,7 +797,7 @@ struct VaelenCLIMain {
             else {
                 let routes = try await client.routeList()
                 let observation = try await client.routeObservedList()
-                let phpByProject = await effectivePHPByProject(projects: projects, workingDirectory: workingDirectory)
+                let phpByProject = await effectivePHPByProject(client: client)
                 print(linkedProjectsOutput(projects, routes: routes, observedRoutes: observation.observedRoutes, phpByProject: phpByProject))
             }
         case .edit(let selector):
@@ -1210,30 +1210,18 @@ struct VaelenCLIMain {
         return lines.joined(separator: "\n")
     }
 
-    private static func effectivePHPByProject(projects: [ProjectWire], workingDirectory: String) async -> [String: String] {
-        let availableProjects = projects.filter { $0.availability == PathAvailability.available.rawValue }
-        let socketPath = CoreEndpointPaths().socket.path
-        let identity = ClientIdentity(name: "val", version: VaelenBuildInfo.version)
-        return await withTaskGroup(of: (String, String?).self, returning: [String: String].self) { group in
-            for project in availableProjects {
-                group.addTask {
-                    let phpClient = VaelenCoreClient(transport: UnixSocketTransport(path: socketPath), identity: identity)
-                    do {
-                        try await phpClient.connect()
-                        let selection = try await phpClient.projectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: workingDirectory)
-                        await phpClient.disconnect()
-                        return (project.path, selection.available ? selection.effectiveVersion : nil)
-                    } catch {
-                        await phpClient.disconnect()
-                        return (project.path, nil)
-                    }
+    private static func effectivePHPByProject(client: VaelenCoreClient) async -> [String: String] {
+        do {
+            let selections = try await client.projectPHPSelections()
+            var result = [String: String]()
+            for selection in selections where selection.available {
+                if let version = selection.effectiveVersion {
+                    result[selection.project.path] = version
                 }
             }
-            var result = [String: String]()
-            for await (path, version) in group {
-                if let version { result[path] = version }
-            }
             return result
+        } catch {
+            return [:]
         }
     }
 

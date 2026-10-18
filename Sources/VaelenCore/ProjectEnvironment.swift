@@ -355,21 +355,10 @@ public struct ProjectEnvironmentInspector: Sendable {
         let env = readDotenv(root: root)
         let cache = inspectConfigCache(root: root, envPath: root.appendingPathComponent(".env"))
         let route = routeObservation(project: project, framework: framework, routes: routes, router: router, registeredProjects: registeredProjects, runtimeRoutes: runtimeRoutes)
-        let installed = phpPackages.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
-        let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
-        // PHP 5 project selection is Core-owned. A linked project without an
-        // override inherits the global exact default; project files remain
-        // observational and are never rewritten by this setting.
+        let observedPHP = observePHP(phpPackages: phpPackages, phpStatuses: phpStatuses, phpDefault: phpDefault, phpOverride: phpOverride, invalidPHPVersions: invalidPHPVersions)
         let selection = phpOverride ?? phpDefault
-        let resolved = selection.flatMap { selection in phpOverride != nil ? phpPackages.map(\.version).first(where: { $0 == selection }) : resolvePHP(family: selection, packages: phpPackages) }
+        let resolved = observedPHP.resolvedVersion
         let resolvedStatus = resolved.flatMap { version in phpStatuses.first(where: { $0.version == version }) }
-        let phpState = resolved == nil ? "unresolved" : (resolvedStatus?.state.rawValue ?? "not-running")
-        let resolutionState: PHPResolutionState
-        if selection == nil { resolutionState = .notRequested }
-        else if resolved != nil { resolutionState = .resolved }
-        else if let family = selection.flatMap(PHPFamily.init), invalidPHPVersions.contains(where: { PHPVersion($0)?.family == family.description }) { resolutionState = .invalid }
-        else { resolutionState = .unavailable }
-        let observedPHP = ProjectObservedPHP(installedVersions: installed, invalidVersions: invalidPHPVersions.sorted(), runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault, overrideVersion: phpOverride, resolutionState: resolutionState, fpmPID: resolvedStatus?.pid, fpmSocket: resolvedStatus?.socket, fpmHealth: resolvedStatus?.health ?? "not-running")
         let dbEndpoint = endpointObservation(host: env.dbHost, port: env.dbPort, expectedHost: "127.0.0.1", expectedPort: mysql?.port, matches: endpointMatches(host: env.dbHost, port: env.dbPort, expectedPort: mysql?.port))
         let mailEndpoint = endpointObservation(host: env.mailHost, port: env.mailPort, expectedHost: "127.0.0.1", expectedPort: mailpit?.smtpPort, matches: endpointMatches(host: env.mailHost, port: env.mailPort, expectedPort: mailpit?.smtpPort))
         let mailAuthentication = mailAuthentication(env: env, mailpit: mailpit, endpointMatches: mailEndpoint.matches)
@@ -388,6 +377,21 @@ public struct ProjectEnvironmentInspector: Sendable {
         let reportDiagnostics = diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, invalidPHPVersions: invalidPHPVersions, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication)
         let targets = routeTargetObservations(project: project, framework: framework, desiredPHP: selection, resolvedPHP: resolved, routes: routes, runtimeRoutes: runtimeRoutes, phpStatuses: phpStatuses, router: router, association: RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects), pendingTransitions: pendingTransitions)
         return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: reportDiagnostics, routeTargets: targets)
+    }
+
+    public func observePHP(phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, phpOverride: String? = nil, invalidPHPVersions: [String] = []) -> ProjectObservedPHP {
+        let installed = phpPackages.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
+        let running = phpStatuses.filter { $0.state == .running }.map(\.version).sorted { (PHPVersion($0) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1) ?? .init(major: 0, minor: 0, patch: 0)) }
+        let selection = phpOverride ?? phpDefault
+        let resolved = selection.flatMap { selection in phpOverride != nil ? phpPackages.map(\.version).first(where: { $0 == selection }) : resolvePHP(family: selection, packages: phpPackages) }
+        let resolvedStatus = resolved.flatMap { version in phpStatuses.first(where: { $0.version == version }) }
+        let phpState = resolved == nil ? "unresolved" : (resolvedStatus?.state.rawValue ?? "not-running")
+        let resolutionState: PHPResolutionState
+        if selection == nil { resolutionState = .notRequested }
+        else if resolved != nil { resolutionState = .resolved }
+        else if let family = selection.flatMap(PHPFamily.init), invalidPHPVersions.contains(where: { PHPVersion($0)?.family == family.description }) { resolutionState = .invalid }
+        else { resolutionState = .unavailable }
+        return ProjectObservedPHP(installedVersions: installed, invalidVersions: invalidPHPVersions.sorted(), runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault, overrideVersion: phpOverride, resolutionState: resolutionState, fpmPID: resolvedStatus?.pid, fpmSocket: resolvedStatus?.socket, fpmHealth: resolvedStatus?.health ?? "not-running")
     }
 
     private struct DesiredRead { let state: ProjectDesiredEnvironment; let error: String? }

@@ -232,6 +232,22 @@ public actor CoreRequestDispatcher {
                     throw error
                 }
                 return (.init(id: request.id, result: .projectPHP(try await projectPHPSelection(project))), true)
+            case .projectPHPSelections:
+                let projects = try await registry.linkedProjects()
+                let overrides = try await registry.phpOverrides()
+                let snapshot = php?.selectionSnapshot()
+                let inspector = ProjectEnvironmentInspector()
+                let selections = projects.filter { $0.availability == .available }.map { project in
+                    let observed = inspector.observePHP(
+                        phpPackages: snapshot?.packages ?? [],
+                        phpStatuses: snapshot?.statuses ?? [],
+                        phpDefault: snapshot?.defaultVersion,
+                        phpOverride: project.id.flatMap { overrides[$0] },
+                        invalidPHPVersions: snapshot?.invalidVersions ?? []
+                    )
+                    return projectPHPSelection(project, observed: observed)
+                }
+                return (.init(id: request.id, result: .projectPHPSelections(.init(selections: selections))), true)
             case .pathPark:
                 let params = try request.params?.decode(ParkPathRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Park parameters are required.") }()
                 let path = try await registry.parkWithCreation(path: params.path, workingDirectory: params.workingDirectory)
@@ -1295,7 +1311,11 @@ public actor CoreRequestDispatcher {
 
     private func projectPHPSelection(_ project: Project) async throws -> ProjectPHPSelection {
         let report = try await projectEnvironmentReport(for: project)
-        return .init(project: .init(project), overrideVersion: report.observed.php.overrideVersion, defaultVersion: report.observed.php.defaultVersion, effectiveVersion: report.observed.php.resolvedVersion, observedVersion: report.observed.php.resolvedState == PHPFPMState.running.rawValue ? report.observed.php.resolvedVersion : nil, available: report.observed.php.resolutionState == .resolved)
+        return projectPHPSelection(project, observed: report.observed.php)
+    }
+
+    private func projectPHPSelection(_ project: Project, observed: ProjectObservedPHP) -> ProjectPHPSelection {
+        .init(project: .init(project), overrideVersion: observed.overrideVersion, defaultVersion: observed.defaultVersion, effectiveVersion: observed.resolvedVersion, observedVersion: observed.resolvedState == PHPFPMState.running.rawValue ? observed.resolvedVersion : nil, available: observed.resolutionState == .resolved)
     }
 
     private func phpCatalog(_ module: PHPModule) async throws -> PHPRuntimeCatalog {
