@@ -177,13 +177,18 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
                     _ = kill(process.processIdentifier, SIGKILL)
                     didExit = exited.wait(timeout: .now() + 2) == .success
                 }
-                if didExit { process.waitUntilExit() }
+                guard didExit else {
+                    preserveRoot = true
+                    try? output.close()
+                    throw NSError(domain: "LinkedProjectsPerformanceTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "timed val links child did not terminate within bounded termination window; preserving its output file and fixture root because it may still be running"])
+                }
+                process.waitUntilExit()
                 try output.close()
                 let data = try Data(contentsOf: outputURL)
                 try fm.removeItem(at: outputURL)
                 let duration = start.duration(to: .now)
                 let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
-                guard didExit, !process.isRunning else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "timed val links child did not terminate within bounded termination window"]) }
+                guard !process.isRunning else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "timed val links child exit was signaled but Process still reports it running"]) }
                 return (String(decoding: data, as: UTF8.self), seconds, process.terminationStatus)
             }
 
