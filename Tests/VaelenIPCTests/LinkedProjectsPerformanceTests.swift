@@ -41,7 +41,8 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
     func testSubprocessTimeoutTerminatesOwnedChildAndPreservesRootIfUnreaped() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("lb-timeout-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        var preserveRoot = false
+        defer { if !preserveRoot { try? FileManager.default.removeItem(at: root) } }
         let fixture = root.appendingPathComponent("fixture.sh")
         try "#!/bin/sh\nexec sleep 30\n".write(to: fixture, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
@@ -50,6 +51,10 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("owned child was terminated"))
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+        let unrelated = try Self.startUnrelatedChild()
+        defer { _ = kill(unrelated, SIGKILL) }
+        XCTAssertEqual(kill(unrelated, 0), 0, "timeout handling must not terminate an unrelated child")
+        preserveRoot = true
     }
 
     func testHumanLinksEndToEndSixMinimalNoPHPProjects() async throws {
@@ -91,11 +96,21 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
                         await client.disconnect()
                     } catch {
                         await client.disconnect()
+                        let shutdownError = error
+                        guard await Self.serverTaskFinished(serverTask, within: .seconds(2)) else {
+                            preserveRoot = true
+                            throw NSError(domain: "LinkedProjectsPerformanceTests", code: 12, userInfo: [NSLocalizedDescriptionKey: "server did not finish within bounded cleanup window after shutdown connection failure: \(shutdownError)"])
+                        }
                         _ = try? await serverTask.value
-                        throw error
+                        serverStopped = true
+                        throw shutdownError
                     }
                 }
-                _ = try await serverTask.value
+                guard await Self.serverTaskFinished(serverTask, within: .seconds(2)) else {
+                    preserveRoot = true
+                    throw NSError(domain: "LinkedProjectsPerformanceTests", code: 13, userInfo: [NSLocalizedDescriptionKey: "server did not finish within bounded cleanup window after private shutdown"])
+                }
+                _ = try? await serverTask.value
                 serverStopped = true
             }
             if !preserveRoot, fm.fileExists(atPath: root.path) { try fm.removeItem(at: root) }
@@ -241,6 +256,28 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
             if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
         }
         return nil
+    }
+
+    private static func startUnrelatedChild() throws -> pid_t {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["30"]
+        try process.run()
+        return process.processIdentifier
+    }
+
+    private static func serverTaskFinished(_ task: Task<Void, Error>, within duration: Duration) async -> Bool {
+        let completed = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = try? await task.value
+            completed.signal()
+        }
+        return Self.wait(completed, duration: duration)
+    }
+
+    private static func wait(_ semaphore: DispatchSemaphore, duration: Duration) -> Bool {
+        let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        return semaphore.wait(timeout: .now() + seconds) == .success
     }
 
     private static func capture(_ executable: String, arguments: [String], timeout: Duration = .seconds(10), terminationGrace: Duration = .seconds(1)) throws -> String {
