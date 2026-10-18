@@ -249,7 +249,9 @@ def launch(root, directory, board, args):
     git_wrapper.chmod(0o755)
     save(spec, {"argv": argv, "cwd": unit["worktree"], "timeout": args.timeout,
                 "receipt": str(receipt), "log": str(receipt.with_suffix(".log")),
-                "git_shim": str(shim)})
+                "git_shim": str(shim), "base": unit["base"],
+                "commits_authorized": allowed,
+                "reflog_before": git(unit["worktree"], "reflog", "--format=%H")})
     process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run", str(spec)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
@@ -280,6 +282,14 @@ def run_spec(path):
                 code = 124
             result.update(exit_code=code, status="returned" if code == 0 else "failed")
         result["head"] = head(spec["cwd"])
+        if "commits_authorized" in spec and not spec["commits_authorized"]:
+            after = git(spec["cwd"], "reflog", "--format=%H")
+            if after != spec.get("reflog_before"):
+                result.update(status="failed", exit_code=125,
+                              error="Run changed the worktree reflog without task-local commit authorization")
+        if "commits_authorized" in spec and not spec["commits_authorized"] and result["head"] != spec.get("base"):
+            result.update(status="failed", exit_code=125,
+                          error="Run created a commit without task-local commit authorization")
     except Exception as error:
         result["error"] = str(error)
     result["finished"] = now()
@@ -345,7 +355,12 @@ def wait_for_completion(root, directory, board, timeout, schedule):
                             launched.append({**json.loads(output.getvalue()), "role": "reviewer"})
                         except (ValueError, subprocess.CalledProcessError) as error:
                             unit["review_schedule_error"] = str(error)
-                while sum(unit["state"] == "running" for unit in board["units"].values()) < board["window"]:
+                refill_allowed = all(item["role"] != "worker" or
+                                     (item["result"].get("status") == "returned" and
+                                      "acceptance" not in item["result"] and
+                                      not item["result"].get("scope_error"))
+                                     for item in completed)
+                while refill_allowed and sum(unit["state"] == "running" for unit in board["units"].values()) < board["window"]:
                     ready = next((unit for unit in board["units"].values() if unit["state"] == "planned"), None)
                     if ready is None:
                         break

@@ -227,6 +227,43 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(collected["completions"][0]["result"]["exit_code"], 0)
         self.call("integrate", "unit", "--owner", "fixture-integrator", "--execute", ok=False)
 
+    def test_unauthorized_absolute_git_commit_is_rejected_by_receipt(self):
+        unit = self.create()
+        binary_dir = self.root / ".build/absolute-git-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\nprintf 'committed\\n' > feature.txt\n/usr/bin/git add feature.txt && /usr/bin/git commit -m bypass -q\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        launched = json.loads(self.call("launch", "unit", "--execute", env=env).stdout)
+        for _ in range(100):
+            if Path(launched["receipt"]).exists():
+                break
+            time.sleep(0.02)
+        result = json.loads(Path(launched["receipt"]).read_text())
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("without task-local commit authorization", result["error"])
+        collected = json.loads(self.call("collect").stdout)
+        self.assertEqual(collected["units"][0]["state"], "failed")
+        self.call("integrate", "unit", "--owner", "fixture-integrator", "--execute", ok=False)
+
+    def test_unauthorized_commit_then_reset_is_rejected_by_reflog(self):
+        unit = self.create()
+        binary_dir = self.root / ".build/reset-git-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\nprintf 'temporary\\n' > feature.txt\n/usr/bin/git add feature.txt && /usr/bin/git commit -m hidden -q && /usr/bin/git reset --hard " + self.base + " -q\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        launched = json.loads(self.call("launch", "unit", "--execute", env=env).stdout)
+        for _ in range(100):
+            if Path(launched["receipt"]).exists():
+                break
+            time.sleep(0.02)
+        result = json.loads(Path(launched["receipt"]).read_text())
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("reflog", result["error"])
+
     def test_authorized_worker_can_commit_through_per_run_guard(self):
         unit = self.create()
         board_path = self.root / ".build/agent-orchestration/fixture/board.json"
@@ -324,6 +361,50 @@ class AgentOrchestrationTests(unittest.TestCase):
         for name in ("pilot-alpha", "pilot-beta", "pilot-gamma"):
             worktree = board["units"][name]["worktree"]
             self.git("worktree", "remove", "--force", worktree)
+
+    def test_scheduled_refill_pauses_after_empty_artifact(self):
+        board_path = self.root / ".build/agent-orchestration/fixture/board.json"
+        board = json.loads(board_path.read_text())
+        board["window"] = 2
+        board_path.write_text(json.dumps(board))
+        for name in ("empty", "queued"):
+            brief = Path(self.temp.name) / (name + ".md")
+            brief.write_text("\n".join(section + " fixture" for section in SECTIONS))
+            self.call("create", name, "--scope", name + ".txt", "--brief", str(brief))
+        binary_dir = self.root / ".build/empty-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        self.call("launch", "empty", "--execute", env=env)
+        result = json.loads(self.call("wait", "--timeout", "15", "--schedule", env=env).stdout)
+        self.assertEqual(result["completions"][0]["result"]["acceptance"], "no-scoped-artifact; replan required")
+        self.assertEqual(result["scheduled"], [])
+        states = {unit["id"]: unit["state"] for unit in json.loads(self.call("status").stdout)["units"]}
+        self.assertEqual(states, {"empty": "failed", "queued": "planned"})
+
+    def test_scheduled_refill_pauses_after_nonzero_worker(self):
+        board_path = self.root / ".build/agent-orchestration/fixture/board.json"
+        board = json.loads(board_path.read_text())
+        board["window"] = 2
+        board_path.write_text(json.dumps(board))
+        for name in ("broken", "queued"):
+            brief = Path(self.temp.name) / (name + ".md")
+            brief.write_text("\n".join(section + " fixture" for section in SECTIONS))
+            self.call("create", name, "--scope", name + ".txt", "--brief", str(brief))
+        binary_dir = self.root / ".build/fail-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\nexit 9\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        self.call("launch", "broken", "--execute", env=env)
+        result = json.loads(self.call("wait", "--timeout", "15", "--schedule", env=env).stdout)
+        self.assertEqual(result["completions"][0]["result"]["status"], "failed")
+        self.assertEqual(result["scheduled"], [])
+        states = {unit["id"]: unit["state"] for unit in json.loads(self.call("status").stdout)["units"]}
+        self.assertEqual(states, {"broken": "failed", "queued": "planned"})
 
     def test_abandon_preserves_work_and_handoff(self):
         unit = self.create()
