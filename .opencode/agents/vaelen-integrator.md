@@ -22,7 +22,7 @@ permission:
     "git rev-parse*": allow
     "./Scripts/vaelen-agents *": allow
     "python3 Scripts/vaelen-agents *": allow
-    "git commit*": allow
+    "git commit*": deny
     "git push*": deny
     "git tag*": deny
     "git reset --hard*": deny

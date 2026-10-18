@@ -239,8 +239,17 @@ def launch(root, directory, board, args):
     receipt = directory / "runs" / f"{unit['id']}-{args.role}-{attempt}.json"
     receipt.parent.mkdir(parents=True, exist_ok=True)
     spec = receipt.with_suffix(".spec.json")
+    git_path = shutil.which("git")
+    shim = directory / "tool-shims" / f"{unit['id']}-{args.role}-{attempt}"
+    shim.mkdir(parents=True, exist_ok=True)
+    git_wrapper = shim / "git"
+    allowed = may_commit and args.role == "worker"
+    gate = "  break\n" if allowed else "  echo 'task contract does not authorize git commit' >&2\n  exit 1\n"
+    git_wrapper.write_text("#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = commit ]; then\n" + gate + "  fi\ndone\nexec " + repr(git_path) + " \"$@\"\n")
+    git_wrapper.chmod(0o755)
     save(spec, {"argv": argv, "cwd": unit["worktree"], "timeout": args.timeout,
-                "receipt": str(receipt), "log": str(receipt.with_suffix(".log"))})
+                "receipt": str(receipt), "log": str(receipt.with_suffix(".log")),
+                "git_shim": str(shim)})
     process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run", str(spec)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
@@ -254,8 +263,11 @@ def run_spec(path):
     result = {"started": now(), "cwd": spec["cwd"], "status": "failed"}
     try:
         with open(spec["log"], "w") as log:
+            env = dict(os.environ)
+            if spec.get("git_shim"):
+                env["PATH"] = spec["git_shim"] + os.pathsep + env.get("PATH", "")
             process = subprocess.Popen(spec["argv"], cwd=spec["cwd"], stdin=subprocess.DEVNULL,
-                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
             try:
                 code = process.wait(timeout=spec["timeout"])
             except subprocess.TimeoutExpired:
@@ -378,6 +390,8 @@ def verify(directory, board, args):
 def integrate(root, board, args):
     if args.owner != board["integration_owner"]:
         fail("Only the program's named integration owner may integrate.")
+    if board.get("authorization") != "task-local-commits-authorized":
+        fail("This integration creates a local merge commit; task-local commits are not authorized.")
     unit = board["units"][args.unit]
     if unit["state"] != "verified":
         fail("Unit is not in verified state; finish current work/review before integration.")
