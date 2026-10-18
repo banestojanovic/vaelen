@@ -16,16 +16,21 @@ delegation; the named integrator alone owns integration writes.
 | Upstream Cursor concept | OpenCode2 mapping |
 | --- | --- |
 | `/poteto-mode` and routed skills | Read `.build/agent-tools/pstack/pstack/skills/poteto-mode/SKILL.md`, then the selected playbook and referenced skills. No invented slash commands. |
-| `Task` for read-only investigation | Native task tool, `subagent_type: vaelen-reviewer`; include complete scope and report shape. |
+| `Task` for read-only investigation | OpenCode2 2.0.32 native `subagent` tool with `agent: vaelen-reviewer`, `description`, and `prompt`; include complete scope and report shape. |
 | `Task` for a code writer | `Scripts/vaelen-agents create`, then `launch --execute`; a separate native `opencode2 run --standalone --agent vaelen-worker` process with a private server in that unit's worktree. Task has no working-directory/worktree parameter. |
 | `poteto-agent` | `vaelen-worker`, which reads this mapping and the relevant upstream playbook. |
 | Independent verifier | Fresh `vaelen-reviewer` task; or `launch --role reviewer --execute` in the unit checkout when isolated tests are required. It must not be the implementation session. |
 | `environment: cloud`, `cloud_base_branch` | Local Git worktree at a named committed base. Vaelen needs macOS/Xcode; no claim of cloud parity. |
-| `run_in_background` | Separate run managed by the helper; `collect` ingests completion receipts. Native task background behavior follows the actual tool schema only. |
+| `run_in_background` | Separate run managed by the helper; `collect` ingests completion receipts. Native subagent background behavior follows the actual tool schema only. |
 | Model defaults / `/setup-pstack` | Omit model fields and `--model`; use current configured OpenAI model. Never invent Grok/Claude entitlement. Different-model review is optional only when independently authorized and available; disclose same-model review. |
 | AskQuestion / TodoWrite | Native question/todowrite when available; otherwise concise questions and durable task state. |
 | Cursor store / `orch` | Ignored `.build/agent-orchestration/<program>/board.json`, briefs, run receipts, exact-SHA ledger, handoff. Helper handles bookkeeping, not reasoning. |
 | Bugbot, Cursor Automations, Cursor cloud UI, Cursor computer-use | Unavailable here. Name the omitted capability. Use existing local harness only when appropriate and PM-owned. Never fabricate Cursor API calls. |
+
+The installed CLI accepts the legacy `task` permission key and normalizes it
+to the `subagent` permission action. Local agent discovery verified the
+reviewer allowlist and deny-all rules. Tool calls themselves use the actual
+`subagent` schema; do not invent a `subagent_type` or worktree field.
 
 ## Execution contract
 

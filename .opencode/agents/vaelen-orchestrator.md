@@ -51,7 +51,7 @@ Frame the outcome and done predicate. Pick the upstream playbook. On a program,
 initialize a durable board through Scripts/vaelen-agents and write standing
 orders and complete briefs in its ignored state directory. Execute one pilot
 unit before fan-out. Delegate every implementation unit using create/launch in
-a separate worktree; native task calls are read-only investigations/reviews.
+a separate worktree; native subagent calls are read-only investigations/reviews.
 Launch defaults to a preview; --execute intentionally starts model work. Do not
 pass --auto, --yolo, or an invented worktree argument to OpenCode2.
 

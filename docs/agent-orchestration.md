@@ -108,9 +108,9 @@ never verified. A failure gets a fresh scoped fix brief; three run attempts
 require re-scoping rather than an infinite retry loop. Refill the rolling
 window as units finish; do not wait for the slowest whole batch.
 
-Read-only native task delegation is supported for investigation/review. Writers
-must use separate sessions because the native task tool has no cwd/worktree
-argument. Do not run write-enabled native tasks in the integration checkout.
+Read-only native `subagent` delegation is supported for investigation/review. Writers
+must use separate sessions because the native `subagent` tool has no cwd/worktree
+argument. Do not run write-enabled native subagents in the integration checkout.
 
 ## Independent verification and integration
 
@@ -187,8 +187,8 @@ python3 Tests/AgentOrchestrationTests.py
 
 These tests create disposable repositories and use a fake native CLI. They do
 not consume model usage, alter real Git refs/index, build/install Vaelen, or
-invoke its services. Agent discovery, actual native task behavior, and model
-availability still require a separately authorized small live read-only trial.
+invoke its services. The approved read-only native delegation trial is recorded below. A real
+implementation pilot remains necessary before scaling write workers.
 
 References: [upstream pstack](https://github.com/cursor/plugins/tree/0b8e952052d482ee6de06deebf14d590d77b1b34/pstack),
 [OpenCode agents](https://opencode.ai/docs/agents/),
@@ -202,11 +202,18 @@ References: [upstream pstack](https://github.com/cursor/plugins/tree/0b8e952052d
 - OpenCode2 2.0.32 local agent discovery recognized all four added roles.
 - The eleven focused bookkeeping tests passed using disposable repositories and
   a fake CLI. The seven bundled-PHP preparation regressions also passed.
-- Native model delegation was not run: automatic approval review required
-  specific permission to send the trial's Vaelen source excerpt to the configured
-  OpenAI-backed OpenCode provider. No source was sent by that attempted trial.
-- Actual native delegation, a real implementation pilot, and end-to-end agent
-  integration remain to be verified. Fixture checks do not establish those.
+- After specific user approval for source access, a native coordinator run
+  successfully called one separate `vaelen-reviewer` through OpenCode2's actual
+  `subagent` tool. The reviewer inspected the PHP update decoder and returned a
+  source-based report. Reviewed head: `4eeb959`.
+- Coordinator session: `ses_eb1c308f3ffeQzxQ4xjfAghm19`; completed reviewer:
+  `ses_eb1c2e23effeisJ5ZEAb6hIgLc`. The checkout remained clean after the trial.
+  Local logs and a checksum-bearing result are under
+  `.build/agent-orchestration/read-only-trial/`.
+- Local discovery confirms legacy `task` permission keys normalize to
+  `subagent` actions, preserving the configured allowlists and deny rules.
+- A real implementation pilot and end-to-end agent integration remain to be
+  verified. Read-only delegation and fixture tests do not establish those.
 - No full Swift suite, installed-product update, live runtime operation, push,
   or tag was performed for this setup. Canonical dev and its local changes were
   preserved.

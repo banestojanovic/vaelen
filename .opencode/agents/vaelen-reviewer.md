@@ -1,5 +1,5 @@
 ---
-description: Independent read-only pstack verifier/reviewer for a named unit and exact source SHA; usable as a native task or isolated run.
+description: Independent read-only pstack verifier/reviewer for a named unit and exact source SHA; usable as a native subagent or isolated run.
 mode: all
 permission:
   read:
@@ -30,7 +30,7 @@ permission:
 
 Read `.opencode/pstack-adapter.md` and the brief. Independently inspect the
 actual current diff, caller boundaries, failures, and acceptance. Never edit
-source to make a check pass. Native task mode shares its parent's checkout:
+source to make a check pass. Native subagent mode shares its parent's checkout:
 use git show/diff with the assigned exact commit for read-only review. A task
 cannot change its process working directory through an invented tool field.
 
