@@ -1,5 +1,129 @@
 # Current development notes
 
+## Accepted PHP provider distribution and standard ports
+
+The user accepted the PHP replacement and Settings experience after manual
+review on 2026-10-02. This checkpoint records that accepted work and the subsequent
+8.0/8.1 addition. Historical `dev` records below remain unchanged; acceptance
+does not imply a release, tag, or hosted publication.
+
+### PHP source
+
+Vaelen no longer compiles or publishes PHP. Packages come from the
+static-php-cli `v3/php-bin/bulk` channel. Provider configuration is authored once
+in `Distribution/PHP/provider.json`; the refresh script and Core read the same
+values. See `Distribution/PHP/README.md` for the full description, including why
+the maintained `common` channel was rejected (its real macOS binaries omit
+`intl`, `mysqli`, and `sodium`) and why Homebrew bottles are unsuitable.
+
+The shipped catalog offers PHP 8.5.9, 8.4.24, 8.3.33, and 8.2.33 from v3, plus
+PHP 8.1.34 and 8.0.30 from the generation-separated `archive-v2` bulk source.
+PHP 8.0/8.1 are labelled end of life; 8.2 is security support only. PHP 8.5.9
+ships inside the app as a bundled CLI/FPM pair with the provider's 63
+per-component notices, so first activation needs no download. Bundling starts
+nothing.
+
+PHP 7.4 remains unavailable: a compatible, redistributable prepared macOS arm64
+CLI/FPM pair satisfying the extension contract has not been established. No
+nonfunctional Install option is shown.
+
+Integrity is documented honestly: the provider publishes no signatures, so a
+digest recorded from downloaded bytes is a **local integrity record**, not
+independent provider authentication. Review-pinned versions keep their pin;
+runtime-discovered versions are labelled `digestPinnedByReview: false` and have
+their recorded digests honoured on later transfers and reinstalls.
+
+### Standard Ports recovery
+
+The machine this candidate was built on had a byte-correct Vaelen PF anchor whose
+`/etc/pf.conf` reference had gone missing. `status()` classified that as a
+foreign conflict and `install()` refused before asking the helper, so the
+supported `val ports install` command could not repair it. Nothing in the
+acquisition path caused it — Vaelen had adopted an already-complete
+configuration, and `pf.conf` was later rewritten by something else.
+
+The recovery is deliberately narrow: when the anchor file is byte-identical to
+the fixed policy Vaelen writes **and** `pf.conf` contains no directive for that
+anchor at all, Core reports `.incomplete` with `repairAvailable`, and the helper
+restores only the missing reference without rewriting the anchor. A modified
+anchor, a foreign anchor, or a *different* reference directive is still refused.
+Ownership checks and ledger usage are unchanged, and nothing is disabled or
+flushed globally.
+
+### Update behaviour
+
+An update names the runtime it replaces. Core validates that source before
+installing anything — it must be installed, in the target's family, older than
+the target, and still present — so a stale or wrong-family selection is rejected
+with a specific reason instead of quietly updating another runtime.
+
+Updating a running default hands the default role over, starts the replacement,
+and requires it to become healthy. A stopped non-default update starts nothing
+and leaves the global default alone.
+
+Before any mutation, an update whose source is still required is refused with
+specifics: exact-version pins name the affected projects, and persisted routes
+no project owns name the stranded hostnames. Pins are never silently migrated.
+
+After verified convergence the superseded runtime is removed — stopped through
+ownership-checked lifecycle control, package and generated artifacts deleted,
+start intent retired. Nothing is kept solely for rollback. While the update is
+incomplete the working source is preserved, and a failed cleanup is reported
+specifically rather than as complete success. Saved settings survive removal and
+return on reinstall.
+
+Installation and convergence are reported separately, so an install that did not
+finish routing is shown as partial success with a targeted retry rather than as a
+completed update.
+
+### Version presentation
+
+The Settings list shows installed runtimes newest first with exact patches,
+running state, default role, and project use. The sidebar update indicator is a
+per-family claim. Runtime actions (Start/Stop, Update, Make Default, Remove) sit
+in one compact row near the selected runtime's header; the progress strip shows
+one stage message with a spinner while work is active. The Package card uses the
+shared inset-card styling with a faint border for light-mode separation.
+
+### Update response decoding and operation lifecycle
+
+`ResponseResult` encoded `.phpUpdateResult` but had no decoding branch for it, so
+a serialized successful update fell through to `.raw`, the client rejected it as
+`invalidResponse`, and the interface reported "operation failed" next to a
+healthy new default. Decoding now keys on the distinctive `convergence` field.
+The existing convergence tests read the dispatcher's in-memory response, so they
+could not see this; they now round-trip through the wire encoding, and new
+lifecycle tests cover the framed Unix-socket path.
+
+The update operation now stays observably pending through dispatcher-level route
+convergence inside one package-operation reservation (new `converging` phase, plus
+`startingRuntime`), so shutdown and rival package work cannot race unfinished
+convergence. The progress strip shows per-stage activity with a spinner once the
+download bar fills, completion messages are kind-specific, a lost connection is
+reconciled against Core's own operation record instead of declared failure, and
+PHP completions trigger the shared snapshot plus fresh project reports so the
+menu-bar popover updates without manual refresh.
+
+### Validation and installed checkpoint
+
+The final focused checks on 2026-10-02 passed: update convergence 12/12,
+update lifecycle 9/9, and provider discovery 21/21. Separate focused checks
+passed for both legacy packages' real CLI/FPM lifecycle, shipped catalog
+digests, support labels, and smoke's authoritative-default selection. No full
+suite was run for this final iteration.
+
+The signed update at `product-dev-20261002T135400Z` passed for `dev.vaelen.app`,
+Team `TFKZJV643G`; embedded Core SHA-256 was
+`d286daecfc5501a275bbebc3d6b759842340ee5388d5d78a866de44bf0eebf2f`.
+Installed smoke passed with default PHP 8.4.24, ports 80/443, and trusted
+Syncproof HTTPS. These records describe that tested build, not later source
+or documentation edits. No new full-suite or installed acceptance is implied.
+
+The authorized Syncproof repair associated its existing route with its linked
+project, preserving route identity and TLS settings. Reconciliation returned
+HTTPS 200. Obsolete 8.3.29 and 8.4.23 packages and generated instance directories
+were removed after dependency checks; saved settings were preserved.
+
 ## PHP Settings
 
 Accepted and integrated into `dev` on 2026-10-01. Shared and version-specific

@@ -228,10 +228,7 @@ struct PHPSettingsView: View {
 
     private var catalog: PHPRuntimeCatalog? { model.phpCatalog }
     private var catalogCheckError: String? { model.phpCatalogCheckError ?? catalog?.catalogCheckError }
-    private var availableSectionTitle: String {
-        guard catalogCheckError != nil else { return "AVAILABLE" }
-        return catalog?.catalogCheckedAt == nil ? "AVAILABLE (UNCONFIRMED)" : "AVAILABLE (CACHED)"
-    }
+    private var availableSectionTitle: String { "Available" }
     private var availableEmptyMessage: String {
         if catalogCheckError != nil {
             return catalog?.catalogCheckedAt == nil
@@ -242,10 +239,21 @@ struct PHPSettingsView: View {
         return "Installed PHP runtimes are up to date."
     }
     private var installed: [PHPRuntimeVersion] { (catalog?.installedVersions ?? []).sorted { phpVersionDescending($0.version, $1.version) } }
+
+    /// Versions offered for installation: families with nothing installed yet.
+    ///
+    /// An update to an already-installed family is shown on that family's row
+    /// instead of appearing here as a second, unexplained installation option.
     private var available: [String] {
         guard let catalog, catalog.availableVersionsKnown else { return [] }
-        let installedVersions = Set(catalog.installedVersions.map(\.version))
-        return catalog.availableVersions.filter { !installedVersions.contains($0) }.sorted(by: phpVersionDescending)
+        let installedVersions = Set(installed.map(\.version))
+        let installedFamilies = Set(installed.map { $0.series ?? $0.version })
+        return catalog.availableVersions
+            .filter { version in
+                !installedVersions.contains(version)
+                    && !installedFamilies.contains(PHPVersion(version)?.family ?? version)
+            }
+            .sorted(by: phpVersionDescending)
     }
     private var coreConnected: Bool {
         if case .running = model.state { return model.refreshError == nil }
@@ -263,11 +271,13 @@ struct PHPSettingsView: View {
                     .buttonStyle(.borderless).help("Refresh PHP runtimes and configuration")
                     .disabled(model.phpRequestInFlight || model.phpConfigurationSaving)
             }
-            if let target = model.phpRequestTarget {
-                phpOperationProgress(target: target, operation: model.phpOperation)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.vertical, 8)
-                    .background(Color.accentColor.opacity(0.06))
-            } else if let completion = model.phpCompletionMessage {
+            // Progress is shown next to the affected version's action and survives
+            // switching panes or closing and reopening Settings, because it is
+            // driven by the operation state rather than by pane-local state.
+            PHPOperationProgressView(operation: model.phpOperation)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.vertical, 8)
+                .background(model.phpOperation == nil ? Color.clear : Color.accentColor.opacity(0.06))
+            if model.phpOperation == nil, let completion = model.phpCompletionMessage {
                 HStack { Label(completion, systemImage: model.phpOperation?.phase == .failed ? "exclamationmark.triangle" : "checkmark.circle").font(.caption).foregroundStyle(model.phpOperation?.phase == .failed ? Color.orange : Color.secondary); Spacer() }.padding(.horizontal, 18).padding(.vertical, 8)
             }
             HStack(spacing: 0) {
@@ -288,6 +298,13 @@ struct PHPSettingsView: View {
             }
         }
         .onChange(of: model.phpCatalog) { _, _ in catalogDidChange() }
+        .onChange(of: model.phpSelectionRequest) { _, request in
+            // After an update, show the replacement's own version, settings, paths,
+            // running state, and default role immediately.
+            guard let request else { return }
+            selectedItem = request
+            model.clearPHPSelectionRequest()
+        }
         .confirmationDialog("Remove PHP \(removalVersion ?? "runtime")?", isPresented: Binding(get: { removalVersion != nil }, set: { if !$0 { removalVersion = nil } }), titleVisibility: .visible) {
             if let removalVersion {
                 Button("Remove", role: .destructive) { Task { await model.removePHP(removalVersion) }; self.removalVersion = nil }.settingsDestructiveTint()
@@ -305,10 +322,23 @@ struct PHPSettingsView: View {
     private var runtimeList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 3) {
-                Text("CONFIGURATION").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 5)
+                // A persistent, unobtrusive indicator on the installed group, so
+                // an available update is visible without selecting anything.
+                if !model.phpInstallableUpdates.isEmpty {
+                    HStack(spacing: 6) {
+                        updateIndicator(to: model.phpInstallableUpdates[0].to)
+                        Text(model.phpInstallableUpdates.count == 1
+                             ? "PHP \(model.phpInstallableUpdates[0].from.version) can update to \(model.phpInstallableUpdates[0].to)"
+                             : "\(model.phpInstallableUpdates.count) PHP runtimes can update")
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                        Spacer(minLength: 0)
+                    }
+                    .help(model.phpUpdateIndicatorHelp)
+                    .padding(.horizontal, 13).padding(.top, 6).padding(.bottom, 2)
+                }
+                phpSectionHeader("Configuration", top: 14)
                 runtimeRow("shared", title: "Shared settings", subtitle: "Values inherited by PHP runtimes", state: model.phpConfiguration == nil ? .pending : .neutral)
-                Text(inventoryHeading("INSTALLED", count: catalog.map { $0.installedVersions.count }))
-                    .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 12).padding(.bottom, 5)
+                phpSectionHeader("Installed", count: catalog == nil ? nil : installed.count, top: 12)
                 if installed.isEmpty {
                     Text(catalog == nil ? (phpChecking ? "Checking installed PHP runtimes…" : "Installed PHP runtimes unavailable.") : "No managed PHP runtimes installed.")
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
@@ -317,37 +347,62 @@ struct PHPSettingsView: View {
                     runtimeRow(runtime.version, title: "PHP \(runtime.version)", subtitle: runtimeSubtitle(runtime), state: runtimeTone(runtime), isDefault: runtime.isDefault, updateAvailable: runtime.updateAvailable == true ? runtime.latestVersion : nil)
                 }
                 Divider().padding(.horizontal, 12).padding(.vertical, 7)
-                HStack {
-                    Text(inventoryHeading(availableSectionTitle, count: catalog?.availableVersionsKnown == true ? available.count : nil))
-                        .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).lineLimit(1).minimumScaleFactor(0.8)
-                    Spacer(minLength: 2)
-                    Button("Check for Updates", systemImage: "arrow.clockwise") { Task { await model.checkPHPUpdates() } }
-                        .buttonStyle(.borderless).font(.system(size: 9)).help("Check Vaelen's trusted PHP catalog for updates").accessibilityLabel("Check for PHP updates")
-                        .disabled(model.phpCatalogCheckPending || !coreConnected || phpChecking)
-                }.padding(.horizontal, 13).padding(.bottom, 5)
-                if model.phpCatalogCheckPending {
-                    HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Checking the trusted PHP catalog…").font(.caption2).foregroundStyle(.secondary) }.padding(.horizontal, 14).padding(.bottom, 5)
-                } else if let error = catalogCheckError {
+                phpSectionHeader(availableSectionTitle, count: catalog?.availableVersionsKnown == true ? available.count : nil, top: 12) {
+                    Button {
+                        Task { await model.checkPHPUpdates() }
+                    } label: {
+                        HStack(spacing: 5) {
+                            if model.phpCatalogCheckPending { ProgressView().controlSize(.small).frame(width: 12, height: 12) }
+                            else { Image(systemName: "arrow.clockwise").frame(width: 12, height: 12) }
+                            Text("Check for Updates")
+                        }
+                        .font(.system(size: 11))
+                        .frame(minHeight: 26)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Check Vaelen's trusted PHP sources for updates")
+                    .accessibilityLabel("Check PHP for updates")
+                    .disabled(model.phpCatalogCheckPending || !coreConnected || phpChecking)
+                }
+                if !model.phpCatalogCheckPending, let error = catalogCheckError {
                     Text("Update check failed: \(error)").font(.caption2).foregroundStyle(.orange).lineLimit(3).padding(.horizontal, 14).padding(.bottom, 5)
                 } else if let checkedAt = catalog?.catalogCheckedAt {
                     Text("Checked \(checkedAt.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.tertiary).padding(.horizontal, 14).padding(.bottom, 5)
                 }
-                if !model.phpCatalogCheckPending, let lastSuccess = catalog?.catalogCheckedAt, catalogCheckError != nil {
-                    Text("Showing cached availability; last successful check \(lastSuccess.formatted(date: .abbreviated, time: .shortened)).")
-                        .font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.bottom, 5)
+                if !model.phpCatalogCheckPending, catalog?.catalogAvailability == .cached || catalog?.catalogAvailability == .unconfirmed {
+                    // Availability is retained, but never presented as current.
+                    if let lastSuccess = catalog?.catalogCheckedAt {
+                        Text("Showing cached availability; last successful check \(lastSuccess.formatted(date: .abbreviated, time: .shortened)).")
+                            .font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.bottom, 5)
+                    } else {
+                        Text("Showing the versions shipped with Vaelen. No successful update check yet.")
+                            .font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.bottom, 5)
+                    }
                 }
                 if catalog == nil {
                     Text(phpChecking ? "Checking available runtimes…" : "Available versions unavailable")
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
                 } else if !catalog!.availableVersionsKnown {
-                    Text("Available versions could not be refreshed.").font(.caption).foregroundStyle(.orange).padding(.horizontal, 14).padding(.vertical, 9)
+                    // Availability is retained, but it is never presented as
+                    // confirmed, and the retry stays available.
+                    Text("Available versions could not be refreshed. \(available.isEmpty ? "" : "Showing \(available.count) cached option\(available.count == 1 ? "" : "s").")")
+                        .font(.caption).foregroundStyle(.orange).padding(.horizontal, 14).padding(.vertical, 9)
                 } else if available.isEmpty {
                     Text(availableEmptyMessage)
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 9)
                 } else {
+                    // Installation options: families with nothing installed yet.
                     ForEach(available, id: \.self) { version in
                         runtimeRow("available:\(version)", title: "PHP \(version)", subtitle: PHPSeriesLabel.series(for: version), state: .pending)
                     }
+                }
+                // Published but not yet recorded with verified package metadata.
+                // Advertised honestly as not installable yet.
+                let unverified = catalog?.advertisedUnverifiedVersions ?? []
+                if !unverified.isEmpty {
+                    Text("Newer patches are published but Vaelen has not verified their packages yet: \(unverified.joined(separator: ", ")). Run Check for Updates again shortly.")
+                        .font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.bottom, 5)
                 }
             }.padding(.bottom, 14)
         }
@@ -355,6 +410,23 @@ struct PHPSettingsView: View {
 
     private var runtimeDetail: some View {
         VStack(alignment: .leading, spacing: 17) {
+            // An update that installed but did not finish converging is reported
+            // as partial success, with a targeted recovery action.
+            if let outcome = model.phpUpdateOutcome, let failure = outcome.convergenceError {
+                SettingsInsetCard {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Label("PHP \(outcome.version) installed, but some work did not finish", systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline).foregroundStyle(.orange)
+                        Text(failure).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        if let replaced = outcome.replacedVersion {
+                            Text("PHP \(replaced) is still installed because the update did not finish. Nothing was lost — retry to finish routing.")
+                                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                        Button("Retry convergence", systemImage: "arrow.clockwise") { Task { await model.retryPHPUpdateConvergence(outcome.version) } }
+                            .disabled(model.phpRequestInFlight || !coreConnected)
+                    }.padding(11)
+                }
+            }
             if !model.phpDefaultProjectIssues.isEmpty {
                 SettingsInsetCard {
                     VStack(alignment: .leading, spacing: 8) {
@@ -387,7 +459,7 @@ struct PHPSettingsView: View {
             if let error = model.phpError {
                 Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 if let runtime = installed.first(where: { $0.version == selectedItem }), runtime.updateAvailable == true, let target = runtime.latestVersion {
-                    Button("Retry Update to PHP \(target)", systemImage: "arrow.clockwise") { Task { await model.updatePHP(target) } }.disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
+                    Button("Retry Update to PHP \(target)", systemImage: "arrow.clockwise") { Task { await model.updatePHP(target, replacing: runtime.version) } }.disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
                 } else {
                     Button("Retry", systemImage: "arrow.clockwise") { Task { await model.refreshPHPSettings() } }
                 }
@@ -432,13 +504,9 @@ struct PHPSettingsView: View {
             HStack(spacing: 8) {
                 if runtime.isDefault { Label("Default runtime", systemImage: "star.fill").font(.caption).foregroundStyle(.secondary) }
                 if runtime.usedByProjectCount > 0 { Text("Used by \(runtime.usedByProjectCount) projects").font(.caption).foregroundStyle(.secondary) }
-                Spacer()
-                if !runtime.isDefault {
-                    Button(model.phpRequestTarget == runtime.version && model.phpOperation?.kind == .defaultSelection ? "Switching…" : "Make Default", systemImage: "star") { Task { await model.setDefaultPHP(runtime.version) } }
-                        .disabled(model.phpRequestInFlight || model.phpConfigurationSaving || !coreConnected || phpChecking || runtime.running == nil)
-                        .help("Use PHP \(runtime.version) for projects without a PHP version override")
-                }
             }
+            runtimeActionRow(runtime)
+            runtimeStopWarning(runtime)
             Text("The default runtime is used by projects without a PHP version override. Making this runtime the default starts its PHP-FPM and refreshes those projects; other runtimes are not stopped.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let config {
@@ -460,8 +528,6 @@ struct PHPSettingsView: View {
                 Button("Retry Settings", systemImage: "arrow.clockwise") { Task { await model.refreshPHPConfiguration() } }
             }
             configLocations(version: runtime.version)
-            phpRuntimeControls(runtime)
-            runtimeActions(runtime)
         }
     }
 
@@ -473,7 +539,16 @@ struct PHPSettingsView: View {
                 Spacer(); SettingsStateBadge(title: "Available", tone: .pending)
             }
             Text("Install this managed PHP runtime for projects that require it. Installing does not change the shared default.").font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            SettingsInsetCard { VStack(alignment: .leading, spacing: 8) { Text("Package").font(.headline); Text("Verified package · managed by Vaelen").font(.caption).foregroundStyle(.secondary); Text("Data and configuration are preserved independently of package installation.").font(.caption).foregroundStyle(.secondary) } }
+            SettingsInsetCard {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Package").font(.headline)
+                    }
+                    Text("Verified package · managed by Vaelen").font(.caption).foregroundStyle(.secondary)
+                    Text("Data and configuration are preserved independently of package installation.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Button("Install PHP \(version)", systemImage: "arrow.down.circle.fill") { Task { await model.installPHP(version) } }
             .buttonStyle(.borderedProminent).tint(.accentColor).disabled(model.phpRequestInFlight || !coreConnected || phpChecking)
             if !coreConnected || phpChecking { Text(phpChecking ? "Checking Core before enabling package actions…" : "Core must confirm current runtime state before installation.").font(.caption).foregroundStyle(.secondary) }
@@ -491,17 +566,69 @@ struct PHPSettingsView: View {
         }.padding(.top, 8)
     }
 
-    private func phpRuntimeControls(_ runtime: PHPRuntimeVersion) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    /// One compact action row near the selected runtime's header: Start or Stop
+    /// by confirmed state, Update when a newer patch is available, Make Default
+    /// and Remove as icon controls. Unknown running state enables no
+    /// start/stop/remove action.
+    private func runtimeActionRow(_ runtime: PHPRuntimeVersion) -> some View {
+        let busy = model.phpRequestTarget == runtime.version
+        let blocked = model.phpRequestInFlight || model.phpConfigurationSaving || !coreConnected || phpChecking
+        return HStack(spacing: 8) {
             if runtime.running == false {
-                Button(model.phpRequestTarget == runtime.version && model.phpOperation?.kind == .start ? "Starting…" : "Start PHP \(runtime.version)", systemImage: "play.circle") { Task { await model.startPHPRuntime(runtime.version) } }
-                    .disabled(model.phpRequestInFlight || model.phpConfigurationSaving || model.serviceOperation != nil || !coreConnected || phpChecking)
+                Button(busy && model.phpOperation?.kind == .start ? "Starting…" : "Start", systemImage: "play.fill") {
+                    Task { await model.startPHPRuntime(runtime.version) }
+                }
+                .help("Start PHP \(runtime.version)")
+                .accessibilityLabel("Start PHP \(runtime.version)")
+                .disabled(blocked || model.serviceOperation != nil)
             } else if runtime.running == true {
-                Button(model.phpRequestTarget == runtime.version && model.phpOperation?.kind == .stop ? "Stopping…" : "Stop PHP \(runtime.version)", systemImage: "stop.circle", role: runtime.usedByProjectCount > 0 ? .destructive : nil) {
+                Button(busy && model.phpOperation?.kind == .stop ? "Stopping…" : "Stop", systemImage: "stop.fill",
+                       role: runtime.usedByProjectCount > 0 ? .destructive : nil) {
                     if runtime.usedByProjectCount > 0 { stopConfirmation = runtime }
                     else { Task { await model.stopPHPRuntime(runtime.version) } }
-                }.settingsDestructiveTint().disabled(model.phpRequestInFlight || model.phpConfigurationSaving || model.serviceOperation != nil || !coreConnected || phpChecking)
-                if runtime.usedByProjectCount > 0 { Text("Used by \(runtime.usedByProjectCount) project(s); stopping interrupts their PHP requests.").font(.caption).foregroundStyle(.secondary) }
+                }
+                .settingsDestructiveTint()
+                .help("Stop PHP \(runtime.version)")
+                .accessibilityLabel("Stop PHP \(runtime.version)")
+                .disabled(blocked || model.serviceOperation != nil)
+            }
+            if runtime.updateAvailable == true, let latest = runtime.latestVersion {
+                // The selected runtime is named as the source so its saved
+                // settings are the ones carried over.
+                Button(busy && model.phpOperation?.kind == .update ? "Updating…" : "Update", systemImage: "arrow.triangle.2.circlepath") {
+                    Task { await model.updatePHP(latest, replacing: runtime.version) }
+                }
+                .help("Update PHP \(runtime.version) to \(latest)")
+                .accessibilityLabel("Update PHP \(runtime.version) to \(latest)")
+                .disabled(blocked)
+            }
+            Spacer(minLength: 4)
+            if !runtime.isDefault {
+                Button {
+                    Task { await model.setDefaultPHP(runtime.version) }
+                } label: {
+                    Image(systemName: busy && model.phpOperation?.kind == .defaultSelection ? "star.fill" : "star")
+                        .frame(minWidth: 28, minHeight: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(busy && model.phpOperation?.kind == .defaultSelection ? "Switching default to PHP \(runtime.version)…" : "Make PHP \(runtime.version) the default for projects without a version override")
+                .accessibilityLabel("Make PHP \(runtime.version) the default")
+                .disabled(blocked || runtime.running == nil)
+            }
+            if runtime.running == false && !runtime.isDefault {
+                Button {
+                    removalVersion = runtime.version
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red)
+                        .frame(minWidth: 28, minHeight: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Remove PHP \(runtime.version)")
+                .accessibilityLabel("Remove PHP \(runtime.version)")
+                .disabled(blocked)
             }
         }
     }
@@ -566,15 +693,10 @@ struct PHPSettingsView: View {
         }
     }
 
-    private func runtimeActions(_ runtime: PHPRuntimeVersion) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if runtime.updateAvailable == true, let latest = runtime.latestVersion {
-                Button("Update PHP \(runtime.version) to \(latest)", systemImage: "arrow.triangle.2.circlepath") { Task { await model.updatePHP(latest) } }.disabled(model.phpRequestInFlight || model.phpConfigurationSaving || !coreConnected || phpChecking)
-            }
-            if runtime.running == false && !runtime.isDefault {
-                Divider()
-                Button("Remove PHP \(runtime.version)…", systemImage: "trash", role: .destructive) { removalVersion = runtime.version }
-                    .settingsDestructiveTint().disabled(model.phpRequestInFlight || model.phpConfigurationSaving || !coreConnected || phpChecking)
+    private func runtimeStopWarning(_ runtime: PHPRuntimeVersion) -> some View {
+        Group {
+            if runtime.running == true, runtime.usedByProjectCount > 0 {
+                Text("Used by \(runtime.usedByProjectCount) project(s); stopping interrupts their PHP requests.").font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -623,10 +745,15 @@ struct PHPSettingsView: View {
         }
     }
 
-    private func inventoryHeading(_ title: String, count: Int?) -> String {
-        if phpInventoryPending { return "\(title) (Checking…)" }
-        if let count { return "\(title) (\(count))" }
-        return "\(title) (Unknown)"
+    @ViewBuilder
+    private func phpSectionHeader<Accessory: View>(_ title: String, count: Int? = nil, top: CGFloat = 0, @ViewBuilder accessory: () -> Accessory = { EmptyView() }) -> some View {
+        HStack(alignment: .center, spacing: 5) {
+            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            if let count { Text("\(count)").font(.system(size: 10, weight: .regular)).foregroundStyle(.tertiary).monospacedDigit() }
+            Spacer(minLength: 4)
+            accessory()
+        }
+        .padding(.horizontal, 13).padding(.top, top).padding(.bottom, 5)
     }
 
     private var phpInventoryPending: Bool {
@@ -634,15 +761,28 @@ struct PHPSettingsView: View {
         return model.phpCatalogReadPending || model.isServiceReadPending("PHP")
     }
 
+    /// The shared update indicator: the existing accent update icon, visually
+    /// distinct from the default star and the running-state dot, with reserved
+    /// width so every row stays aligned whether or not it is shown.
+    private func updateIndicator(to target: String) -> some View {
+        Image(systemName: "arrow.down.circle.fill")
+            .font(.system(size: 12))
+            .foregroundStyle(Color.accentColor)
+            .frame(width: 14, height: 12)
+            .help("Update available: PHP \(target)")
+            .accessibilityLabel("Update available: PHP \(target)")
+    }
+
+    private static let updateIndicatorPlaceholder: some View = Color.clear.frame(width: 14, height: 12).accessibilityHidden(true)
+
     private func runtimeRow(_ key: String, title: String, subtitle: String, state: SettingsStateBadge.Tone, isDefault: Bool = false, updateAvailable: String? = nil) -> some View {
         Button { selectedItem = key } label: {
             HStack(spacing: 8) {
-                Image(systemName: "star.fill").font(.system(size: 9, weight: .semibold)).foregroundStyle(.orange).frame(width: 12).opacity(isDefault ? 1 : 0).accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 3) { Text(title).font(.subheadline.weight(.medium)).foregroundStyle(.primary); Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(2) }
+                // Default star, left-aligned and always in the same position.
+                Image(systemName: "star.fill").font(.system(size: 9, weight: .semibold)).foregroundStyle(.orange).frame(width: 12, height: 12).opacity(isDefault ? 1 : 0).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) { Text(title).font(.subheadline.weight(.medium)).foregroundStyle(.primary); Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
                 Spacer(minLength: 2)
-                if let updateAvailable {
-                    Image(systemName: "arrow.down.circle.fill").font(.system(size: 12)).foregroundStyle(Color.accentColor).help("Update available: PHP \(updateAvailable)").accessibilityLabel("Update available: PHP \(updateAvailable)")
-                } else { Color.clear.frame(width: 12, height: 12).accessibilityHidden(true) }
+                if let updateAvailable { updateIndicator(to: updateAvailable) } else { Self.updateIndicatorPlaceholder }
                 SettingsStateDot(title: "", tone: state)
             }
             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 9)
@@ -657,11 +797,13 @@ struct PHPSettingsView: View {
         return left > right
     }
 
+    /// Row subtitles stay short: project use and running state. An available
+    /// update is communicated by the adjacent update symbol (with its tooltip),
+    /// not by repeating it as prose.
     private func runtimeSubtitle(_ runtime: PHPRuntimeVersion) -> String {
         var parts: [String] = []
         if runtime.usedByProjectCount > 0 { parts.append("\(runtime.usedByProjectCount) projects") }
         parts.append(runtimeStateTitle(runtime))
-        if runtime.updateAvailable == true, let latest = runtime.latestVersion { parts.append("Update to PHP \(latest)") }
         return parts.joined(separator: " · ")
     }
 
@@ -681,60 +823,178 @@ struct PHPSettingsView: View {
         return .attention
     }
 
-    @ViewBuilder private func phpOperationProgress(target: String, operation: PHPOperationState?) -> some View {
-        let matching = operation?.targetVersion == target ? operation : nil
-        Label(phpOperationDescription(target: target, operation: matching), systemImage: "arrow.triangle.2.circlepath")
-            .font(.caption).foregroundStyle(.secondary)
-        if let matching, matching.kind == .install || matching.kind == .update {
-            if let bytes = matching.bytesTransferred, let total = matching.totalBytes, total > 0,
-               matching.phase != .failed {
-                ProgressView(value: Double(bytes), total: Double(total)).progressViewStyle(.linear).frame(maxWidth: 260)
-                Text(matching.usingVerifiedCachedDownloads == true ? "Using verified cached downloads · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) verified" :
-                    matching.phase == .downloading ? "Download progress · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))" :
-                    "Download complete · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) verified")
-                    .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
-            }
-            switch matching.phase {
-            case .downloading:
-                if matching.bytesTransferred == nil || matching.totalBytes == nil {
-                    Text("\(ByteCountFormatter.string(fromByteCount: matching.bytesTransferred ?? 0, countStyle: .file)) transferred · Total size unknown")
-                        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+    /// Shared measured progress for PHP install and update operations.
+///
+/// Backed by the typed Core operation state. One horizontal determinate bar is
+/// shown whenever the aggregate total is known, with a numeric percentage from
+/// the first byte of the first archive. When the aggregate total genuinely
+/// cannot be known, per-archive progress and transferred bytes are shown instead
+/// of an invented percentage. Verification and installation stay visible after
+/// the transfer reaches 100%, so "download complete" is never mistaken for a
+/// finished update.
+struct PHPOperationProgressView: View {
+    let operation: PHPOperationState?
+
+    private var determinate: (transferred: Double, total: Double)? {
+        guard let bytes = operation?.bytesTransferred, let total = operation?.totalBytes, total > 0 else { return nil }
+        return (Double(bytes), Double(total))
+    }
+
+    private var percentage: Int {
+        guard let determinate, determinate.total > 0 else { return 0 }
+        return min(100, max(0, Int((determinate.transferred / determinate.total * 100).rounded())))
+    }
+
+    /// Whether every expected byte has arrived. Past this point the determinate
+    /// transfer bar is finished context, not the current activity.
+    private var downloadComplete: Bool {
+        guard let determinate else { return false }
+        return determinate.total > 0 && determinate.transferred >= determinate.total
+    }
+
+    /// Phases where work is still in flight. These show a small native activity
+    /// indicator in place of the leading icon; terminal phases restore the icon.
+    private func isActive(_ operation: PHPOperationState) -> Bool {
+        switch operation.phase {
+        case .starting, .downloading, .verifying, .installing, .startingRuntime, .converging, .removing:
+            return true
+        case .ready, .removed, .failed:
+            return false
+        }
+    }
+
+    var body: some View {
+        if let operation {
+            VStack(alignment: .leading, spacing: 5) {
+                // One stage message with one leading indicator: a spinner while
+                // work is active, the outcome icon once it finishes. The fixed
+                // frame keeps the row's alignment stable when the icon changes.
+                HStack(spacing: 6) {
+                    if isActive(operation) {
+                        ProgressView().controlSize(.small).frame(width: 14)
+                    } else {
+                        Image(systemName: symbol(operation)).frame(width: 14)
+                    }
+                    Text(description(operation))
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-            case .verifying:
-                Text(matching.usingVerifiedCachedDownloads == true ? "Verifying cached PHP archives…" : "Verifying downloaded PHP archives…").font(.caption2).foregroundStyle(.secondary)
-            case .installing:
-                Text("Download complete · installing and validating PHP \(target)…").font(.caption2).foregroundStyle(.secondary)
-            case .ready:
-                EmptyView()
-            case .failed:
-                EmptyView()
-            default:
-                EmptyView()
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(accessibilityText(operation))
+                switch operation.phase {
+                case .downloading:
+                    if let determinate {
+                        // Determinate from the start; both archives contribute.
+                        ProgressView(value: determinate.transferred, total: determinate.total)
+                            .progressViewStyle(.linear)
+                            .frame(maxWidth: 260)
+                        Text(detail(operation, determinate: determinate))
+                            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                    } else {
+                        // Truthful fallback: transferred bytes, no invented total.
+                        Text("\(ByteCountFormatter.string(fromByteCount: operation.bytesTransferred ?? 0, countStyle: .file)) transferred · total size unknown\(archiveSuffix(operation))")
+                            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                case .verifying, .installing, .startingRuntime, .converging, .removing:
+                    // A completed download stays visible as finished context,
+                    // clearly labelled so it never reads as overall completion.
+                    if downloadComplete, let determinate {
+                        Text("Download complete · \(ByteCountFormatter.string(fromByteCount: Int64(determinate.total), countStyle: .file)) received")
+                            .font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+                    }
+                default:
+                    EmptyView()
+                }
             }
         }
     }
 
-    private func phpOperationDescription(target: String, operation: PHPOperationState?) -> String {
-        guard let operation, operation.targetVersion == target else { return "Preparing PHP \(target)…" }
-        if operation.kind == .start { return operation.phase == .ready ? "PHP \(target) is running." : operation.phase == .failed ? "Could not start PHP \(target)." : "Starting PHP \(target)…" }
-        if operation.kind == .stop { return operation.phase == .ready ? "PHP \(target) is stopped." : operation.phase == .failed ? "Could not stop PHP \(target)." : "Stopping PHP \(target)…" }
-        if operation.kind == .defaultSelection, operation.phase == .starting { return "Switching default to PHP \(target)…" }
-        if operation.kind == .defaultSelection, operation.phase == .ready { return "PHP \(target) is the verified default." }
-        if operation.kind == .defaultSelection, operation.phase == .failed { return "Could not switch default to PHP \(target)." }
+    private func accessibilityText(_ operation: PHPOperationState) -> String {
+        if case .downloading = operation.phase, determinate != nil {
+            return "\(description(operation)) \(percentage) percent"
+        }
+        return description(operation)
+    }
+
+    private func archiveSuffix(_ operation: PHPOperationState) -> String {
+        guard let name = operation.artifactName else { return "" }
+        if let index = operation.artifactIndex, let count = operation.artifactCount, count > 1 {
+            return " · \(name) (\(index) of \(count))"
+        }
+        return " · \(name)"
+    }
+
+    private func detail(_ operation: PHPOperationState, determinate: (transferred: Double, total: Double)) -> String {
+        let transferred = ByteCountFormatter.string(fromByteCount: Int64(determinate.transferred), countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: Int64(determinate.total), countStyle: .file)
+        // Verified cache reuse is stated plainly, and is allowed to finish quickly
+        // rather than being slowed down to animate.
+        if operation.usingVerifiedCachedDownloads == true {
+            return "Using verified cached downloads · \(transferred) verified"
+        }
         switch operation.phase {
-        case .starting: return "Preparing PHP \(target)…"
         case .downloading:
-            let artifact = operation.artifactName.map { " · \($0) archive" } ?? ""
-            let position = if let index = operation.artifactIndex, let count = operation.artifactCount { " (\(index) of \(count))" } else { "" }
-            return "Downloading PHP \(target)\(artifact)\(position)…"
-        case .verifying: return "Verifying PHP \(target)…"
-        case .installing: return "Installing PHP \(target)…"
-        case .removing: return "Removing PHP \(target)…"
-        case .ready: return "PHP \(target) installed successfully."
-        case .failed: return "PHP \(target) operation failed."
-        default: return "Working on PHP \(target)…"
+            return "\(percentage)% · \(transferred) of \(total)\(archiveSuffix(operation))"
+        case .verifying:
+            return "Transfer complete · verifying \(transferred)\(archiveSuffix(operation))"
+        case .installing:
+            return "Verified · installing and validating PHP \(operation.targetVersion)"
+        default:
+            return "\(transferred) of \(total)"
         }
     }
+
+    private func symbol(_ operation: PHPOperationState) -> String {
+        switch operation.phase {
+        case .failed: "exclamationmark.triangle"
+        case .ready: "checkmark.circle"
+        case .verifying: "checkmark.shield"
+        case .installing: "shippingbox"
+        case .startingRuntime: "play.circle"
+        case .converging: "arrow.triangle.2.circlepath"
+        default: "arrow.triangle.2.circlepath"
+        }
+    }
+
+    private func description(_ operation: PHPOperationState) -> String {
+        let target = operation.targetVersion
+        switch operation.phase {
+        case .starting: return "Preparing PHP \(target)…"
+        case .downloading: return "Downloading PHP \(target)…"
+        case .verifying:
+            return operation.usingVerifiedCachedDownloads == true
+                ? "Using verified cached downloads"
+                : "Verifying package…"
+        case .installing: return "Installing PHP \(target)…"
+        case .startingRuntime: return "Starting PHP \(target)…"
+        case .converging: return "Updating project routing…"
+        case .removing:
+            // Update cleanup removes the replaced runtime through this phase.
+            // The operation names the incoming version, so the stage names the
+            // outgoing role instead of a wrong version number.
+            return operation.kind == .update ? "Removing replaced runtime…" : "Removing PHP \(target)…"
+        case .removed: return "PHP \(target) removed."
+        case .ready: return readyDescription(operation)
+        case .failed: return "PHP \(target) operation failed."
+        }
+    }
+
+    /// Terminal messages name the action that finished. Start, Stop, Make
+    /// Default, Remove, Install, and Update each read differently so a finished
+    /// switch of defaults is never described as an installation.
+    private func readyDescription(_ operation: PHPOperationState) -> String {
+        let target = operation.targetVersion
+        switch operation.kind {
+        case .install: return "PHP \(target) installed."
+        case .update: return "PHP \(target) updated."
+        case .remove: return "PHP \(target) removed."
+        case .defaultSelection: return "PHP \(target) is now the default."
+        case .configurationUpdate: return "PHP \(target) settings saved."
+        case .start: return "PHP \(target) started."
+        case .stop: return "PHP \(target) stopped."
+        }
+    }
+}
+
 }
 
 private struct PHPConfigurationForm: View {
@@ -901,7 +1161,7 @@ private struct PHPVersionRow: View {
                 ProgressView().controlSize(.small)
             } else if runtime.updateAvailable == true, let latest = runtime.latestVersion {
                 Button("Update", systemImage: "arrow.triangle.2.circlepath") {
-                    Task { await model.updatePHP(latest) }
+                    Task { await model.updatePHP(latest, replacing: runtime.version) }
                 }
                 .labelStyle(.titleAndIcon)
                 .accessibilityLabel("Update PHP \(runtime.version) to \(latest)")
@@ -941,8 +1201,9 @@ private struct PHPVersionRow: View {
 
 private enum PHPSeriesLabel {
     static func series(for version: String) -> String {
-        if let parsed = PHPVersion(version) { return "PHP \(parsed.family) series" }
-        return "PHP series unavailable"
+        guard let parsed = PHPVersion(version) else { return "PHP series unavailable" }
+        if let status = PHPPackageProvider.seriesLabels[parsed.family] { return "PHP \(parsed.family) · \(status)" }
+        return "PHP \(parsed.family) series"
     }
 }
 

@@ -2,6 +2,7 @@
 set -eu
 
 ROOT="${SRCROOT}/../.."
+"$ROOT/Scripts/prepare-bundled-php"
 swift build --package-path "$ROOT" --configuration release --product vaelend
 
 CORE="$ROOT/.build/release/vaelend"

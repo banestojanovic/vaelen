@@ -41,6 +41,69 @@ final class AppModel {
     }
     private(set) var phpConfigurationSaving = false
     private(set) var phpOperation: PHPOperationState?
+    /// What the most recent update actually achieved, including any step that
+    /// did not converge.
+    private(set) var phpUpdateOutcome: PHPUpdateResult?
+
+    /// Set after an update so the interface immediately shows the replacement's
+    /// exact version, settings, paths, running state, and default role. The
+    /// replacement keeps its own settings draft; nothing is carried over from an
+    /// unrelated version's unsaved draft.
+    private(set) var phpSelectionRequest: String?
+    func clearPHPSelectionRequest() { phpSelectionRequest = nil }
+
+    /// Installed runtimes whose family has an installable newer patch.
+    ///
+    /// This is a per-family claim, not a per-patch one: once the newest patch of
+    /// a line is installed, that line no longer needs an update. It follows the
+    /// authoritative catalog, so it clears when the update completes and never
+    /// appears from a failed or unconfirmed check.
+    var phpInstallableUpdates: [(from: PHPRuntimeVersion, to: String)] {
+        guard let catalog = phpCatalog, catalog.availableVersionsKnown else { return [] }
+        var newestInstalledByFamily: [String: String] = [:]
+        var runtimeByVersion: [String: PHPRuntimeVersion] = [:]
+        for runtime in catalog.installedVersions {
+            runtimeByVersion[runtime.version] = runtime
+            let family = runtime.series ?? PHPVersion(runtime.version)?.family ?? runtime.version
+            if let existing = newestInstalledByFamily[family] {
+                if phpIsNewer(runtime.version, existing) { newestInstalledByFamily[family] = runtime.version }
+            } else {
+                newestInstalledByFamily[family] = runtime.version
+            }
+        }
+        var updates: [(from: PHPRuntimeVersion, to: String)] = []
+        for family in Set(newestInstalledByFamily.keys) {
+            let newestInstalled = newestInstalledByFamily[family] ?? ""
+            let newestAvailable = catalog.availableVersions
+                .filter { (PHPVersion($0)?.family ?? "") == family }
+                .max(by: { phpIsNewer($1, $0) })
+            guard let newestAvailable, phpIsNewer(newestAvailable, newestInstalled) else { continue }
+            // Report against the runtime the list shows for this family, which is
+            // the user's active runtime rather than necessarily the highest patch.
+            guard let representative = catalog.installedVersions
+                .filter({ ($0.series ?? "") == family })
+                .sorted(by: { phpIsNewer($1.version, $0.version) })
+                .first else { continue }
+            updates.append((representative, newestAvailable))
+        }
+        return updates.sorted { phpIsNewer($0.to, $1.to) }
+    }
+
+    private func phpIsNewer(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = PHPVersion(lhs), let right = PHPVersion(rhs) else { return false }
+        return left > right
+    }
+
+    var hasInstallablePHPUpdate: Bool { !phpInstallableUpdates.isEmpty }
+
+    var phpUpdateIndicatorHelp: String {
+        let updates = phpInstallableUpdates
+        guard let first = updates.first else { return "" }
+        if updates.count == 1 {
+            return "Update available: PHP \(first.from.version) → \(first.to)"
+        }
+        return "\(updates.count) PHP runtimes have updates available: " + updates.map { "\($0.from.version) → \($0.to)" }.joined(separator: ", ")
+    }
     private(set) var phpCompletionMessage: String?
     private(set) var phpCatalogCheckPending = false
     private(set) var phpCatalogCheckError: String?
@@ -71,6 +134,7 @@ final class AppModel {
     private var refreshRequested = false
     private var monitorTask: Task<Void, Never>?
     private var phpOperationPollTask: Task<Void, Never>?
+    private var phpOperationWatchTask: Task<Void, Never>?
     private var lastAutomaticPHPCheckRequestAt: Date?
     private var serviceCheckTimeoutTask: Task<Void, Never>?
     private var serviceCheckStartedAt: ContinuousClock.Instant?
@@ -755,12 +819,32 @@ final class AppModel {
         await performPHPCommand(version, kind: .install) { _ = try await $0.phpInstall(version) }
     }
 
-    func updatePHP(_ version: String) async {
+    /// Update a runtime. `source` names the runtime being replaced so its saved
+    /// settings are the ones carried over when several patches coexist.
+    func updatePHP(_ version: String, replacing source: String? = nil) async {
         if isSettingsFixture, settingsFixtureMode?.hasPrefix("php-update") == true {
             await performPHPUpdateFixture(version)
             return
         }
-        await performPHPCommand(version, kind: .update) { _ = try await $0.phpUpdate(version) }
+        // A previous outcome must not survive into this operation, whether the
+        // new one succeeds, partially succeeds, or fails.
+        phpUpdateOutcome = nil
+        var updateResult: PHPUpdateResult?
+        await performPHPCommand(version, kind: .update) { updateResult = try await $0.phpUpdate(version, sourceVersion: source) }
+        guard let updateResult else { return }
+        phpUpdateOutcome = updateResult
+        // Show the replacement rather than leaving the user on the superseded row.
+        phpSelectionRequest = updateResult.version
+        // Describe what actually happened. "Installed and ready" is only truthful
+        // when startup, default handover, and routing all completed.
+        if let failure = updateResult.convergenceError {
+            phpError = "PHP \(updateResult.version) installed, but some work did not finish: \(failure)"
+            phpCompletionMessage = nil
+        } else if let replaced = updateResult.replacedVersion {
+            phpCompletionMessage = "PHP \(updateResult.version) is installed and ready. PHP \(replaced) was removed; its saved settings are kept and return if you reinstall it."
+        } else {
+            phpCompletionMessage = "PHP \(updateResult.version) is installed and ready."
+        }
     }
 
     private func performPHPUpdateFixture(_ version: String) async {
@@ -791,6 +875,21 @@ final class AppModel {
         }
         phpRequestInFlight = false
         phpRequestTarget = nil
+    }
+
+    /// Retry only the convergence work for an update that already installed its
+    /// replacement. The package is not downloaded or installed again.
+    func retryPHPUpdateConvergence(_ version: String) async {
+        var updateResult: PHPUpdateResult?
+        await performPHPCommand(version, kind: .update) { updateResult = try await $0.phpUpdate(version) }
+        guard let updateResult else { return }
+        phpUpdateOutcome = updateResult
+        if let failure = updateResult.convergenceError {
+            phpError = "PHP \(version) is installed, but some work did not finish: \(failure)"
+        } else {
+            phpError = nil
+            phpCompletionMessage = "PHP \(version) is installed and fully converged."
+        }
     }
 
     func checkPHPUpdates() async {
@@ -1366,6 +1465,10 @@ final class AppModel {
     private func refreshAuthoritativeServiceState() async {
         refreshGeneration += 1 // invalidate any older, slower reconciliation snapshot
         let generation = refreshGeneration
+        let reportsStarted = ContinuousClock.now
+        // Cancelling here must be paired with rescheduling below: waiting for
+        // the next tick would otherwise never refresh project PHP labels after
+        // a mutation cancelled the in-flight report work.
         projectReportsTask?.cancel()
         projectReportsTask = nil
         beginServiceReadinessCheck(generation: generation)
@@ -1406,6 +1509,13 @@ final class AppModel {
             }
             refreshError = nil
             await refreshClient.disconnect()
+            // Service-only polling refreshes the same project reports the full
+            // path does, so a tick that cancelled report work still leaves fresh
+            // project PHP labels behind instead of nothing.
+            guard generation == refreshGeneration else { return }
+            if case .running(_, let refreshedProjects, _, _, _, _, _, _, _) = state {
+                startProjectReports(refreshedProjects, generation: generation, refreshStarted: reportsStarted)
+            }
         } catch {
             await refreshClient.disconnect()
             refreshError = error.localizedDescription
@@ -1417,6 +1527,10 @@ final class AppModel {
         guard !isSettingsFixture else { phpError = "This isolated Settings fixture cannot operate Vaelen Core."; return false }
         guard !phpRequestInFlight, !phpConfigurationSaving else { return false }
         guard client != nil else { phpError = "Vaelen Core is unavailable."; return false }
+        // A newer command owns the outcome now; a stale interruption watcher
+        // must not overwrite it later.
+        phpOperationWatchTask?.cancel()
+        phpOperationWatchTask = nil
         phpError = nil
         phpCompletionMessage = nil
         phpRequestInFlight = true
@@ -1429,7 +1543,15 @@ final class AppModel {
         phpRequestInFlight = false
         phpRequestTarget = nil
         phpError = error
+        // Settings inventory and configuration first: fast, and what the
+        // completion message describes.
         await refreshPHPSettings()
+        // Then the shared snapshot the menu-bar popover reads, plus fresh
+        // project reports and route presentation — asynchronously, so slower
+        // read-only work never keeps installation activity running after the
+        // operation itself completed. Generation guards reject stale responses,
+        // and refresh coalesces with any refresh already in flight.
+        Task { @MainActor [weak self] in await self?.refresh() }
     }
 
     func refreshPHPSettings() async {
@@ -1485,6 +1607,8 @@ final class AppModel {
             phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: .ready)
             phpCompletionMessage = switch kind {
             case .install: "PHP \(version) installed. It remains stopped until you choose Start."
+            // An update's message describes what actually happened. `updatePHP`
+            // refines this with the convergence outcome.
             case .update: "PHP \(version) update completed."
             case .remove: "PHP \(version) removed. Saved settings and verified downloads are kept."
             case .defaultSelection: "PHP \(version) is now the default."
@@ -1497,9 +1621,125 @@ final class AppModel {
             await commandClient.disconnect()
             phpOperationPollTask?.cancel()
             phpOperationPollTask = nil
-            phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: .failed, message: phpErrorMessage(error))
-            phpCompletionMessage = "PHP \(version) operation failed: \(phpErrorMessage(error))"
-            await finishPHPRequest(error: phpErrorMessage(error))
+            // A genuine Core rejection is reported as-is. A lost connection
+            // proves nothing about the work itself, so reconcile against what
+            // Core actually recorded before calling it a failure.
+            if case CoreClientError.remote = error {
+                phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: .failed, message: phpErrorMessage(error))
+                phpCompletionMessage = nil
+                await finishPHPRequest(error: phpErrorMessage(error))
+            } else if let reconciled = await reconcileUncertainPHPOutcome(version: version, kind: kind) {
+                phpOperation = reconciled.operation
+                phpError = reconciled.errorMessage
+                phpCompletionMessage = reconciled.completionMessage
+                if reconciled.confirmedUpdate, kind == .update { phpSelectionRequest = version }
+                await finishPHPRequest(error: reconciled.errorMessage)
+            } else {
+                phpOperation = PHPOperationState(kind: kind, targetVersion: version, phase: .failed, message: phpErrorMessage(error))
+                phpCompletionMessage = nil
+                await finishPHPRequest(error: phpErrorMessage(error))
+            }
+        }
+    }
+
+    /// Reconcile an interrupted command against Core's own records.
+    ///
+    /// The reply was lost, so the outcome is unknown — but Core keeps the
+    /// operation's terminal state and the authoritative inventory. Use both:
+    /// never declare success from a package directory alone, and never call an
+    /// interrupted request a proven failure. Returns nil only when Core cannot
+    /// be reached at all, in which case the caller reports the original error.
+    private func reconcileUncertainPHPOutcome(version: String, kind: PHPOperationKind) async -> (operation: PHPOperationState, errorMessage: String?, completionMessage: String?, confirmedUpdate: Bool)? {
+        let readClient = makeCoreClient()
+        do {
+            try await readClient.connect()
+            let recorded = try await readClient.phpOperation()
+            let catalog = try? await readClient.phpCatalogSnapshot()
+            await readClient.disconnect()
+            guard let recorded, recorded.kind == kind, recorded.targetVersion == version else {
+                return (PHPOperationState(kind: kind, targetVersion: version, phase: .failed, message: nil),
+                        "PHP \(version) could not be confirmed: the request was interrupted and Core holds no record of it. Check the inventory, then retry if needed.", nil, false)
+            }
+            switch recorded.phase {
+            case .ready:
+                // Core's own terminal record says the whole operation — package
+                // work and convergence — finished. Confirm against inventory
+                // rather than trusting the reply alone.
+                let installed = catalog?.installedVersions.contains { $0.version == version } ?? false
+                if installed {
+                    return (recorded, nil, "PHP \(version) finished successfully. The reply was lost when the connection dropped, so this was verified against Core afterwards.", kind == .update)
+                }
+                return (recorded, "PHP \(version) needs checking: Core reports the operation finished, but the runtime is not in the inventory. Refresh and verify before retrying.", nil, false)
+            case .failed:
+                let detail = recorded.message ?? "The operation did not complete."
+                return (recorded, "PHP \(version) did not complete: \(detail)", nil, false)
+            case .starting, .downloading, .verifying, .installing, .startingRuntime, .converging, .removing:
+                // Core is still working. Keep watching its operation to a
+                // terminal state rather than freezing the strip mid-stage.
+                watchInterruptedPHPOperation(version: version, kind: kind)
+                return (recorded, nil, "PHP \(version) is still \(Self.plainStageName(recorded.phase)). The request was interrupted, but Core kept working; watching for its outcome.", false)
+            case .removed:
+                return (recorded, nil, "PHP \(version) was removed. The reply was lost when the connection dropped, so this was verified against Core afterwards.", false)
+            }
+        } catch {
+            await readClient.disconnect()
+            return nil
+        }
+    }
+
+    /// Watch an operation Core is still running after our request was
+    /// interrupted, until it reaches a terminal state. Cancelled as soon as a
+    /// newer command starts, so it can never overwrite a newer outcome.
+    private func watchInterruptedPHPOperation(version: String, kind: PHPOperationKind) {
+        phpOperationWatchTask?.cancel()
+        phpOperationWatchTask = Task { [weak self] in
+            let watchClient = self?.makeCoreClient()
+            try? await watchClient?.connect()
+            defer { Task { await watchClient?.disconnect() } }
+            for _ in 0..<600 {
+                if Task.isCancelled { break }
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { break }
+                guard let self, !self.phpRequestInFlight else { break }
+                guard let observed = try? await watchClient?.phpOperation(),
+                      observed.kind == kind, observed.targetVersion == version
+                else { continue }
+                switch observed.phase {
+                case .ready, .removed:
+                    self.phpOperation = observed
+                    self.phpError = nil
+                    self.phpCompletionMessage = "PHP \(version) finished after the interruption. Verified against Core."
+                    if kind == .update { self.phpSelectionRequest = version }
+                    await self.refreshPHPSettings()
+                    break
+                case .failed:
+                    self.phpOperation = observed
+                    self.phpCompletionMessage = nil
+                    self.phpError = "PHP \(version) did not complete: \(observed.message ?? "The operation did not complete.")"
+                    await self.refreshPHPSettings()
+                    break
+                default:
+                    self.phpOperation = observed
+                    continue
+                }
+                break
+            }
+            self?.phpOperationWatchTask = nil
+        }
+    }
+
+    private static func plainStageName(_ phase: PHPOperationPhase) -> String {
+        switch phase {
+        case .starting: return "preparing"
+        case .downloading: return "downloading"
+        case .verifying: return "verifying"
+        case .installing: return "installing"
+        case .startingRuntime: return "starting"
+        case .converging: return "finishing project routing"
+        case .removing: return "removing"
+        case .ready: return "finishing"
+        case .removed: return "finishing removal"
+        case .failed: return "finishing"
         }
     }
 

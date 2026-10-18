@@ -212,8 +212,18 @@ public actor VaelenCoreClient {
     public func phpInstall(_ version: String) async throws -> PHPPackageWire {
         guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpInstall, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version }) ?? result.installed.last else { throw CoreClientError.invalidResponse }; return package
     }
-    public func phpUpdate(_ version: String) async throws -> PHPPackageWire {
-        guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpUpdate, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; guard let package = result.installed.first(where: { $0.version == version }) ?? result.installed.last else { throw CoreClientError.invalidResponse }; return package
+    /// Update a runtime, naming the runtime being replaced when several patches of
+    /// the same line are installed. Returns what actually converged so partial
+    /// success is visible rather than reported as a bare completion.
+    public func phpUpdate(_ version: String, sourceVersion: String? = nil) async throws -> PHPUpdateResult {
+        switch try result(from: await send(IPCRequest(method: .phpUpdate, params: .phpVersion(.init(version: version, sourceVersion: sourceVersion))))) {
+        case .phpUpdateResult(let result): return result
+        case .phpVersions(let result):
+            // Compatibility with an older Core that reports only the version list.
+            guard result.installed.contains(where: { $0.version == version }) else { throw CoreClientError.invalidResponse }
+            return PHPUpdateResult(version: version, replacedVersion: nil, wasDefault: result.default == version, isDefault: result.default == version, isRunning: false, convergence: [], convergenceError: nil)
+        default: throw CoreClientError.invalidResponse
+        }
     }
     public func phpRemove(_ version: String) async throws -> PHPVersionsResult {
         guard case .phpVersions(let result) = try result(from: await send(IPCRequest(method: .phpRemove, params: .phpVersion(.init(version: version))))) else { throw CoreClientError.invalidResponse }; return result

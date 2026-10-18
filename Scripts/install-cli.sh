@@ -106,6 +106,7 @@ trap 'exit 143' TERM
 cli_txn_recover "$bin_dir" || fail "could not recover a previous incomplete CLI installation"
 
 printf 'Building Release CLI for Vaelen %s (%s)...\n' "$version" "$identity"
+"$repo_root/Scripts/prepare-bundled-php" || fail "bundled PHP preparation failed"
 (cd "$repo_root" && swift build --configuration release --product val)
 [[ -x "$candidate" ]] || fail "Release CLI was not produced at $candidate"
 file "$candidate" | grep -q 'Mach-O' || fail "Release CLI is not a macOS executable"

@@ -20,7 +20,20 @@ struct SettingsView: View {
                         Label("Projects", systemImage: "folder").tag(SettingsPage.projects)
                     }
                     Section("DEVELOPMENT") {
-                        Label("PHP", systemImage: "curlybraces").tag(SettingsPage.php)
+                        // A persistent, unobtrusive marker: an installed runtime
+                        // has an installable newer patch. It reflects catalog
+                        // state only, so a failed check never fabricates it.
+                        HStack(spacing: 5) {
+                            Label("PHP", systemImage: "curlybraces")
+                            Spacer(minLength: 2)
+                            if model.hasInstallablePHPUpdate {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.accentColor)
+                                    .help(model.phpUpdateIndicatorHelp)
+                                    .accessibilityLabel(model.phpUpdateIndicatorHelp)
+                            }
+                        }.tag(SettingsPage.php)
                         Label("Network & Security", systemImage: "lock.shield").tag(SettingsPage.network)
                     }
                     Section("PREFERENCES") {
@@ -160,5 +173,8 @@ struct SettingsInsetCard<Content: View>: View {
     var body: some View {
         content.padding(14).frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 9))
+            // A faint border gives the card separation from the surrounding pane
+            // in light appearance while staying quiet in dark appearance.
+            .overlay(RoundedRectangle(cornerRadius: 9).stroke(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 1))
     }
 }

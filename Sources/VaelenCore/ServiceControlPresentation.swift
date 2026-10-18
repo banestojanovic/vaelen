@@ -102,6 +102,19 @@ public struct ServiceControlPresentation: Equatable, Sendable {
             return .init(title: "Off", detail: status.conflict ?? status.detail)
         }
 
+        // A verified incomplete Vaelen configuration: Vaelen's own anchor is
+        // present and correct but nothing loads it. This is repairable through the
+        // normal supported path, so it is presented as an action rather than as a
+        // foreign conflict the user cannot resolve.
+        if status.state == .incomplete, status.repairAvailable == true {
+            return .init(
+                title: "Needs repair",
+                detail: status.detail ?? "Vaelen's PF anchor is present but /etc/pf.conf no longer loads it. Repair restores that reference.",
+                action: .retry,
+                canDisable: owned
+            )
+        }
+
         guard owned else {
             let unownedReason = status.ownership == .external
                 ? "Existing PF integration has no active Vaelen ownership record; existing rules were left unchanged."

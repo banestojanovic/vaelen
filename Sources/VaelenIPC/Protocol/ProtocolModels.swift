@@ -380,7 +380,14 @@ public struct ParkedPathListResult: Codable, Equatable, Sendable {
     public init(paths: [ParkedPathWire]) { self.paths = paths }
 }
 
-public struct PHPVersionRequest: Codable, Equatable, Sendable { public let version: String; public init(version: String) { self.version = version } }
+public struct PHPVersionRequest: Codable, Equatable, Sendable {
+    public let version: String
+    /// For updates: the runtime being replaced. Required when more than one patch
+    /// of the same line is installed, so settings are copied from the runtime the
+    /// user actually updated.
+    public let sourceVersion: String?
+    public init(version: String, sourceVersion: String? = nil) { self.version = version; self.sourceVersion = sourceVersion }
+}
 public struct PHPSettingsValues: Codable, Equatable, Sendable {
     public let uploadLimitMB: Int
     public let memoryLimitMB: Int
@@ -423,6 +430,31 @@ public struct PHPResolveResult: Codable, Equatable, Sendable { public let versio
 public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
 public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
 public struct PHPRuntimeCatalogResult: Codable, Equatable, Sendable { public let catalog: PHPRuntimeCatalog; public init(catalog: PHPRuntimeCatalog) { self.catalog = catalog } }
+
+/// What an update actually achieved.
+///
+/// Installation can succeed while route convergence fails. That partial outcome
+/// is reported rather than collapsed into a bare success.
+public struct PHPUpdateResult: Codable, Equatable, Sendable {
+    public let version: String
+    /// The runtime this replaced. It is removed once the replacement is
+    /// verified; while the update is incomplete it stays installed for recovery.
+    public let replacedVersion: String?
+    public let wasDefault: Bool
+    public let isDefault: Bool
+    public let isRunning: Bool
+    /// Steps that completed, e.g. "running", "default", "routes", "intents".
+    public let convergence: [String]
+    /// A convergence step that failed after installation succeeded.
+    public let convergenceError: String?
+    public init(version: String, replacedVersion: String?, wasDefault: Bool, isDefault: Bool, isRunning: Bool, convergence: [String], convergenceError: String?) {
+        self.version = version; self.replacedVersion = replacedVersion; self.wasDefault = wasDefault
+        self.isDefault = isDefault; self.isRunning = isRunning; self.convergence = convergence; self.convergenceError = convergenceError
+    }
+    public init(outcome: PHPUpdateOutcome, convergence: [String], convergenceError: String?) {
+        self.init(version: outcome.version, replacedVersion: outcome.replacedVersion, wasDefault: outcome.wasDefault, isDefault: outcome.isDefault, isRunning: outcome.isRunning, convergence: outcome.convergence + convergence, convergenceError: convergenceError)
+    }
+}
 public struct PHPDefaultProjectIssue: Codable, Equatable, Sendable {
     public let projectName: String
     public let message: String
@@ -492,6 +524,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
     case phpCatalog(PHPRuntimeCatalogResult)
+    case phpUpdateResult(PHPUpdateResult)
     case phpDefaultSelection(PHPDefaultSelectionResult)
     case phpOperation(PHPOperationResult)
     case phpStatus(PHPStatusResult)
@@ -529,6 +562,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
+        case .phpUpdateResult(let value): try value.encode(to: encoder)
         case .phpCatalog(let value): try value.encode(to: encoder)
         case .phpDefaultSelection(let value): try value.encode(to: encoder)
         case .phpOperation(let value): try value.encode(to: encoder)
@@ -576,6 +610,10 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["mailpit"] != nil, let result = try? IPCCodec.decode(MailpitStatusResult.self, from: data) { self = .mailpitStatus(result) }
         else if fields["projectIssues"] != nil, let result = try? IPCCodec.decode(PHPDefaultSelectionResult.self, from: data) { self = .phpDefaultSelection(result) }
         else if fields["catalog"] != nil, let result = try? IPCCodec.decode(PHPRuntimeCatalogResult.self, from: data) { self = .phpCatalog(result) }
+        // `convergence` is the distinctive shape of an update result: no other
+        // response carries it. It must be tested before `version`-shaped checks so
+        // a successful update is never mistaken for `.raw` and then for failure.
+        else if fields["convergence"] != nil, let result = try? IPCCodec.decode(PHPUpdateResult.self, from: data) { self = .phpUpdateResult(result) }
         else if fields["operation"] != nil, let result = try? IPCCodec.decode(PHPOperationResult.self, from: data) { self = .phpOperation(result) }
         else if fields["available"] != nil, let result = try? IPCCodec.decode(PHPVersionsResult.self, from: data) { self = .phpVersions(result) }
         else if fields["status"] != nil, let result = try? IPCCodec.decode(PHPStatusResult.self, from: data) { self = .phpStatus(result) }

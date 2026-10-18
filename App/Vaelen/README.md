@@ -7,6 +7,12 @@ requires macOS 14 or newer and embeds the matching `vaelend` Core. Use
 versions, development install paths, harness boundaries, and the latest test
 result.
 
+The Core embed phase runs `Scripts/prepare-bundled-php` before its Swift build,
+materializing the exact pinned PHP resources on a fresh checkout. Direct package
+builds/tests require running that preparation command first from the repository
+root. With verified resources or archives cached, pass `--offline` to prepare
+without network access. No PHP compilation or catalog refresh occurs.
+
 The compact popover provides quick project and service operations. Deeper
 project and service configuration belongs in the native Settings window. The
 app does not own managed runtime state: Core is authoritative, and the app and

@@ -845,7 +845,10 @@ final class DispatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"), logsDirectoryURL: root.appendingPathComponent("logs"))
         let manifestURL = root.appendingPathComponent("manifest.json")
-        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "https://example.test/cli.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "https://example.test/fpm.tar.gz", sha256: String(repeating: "b", count: 64))]
+        // Artifact URLs must satisfy the product's HTTPS-and-allowlist rule even
+        // though this test injects the transfer, so the injected transport is
+        // reached for a permitted URL and never for a rejected one.
+        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: PHPPackageProvider.artifactURL(version: "8.4.23", kind: "cli"), sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: PHPPackageProvider.artifactURL(version: "8.4.23", kind: "fpm"), sha256: String(repeating: "b", count: 64))]
         let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"))
         try JSONEncoder().encode(manifest).write(to: manifestURL)
         let gate = PausedPHPDownloader()
@@ -894,7 +897,10 @@ final class DispatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"), logsDirectoryURL: root.appendingPathComponent("logs"))
         let manifestURL = root.appendingPathComponent("manifest.json")
-        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: "https://example.test/cli.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: "https://example.test/fpm.tar.gz", sha256: String(repeating: "b", count: 64))]
+        // Artifact URLs must satisfy the product's HTTPS-and-allowlist rule even
+        // though this test injects the transfer, so the injected transport is
+        // never reached for a rejected URL.
+        let artifacts = ["cli": PHPArtifact(file: "cli.tar.gz", url: PHPPackageProvider.artifactURL(version: "8.4.23", kind: "cli"), sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "fpm.tar.gz", url: PHPPackageProvider.artifactURL(version: "8.4.23", kind: "fpm"), sha256: String(repeating: "b", count: 64))]
         let manifest = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.4.23", platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"))
         try JSONEncoder().encode(manifest).write(to: manifestURL)
         let gate = PausedPHPDownloader()

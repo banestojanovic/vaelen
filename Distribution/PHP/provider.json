@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "module": "php",
+  "provider": {
+    "id": "static-php-cli",
+    "generation": "v3",
+    "channel": "bulk",
+    "feedURL": "https://dl.static-php.dev/v3/php-bin/bulk/?format=json",
+    "baseURL": "https://dl.static-php.dev/v3/php-bin/bulk",
+    "licenseBaseURL": "https://dl.static-php.dev/v3/php-bin/bulk/license",
+    "objectStorageHost": "static-php-cli.fra1.digitaloceanspaces.com",
+    "artifactHostAllowlist": [
+      "dl.static-php.dev",
+      "static-php-cli.fra1.digitaloceanspaces.com"
+    ],
+    "authenticity": "static-php-cli-prepared-packages",
+    "platform": "macos",
+    "architecture": "arm64",
+    "minimumMacOS": "12.0",
+    "integrityTrustModel": "https-origin",
+    "integrityTrustModelDetail": "Vaelen verifies the provider's HTTPS origin and host allowlist, then records the SHA-256 of the bytes it downloaded. That digest is a local integrity record, not independent provider authentication: the provider publishes no signed checksum metadata, so Vaelen cannot authenticate a pinned digest against the provider's own signature."
+  },
+  "supportedFamilies": ["8.5", "8.4", "8.3", "8.2"],
+  "bundledFamily": "8.5",
+  "legacyFamilies": {
+    "7.4": "Legacy · End of life",
+    "8.0": "Legacy · End of life",
+    "8.1": "Legacy · End of life",
+    "8.2": "Security support · New projects should use 8.3 or newer"
+  },
+  "legacyProvider": {
+    "id": "static-php-cli",
+    "generation": "archive-v2",
+    "channel": "bulk",
+    "feedURL": "https://dl.static-php.dev/static-php-cli/bulk/?format=json",
+    "baseURL": "https://dl.static-php.dev/static-php-cli/bulk",
+    "licenseBaseURL": "https://dl.static-php.dev/static-php-cli/bulk/license",
+    "authenticity": "static-php-cli-prepared-packages",
+    "platform": "macos",
+    "architecture": "arm64",
+    "versions": ["8.0.30", "8.1.34"],
+    "minimumMacOS": {"8.0.30": "14.0", "8.1.34": "12.0"},
+    "notices": ["src_php-src_0.txt"]
+  },
+  "requiredExtensions": [
+    "bcmath",
+    "ctype",
+    "curl",
+    "dom",
+    "fileinfo",
+    "filter",
+    "gd",
+    "iconv",
+    "intl",
+    "mbstring",
+    "mysqli",
+    "mysqlnd",
+    "openssl",
+    "pcntl",
+    "pdo",
+    "pdo_mysql",
+    "phar",
+    "session",
+    "simplexml",
+    "sodium",
+    "tokenizer",
+    "xml",
+    "xmlreader",
+    "xmlwriter",
+    "zip"
+  ],
+  "optionalExtensions": [
+    "imagick"
+  ]
+}

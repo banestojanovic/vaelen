@@ -18,7 +18,11 @@ struct VaelenDaemonMain {
             // installed helper every mutation reports helperUnavailable and
             // observation stays user-space, so development behavior is safe.
             let ports = StandardPortsCapability(privileged: HelperStandardPortsPrivileged(), ledger: SystemModificationLedger(store: store), backendHealthy: { let status = await router.status(); return status.state == .running && status.health == .healthy })
-            let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version), registry: registry, php: PHPModule.development(layout: layout), mysql: MySQLModule(layout: layout), mailpit: MailpitModule(layout: layout), router: router, routeRepository: RouteIntentRepository(store: store), dns: DNSCapability(layout: layout, helper: helper, ledger: SystemModificationLedger(store: store)), tls: tls, ports: ports, serviceIntents: ServiceIntentStore(url: layout.stateDirectoryURL.appendingPathComponent("service-intents.json")))
+            // The shipped catalog is the production PHP source. A development
+            // manifest, when present, still takes precedence so local work can
+            // pin its own packages.
+            let php = PHPModule.development(layout: layout) ?? PHPModule.bundled(layout: layout)
+            let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: VaelenBuildInfo.version), registry: registry, php: php, mysql: MySQLModule(layout: layout), mailpit: MailpitModule(layout: layout), router: router, routeRepository: RouteIntentRepository(store: store), dns: DNSCapability(layout: layout, helper: helper, ledger: SystemModificationLedger(store: store)), tls: tls, ports: ports, serviceIntents: ServiceIntentStore(url: layout.stateDirectoryURL.appendingPathComponent("service-intents.json")))
             try await dispatcher.reconcilePersistedRoutesOnStartup()
             await dispatcher.restoreServicesOnStartup()
             let parentPID = ProcessInfo.processInfo.environment["VAELEN_PARENT_PID"].flatMap(Int32.init)

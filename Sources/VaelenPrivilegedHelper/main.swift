@@ -143,7 +143,15 @@ final class StandardPortsHelper: NSObject, VaelenStandardPortsHelperProtocol {
         let hasAnyReference = refLines.contains { pfConf.contains($0) } || pfConf.contains(StandardPortsForwardingPolicy.anchorName)
         let exactExisting = anchorPre.exists && anchorPre.bytes == Data(expectedAnchor.utf8) && StandardPortsForwardingPolicy.hasExactReference(in: pfConf)
         let absent = !anchorPre.exists && !hasAnyReference
-        guard exactExisting || absent else { throw StandardPortsHelperError.ownershipMismatch.nsError }
+        // Narrow recovery for Vaelen's own incomplete configuration: the anchor
+        // file is byte-identical to the fixed policy Vaelen writes, but pf.conf no
+        // longer references it at all. Nothing foreign is present and nothing
+        // about the anchor is overwritten, so restoring the missing reference is
+        // safe. A different anchor, or a pf.conf that still carries some directive
+        // for this anchor, is never accepted here.
+        let anchorIsOwnContent = anchorPre.exists && anchorPre.bytes == Data(expectedAnchor.utf8)
+        let missingReferenceOnly = anchorIsOwnContent && !hasAnyReference
+        guard exactExisting || absent || missingReferenceOnly else { throw StandardPortsHelperError.ownershipMismatch.nsError }
         let initiallyEnabled = pfEnabled() == true
         let activeBefore = forwardingActive() == true
         portsLogger.info("PF install preflight completed; exact compatible state: \(exactExisting, privacy: .public), PF initially enabled: \(initiallyEnabled, privacy: .public), forwarding active: \(activeBefore, privacy: .public)")
@@ -161,8 +169,14 @@ final class StandardPortsHelper: NSObject, VaelenStandardPortsHelperProtocol {
                 vaelenAnchor = try fileSnapshot(StandardPortsForwardingPolicy.anchorPath)
                 try atomicWrite(Data(StandardPortsForwardingPolicy.addingReference(to: pfConf).utf8), to: StandardPortsForwardingPolicy.pfConfPath, owner: pfPre.owner ?? 0, group: pfPre.group ?? 0, mode: pfPre.mode ?? 0o644)
                 vaelenPFConf = try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath)
+            } else if missingReferenceOnly {
+                // The anchor is already exactly Vaelen's fixed policy. Restore only
+                // the missing reference; the anchor file is not rewritten, so a
+                // later removal has nothing to undo there.
+                try atomicWrite(Data(StandardPortsForwardingPolicy.addingReference(to: pfConf).utf8), to: StandardPortsForwardingPolicy.pfConfPath, owner: pfPre.owner ?? 0, group: pfPre.group ?? 0, mode: pfPre.mode ?? 0o644)
+                vaelenPFConf = try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath)
             }
-            if absent || !activeBefore {
+            if absent || missingReferenceOnly || !activeBefore {
                 portsLogger.info("PF main configuration reload attempted")
                 try runPfctl(["-f", StandardPortsForwardingPolicy.pfConfPath], stage: "reload-main-configuration")
                 portsLogger.info("PF main configuration reload completed")
@@ -179,11 +193,11 @@ final class StandardPortsHelper: NSObject, VaelenStandardPortsHelperProtocol {
                 preimagePFConf: pfPre, preimageAnchor: anchorPre,
                 writtenPFConf: try fileSnapshot(StandardPortsForwardingPolicy.pfConfPath),
                 writtenAnchor: try fileSnapshot(StandardPortsForwardingPolicy.anchorPath),
-                changedPFConf: absent, changedAnchor: absent, forwardingWasActive: activeBefore, pfToken: token
+                changedPFConf: absent || missingReferenceOnly, changedAnchor: absent, forwardingWasActive: activeBefore, pfToken: token
             )
         } catch {
             portsLogger.error("PF install stage failed; attempting best-effort rollback")
-            if absent {
+            if absent || missingReferenceOnly {
                 if let vaelenPFConf { try? restoreIfMatches(StandardPortsForwardingPolicy.pfConfPath, expected: vaelenPFConf, preimage: pfPre) }
                 if let vaelenAnchor { try? restoreIfMatches(StandardPortsForwardingPolicy.anchorPath, expected: vaelenAnchor, preimage: anchorPre) }
             }

@@ -1,0 +1,369 @@
+{
+    "artifacts": {
+        "attr": {
+            "license": "LGPL-2.1-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "brotli": {
+            "license": "MIT",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "bzip2": {
+            "license": "bzip2-1.0.6",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "curl": {
+            "license": "curl",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-apcu": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-event": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-igbinary": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-imagick": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-imap": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-msgpack": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-opentelemetry": {
+            "license": "Apache-2.0",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-protobuf": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-redis": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-swoole": {
+            "license": "Apache-2.0",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ext-zip": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "freetype": {
+            "license": "FTL",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "gettext": {
+            "license": "LGPL-2.1-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "gmp": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "icu": {
+            "license": "ICU",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "idn2": {
+            "license": "LGPL-3.0-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "imagemagick": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "imap": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "jbig": {
+            "license": "GPL-2.0-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "krb5": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ldap": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "lerc": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libacl": {
+            "license": "LGPL-2.1-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libaom": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libavif": {
+            "license": "BSD-2-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libcares": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libde265": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libedit": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libevent": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libheif": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libiconv": {
+            "license": "LGPL-2.0-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libjpeg": {
+            "license": "IJG",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libjxl": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "liblz4": {
+            "license": "BSD-2-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libpng": {
+            "license": "PNG",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libsodium": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libssh2": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libtiff": {
+            "license": "libtiff",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libunistring": {
+            "license": "LGPL-3.0-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "liburing": {
+            "license": "LGPL-2.1-or-later",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libwebp": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libxml2": {
+            "license": "MIT",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libxslt": {
+            "license": "MIT",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "libzip": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ncurses": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "nghttp2": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "nghttp3": {
+            "license": "MIT",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "ngtcp2": {
+            "license": "MIT",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "onig": {
+            "license": "Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "openssl": {
+            "license": "OpenSSL",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "php-src": {
+            "license": "PHP-3.01",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "postgresql": {
+            "license": "PostgreSQL",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "qdbm": {
+            "license": "GPL-2.0-only OR LGPL-2.1-only",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "sqlite": {
+            "license": "Unlicense",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "unixodbc": {
+            "license": "LGPL-2.1-only",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "xz": {
+            "license": "0BSD",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "zlib": {
+            "license": "Zlib-Custom",
+            "dumped-at": "2026-08-10 04:30:38"
+        },
+        "zstd": {
+            "license": "BSD-3-Clause",
+            "dumped-at": "2026-08-10 04:30:38"
+        }
+    },
+    "summary": {
+        "license-types": {
+            "0BSD": [
+                "xz"
+            ],
+            "Apache-2.0": [
+                "ext-opentelemetry",
+                "ext-swoole"
+            ],
+            "BSD-2-Clause": [
+                "libavif",
+                "liblz4"
+            ],
+            "BSD-3-Clause": [
+                "ext-igbinary",
+                "ext-msgpack",
+                "ext-protobuf",
+                "krb5",
+                "libedit",
+                "libevent",
+                "libjxl",
+                "libssh2",
+                "libwebp",
+                "libzip",
+                "zstd"
+            ],
+            "Custom": [
+                "gmp",
+                "imagemagick",
+                "imap",
+                "ldap",
+                "lerc",
+                "libaom",
+                "libcares",
+                "libde265",
+                "libheif",
+                "libsodium",
+                "ncurses",
+                "nghttp2",
+                "onig"
+            ],
+            "FTL": [
+                "freetype"
+            ],
+            "GPL-2.0-only OR LGPL-2.1-only": [
+                "qdbm"
+            ],
+            "GPL-2.0-or-later": [
+                "jbig"
+            ],
+            "ICU": [
+                "icu"
+            ],
+            "IJG": [
+                "libjpeg"
+            ],
+            "LGPL-2.0-or-later": [
+                "libiconv"
+            ],
+            "LGPL-2.1-only": [
+                "unixodbc"
+            ],
+            "LGPL-2.1-or-later": [
+                "attr",
+                "gettext",
+                "libacl",
+                "liburing"
+            ],
+            "LGPL-3.0-or-later": [
+                "idn2",
+                "libunistring"
+            ],
+            "MIT": [
+                "brotli",
+                "libxml2",
+                "libxslt",
+                "nghttp3",
+                "ngtcp2"
+            ],
+            "OpenSSL": [
+                "openssl"
+            ],
+            "PHP-3.01": [
+                "ext-apcu",
+                "ext-event",
+                "ext-imagick",
+                "ext-imap",
+                "ext-redis",
+                "ext-zip",
+                "php-src"
+            ],
+            "PNG": [
+                "libpng"
+            ],
+            "PostgreSQL": [
+                "postgresql"
+            ],
+            "Unlicense": [
+                "sqlite"
+            ],
+            "Zlib-Custom": [
+                "zlib"
+            ],
+            "bzip2-1.0.6": [
+                "bzip2"
+            ],
+            "curl": [
+                "curl"
+            ],
+            "libtiff": [
+                "libtiff"
+            ]
+        },
+        "total-artifacts": 62,
+        "total-license-types": 24,
+        "last-updated": "2026-08-10 04:30:38"
+    }
+}

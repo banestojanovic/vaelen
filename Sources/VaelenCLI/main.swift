@@ -967,7 +967,18 @@ struct VaelenCLIMain {
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
             else { print(phpCatalogHumanOutput(result)) }
         case .phpInstall(let version): let result = try await client.phpInstall(version); print(HumanOutput.success("Installed PHP \(result.version)"))
-        case .phpUpdate(let version): let result = try await client.phpUpdate(version); print(HumanOutput.success("Updated PHP \(result.version)"))
+        case .phpUpdate(let version):
+            let result = try await client.phpUpdate(version)
+            if let failure = result.convergenceError {
+                print(HumanOutput.warning("PHP \(result.version) installed, but some work did not finish: \(failure)"))
+            } else {
+                var summary = "Updated PHP \(result.version)"
+                if let replaced = result.replacedVersion { summary += " (replacing \(replaced))" }
+                print(HumanOutput.success(summary))
+                if let replaced = result.replacedVersion, result.convergence.contains("cleanup") {
+                    print("  Removed superseded PHP \(replaced); saved settings are preserved.")
+                }
+            }
         case .phpRemove(let version): _ = try await client.phpRemove(version); print(HumanOutput.success("Removed PHP \(version)"))
         case .phpOperation(let json):
             let operation = try await client.phpOperation(); if json { print(String(decoding: try IPCCodec.encode(PHPOperationResult(operation: operation)), as: UTF8.self)) } else if let operation { print(HumanOutput.report("PHP operation", rows: [("Operation", "\(operation.kind.rawValue) \(operation.targetVersion)"), ("Phase", HumanOutput.state(operation.phase.rawValue)), ("Details", operation.message ?? "none")])) } else { print(HumanOutput.message("No PHP operation recorded", tint: 90)) }
@@ -1121,11 +1132,31 @@ struct VaelenCLIMain {
             else {
                 var rows: [(String, String)] = [("State", HumanOutput.state(result.state.rawValue)), ("HTTP", "127.0.0.1:\(result.httpPort) → 127.0.0.1:\(result.backendHTTPPort)"), ("HTTPS", "127.0.0.1:\(result.httpsPort) → 127.0.0.1:\(result.backendHTTPSPort)")]
                 if let conflict = result.conflict { rows.append(("Conflict", HumanOutput.state("conflict") + " · " + conflict)) }
+                // Preserve the real diagnostic rather than reporting every
+                // observation failure as "observation unavailable".
+                rows.append(("Forwarding", result.forwardingActive == true ? "active" : (result.forwardingActive == false ? "inactive" : "not observed")))
+                if result.repairAvailable == true { rows.append(("Repair", "available · run ‘val ports install’")) }
                 if let detail = result.detail { rows.append(("Detail", detail)) }
                 print(HumanOutput.report("Standard Local Ports", rows: rows))
             }
         case .portsInstall:
-            let result = try await client.portsInstall(); print(HumanOutput.report("Standard Local Ports", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Details", result.detail ?? "None")]))
+            // Both the GUI and this command use the same Core capability. When
+            // authorization is what is missing, say exactly where to grant it and
+            // that the command can simply be repeated afterwards.
+            do {
+                let result = try await client.portsInstall()
+                var rows = [("State", HumanOutput.state(result.state.rawValue)), ("Details", result.detail ?? "None")]
+                if result.repairAvailable == true { rows.append(("Repair", "Restored the missing PF reference")) }
+                print(HumanOutput.report("Standard Local Ports", rows: rows))
+            } catch {
+                print(HumanOutput.warning(error.localizedDescription))
+                if error.localizedDescription.contains("approval in Vaelen.app") {
+                    print("  Approve it once: open Vaelen.app, go to Settings → Network & Security → Standard Local Ports, and choose Repair.")
+                    print("  Then run ‘val ports install’ again to verify HTTP on 80 and HTTPS on 443.")
+                } else if error.localizedDescription.contains("conflict") || error.localizedDescription.contains("ownership") || error.localizedDescription.contains("incomplete") {
+                    print("  Vaelen left the existing PF configuration unchanged. See ‘val ports status’ for the specific reason.")
+                }
+            }
         case .portsRemove:
             let result = try await client.portsRemove(); print(HumanOutput.report("Standard Local Ports", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Details", result.detail ?? "None")]))
         }

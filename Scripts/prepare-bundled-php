@@ -1,0 +1,5 @@
+#!/bin/sh
+# Materialize the exact reviewed runtime; never refresh the catalog or build PHP.
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+exec python3 "$ROOT/Scripts/prepare-bundled-php.py" "$@"

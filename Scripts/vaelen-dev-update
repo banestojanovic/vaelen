@@ -15,7 +15,8 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN="$ARTIFACTS/product-dev-$STAMP"
 OLD_APP="/Applications/Vaelen.previous-$STAMP.app"
 STAGED_APP="/Applications/.Vaelen.candidate-$STAMP.app"
-APP="$RUN/derived/Build/Products/Release/Vaelen.app"
+DERIVED="$ROOT/.build/product-dev-release"
+APP="$DERIVED/Build/Products/Release/Vaelen.app"
 CORE="$APP/Contents/Resources/vaelend"
 
 die() { echo "vaelen-dev-update: $*" >&2; exit 1; }
@@ -72,9 +73,12 @@ XCODE_TEAM="$(xcodebuild -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Va
 IDENTITY="$(security find-identity -v -p codesigning | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-F]*\) ".*"$/\1/p' | head -1)"
 [[ -n "$IDENTITY" ]] || die "no valid codesigning identity is available"
 
+note "Preparing pinned bundled PHP"
+"$ROOT/Scripts/prepare-bundled-php" || die "bundled PHP preparation failed"
+
 note "Building signed Release candidate (team $TEAM)"
 if ! xcodebuild -quiet -project "$ROOT/App/Vaelen/Vaelen.xcodeproj" -scheme Vaelen -configuration Release \
-  -derivedDataPath "$RUN/derived" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" DEVELOPMENT_TEAM="$TEAM" build \
+  -derivedDataPath "$DERIVED" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" DEVELOPMENT_TEAM="$TEAM" build \
   >"$RUN/build.log" 2>&1; then
   cat "$RUN/build.log" >&2
   die "signed Release build failed"
@@ -89,6 +93,13 @@ CORE_SHA="$(shasum -a 256 "$CORE" | awk '{print $1}')"
 APP_SHA="$(tree_hash "$APP")"
 printf 'candidate-app-tree-sha256=%s\ncandidate-core-sha256=%s\ncandidate-core-schema=7\nteam=%s\n' \
   "$APP_SHA" "$CORE_SHA" "$TEAM" > "$RUN/candidate.manifest"
+printf 'source-root=%s\nsource-head=%s\nsource-branch=%s\nsource-diff-sha256=%s\nderived-data=%s\n' \
+  "$ROOT" "$(git -C "$ROOT" rev-parse HEAD)" "$(git -C "$ROOT" branch --show-current)" \
+  "$(git -C "$ROOT" diff HEAD --binary | shasum -a 256 | awk '{print $1}')" "$DERIVED" >> "$RUN/candidate.manifest"
+git -C "$ROOT" status --short > "$RUN/source-status.txt"
+git -C "$ROOT" ls-files --others --exclude-standard -z | while IFS= read -r -d '' file; do
+  [[ -f "$ROOT/$file" ]] && shasum -a 256 "$ROOT/$file"
+done > "$RUN/source-untracked.sha256"
 
 # Recovery artifacts never restore data: the online SQLite backup is evidence,
 # and rollback restores only the prior app bundle. Live v7 and later MySQL or

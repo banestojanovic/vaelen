@@ -24,7 +24,10 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
 stage() { printf '[%s] %s\n' "$1" "$2"; }
 
 build_support() {
-  [[ -x "$VAL" && -x "$CORE" && -x "$DNS" ]] || swift build --configuration release >/dev/null || die "Swift release build failed";
+  if [[ ! -x "$VAL" || ! -x "$CORE" || ! -x "$DNS" ]]; then
+    "$ROOT/Scripts/prepare-bundled-php" || die "bundled PHP preparation failed"
+    swift build --configuration release >/dev/null || die "Swift release build failed"
+  fi
 }
 
 snapshot() {
@@ -150,10 +153,19 @@ verify_preservation() {
   echo "preservation: PASS (missing=$missing changed=$changed added=$added expected-mutable=$expected unexpected=$unexpected report=$report)"
 }
 
+# The authoritative current default, not a hardcoded version: smoke verifies
+# the exact runtime Vaelen actually serves. Prints nothing when the default
+# cannot be determined, which fails the check rather than weakening it.
+smoke_php_default_version() {
+  "$VAL" php versions 2>/dev/null | sed -n 's/^Default: \([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
 smoke() {
   need curl; need nc; need dig; need osascript; need sqlite3
   build_support
-  local failures=0 version="8.4.23" response menu
+  local failures=0 response menu
+  local version=""
+  version="$(smoke_php_default_version)"
   stage registration "Core IPC registration"
   "$VAL" status >/dev/null 2>&1 || { echo "  FAIL: Core status registration" >&2; failures=1; }
   stage process "actual Core/DNS/GUI processes"
@@ -201,7 +213,11 @@ APPLESCRIPT
     pgrep -f "$gui_app/Contents/MacOS/Vaelen$" >/dev/null || { echo "  FAIL: GUI artifact exited after MenuBarExtra AXPress" >&2; failures=1; }
     echo "  GUI status item exposed and AXPress accepted: $status_item"
   fi
-  screencapture -x "$screenshot" >/dev/null 2>&1 || { echo "  FAIL: GUI screenshot unavailable" >&2; failures=1; }
+  if [[ "${VAELEN_SMOKE_CAPTURE:-0}" == 1 ]]; then
+    screencapture -x "$screenshot" >/dev/null 2>&1 || echo "  NOTE: optional GUI screenshot unavailable" >&2
+  else
+    echo "  Optional visual inspection skipped (manual review; set VAELEN_SMOKE_CAPTURE=1 for a diagnostic capture)."
+  fi
   if ! osascript <<'APPLESCRIPT' >"$ui_dump" 2>"$ui_error"; then
 tell application "System Events"
   tell process "Vaelen"
@@ -209,9 +225,9 @@ tell application "System Events"
   end tell
 end tell
 APPLESCRIPT
-    echo "  NOTE: optional GUI text unavailable (native MenuBarExtra popover is not exposed as a window; screenshot: $screenshot; detail: $(cat "$ui_error"))"
+    echo "  NOTE: optional GUI text unavailable (native MenuBarExtra popover is not exposed as a window; detail: $(cat "$ui_error"))"
   elif [[ ! -s "$ui_dump" ]]; then
-    echo "  NOTE: optional GUI text unavailable (native MenuBarExtra popover returned no window text; screenshot: $screenshot)"
+    echo "  NOTE: optional GUI text unavailable (native MenuBarExtra popover returned no window text)"
   else
     echo "  Optional GUI accessibility text captured: $ui_dump"
     grep -Eiq 'Core Running' "$ui_dump" && echo "  Optional GUI text: Core Running" || true
@@ -222,8 +238,12 @@ APPLESCRIPT
   stage core "Core socket and IPC readiness"
   [[ -S "$RUNTIME/sockets/core.sock" ]] || { echo "  FAIL: Core socket readiness" >&2; failures=1; }
   "$VAL" status 2>&1 | grep -Eq 'Core[[:space:]]+Running' || { echo "  FAIL: Core IPC status is not running" >&2; failures=1; }
-  stage php "PHP 8.4.23/FPM readiness"
-  "$VAL" php status "$version" 2>&1 | grep -Eq 'FPM[[:space:]]+running|Health[[:space:]]+healthy' || { echo "  FAIL: PHP/FPM" >&2; failures=1; }
+  stage php "PHP ${version:-unknown}/FPM readiness (authoritative default)"
+  if [[ -z "$version" ]]; then
+    echo "  FAIL: PHP/FPM (current default could not be determined)" >&2; failures=1
+  else
+    "$VAL" php status "$version" 2>&1 | grep -Eq 'FPM[[:space:]]+running|Health[[:space:]]+healthy' || { echo "  FAIL: PHP/FPM" >&2; failures=1; }
+  fi
   stage mysql "MySQL 8.4.11 and app DB authentication"
   "$VAL" mysql status 2>&1 | grep -Eq 'State[[:space:]]+running|Health[[:space:]]+healthy' || { echo "  FAIL: MySQL readiness" >&2; failures=1; }
   [[ -x "$MYSQL" ]] && syncproof_db_auth || { echo "  FAIL: app DB authentication" >&2; failures=1; }

@@ -29,15 +29,25 @@ Earlier acceptance records are preserved in `docs/`.
 
 - macOS 14 or newer.
 - Swift 6 or newer for package builds and tests.
+- Python 3 for preparing the descriptor-pinned bundled PHP resources.
 - Full Xcode is required to build/sign the native app and for the supported
   XCTest toolchain.
 
 ```bash
+./Scripts/prepare-bundled-php
 swift build
 swift test
 xcodebuild -project App/Vaelen/Vaelen.xcodeproj -scheme Vaelen \
   -configuration Debug build
 ```
+
+The preparation command materializes the exact reviewed PHP CLI/FPM resources
+from pinned archives; it does not compile PHP or refresh the catalog. Verified
+resources are reused immediately. Use `./Scripts/prepare-bundled-php --offline`
+when the resources or pinned archives are already cached. Xcode's Core embed
+phase invokes preparation automatically. See
+[`Distribution/PHP/README.md`](Distribution/PHP/README.md) for fresh-checkout
+and offline-build details.
 
 The app is a native menu-bar app (`dev.vaelen.app`) that bundles its matching
 `vaelend` Core. Core owns the managed runtime state; GUI and CLI are interfaces

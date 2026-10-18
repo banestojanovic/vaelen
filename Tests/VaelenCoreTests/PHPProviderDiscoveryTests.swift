@@ -1,0 +1,540 @@
+import Foundation
+import XCTest
+import VaelenTestSupport
+@testable import VaelenCore
+
+/// Coverage for the behaviour the provider integration must get right, all of it
+/// deterministic and independent of provider uptime.
+final class PHPProviderDiscoveryTests: XCTestCase {
+    private var root: URL!
+    private var layout: VaelenFilesystemLayout!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        root = URL(fileURLWithPath: "/private/var/tmp/vaelen-discovery-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
+        try FileManager.default.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        if let root, FileManager.default.fileExists(atPath: root.path) { try? FileManager.default.removeItem(at: root) }
+        root = nil
+        try super.tearDownWithError()
+    }
+
+    // MARK: - Discovery
+
+    /// A provider check must find a patch published after the app was built, and
+    /// make it installable without a new Vaelen release.
+    func testCheckDiscoversNewerPatchPublishedAfterTheBuild() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let feed = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.24-cli", "8.4.24-fpm"])
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { feed })
+        try location.checkCatalogNow()
+
+        let discovered = location.discoveredManifests()
+        XCTAssertEqual(discovered.map(\.phpVersion), ["8.4.24"], "A newer patch must be discovered, not merely noticed in the listing.")
+        let manifest = try XCTUnwrap(discovered.first)
+        XCTAssertEqual(manifest.artifacts["cli"]?.url, PHPPackageProvider.artifactURL(version: "8.4.24", kind: "cli"))
+        XCTAssertEqual(manifest.artifacts["fpm"]?.url, PHPPackageProvider.artifactURL(version: "8.4.24", kind: "fpm"))
+        // Discovered digests are recorded from received bytes, never invented.
+        XCTAssertEqual(manifest.artifacts["cli"]?.sha256, "")
+        XCTAssertFalse(manifest.verification.isPinnedByReview)
+        XCTAssertEqual(manifest.verification.authenticity, PHPPackageProvider.authenticity)
+        // The new version is offered through the normal catalog.
+        XCTAssertTrue(try location.knownManifests().map(\.phpVersion).contains("8.4.24"))
+    }
+
+    func testModernAndArchivedCatalogFeedsAreCheckedIndependently() throws {
+        let modern = try manifestFixture(version: "8.4.24", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
+        let legacy = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.0.30", platform: "macos", architecture: "arm64",
+            build: .init(requiredExtensions: ["bcmath"], minimumMacOS: "14.0", notices: PHPPackageProvider.legacyLicenseNotices, generation: PHPPackageProvider.legacyGeneration, channel: PHPPackageProvider.legacyChannel),
+            artifacts: ["cli": PHPArtifact(file: "archive-v2-8.0.30-cli-macos-aarch64.tar.gz", url: "\(PHPPackageProvider.legacyBaseURL)/php-8.0.30-cli-macos-aarch64.tar.gz", sha256: String(repeating: "c", count: 64)),
+                        "fpm": PHPArtifact(file: "archive-v2-8.0.30-fpm-macos-aarch64.tar.gz", url: "\(PHPPackageProvider.legacyBaseURL)/php-8.0.30-fpm-macos-aarch64.tar.gz", sha256: String(repeating: "d", count: 64))],
+            verification: .init(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity),
+            release: .init(tag: PHPPackageProvider.legacyChannel, url: PHPPackageProvider.legacyBaseURL))
+        XCTAssertTrue(FilePHPManifestLocation.isProviderBackedManifest(legacy))
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [modern, legacy]), stateDirectory: layout.stateDirectoryURL, now: { Self.now },
+            fetchFeed: { Self.feed(published: ["8.4.24-cli", "8.4.24-fpm"]) },
+            fetchLegacyFeed: { Self.feed(published: ["8.0.30-cli", "8.0.30-fpm"]) })
+        XCTAssertNoThrow(try location.checkCatalogNow(), "A legacy family omitted from modern v3 must not invalidate the modern check.")
+        XCTAssertEqual(location.catalogAvailability(), .current)
+        XCTAssertTrue(try location.knownManifests().map(\.phpVersion).contains("8.0.30"))
+    }
+
+    func testLegacyFeedFailureKeepsShippedOptionsAndReportsCachedOrUnconfirmed() throws {
+        let legacy = try manifestFixture(version: "8.0.30", cliSHA: String(repeating: "c", count: 64), fpmSHA: String(repeating: "d", count: 64))
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [legacy]), stateDirectory: layout.stateDirectoryURL, now: { Self.now },
+            fetchFeed: { Self.feed(published: ["8.4.24-cli", "8.4.24-fpm"]) },
+            fetchLegacyFeed: { throw PHPModuleError.catalogUnavailable("archive source unavailable") })
+        XCTAssertThrowsError(try location.checkCatalogNow())
+        XCTAssertTrue(try location.knownManifests().contains { $0.phpVersion == "8.0.30" }, "The shipped legacy package remains usable after a source-check failure.")
+        XCTAssertNotNil(location.catalogCheckStatus().1)
+        XCTAssertEqual(location.catalogAvailability(), .unconfirmed)
+    }
+
+    func testSupportLabelsMatchTheProviderCatalogMetadata() {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let providerURL = repository.appendingPathComponent("Distribution/PHP/provider.json")
+        let data = try! Data(contentsOf: providerURL)
+        let config = try! XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(config["legacyFamilies"] as? [String: String], PHPPackageProvider.seriesLabels,
+                       "Core and Settings labels must stay aligned with provider package metadata.")
+        let legacyProvider = try! XCTUnwrap(config["legacyProvider"] as? [String: Any])
+        XCTAssertEqual(legacyProvider["generation"] as? String, PHPPackageProvider.legacyGeneration)
+        XCTAssertEqual(legacyProvider["channel"] as? String, PHPPackageProvider.legacyChannel)
+    }
+
+    /// Discovery must not invent versions for unsupported lines or regress.
+    func testDiscoveryOnlyAdvancesSupportedLinesAndNeverRegresses() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        // 8.4 is behind, 8.6 is an unsupported new line, 8.5 is known nowhere.
+        let feed = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.22-cli", "8.4.22-fpm", "8.6.0-cli", "8.6.0-fpm"])
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { feed })
+        try location.checkCatalogNow()
+        XCTAssertEqual(location.discoveredManifests().map(\.phpVersion), [], "An older patch and an unsupported new line must not be offered.")
+    }
+
+    /// A version the provider publishes but Vaelen has not recorded must be
+    /// advertised as unverified, never as installable.
+    func testAdvertisedButUnverifiedIsSeparateFromInstallable() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let feed = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.24-cli", "8.4.24-fpm"])
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { feed })
+        // Before any check, nothing is discovered.
+        XCTAssertEqual(location.discoveredManifests().map(\.phpVersion), [])
+        try location.checkCatalogNow()
+        XCTAssertTrue(try location.knownManifests().map(\.phpVersion).contains("8.4.24"))
+        // A version with no recorded digest is not installable.
+        let manifest = try XCTUnwrap(location.knownManifests().first { $0.phpVersion == "8.4.24" })
+        XCTAssertFalse(FilePHPManifestLocation.isProviderBackedManifest(manifest), "A version with no verified digest is not a pinned catalog entry.")
+    }
+
+    // MARK: - Persistence, cadence, failure and recovery
+
+    func testDiscoveryIsPersistedAcrossLocations() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let feed = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.24-cli", "8.4.24-fpm"])
+        let first = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { feed })
+        try first.checkCatalogNow()
+        // A new location sharing the state directory keeps the discovery, which is
+        // what makes it survive an app restart.
+        let second = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { feed })
+        XCTAssertEqual(second.discoveredManifests().map(\.phpVersion), ["8.4.24"])
+        XCTAssertEqual(second.catalogAvailability(), .current)
+    }
+
+    func testCheckIsThrottledToTwelveHoursAndForceBypassesIt() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let calls = Counter()
+        let feedProvider: @Sendable () throws -> Data = { calls.increment(); return Self.feed(published: ["8.4.23-cli", "8.4.23-fpm"]) }
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: feedProvider)
+        try location.checkCatalogNow()
+        XCTAssertEqual(calls.value, 1)
+        // Within the interval an automatic check does not re-request.
+        try location.refreshCatalogIfNeeded()
+        XCTAssertEqual(calls.value, 1, "Automatic checks are throttled to roughly twice daily.")
+        // A manual check always performs the request.
+        try location.checkCatalogNow()
+        XCTAssertEqual(calls.value, 2, "A manual check must actually check.")
+    }
+
+    func testOverdueCheckRunsAfterTwelveHours() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let calls = Counter()
+        let clock = ClockBox(Self.now)
+        let feedProvider: @Sendable () throws -> Data = { calls.increment(); return Self.feed(published: ["8.4.23-cli", "8.4.23-fpm"]) }
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { clock.now }, fetchFeed: feedProvider)
+        try location.checkCatalogNow()
+        clock.advance(13 * 60 * 60)
+        try location.refreshCatalogIfNeeded()
+        XCTAssertEqual(calls.value, 2, "An elapsed interval must make the next automatic check run.")
+    }
+
+    func testFailureKeepsLastUsableCatalogAndDowngradesAvailability() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let good = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.24-cli", "8.4.24-fpm"])
+        let failing = Toggle()
+        let clock = ClockBox(Self.now)
+        let provider: @Sendable () throws -> Data = { if failing.isOn { throw PHPModuleError.catalogUnavailable("The PHP provider feed could not be reached (network error -1009).") } ; return good }
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { clock.now }, fetchFeed: provider)
+        try location.checkCatalogNow()
+        XCTAssertEqual(location.catalogAvailability(), .current)
+        XCTAssertEqual(location.discoveredManifests().map(\.phpVersion), ["8.4.24"])
+
+        failing.set(true)
+        clock.advance(13 * 60 * 60)
+        XCTAssertThrowsError(try location.checkCatalogNow())
+        // Availability is retained, but no longer claimed as current.
+        XCTAssertEqual(location.discoveredManifests().map(\.phpVersion), ["8.4.24"], "A network failure must not erase what was last usable.")
+        XCTAssertEqual(location.catalogAvailability(), .cached)
+        XCTAssertNotNil(location.catalogCheckStatus().1)
+
+        // Recovery needs no restart.
+        failing.set(false)
+        clock.advance(13 * 60 * 60)
+        try location.checkCatalogNow()
+        XCTAssertEqual(location.catalogAvailability(), .current)
+        XCTAssertNil(location.catalogCheckStatus().1)
+    }
+
+    func testUnconfirmedAvailabilityBeforeAnySuccessfulCheck() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { Self.feed(published: ["8.4.23-cli", "8.4.23-fpm"]) })
+        XCTAssertEqual(location.catalogAvailability(), .unconfirmed)
+        XCTAssertNil(location.catalogCheckStatus().0)
+        let failing = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { throw PHPModuleError.catalogUnavailable("unreachable") })
+        XCTAssertThrowsError(try failing.checkCatalogNow())
+        XCTAssertEqual(failing.catalogAvailability(), .unconfirmed, "A failed first check leaves availability unconfirmed, not current.")
+    }
+
+    func testConcurrentChecksAreDeduplicated() async throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: "a", fpmSHA: "b")
+        let counter = Counter()
+        let gate = Gate()
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: {
+            counter.increment()
+            gate.waitUntilOpen()
+            return Self.feed(published: ["8.4.23-cli", "8.4.23-fpm"])
+        })
+        async let first: Void = try Task.detached { try location.checkCatalogNow() }.value
+        // Give the first check time to register as in flight.
+        while counter.value == 0 { await Task.yield() }
+        // A second manual check while the first is in flight is refused rather
+        // than starting a duplicate request.
+        do { try location.checkCatalogNow(); XCTFail("A concurrent forced check must not start a duplicate request.") }
+        catch { XCTAssertTrue("\(error)".contains("already in progress"), "Unexpected error: \(error)") }
+        gate.open()
+        try await first
+        XCTAssertEqual(counter.value, 1, "Concurrent checks must be deduplicated into a single provider request.")
+    }
+
+    // MARK: - Runtime catalog truthfulness
+
+    /// Failed discovery must not look like a confirmed empty catalog, and a
+    /// successful one must be reported as current.
+    func testRuntimeCatalogDistinguishesCurrentCachedAndUnconfirmed() throws {
+        let shipped = try manifestFixture(version: "8.4.23", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
+        let feed = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.24-cli", "8.4.24-fpm"])
+        let failing = Toggle()
+        let clock = ClockBox(Self.now)
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { clock.now }, fetchFeed: {
+            if failing.isOn { throw PHPModuleError.catalogUnavailable("unreachable") }
+            return feed
+        })
+        let module = PHPModule(layout: layout, location: location, includesBundledCatalog: false)
+
+        XCTAssertEqual(try module.runtimeCatalog().catalogAvailability, .unconfirmed)
+        try location.checkCatalogNow()
+        let current = try module.runtimeCatalog()
+        XCTAssertEqual(current.catalogAvailability, .current)
+        XCTAssertEqual(current.availableVersionsKnown, true)
+        // The discovered version is offered newest first.
+        XCTAssertEqual(current.availableVersions.first, "8.4.24")
+
+        failing.set(true)
+        clock.advance(13 * 60 * 60)
+        _ = try? location.checkCatalogNow()
+        let cached = try module.runtimeCatalog()
+        XCTAssertEqual(cached.catalogAvailability, .cached)
+        XCTAssertEqual(cached.availableVersions.first, "8.4.24", "Cached availability must be retained, not erased.")
+        XCTAssertNotNil(cached.catalogCheckError)
+    }
+
+    // MARK: - Bundled offline activation
+
+    /// First activation must work with no network at all.
+    func testBundledRuntimeInstallsWithoutAnyDownload() throws {
+        guard let bundled = try? PHPBundledRuntime.bundled() else {
+            throw XCTSkip("No bundled PHP runtime in this build.")
+        }
+        let module = PHPModule(layout: layout, location: StaticCatalogLocation(catalog: PHPManifestCatalog(manifests: [bundled.manifest])), includesBundledCatalog: false)
+        let package = try module.install(requestedVersion: bundled.phpVersion)
+        XCTAssertEqual(package.version, bundled.phpVersion)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: package.cliPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: package.fpmPath))
+        // It is a real runtime.
+        let executed = try module.exec(requestedVersion: bundled.phpVersion, workingDirectory: root.path, arguments: ["-r", "echo PHP_VERSION;"])
+        XCTAssertEqual(executed.output.trimmingCharacters(in: .whitespacesAndNewlines), bundled.phpVersion)
+        // Bundling alone must not start anything or set a default.
+        XCTAssertNil(module.defaultVersion())
+        XCTAssertEqual(try module.status(requestedVersion: bundled.phpVersion).state, PHPFPMState.stopped)
+        // Notices travel with the package.
+        let notices = package.packagePath + "/license"
+        XCTAssertTrue(FileManager.default.fileExists(atPath: notices + "/" + PHPPackageProvider.phpLicenseComponent + "_LICENSE.txt"), "PHP's own license must be retained with the installed package.")
+        // Settings are usable immediately, before any start.
+        let configuration = try module.configuration()
+        XCTAssertTrue(configuration.versions.contains { $0.version == bundled.phpVersion })
+    }
+
+    func testBundledRuntimeRejectsTamperedBinaries() throws {
+        guard let bundled = try? PHPBundledRuntime.bundled() else { throw XCTSkip("No bundled PHP runtime in this build.") }
+        XCTAssertEqual(bundled.verification.algorithm, "sha256")
+        for kind in ["cli", "fpm"] {
+            let binary = try XCTUnwrap(bundled.binaries[kind])
+            XCTAssertEqual(binary.sha256.count, 64)
+        }
+        XCTAssertFalse(bundled.licenseNotices().isEmpty, "The bundle must carry license notices.")
+        let phpLicense = bundled.licenseNotices().first { $0.name == "php-src_LICENSE.txt" }
+        XCTAssertNotNil(phpLicense, "The build tool's license does not cover PHP; PHP's own notice is required.")
+        XCTAssertTrue(phpLicense?.text.contains("PHP License") == true)
+    }
+
+    // MARK: - Progress measurement
+
+    /// Two archives must contribute to one monotonic total: the byte count and
+    /// percentage never reset when the second archive begins.
+    func testTwoArchiveProgressIsMonotonicAndDeterminate() throws {
+        let samples = ProgressSamples()
+        let tracker = PHPArtifactProgressTracker(artifactCount: 2) { bytes, total, name, index, count in
+            samples.append(bytes, total)
+        }
+        tracker.declareSize(index: 1, bytes: 1_000)
+        // One total is not yet an aggregate total.
+        XCTAssertNil(samples.snapshot().last?.1, "A partial total must not be presented as the aggregate total.")
+        tracker.declareSize(index: 2, bytes: 1_000)
+        // Both sizes are known before transfer, so the bar is determinate at once.
+        XCTAssertEqual(samples.snapshot().last?.1, 2_000)
+        XCTAssertEqual(samples.snapshot().last?.0, 0, "A determinate bar starts at zero, not at an invented fraction.")
+        tracker.update(name: "CLI", index: 1, bytes: 400, total: 1_000)
+        let first = try XCTUnwrap(samples.snapshot().last)
+        XCTAssertEqual(first.0, 400)
+        XCTAssertEqual(first.1, 2_000)
+        // The first archive completes; the second begins at its own zero. The
+        // aggregate must continue from where it was, not reset.
+        tracker.update(name: "CLI", index: 1, bytes: 1_000, total: 1_000)
+        tracker.update(name: "FPM", index: 2, bytes: 250, total: 1_000)
+        let second = try XCTUnwrap(samples.snapshot().last)
+        XCTAssertEqual(second.0, 1_250, "Aggregate transferred bytes must include the completed archive.")
+        XCTAssertEqual(second.1, 2_000)
+        // Monotonic across the whole run.
+        let reported = samples.snapshot().map(\.0)
+        XCTAssertEqual(reported, reported.sorted(), "Reported transfer must never move backwards.")
+        // A later, smaller report for the same archive cannot pull the total back.
+        tracker.update(name: "FPM", index: 2, bytes: 10, total: 1_000)
+        XCTAssertEqual(try XCTUnwrap(samples.snapshot().last?.0), 1_250, "A later smaller report must not pull the visible total backwards.")
+    }
+
+    /// When a total genuinely cannot be known, no percentage is invented.
+    func testUnknownTotalReportsNoPercentage() throws {
+        let samples = ProgressSamples()
+        let tracker = PHPArtifactProgressTracker(artifactCount: 2) { bytes, total, _, _, _ in samples.append(bytes, total) }
+        tracker.update(name: "CLI", index: 1, bytes: 400, total: nil)
+        let sample = try XCTUnwrap(samples.snapshot().last)
+        XCTAssertEqual(sample.0, 400)
+        XCTAssertNil(sample.1, "An unknown total must stay unknown rather than be invented.")
+    }
+
+    /// Mixed cache and download must be reflected honestly.
+    func testCachedArtifactIsReportedWhileTheOtherDownloads() throws {
+        let samples = ProgressSamples()
+        let tracker = PHPArtifactProgressTracker(artifactCount: 2) { bytes, total, _, _, _ in samples.append(bytes, total) }
+        tracker.declareSize(index: 1, bytes: 800)
+        tracker.declareSize(index: 2, bytes: 800)
+        // The CLI is reused from verified cache; it contributes its full size.
+        tracker.update(name: "CLI", index: 1, bytes: 800, total: 800)
+        tracker.update(name: "FPM", index: 2, bytes: 100, total: 800)
+        let sample = try XCTUnwrap(samples.snapshot().last)
+        XCTAssertEqual(sample.0, 900, "A cached archive still counts toward the aggregate.")
+        XCTAssertEqual(sample.1, 1_600)
+    }
+
+    // MARK: - Update source identity
+
+    /// An explicitly named runtime must be validated, never silently replaced by a
+    /// different one. Each rejection names the actual problem.
+    func testExplicitUpdateSourceIsValidatedRatherThanSubstituted() throws {
+        let cache = ProviderArtifactCache.shared
+        let older = try cache.manifest(version: "8.4.23")
+        let newer = try cache.manifest(version: "8.4.24")
+        let otherFamily = try cache.manifest(version: "8.3.33")
+        let location = PHPProviderManifestLocation(
+            box: .init(PHPManifestCatalog(manifests: [older, newer, otherFamily])),
+            stateDirectory: layout.stateDirectoryURL,
+            artifactBase: try cache.flatDirectory()
+        )
+        let module = PHPModule(layout: layout, location: location, includesBundledCatalog: false)
+        try seedInstalledPackage(module: module, manifest: older)
+        try seedInstalledPackage(module: module, manifest: newer)
+        try seedInstalledPackage(module: module, manifest: otherFamily)
+        let installedBefore = Set(module.installedVersions().map(\.version))
+
+        // Not installed at all.
+        assertInvalidSource(module, version: newer.phpVersion, source: "8.9.9", containing: "not installed", installedBefore: installedBefore)
+        // Wrong family.
+        assertInvalidSource(module, version: newer.phpVersion, source: otherFamily.phpVersion, containing: "not an earlier patch", installedBefore: installedBefore)
+        // The target itself: nothing to update.
+        assertInvalidSource(module, version: newer.phpVersion, source: newer.phpVersion, containing: "already the requested version", installedBefore: installedBefore)
+        // A newer patch is not an update source for an older target.
+        assertInvalidSource(module, version: older.phpVersion, source: newer.phpVersion, containing: "not older than", installedBefore: installedBefore)
+    }
+
+    private func assertInvalidSource(_ module: PHPModule, version: String, source: String, containing fragment: String, installedBefore: Set<String>, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try module.update(requestedVersion: version, sourceVersion: source), "an invalid source must never update another runtime", file: file, line: line) { error in
+            guard case PHPModuleError.invalidUpdateSource(let reason) = error else {
+                return XCTFail("Expected a specific invalid-source error, got \(error)", file: file, line: line)
+            }
+            XCTAssertTrue(reason.contains(fragment), "Unexpected reason: \(reason)", file: file, line: line)
+        }
+        // No runtime was replaced and nothing was installed on the way out.
+        XCTAssertEqual(Set(module.installedVersions().map(\.version)), installedBefore,
+                       "A rejected update source must not change any installed runtime.", file: file, line: line)
+    }
+
+    /// Place an already-installed package from the provider cache's real binaries,
+    /// so package validation succeeds exactly as it would in production.
+    private func seedInstalledPackage(module: PHPModule, manifest: PHPManifest) throws {
+        let staged = try ProviderArtifactCache.shared.stagedExecutables(version: manifest.phpVersion)
+        let directory = module.packageDirectoryURL(forTesting: manifest.phpVersion)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for name in ["php", "php-fpm"] {
+            let destination = directory.appendingPathComponent(name)
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.copyItem(at: staged.appendingPathComponent(name), to: destination)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
+        }
+        let digests = try ProviderArtifactCache.shared.artifacts(version: manifest.phpVersion)
+        let package = PHPPackage(version: manifest.phpVersion, architecture: "arm64", packagePath: directory.path,
+                                 cliPath: directory.appendingPathComponent("php").path,
+                                 fpmPath: directory.appendingPathComponent("php-fpm").path,
+                                 source: manifest.artifacts["cli"]!.url, cliSHA256: digests["cli"]!, fpmSHA256: digests["fpm"]!, installedAt: Date())
+        try JSONEncoder().encode(package).write(to: directory.appendingPathComponent(".vaelen-package.json"))
+    }
+
+    // MARK: - Progress handover
+
+    /// Announcing the second archive must not reset the aggregate measurement the
+    /// first archive already contributed.
+    func testAnnouncingTheNextArchivePreservesTheAggregateMeasurement() throws {
+        let samples = ProgressSamples()
+        let tracker = PHPArtifactProgressTracker(artifactCount: 2) { bytes, total, _, _, _ in samples.append(bytes, total) }
+        tracker.declareSize(index: 1, bytes: 1_000)
+        tracker.declareSize(index: 2, bytes: 1_000)
+        tracker.update(name: "CLI", index: 1, bytes: 1_000, total: 1_000)
+        let completed = try XCTUnwrap(samples.snapshot().last)
+        XCTAssertEqual(completed.0, 1_000)
+        // Starting the second archive must not publish a bare zero.
+        tracker.announce(name: "FPM", index: 2)
+        let announced = try XCTUnwrap(samples.snapshot().last)
+        XCTAssertEqual(announced.0, 1_000, "The first archive's completed bytes must survive the handover.")
+        XCTAssertEqual(announced.1, 2_000)
+        // The visible series is monotonic across the whole operation.
+        let reported = samples.snapshot().map(\.0)
+        XCTAssertEqual(reported, reported.sorted(), "A bare zero would make the visible transfer jump backwards.")
+    }
+
+    // MARK: - Discovered package reuse
+
+    /// A version a provider check discovered must install on first download, then
+    /// reuse its verified cache and re-verify against the recorded digest. The
+    /// recorded digest is a local integrity record, not provider authentication,
+    /// and is labelled as such.
+    func testDiscoveredVersionReusesItsRecordedDigestOnReinstall() throws {
+        let cache = ProviderArtifactCache.shared
+        let version = "8.4.24"
+        // Discovered, not review-pinned, and carrying no digest yet.
+        let manifest = try cache.manifest(version: version)
+        let discovered = manifest.replacingVersion(version, artifacts: [
+            "cli": PHPArtifact(file: manifest.artifacts["cli"]!.file, url: manifest.artifacts["cli"]!.url, sha256: ""),
+            "fpm": PHPArtifact(file: manifest.artifacts["fpm"]!.file, url: manifest.artifacts["fpm"]!.url, sha256: ""),
+        ], verification: PHPVerification(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity, digestPinnedByReview: false))
+        XCTAssertFalse(discovered.verification.isPinnedByReview)
+
+        let directory = URL(fileURLWithPath: "/private/var/tmp/vaelen-discovered-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let moduleLayout = VaelenFilesystemLayout(rootURL: directory.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: directory.appendingPathComponent("logs", isDirectory: true))
+        let module = PHPModule(layout: moduleLayout, location: PHPProviderManifestLocation(
+            box: .init(PHPManifestCatalog(manifests: [discovered])),
+            stateDirectory: moduleLayout.stateDirectoryURL,
+            artifactBase: try cache.flatDirectory()
+        ), includesBundledCatalog: false)
+
+        let installed = try module.install(requestedVersion: version)
+        // The digest of the bytes actually received is recorded, never invented.
+        XCTAssertEqual(installed.cliSHA256.count, 64)
+        XCTAssertEqual(installed.fpmSHA256.count, 64)
+        XCTAssertNotEqual(installed.cliSHA256, String(repeating: "0", count: 64))
+
+        // Removal then reinstall must verify the recorded digest rather than
+        // skipping verification, and must reuse the verified cache.
+        try module.remove(requestedVersion: version)
+        let reinstalled = try module.install(requestedVersion: version)
+        XCTAssertEqual(reinstalled.cliSHA256, installed.cliSHA256, "Reinstall must match the recorded integrity record.")
+        XCTAssertEqual(reinstalled.fpmSHA256, installed.fpmSHA256)
+    }
+
+    // MARK: - Support
+
+    static let now = Date(timeIntervalSince1970: 2_100_000_000)
+
+    private static func feed(published: [String]) -> Data {
+        let entries = published.map { ["is_dir": false, "name": "php-\($0)-macos-aarch64.tar.gz"] }
+        return (try? JSONSerialization.data(withJSONObject: entries)) ?? Data()
+    }
+
+    private func manifestFixture(version: String, cliSHA: String, fpmSHA: String) -> PHPManifest {
+        PHPManifest(
+            schemaVersion: 1, module: "php", phpVersion: version, platform: "macos", architecture: "arm64",
+            build: .init(requiredExtensions: ["pdo_mysql"], optionalExtensions: ["imagick"]),
+            artifacts: [
+                "cli": PHPArtifact(file: PHPPackageProvider.artifactFile(version: version, kind: "cli"), url: PHPPackageProvider.artifactURL(version: version, kind: "cli"), sha256: cliSHA),
+                "fpm": PHPArtifact(file: PHPPackageProvider.artifactFile(version: version, kind: "fpm"), url: PHPPackageProvider.artifactURL(version: version, kind: "fpm"), sha256: fpmSHA),
+            ],
+            verification: .init(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity, digestPinnedByReview: true),
+            release: .init(tag: PHPPackageProvider.channel, url: PHPPackageProvider.baseURL)
+        )
+    }
+}
+
+/// A catalog that never checks the provider, for tests that supply their own.
+struct StaticCatalogLocation: PHPManifestLocation {
+    let catalog: PHPManifestCatalog
+    func manifests() throws -> [PHPManifest] { catalog.manifests }
+    func manifest() throws -> PHPManifest {
+        guard let first = catalog.manifests.max(by: { (PHPVersion($0.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) < (PHPVersion($1.phpVersion) ?? .init(major: 0, minor: 0, patch: 0)) }) else {
+            throw PHPModuleError.manifestUnavailable
+        }
+        return first
+    }
+    func artifactBaseURL() -> URL? { nil }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
+private final class Toggle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+    init(_ value: Bool = false) { self.value = value }
+    var isOn: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ newValue: Bool) { lock.lock(); value = newValue; lock.unlock() }
+}
+
+/// Blocks a provider stub until the test releases it, so an in-flight check is
+/// observable deterministically.
+private final class Gate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isOpen = false
+    private let semaphore = DispatchSemaphore(value: 0)
+    func open() { lock.lock(); isOpen = true; lock.unlock(); semaphore.signal() }
+    func waitUntilOpen() { lock.lock(); let open = isOpen; lock.unlock(); if !open { semaphore.wait() } }
+}
+
+private final class ClockBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+    init(_ value: Date) { self.value = value }
+    var now: Date { lock.lock(); defer { lock.unlock() }; return value }
+    func advance(_ seconds: TimeInterval) { lock.lock(); value = value.addingTimeInterval(seconds); lock.unlock() }
+}
+
+private final class ProgressSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values = [(Int64, Int64?)]()
+    func append(_ bytes: Int64, _ total: Int64?) { lock.lock(); values.append((bytes, total)); lock.unlock() }
+    func snapshot() -> [(Int64, Int64?)] { lock.lock(); defer { lock.unlock() }; return values }
+}

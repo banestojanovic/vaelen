@@ -1,5 +1,10 @@
 # M2 Phase B Local Development
 
+> Superseded for PHP distribution. `Scripts/build-php.sh` and
+> `Scripts/configure-local-php-distribution.sh` were removed when Vaelen stopped
+> compiling PHP. PHP now comes from the provider catalog shipped inside the app;
+> see `Distribution/PHP/README.md`. This document is kept as the M2 record.
+
 Phase B consumes the Phase A bootstrap manifest through a manifest-location
 abstraction. The normal local bootstrap procedure is:
 

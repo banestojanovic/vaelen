@@ -22,14 +22,28 @@ private actor FixtureStandardPortsPrivileged: StandardPortsPrivileged {
         let preConf = try snapshot(paths.pfConfPath), preAnchor = try snapshot(paths.anchorPath)
         let wasActive = forwardingActive
         let pfConf = (try? String(contentsOfFile: paths.pfConfPath, encoding: .utf8)) ?? ""
-        let changed = !preAnchor.exists && !pfConf.contains(StandardPortsForwardingPolicy.anchorName)
-        if changed {
+        let hasAnyReference = pfConf.contains(StandardPortsForwardingPolicy.anchorName)
+        let exactExisting = preAnchor.exists && preAnchor.bytes == Data(StandardPortsForwardingPolicy.anchorRules().utf8) && StandardPortsForwardingPolicy.hasExactReference(in: pfConf, anchorPath: paths.anchorPath)
+        let absent = !preAnchor.exists && !hasAnyReference
+        // Mirrors the production helper: an anchor that is byte-exact Vaelen
+        // content with no pf.conf reference at all is repairable; anything else is
+        // refused.
+        let missingReferenceOnly = preAnchor.exists && preAnchor.bytes == Data(StandardPortsForwardingPolicy.anchorRules().utf8) && !hasAnyReference
+        guard exactExisting || absent || missingReferenceOnly else { throw StandardPortsError.ownershipMismatch }
+        var changedPFConf = false, changedAnchor = false
+        if absent {
             try StandardPortsForwardingPolicy.writeAnchor(to: paths.anchorPath)
             try StandardPortsForwardingPolicy.addingReference(to: pfConf, anchorPath: paths.anchorPath).write(toFile: paths.pfConfPath, atomically: true, encoding: .utf8)
-        } else if preAnchor.bytes != Data(StandardPortsForwardingPolicy.anchorRules().utf8) || !StandardPortsForwardingPolicy.pfConfReferenceLines(anchorPath: paths.anchorPath).allSatisfy(pfConf.contains) { throw StandardPortsError.externalConflict("incompatible fixture state") }
+            changedPFConf = true; changedAnchor = true
+        } else if missingReferenceOnly {
+            // Only the reference is restored. The anchor file is not rewritten, so
+            // removal has nothing to undo there.
+            try StandardPortsForwardingPolicy.addingReference(to: pfConf, anchorPath: paths.anchorPath).write(toFile: paths.pfConfPath, atomically: true, encoding: .utf8)
+            changedPFConf = true
+        }
         let token = pfEnabled ? nil : "fixture-token"
         pfEnabled = true; forwardingActive = true
-        return StandardPortsAcquisition(preimagePFConf: preConf, preimageAnchor: preAnchor, writtenPFConf: try snapshot(paths.pfConfPath), writtenAnchor: try snapshot(paths.anchorPath), changedPFConf: changed, changedAnchor: changed, forwardingWasActive: wasActive, pfToken: token)
+        return StandardPortsAcquisition(preimagePFConf: preConf, preimageAnchor: preAnchor, writtenPFConf: try snapshot(paths.pfConfPath), writtenAnchor: try snapshot(paths.anchorPath), changedPFConf: changedPFConf, changedAnchor: changedAnchor, forwardingWasActive: wasActive, pfToken: token)
     }
 
     func removeForwarding(acquisition: StandardPortsAcquisition) async throws {
@@ -443,11 +457,26 @@ final class StandardPortsCapabilityTests: XCTestCase {
         XCTAssertEqual(StandardPortsForwardingPolicy.addingReference(to: misplaced), integrated)
     }
 
-    func testPartialAnchorWithoutReferenceIsConflict() async throws {
+    /// Vaelen's own anchor with no pf.conf reference is *incomplete*, not a
+    /// foreign conflict. This is the exact condition that made the supported
+    /// `val ports install` command unable to repair a real machine. See
+    /// `StandardPortsRepairTests` for the repair path itself.
+    func testVaelenAnchorWithoutReferenceIsIncompleteAndRepairable() async throws {
         let fixture = try makeFixture(); defer { tearDown(fixture) }
         try StandardPortsForwardingPolicy.anchorRules().write(toFile: fixture.paths.anchorPath, atomically: true, encoding: .utf8)
         let observed = await makeCapability(fixture).status()
+        XCTAssertEqual(observed.state, .incomplete)
+        XCTAssertEqual(observed.repairAvailable, true)
+    }
+
+    /// A foreign anchor with no pf.conf reference stays a conflict.
+    func testForeignAnchorWithoutReferenceIsStillConflict() async throws {
+        let fixture = try makeFixture(); defer { tearDown(fixture) }
+        try "rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80 -> 127.0.0.1 port 9999\n"
+            .write(toFile: fixture.paths.anchorPath, atomically: true, encoding: .utf8)
+        let observed = await makeCapability(fixture).status()
         XCTAssertEqual(observed.state, .conflict)
+        XCTAssertNil(observed.repairAvailable)
     }
 
     func testHelperUnavailable() async throws {

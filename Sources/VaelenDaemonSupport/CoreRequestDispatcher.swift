@@ -261,10 +261,17 @@ public actor CoreRequestDispatcher {
                     return try await Task.detached { try module.install(requestedVersion: params.version) }.value
                 }; return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpUpdate:
-                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try await withPHPPackageOperation {
-                    _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value
-                    return try await Task.detached { try module.update(requestedVersion: params.version) }.value
-                }; return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
+                let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }()
+                // Install, settings carry-over, default handover, runtime start,
+                // and route convergence all happen off the dispatcher executor so
+                // status, progress, navigation and Quit stay responsive — but
+                // inside one package-operation reservation, so the operation
+                // stays observably pending through convergence and no other
+                // package work or shutdown can race unfinished work.
+                let result = try await withPHPPackageOperation {
+                    try await self.performPHPUpdate(module: module, params: params)
+                }
+                return (.init(id: request.id, result: .phpUpdateResult(result)), true)
             case .phpRemove:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }();
                 var dependencies = [String]()
@@ -451,6 +458,7 @@ public actor CoreRequestDispatcher {
             case .authorizationRequired(let detail): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports authorization failed: \(detail)")), true)
             case .externalConflict(let detail): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports conflict: \(detail)")), true)
             case .ownershipMismatch: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports ownership mismatch: external state changed.")), true)
+            case .incomplete(let detail): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports are incomplete and cannot be repaired automatically: \(detail)")), true)
             case .backendUnavailable: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Standard Ports require the backend router to be running.")), true)
             case .unavailable(let detail): return (.init(id: request.id, error: .init(code: .internalError, message: "Standard Ports are unavailable: \(detail)")), true)
             }
@@ -480,22 +488,56 @@ public actor CoreRequestDispatcher {
         try serviceIntents.set("php:\(version)", enabled: true)
         let reconcileStarted = ContinuousClock.now
         var failures = [String]()
-        let projects = try await registry.linkedProjects()
-        let overrides = try await registry.phpOverrides()
+        let converged = await reconcileInheritedPHPRoutes(failures: &failures)
+        _ = converged
+        let reconciliationFinished = ContinuousClock.now
+        lastPHPDefaultSwitchTimings = module.defaultSwitchTimings().merging(["apply_verify_ms": timingMilliseconds(reconcileStarted.duration(to: reconciliationFinished))]) { _, new in new }
+        logger.info("PHP default switch version=\(version, privacy: .public) routing-reconciliation_ms=\(self.timingMilliseconds(reconcileStarted.duration(to: reconciliationFinished)), privacy: .public) failures=\(failures.count, privacy: .public)")
+        let issues = await phpProjectIssues(from: failures)
+        return PHPDefaultSelectionResult(catalog: catalog, projectIssues: issues, routingIssues: failures.filter { $0.hasPrefix("Routing:") })
+    }
+
+    /// Projects whose FastCGI target inherits the PHP default, reported with the
+    /// convergence failures that concern them.
+    private func phpProjectIssues(from failures: [String]) async -> [PHPDefaultProjectIssue] {
+        let projects = (try? await registry.linkedProjects()) ?? []
+        return projects.compactMap { project in
+            let related = failures.filter { $0.hasPrefix("\(project.name):") }
+            guard !related.isEmpty else { return nil }
+            return PHPDefaultProjectIssue(projectName: project.name, message: related.joined(separator: "; "))
+        }
+    }
+
+    /// Converge inherited project routes after a PHP default change.
+    ///
+    /// Only projects that inherit the default are touched. Projects with an
+    /// explicit PHP pin are left resolving to the version their user chose.
+    private func reconcileInheritedPHPRoutes(failures: inout [String]) async -> Bool {
+        let reconcileStarted = ContinuousClock.now
+        let projects = (try? await registry.linkedProjects()) ?? []
+        let overrides = (try? await registry.phpOverrides()) ?? [:]
         let inheritedProjects = projects.filter { $0.id.map { overrides[$0] == nil } == true }
         let scanFinished = ContinuousClock.now
+        // A failure to observe the existing state must not be reported as a
+        // converged route set.
+        guard let observations = try? await collectProjectReportObservations() else {
+            failures.append("Routing: Vaelen could not observe current project routes; retry the update")
+            return false
+        }
         // A default change only converges inherited FastCGI targets. Running
         // full project activation repeatedly re-observed every service and
         // reloaded the entire Caddy configuration for each individual route.
         // Take one planning observation, preserve transition provenance, then
         // apply and verify the complete route set once.
-        let observations = try await collectProjectReportObservations()
         var changed = [(Project, RouteID)]()
         for project in inheritedProjects {
             guard let id = project.id else { continue }
-            let report = try await projectEnvironmentReport(for: project, observations: observations)
-            guard try await registry.phpOverride(for: id) == nil,
-                  try await registry.linkedProject(id: id) != nil else { continue }
+            guard let report = try? await projectEnvironmentReport(for: project, observations: observations) else {
+                failures.append("\(project.name): Vaelen could not observe this project's PHP route; retry the update")
+                continue
+            }
+            guard (try? await registry.phpOverride(for: id)) == nil,
+                  (try? await registry.linkedProject(id: id)) != nil else { continue }
             for target in report.routeTargets where target.disposition != .satisfied {
                 guard target.disposition == .actionable || target.disposition == .pending,
                       let socket = target.desiredSocket, let repository = routeRepository else {
@@ -516,9 +558,15 @@ public actor CoreRequestDispatcher {
             var routingFailed = false
             do { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
             catch { failures.append("Routing: \(error.localizedDescription)"); routingFailed = true }
-            let verifiedObservations = try await collectProjectReportObservations()
+            guard let verifiedObservations = try? await collectProjectReportObservations() else {
+                failures.append("Routing: Vaelen could not verify the applied routes; retry the update")
+                return false
+            }
             for project in inheritedProjects where !routingFailed && changed.contains(where: { $0.0.id == project.id }) {
-                let report = try await projectEnvironmentReport(for: project, observations: verifiedObservations)
+                guard let report = try? await projectEnvironmentReport(for: project, observations: verifiedObservations) else {
+                    failures.append("\(project.name): Vaelen could not verify this project's route after the update")
+                    continue
+                }
                 for (owner, routeID) in changed where owner.id == project.id {
                     if report.routeTargets.first(where: { $0.routeID == routeID })?.disposition != .satisfied {
                         failures.append("\(project.name): route \(routeID) is still pending; retry after resolving routing health")
@@ -526,13 +574,115 @@ public actor CoreRequestDispatcher {
                 }
             }
         }
-        let reconciliationFinished = ContinuousClock.now
-        lastPHPDefaultSwitchTimings = module.defaultSwitchTimings().merging(["project_scan_ms": timingMilliseconds(reconcileStarted.duration(to: scanFinished)), "planning_ms": timingMilliseconds(scanFinished.duration(to: planned)), "apply_verify_ms": timingMilliseconds(planned.duration(to: reconciliationFinished))]) { _, new in new }
-        logger.info("PHP default switch inherited-state version=\(version, privacy: .public) linked-project-scan_ms=\(self.timingMilliseconds(reconcileStarted.duration(to: scanFinished)), privacy: .public) routing-reconciliation_ms=\(self.timingMilliseconds(scanFinished.duration(to: reconciliationFinished)), privacy: .public) projects=\(inheritedProjects.count, privacy: .public) failures=\(failures.count, privacy: .public)")
-        let issues = inheritedProjects.filter { project in failures.contains(where: { $0.hasPrefix("\(project.name):") }) }.map { project in
-            PHPDefaultProjectIssue(projectName: project.name, message: failures.filter { $0.hasPrefix("\(project.name):") }.joined(separator: "; "))
+        let finished = ContinuousClock.now
+        let failureCount = failures.count
+        logger.info("PHP inherited-route convergence projects=\(inheritedProjects.count, privacy: .public) scan_ms=\(self.timingMilliseconds(reconcileStarted.duration(to: scanFinished)), privacy: .public) planning_ms=\(self.timingMilliseconds(scanFinished.duration(to: planned)), privacy: .public) apply_verify_ms=\(self.timingMilliseconds(planned.duration(to: finished)), privacy: .public) failures=\(failureCount, privacy: .public)")
+        return failures.isEmpty
+    }
+
+    /// Post-update convergence: persist the new start intent and converge
+    /// inherited routes, reporting partial success when a step fails after the
+    /// replacement is already installed.
+    /// The full update inside one reservation: package work with its operation
+    /// held open, then convergence, then a single terminal operation state.
+    private func performPHPUpdate(module: PHPModule, params: PHPVersionRequest) async throws -> PHPUpdateResult {
+        _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value
+        // Dependency pre-check before any mutation: an exact-version project pin
+        // or a persisted route that the update cannot move must refuse the update
+        // with specifics, never silently migrate pins or strand routes.
+        try await refusePinnedOrServingUpdateSource(module: module, params: params)
+        let outcome = try await Task.detached { try module.update(requestedVersion: params.version, sourceVersion: params.sourceVersion, holdOpenOnSuccess: true) }.value
+        // Convergence: persist the new start intent, converge inherited
+        // routes, and report partial success honestly.
+        let convergence = await convergeAfterPHPUpdate(outcome: outcome, module: module)
+        return PHPUpdateResult(outcome: outcome, convergence: convergence.converged, convergenceError: convergence.failure)
+    }
+
+    /// Refuse an update whose source is still required, before anything mutates.
+    ///
+    /// Exact-version pins are never migrated by an update: the user migrates
+    /// projects explicitly. Routes the update cannot move — orphaned intents, or
+    /// intents of pinned projects — must not be left dialling a removed runtime.
+    /// Associated routes of unpinned projects converge onto the replacement
+    /// during the update, so they are not blockers.
+    private func refusePinnedOrServingUpdateSource(module: PHPModule, params: PHPVersionRequest) async throws {
+        guard let source = try? module.updateSourceCandidate(target: params.version, sourceVersion: params.sourceVersion) else { return }
+        let overrides = (try? await registry.phpOverrides()) ?? [:]
+        if !overrides.isEmpty {
+            let projects = (try? await registry.linkedProjects()) ?? []
+            let pinned = overrides.compactMap { (id, version) -> String? in
+                guard version == source.version else { return nil }
+                return projects.first { $0.id == id }?.name ?? id.rawValue.uuidString
+            }.sorted()
+            if !pinned.isEmpty {
+                throw PHPModuleError.invalidUpdateSource("PHP \(source.version) cannot be updated because explicitly pinned projects still require it: \(pinned.joined(separator: ", ")). Change those projects to PHP \(params.version) or the default first, then update again.")
+            }
         }
-        return PHPDefaultSelectionResult(catalog: catalog, projectIssues: issues, routingIssues: failures.filter { $0.hasPrefix("Routing:") })
+        // Routes that would still dial the source after the update: orphaned
+        // intents no project owns, which convergence cannot move.
+        let sourceSocket = (try? module.status(requestedVersion: source.version))?.socket
+        if let sourceSocket {
+            let expected = URL(fileURLWithPath: sourceSocket).standardizedFileURL.path
+            let stranded = routeIntents.values.compactMap { intent -> String? in
+                guard case .fastCGI(let socket, _) = intent.route.target,
+                      URL(fileURLWithPath: socket).standardizedFileURL.path == expected,
+                      intent.projectID == nil
+                else { return nil }
+                return intent.route.hostname
+            }.sorted()
+            if !stranded.isEmpty {
+                throw PHPModuleError.invalidUpdateSource("PHP \(source.version) cannot be updated because routes with no owning project still dial it: \(stranded.joined(separator: ", ")). Associate or remove those routes first, then update again.")
+            }
+        }
+    }
+
+    private func convergeAfterPHPUpdate(outcome: PHPUpdateOutcome, module: PHPModule) async -> (converged: [String], failure: String?) {
+        // The package is installed; follow-up work now owns the operation until
+        // it is reported complete or partial.
+        module.beginPostInstallConvergence(targetVersion: outcome.version)
+        var converged: [String] = []
+        var failures: [String] = []
+        // The replacement inherits the replaced runtime's start intent only when
+        // that runtime was meant to be running.
+        if outcome.wasRunning || outcome.isRunning {
+            do { try serviceIntents.set("php:\(outcome.version)", enabled: true); converged.append("intents") }
+            catch { failures.append("start intent: \(error.localizedDescription)") }
+        }
+        // Convergence must be verified, not assumed. Ask for the inherited-route pass
+        // and only claim success when it reports no unresolved project.
+        if outcome.isDefault {
+            await reconcileInheritedPHPRoutes(failures: &failures)
+            if failures.isEmpty { converged.append("routes") }
+        }
+        var failure = failures.isEmpty ? nil : failures.joined(separator: "; ")
+        if failure != nil {
+            logger.warning("PHP \(outcome.version, privacy: .public) installed but convergence reported: \(failure!, privacy: .public)")
+        }
+        // Replacement cleanup runs only after verified convergence. The source
+        // stays installed while anything is incomplete; nothing is deleted
+        // prematurely and complete success is never reported when cleanup failed.
+        if failure == nil, let replaced = outcome.replacedVersion {
+            do {
+                // A pin created mid-update wins over cleanup: keep the runtime
+                // rather than strand the project that now requires it.
+                let pinnedNow = (try? await registry.phpOverrides())?.values.contains(replaced) ?? false
+                guard !pinnedNow else {
+                    throw PHPModuleError.invalidUpdateSource("PHP \(replaced) became pinned while updating; it was kept installed.")
+                }
+                try await Task.detached { try module.stop(requestedVersion: replaced) }.value
+                try await Task.detached { try module.removeReplacedRuntime(version: replaced) }.value
+                try serviceIntents.set("php:\(replaced)", enabled: false)
+                converged.append("cleanup")
+            } catch {
+                failures.append("cleanup: \(error.localizedDescription)")
+                failure = failures.joined(separator: "; ")
+                logger.warning("PHP \(outcome.version, privacy: .public) installed but cleanup reported: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        // One terminal operation state for the whole update: ready only when
+        // everything converged, otherwise the specific partial failure.
+        module.finishPostInstallConvergence(targetVersion: outcome.version, failure: failure)
+        return (converged, failure)
     }
 
     private func timingMilliseconds(_ duration: Duration) -> Double {
@@ -814,6 +964,14 @@ public actor CoreRequestDispatcher {
         let router = self.router, dns = self.dns, ports = self.ports
         let routes = routeIntents.values.map(\.route)
         restorationTask = Task.detached {
+            // An overdue PHP provider check runs once on startup so a machine
+            // that was asleep or off when the twelve-hour interval elapsed still
+            // discovers newly published patches. It never blocks the interface:
+            // every request is already serviceable from the last usable catalog,
+            // and a failure simply leaves availability as cached.
+            if let php {
+                try? await Task.detached { try php.refreshCatalogIfNeeded() }.value
+            }
             let enabled: Set<String>
             do { enabled = try intents.enabledServices() }
             catch { return }
@@ -838,6 +996,7 @@ public actor CoreRequestDispatcher {
                         case .authorizationRequired(let message): detail = "PF authorization failed: \(message)"
                         case .externalConflict(let message): detail = "External PF/port conflict: \(message)"
                         case .ownershipMismatch: detail = "PF ownership no longer matches Vaelen's saved record; external rules were left unchanged."
+                        case .incomplete(let message): detail = "Vaelen's PF integration is incomplete and cannot be repaired automatically: \(message)"
                         case .backendUnavailable: detail = "Caddy must be healthy before Standard Ports can be enabled."
                         case .unavailable(let message): detail = message
                         }
@@ -977,6 +1136,10 @@ public actor CoreRequestDispatcher {
             return .init(code: .invalidRequest, message: "PHP working directory is unavailable: \(path)")
         case .packageMissing(let version):
             return .init(code: .invalidRequest, message: "PHP \(version) is not an installed managed runtime.")
+        case .invalidUpdateSource(let reason):
+            // The user's selected runtime cannot serve as the update source. Say
+            // so precisely rather than substituting a different runtime.
+            return .init(code: .invalidRequest, message: "PHP update rejected: \(reason)")
         case .unsupportedVersion(let version):
             return .init(code: .invalidRequest, message: "PHP version \(version) is not supported.")
         case .operationInProgress(let version):

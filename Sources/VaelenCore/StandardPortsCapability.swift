@@ -13,6 +13,15 @@ public enum StandardPortsState: String, Codable, Sendable {
     case healthy
     case unhealthy
     case conflict
+    /// Vaelen's own PF anchor is present and byte-correct, but the
+    /// `/etc/pf.conf` reference that makes PF load it has gone missing.
+    ///
+    /// This is Vaelen's incomplete configuration, not a foreign claim: the
+    /// anchor content is exactly the fixed policy Vaelen writes and nothing in
+    /// `pf.conf` targets the anchor at all. Restoring the missing reference is a
+    /// narrow, supported repair. A modified anchor, or a `pf.conf` that contains
+    /// some *other* directive for this anchor, is never this state.
+    case incomplete
     case ownershipMismatch
     case unavailable
 }
@@ -36,13 +45,17 @@ public struct StandardPortsStatus: Codable, Equatable, Sendable {
     /// Whether the helper verified that the fixed forwarding rule is active.
     /// Nil means the helper could not provide an authoritative observation.
     public let forwardingActive: Bool?
+    /// Whether `install()` can repair this state. True only for a verified
+    /// `incomplete` configuration that Vaelen previously recorded in its own
+    /// ledger, so an unrepairable conflict never looks actionable.
+    public let repairAvailable: Bool?
     /// Ownership is reported by Core only when the active ledger and the
     /// currently observed fixed-policy integration agree. Nil is an
     /// unrecognized older Core response, never proof of ownership.
     public let ownership: StandardPortsOwnership?
 
-    public init(state: StandardPortsState, httpPort: Int = VaelenNetworkPorts.standardHTTP, httpsPort: Int = VaelenNetworkPorts.standardHTTPS, backendHTTPPort: Int = VaelenNetworkPorts.httpBackend, backendHTTPSPort: Int = VaelenNetworkPorts.httpsBackend, anchor: String = StandardPortsForwardingPolicy.anchorName, detail: String? = nil, conflict: String? = nil, ownership: StandardPortsOwnership? = nil, forwardingActive: Bool? = nil) {
-        self.state = state; self.httpPort = httpPort; self.httpsPort = httpsPort; self.backendHTTPPort = backendHTTPPort; self.backendHTTPSPort = backendHTTPSPort; self.anchor = anchor; self.detail = detail; self.conflict = conflict; self.ownership = ownership; self.forwardingActive = forwardingActive
+    public init(state: StandardPortsState, httpPort: Int = VaelenNetworkPorts.standardHTTP, httpsPort: Int = VaelenNetworkPorts.standardHTTPS, backendHTTPPort: Int = VaelenNetworkPorts.httpBackend, backendHTTPSPort: Int = VaelenNetworkPorts.httpsBackend, anchor: String = StandardPortsForwardingPolicy.anchorName, detail: String? = nil, conflict: String? = nil, ownership: StandardPortsOwnership? = nil, forwardingActive: Bool? = nil, repairAvailable: Bool? = nil) {
+        self.state = state; self.httpPort = httpPort; self.httpsPort = httpsPort; self.backendHTTPPort = backendHTTPPort; self.backendHTTPSPort = backendHTTPSPort; self.anchor = anchor; self.detail = detail; self.conflict = conflict; self.ownership = ownership; self.forwardingActive = forwardingActive; self.repairAvailable = repairAvailable
     }
 }
 
@@ -51,6 +64,9 @@ public enum StandardPortsError: Error, Equatable, Sendable {
     case authorizationRequired(String)
     case externalConflict(String)
     case ownershipMismatch
+    /// A verified incomplete Vaelen configuration that cannot be repaired.
+    /// Carries the reason rather than collapsing to a generic conflict.
+    case incomplete(String)
     case backendUnavailable
     case unavailable(String)
 }
@@ -74,6 +90,21 @@ public enum StandardPortsForwardingPolicy {
     /// This is the smallest integration that makes a non-Apple anchor evaluate.
     public static func pfConfReferenceLines(anchorPath: String = anchorPath) -> [String] {
         ["# Vaelen standard local ports (managed by Vaelen; do not edit)", "rdr-anchor \"\(anchorName)\"", "load anchor \"\(anchorName)\" from \"\(anchorPath)\""]
+    }
+
+    /// Whether `pf.conf` mentions this Vaelen anchor at all, in any form.
+    ///
+    /// Used to tell "Vaelen's reference was removed" (recoverable) apart from
+    /// "something else drives this anchor" (not recoverable).
+    public static func hasAnyReference(in content: String, anchorPath: String = anchorPath) -> Bool {
+        content.contains(anchorName) || content.contains(anchorPath)
+    }
+
+    /// Whether Vaelen's anchor file content on disk is exactly the fixed policy.
+    /// A match proves the file is Vaelen's own content rather than a foreign
+    /// claim that happens to use the same path.
+    public static func anchorIsVaelenOwned(_ content: String?, httpBackend: Int = VaelenNetworkPorts.httpBackend, httpsBackend: Int = VaelenNetworkPorts.httpsBackend) -> Bool {
+        content == anchorRules(httpBackend: httpBackend, httpsBackend: httpsBackend)
     }
 
     /// Strictly recognizes the fixed three-line integration block and rejects
@@ -260,6 +291,22 @@ public actor StandardPortsCapability {
             }
             return StandardPortsStatus(state: .absent, ownership: StandardPortsOwnership.none, forwardingActive: inspection.forwardingActive)
         }
+        // Vaelen's own anchor file survived, but nothing in pf.conf loads it any
+        // more. This is provably Vaelen's incomplete configuration rather than a
+        // foreign claim: the anchor bytes are exactly the fixed policy, and pf.conf
+        // contains no directive for the anchor at all. Restoring the reference is
+        // therefore a supported repair. A modified anchor, or a pf.conf carrying
+        // some other directive for this anchor, is still refused below.
+        let pfConfReferencesAnchor = pfConf.map { StandardPortsForwardingPolicy.hasAnyReference(in: $0, anchorPath: paths.anchorPath) } ?? false
+        if anchorMatches, !referencePresent, !pfConfReferencesAnchor {
+            return StandardPortsStatus(
+                state: .incomplete,
+                detail: "Vaelen's PF anchor is present and correct, but /etc/pf.conf no longer loads it. Vaelen can restore that reference.",
+                ownership: ownership,
+                forwardingActive: inspection.forwardingActive,
+                repairAvailable: true
+            )
+        }
         guard anchorMatches, referencePresent else {
             if active { return StandardPortsStatus(state: .ownershipMismatch, detail: "Vaelen PF integration is partially missing or was modified", ownership: .unknown, forwardingActive: inspection.forwardingActive) }
             return StandardPortsStatus(state: .conflict, conflict: "Partial foreign PF integration for Vaelen anchor", ownership: .external, forwardingActive: inspection.forwardingActive)
@@ -293,6 +340,14 @@ public actor StandardPortsCapability {
         case .conflict: throw StandardPortsError.externalConflict(current.conflict ?? "Standard ports conflict with external state")
         case .ownershipMismatch: throw StandardPortsError.ownershipMismatch
         case .unavailable: throw StandardPortsError.unavailable("Standard port observation is unavailable")
+        case .incomplete:
+            // A verified incomplete Vaelen configuration. The helper independently
+            // re-checks that the anchor is byte-identical and that pf.conf has no
+            // reference before it restores one, and refuses otherwise.
+            guard current.repairAvailable == true else {
+                throw StandardPortsError.externalConflict(current.detail ?? "Vaelen's PF integration is incomplete and cannot be repaired automatically")
+            }
+            break
         case .unhealthy:
             // With an exact compatible unowned pre-existing config, the helper
             // may take a session PF reference and verify/load that fixed policy.

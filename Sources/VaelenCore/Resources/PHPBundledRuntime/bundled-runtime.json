@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "module": "php-bundled-runtime",
+  "phpVersion": "8.5.9",
+  "verification": {
+    "algorithm": "sha256",
+    "authenticity": "static-php-cli-prepared-packages",
+    "digestPinnedByReview": true
+  },
+  "binaries": {
+    "cli": {
+      "file": "php",
+      "sha256": "3717aed27579a59e679c561b03487ca155b8cf6074305595e79d48d6134d21c2"
+    },
+    "fpm": {
+      "file": "php-fpm",
+      "sha256": "555b7926e3c2ed82520c4d9d6403bc0ee37adcf5fe90445220f09f8c1ae92cd3"
+    }
+  },
+  "notices": "license",
+  "manifest": {
+    "schemaVersion": 1,
+    "module": "php",
+    "phpVersion": "8.5.9",
+    "platform": "macos",
+    "architecture": "arm64",
+    "release": {
+      "tag": "bulk",
+      "url": "https://dl.static-php.dev/v3/php-bin/bulk"
+    },
+    "build": {
+      "mechanism": "static-php-cli-prepared-package",
+      "minimumMacOS": "12.0",
+      "requiredExtensions": [
+        "bcmath",
+        "ctype",
+        "curl",
+        "dom",
+        "fileinfo",
+        "filter",
+        "gd",
+        "iconv",
+        "intl",
+        "mbstring",
+        "mysqli",
+        "mysqlnd",
+        "openssl",
+        "pcntl",
+        "pdo",
+        "pdo_mysql",
+        "phar",
+        "session",
+        "simplexml",
+        "sodium",
+        "tokenizer",
+        "xml",
+        "xmlreader",
+        "xmlwriter",
+        "zip"
+      ],
+      "optionalExtensions": [
+        "imagick"
+      ]
+    },
+    "verification": {
+      "algorithm": "sha256",
+      "authenticity": "static-php-cli-prepared-packages",
+      "digestPinnedByReview": true
+    },
+    "verifiedArtifactSizes": {
+      "cli": 38165865,
+      "fpm": 38191049
+    },
+    "artifacts": {
+      "cli": {
+        "file": "php-8.5.9-cli-macos-aarch64.tar.gz",
+        "url": "https://dl.static-php.dev/v3/php-bin/bulk/php-8.5.9-cli-macos-aarch64.tar.gz",
+        "sha256": "2c6f470f93014dc5bd370756894a73fe753c8186d4ab967d866bed960bd7f59d"
+      },
+      "fpm": {
+        "file": "php-8.5.9-fpm-macos-aarch64.tar.gz",
+        "url": "https://dl.static-php.dev/v3/php-bin/bulk/php-8.5.9-fpm-macos-aarch64.tar.gz",
+        "sha256": "62952b24c875b705a31a09abf8a6ac2e8b3a32633abbe572c28bbbbc454183ec"
+      }
+    }
+  }
+}

@@ -2,6 +2,11 @@
 
 Status: **accepted for M2 development only**
 
+> Superseded for PHP distribution. Vaelen no longer compiles PHP: `Scripts/build-php.sh`,
+> the `build-php` workflow, and the release-publication scripts were removed. The
+> installed product takes PHP from the provider catalog it ships — see
+> `Distribution/PHP/README.md`. This document is kept as the M2 record.
+
 ## Provenance
 
 The M2 bootstrap PHP artifacts were produced by the Vaelen-controlled build

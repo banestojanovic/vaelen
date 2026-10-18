@@ -4,3 +4,7 @@
 DerivedData/
 *.xcuserstate
 xcuserdata/
+
+# Exact descriptor-pinned PHP resources, materialized before a build.
+/Sources/VaelenCore/Resources/PHPBundledRuntime/php
+/Sources/VaelenCore/Resources/PHPBundledRuntime/php-fpm

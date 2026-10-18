@@ -4,6 +4,20 @@ import CryptoKit
 
 private struct TestCatalogCheckState: Codable { let checkedAt: Date; let error: String? }
 
+private final class ProviderCheckStub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var feed: Data
+    private var failure: Error?
+    private var date: Date
+    init(feed: Data, date: Date) { self.feed = feed; self.date = date }
+    func setFeed(_ feed: Data) { lock.lock(); self.feed = feed; self.failure = nil; lock.unlock() }
+    func setFailure(_ error: Error) { lock.lock(); failure = error; lock.unlock() }
+    func advance(_ seconds: TimeInterval) { lock.lock(); date = date.addingTimeInterval(seconds); lock.unlock() }
+    var currentFeed: Data { lock.lock(); defer { lock.unlock() }; return feed }
+    var currentDate: Date { lock.lock(); defer { lock.unlock() }; return date }
+    var currentFailure: Error? { lock.lock(); defer { lock.unlock() }; return failure }
+}
+
 private final class ArtifactProgressSamples: @unchecked Sendable {
     private let lock = NSLock()
     private var values = [(Int64, Int64?)]()
@@ -135,13 +149,8 @@ final class PHPModuleTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-catalog-success-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        func releaseManifest(_ version: String) -> PHPManifest {
-            let root = "https://github.com/banestojanovic/vaelen/releases/download/php-v\(version)"
-            let artifacts = ["cli": PHPArtifact(file: "php-\(version)-cli-macos-arm64.tar.gz", url: "\(root)/php-\(version)-cli-macos-arm64.tar.gz", sha256: String(repeating: "a", count: 64)), "fpm": PHPArtifact(file: "php-\(version)-fpm-macos-arm64.tar.gz", url: "\(root)/php-\(version)-fpm-macos-arm64.tar.gz", sha256: String(repeating: "b", count: 64))]
-            return PHPManifest(schemaVersion: 1, module: "php", phpVersion: version, platform: "macos", architecture: "arm64", artifacts: artifacts, verification: .init(algorithm: "sha256", authenticity: "trusted-vaelen-release-manifest"), release: .init(tag: "php-v\(version)", url: root))
-        }
-        let current = releaseManifest("8.4.26")
-        let newer = releaseManifest("8.4.27")
+        let current = providerManifest(version: "8.4.26", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
+        let newer = providerManifest(version: "8.4.27", cliSHA: String(repeating: "c", count: 64), fpmSHA: String(repeating: "d", count: 64))
         let manifestURL = root.appendingPathComponent("manifest.json")
         try JSONEncoder().encode(current).write(to: manifestURL)
         let body = try JSONEncoder().encode(PHPManifestCatalog(manifests: [current, newer]))
@@ -221,10 +230,99 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertEqual(catalog.installedVersions.first { $0.version == "8.4.23" }?.series, "8.4")
     }
 
-    func testBundledCatalogDoesNotAdvertiseUnpublishedPlaceholderReleases() throws {
+    func testBundledCatalogAdvertisesOnlyVerifiedProviderPackages() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "php-catalog", withExtension: "json"))
         let bundled = try JSONDecoder().decode(PHPManifestCatalog.self, from: Data(contentsOf: url))
-        XCTAssertTrue(bundled.manifests.isEmpty, "Only trusted catalog entries whose immutable CLI/FPM assets have been verified are advertised.")
+        XCTAssertEqual(bundled.schemaVersion, 1)
+        XCTAssertEqual(bundled.module, "php")
+        XCTAssertFalse(bundled.manifests.isEmpty, "The signed app must ship the latest stable PHP so it is available with no distribution configuration.")
+        XCTAssertEqual(Set(bundled.manifests.map(\.phpVersion)).count, bundled.manifests.count, "A version must appear only once.")
+        for manifest in bundled.manifests {
+            XCTAssertTrue(FilePHPManifestLocation.isProviderBackedManifest(manifest), "\(manifest.phpVersion) is not a verified provider package with a pinned digest.")
+            XCTAssertFalse(manifest.build?.requiredExtensions.isEmpty ?? true, "\(manifest.phpVersion) must declare the extensions Vaelen validates after install.")
+        }
+        // The latest stable PHP must actually be included, not merely some entry.
+        let newest = try XCTUnwrap(bundled.manifests.compactMap({ PHPVersion($0.phpVersion) }).max())
+        XCTAssertNotNil(bundled.manifests.first { $0.phpVersion == newest.description })
+        XCTAssertTrue(newest.isStable)
+    }
+
+    func testBundledPHPModuleServesLatestStableWithoutDistributionConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-bundled-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let module = try XCTUnwrap(PHPModule.bundled(layout: .init(rootURL: root)), "The installed product must provide PHP from the shipped catalog.")
+        let catalog = try module.runtimeCatalog()
+        XCTAssertTrue(catalog.availableVersionsKnown)
+        XCTAssertNil(catalog.catalogCheckError)
+        let bundled = try JSONDecoder().decode(PHPManifestCatalog.self, from: Data(contentsOf: try XCTUnwrap(Bundle.module.url(forResource: "php-catalog", withExtension: "json"))))
+        let newest = try XCTUnwrap(bundled.manifests.compactMap({ PHPVersion($0.phpVersion) }).max())
+        // Versions are presented newest first.
+        // Every supported family is offered, newest patch first, with the legacy line
+        // clearly labelled rather than dropped.
+        XCTAssertEqual(catalog.availableVersions, ["8.5.9", "8.4.24", "8.3.33", "8.2.33"])
+        XCTAssertTrue(catalog.availableVersions.contains(newest.description))
+        // Nothing is installed yet, and that must be reported honestly.
+        XCTAssertEqual(catalog.installedVersions, [])
+        XCTAssertNil(catalog.defaultVersion)
+    }
+
+    func testBundledProviderCheckConfirmsPinnedPackagesAndSurvivesProviderFailure() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-provider-check-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalog = PHPManifestCatalog(manifests: [providerManifest(version: "8.5.8", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))])
+        let stub = ProviderCheckStub(feed: Self.feedJSON(published: ["8.5.8-cli", "8.5.8-fpm"]), date: Date(timeIntervalSince1970: 2_000_000_000))
+        let location = BundledPHPManifestLocation(catalog: catalog, stateDirectory: root, now: { stub.currentDate }, fetchFeed: {
+            if let failure = stub.currentFailure { throw failure }
+            return stub.currentFeed
+        })
+        try location.checkCatalogNow()
+        XCTAssertNotNil(location.catalogCheckStatus().0)
+        XCTAssertNil(location.catalogCheckStatus().1)
+
+        // A provider that no longer publishes a pinned package must surface a
+        // retryable cause instead of presenting the catalog as confirmed.
+        stub.setFeed(Self.feedJSON(published: ["8.4.23-cli", "8.4.23-fpm"]))
+        stub.advance(13 * 60 * 60)
+        XCTAssertThrowsError(try location.checkCatalogNow())
+        XCTAssertTrue(location.catalogCheckStatus().1?.contains("8.5.8") == true, "The cause must name the package the provider stopped publishing.")
+
+        // Recovery needs no restart: a restored provider clears the error.
+        stub.setFeed(Self.feedJSON(published: ["8.5.8-cli", "8.5.8-fpm"]))
+        stub.advance(13 * 60 * 60)
+        try location.checkCatalogNow()
+        XCTAssertNil(location.catalogCheckStatus().1)
+
+        // An unreachable provider is also recoverable and never looks current.
+        stub.setFailure(PHPModuleError.catalogUnavailable("The PHP provider feed could not be reached (network error -1009)."))
+        stub.advance(13 * 60 * 60)
+        XCTAssertThrowsError(try location.checkCatalogNow())
+        XCTAssertTrue(location.catalogCheckStatus().1?.contains("could not be reached") == true)
+    }
+
+    func testProviderFeedParsingRequiresBothSAPIsAndReportsNewestPerFamily() throws {
+        let published = try BundledPHPManifestLocation.publishedVersions(from: Self.feedJSON(published: ["8.5.8-cli", "8.5.8-fpm", "8.4.23-cli", "8.4.23-fpm", "8.4.24-cli"]))
+        XCTAssertEqual(published.allVersions, ["8.5.8", "8.4.23"], "A version without both a CLI and an FPM package is not offered.")
+        XCTAssertEqual(published.newestByFamily, ["8.5": "8.5.8", "8.4": "8.4.23"])
+        XCTAssertThrowsError(try BundledPHPManifestLocation.publishedVersions(from: Data("[]".utf8)))
+        XCTAssertThrowsError(try BundledPHPManifestLocation.publishedVersions(from: Data("not-json".utf8)))
+    }
+
+    private static func feedJSON(published: [String]) -> Data {
+        let entries = published.map { ["is_dir": false, "name": "php-\($0)-macos-aarch64.tar.gz"] }
+        return (try? JSONSerialization.data(withJSONObject: entries)) ?? Data()
+    }
+
+    private func providerManifest(version: String, cliSHA: String, fpmSHA: String) -> PHPManifest {
+        PHPManifest(
+            schemaVersion: 1, module: "php", phpVersion: version, platform: "macos", architecture: "arm64",
+            build: .init(requiredExtensions: ["pdo_mysql", "mbstring", "intl"], optionalExtensions: ["imagick"]),
+            artifacts: [
+                "cli": PHPArtifact(file: PHPPackageProvider.artifactFile(version: version, kind: "cli"), url: PHPPackageProvider.artifactURL(version: version, kind: "cli"), sha256: cliSHA),
+                "fpm": PHPArtifact(file: PHPPackageProvider.artifactFile(version: version, kind: "fpm"), url: PHPPackageProvider.artifactURL(version: version, kind: "fpm"), sha256: fpmSHA),
+            ],
+            verification: .init(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity),
+            release: .init(tag: PHPPackageProvider.channel, url: PHPPackageProvider.baseURL)
+        )
     }
 
     func testCatalogFixtureCanDescribeMultipleAvailableReleasesWithoutNetwork() throws {
