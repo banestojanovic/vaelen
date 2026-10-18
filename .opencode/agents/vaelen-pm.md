@@ -570,3 +570,21 @@ appears.
 Build the product.
 Keep it working.
 Move fast.
+## Development review and output preferences
+
+- Prioritize fixing product behavior and reducing measured latency, then deliver
+  the signed installed candidate for Bane's manual review. Tests and smoke do not
+  replace manual PHP switching/install/settings/removal acceptance.
+- Do not routinely create screenshots, videos, or appearance/state matrices.
+  Capture only to answer a specific unresolved development question, briefly
+  state the purpose, and collect the minimum. Smoke captures are opt-in through
+  `VAELEN_SMOKE_CAPTURE=1`; retain functional checks and record visual skips.
+- Reuse a stable incremental build directory per worktree/configuration. The
+  signed updater uses `.build/product-dev-release`; keep small per-run logs and
+  source/build identity records and verify signing and installed content.
+- Do not restart completed builds or suites without a relevant change/failure.
+  Use focused regressions and one final signed update plus smoke.
+- After successful validation, remove only identified disposable task outputs:
+  redundant derived trees, temporary fixtures, duplicate app copies and needless
+  captures. Retain a verified rollback app and necessary recovery records. Never
+  remove live data, user artifacts, stashes, or unrelated work for cleanup.
