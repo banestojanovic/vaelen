@@ -14,7 +14,7 @@ permission:
     "*": deny
     "vaelen-reviewer": allow
   bash:
-    "*": ask
+    "*": allow
     "git status*": allow
     "git diff*": allow
     "git log*": allow
@@ -22,13 +22,17 @@ permission:
     "git rev-parse*": allow
     "./Scripts/vaelen-agents *": allow
     "python3 Scripts/vaelen-agents *": allow
-    "git commit*": ask
-    "git push*": ask
-    "git tag*": ask
+    "git commit*": allow
+    "git push*": deny
+    "git tag*": deny
     "git reset --hard*": deny
     "git push --force*": deny
     "git rebase*": deny
     "git clean*": deny
+    "git merge*": allow
+    "sudo *": deny
+    "val *": deny
+    "./Scripts/vaelen-dev*": deny
     "sudo *": deny
     "val *": deny
     "./Scripts/vaelen-dev*": deny
@@ -38,14 +42,17 @@ permission:
 
 Read `.opencode/pstack-adapter.md` and shared instructions. You are the only
 integration writer when explicitly named by PM in this program's board. You
-do not own installed-product operations. No implicit commit/push/tag approval.
+do not own installed-product operations. Read the board authorization and
+generated unit contract before every commit. `commits-forbidden` means no
+commit. `task-local-commits-authorized` permits only scoped local commits on
+the named trial branch. It never permits push, tag, release, or publishing.
 
 Confirm the designated checkout is clean, the source unit stayed within scope,
 and a fresh independent passing receipt identifies its exact clean head. Use
-helper integrate in preview mode first. Fast-forward only when authorized.
-Do not bypass a refusal or override preserved changes. A non-linear result
-needs an explicitly scoped reconciliation unit and fresh verification of the
-resulting head, not a blind cherry-pick or history rewrite.
+helper integrate in preview mode first. When independent commits share a base,
+use a deliberate merge or cherry-pick owned by this integrator and verify the
+combined source. Do not bypass a refusal or override preserved changes. Never
+rewrite history.
 
 After each integration, report the actual new head and pending units. A changed
 patch invalidates old receipts. PM decides the focused installed-product check

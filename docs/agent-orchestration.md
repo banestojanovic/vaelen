@@ -61,7 +61,7 @@ until its committed base, write scope, acceptance, and focused verification
 recipe are known. A pilot validates the complete path before fan-out.
 
 ```sh
-./Scripts/vaelen-agents --program php-polish init --integration-owner vaelen-integrator --window 3
+./Scripts/vaelen-agents --program php-polish init --integration-owner vaelen-integrator --authorization commits-forbidden --window 3
 ```
 
 The coordinator writes a brief under
@@ -83,7 +83,7 @@ STANDING: Current user preferences and preservation/runtime-slot rules.
 ./Scripts/vaelen-agents --program php-polish create progress-copy --scope App/Vaelen/Vaelen/VaelenApp.swift --brief .build/agent-orchestration/php-polish/progress-copy.md
 ./Scripts/vaelen-agents --program php-polish launch progress-copy
 ./Scripts/vaelen-agents --program php-polish launch progress-copy --execute
-./Scripts/vaelen-agents --program php-polish collect
+./Scripts/vaelen-agents --program php-polish wait
 ./Scripts/vaelen-agents --program php-polish status
 ./Scripts/vaelen-agents --program php-polish status --human
 ```
@@ -112,10 +112,14 @@ The helper observes a bounded concurrent window and timebox. Output goes to
 one per-run log and completion receipt. An expired run is terminated only
 through the process group this runner created. No unknown sessions are killed.
 
-`collect` reads receipts without waking agents. Exit zero means needs-review,
-never verified. A failure gets a fresh scoped fix brief; three run attempts
-require re-scoping rather than an infinite retry loop. Refill the rolling
-window as units finish; do not wait for the slowest whole batch.
+`wait` is a foreground bounded collection operation. It waits for the next
+receipt, reconciles the board, and returns control to the initiating coordinator
+turn. A coordinator must use it rather than end its turn after dispatch.
+`collect` is nonblocking. Process return means needs-review, never verified.
+Worker and reviewer retries are counted separately and prior runs remain in the
+ledger. Refill ready work as each unit completes; do not wait for the slowest
+whole batch. Status also reconciles receipts so it cannot leave a completed run
+marked running.
 
 Read-only native `subagent` delegation is supported for investigation/review. Writers
 must use separate sessions because the native `subagent` tool has no cwd/worktree
@@ -131,10 +135,12 @@ Have a fresh `vaelen-reviewer` inspect the actual unit. For isolated tests:
 ./Scripts/vaelen-agents --program php-polish collect
 ```
 
-Review can begin before commit, but a passing immutable receipt requires an
-explicitly authorized snapshot commit and clean worktree. Neither helper nor
-worker silently commits. Put the reviewer's exact SHA and actual checks in a
-report, then record it using the real SHA, not the placeholder below:
+The board's explicit authorization is copied into each brief and role prompt.
+Under `commits-forbidden`, no worker commits. Under
+`task-local-commits-authorized`, scoped task-local commits are permitted. A
+passing immutable receipt still requires a clean worktree and exact SHA. Put the
+reviewer's actual source SHA and checks in a report, then record it using the
+real SHA, not the placeholder below:
 
 ```sh
 ./Scripts/vaelen-agents --program php-polish record progress-copy --head EXACT_SHA --reviewer REVIEW_SESSION_ID --report /absolute/path/review.md --check 'actual focused command and outcome' --verdict unit-test-verified
@@ -142,11 +148,11 @@ report, then record it using the real SHA, not the placeholder below:
 ```
 
 Only the named integration session uses `integrate ... --execute`, with the
-necessary authorization. The helper requires clean source/target, a current
-passing exact-SHA receipt, owned paths, and fast-forward ancestry. No automatic
-merge commits, cherry-picks, rebases, force-pushes, PR publishing, or tagging.
-A non-linear integration needs a scoped reconciliation unit and fresh checks
-on its resulting SHA. Type-check-only/blocked/failed receipts cannot land.
+board authorization. Clean independent commits can be integrated with an
+explicit non-fast-forward merge, avoiding a fast-forward-only dead end. The
+result remains `integrated-needs-check` until `accept-integration` records focused
+checks and an exact combined SHA. Conflicts remain the integrator's explicit
+decision. Push, tag, release, and publication are never authorized here.
 
 Delegate this to a separate native session from the designated integration
 checkout, rather than editing as coordinator:

@@ -52,21 +52,28 @@ initialize a durable board through Scripts/vaelen-agents and write standing
 orders and complete briefs in its ignored state directory. Execute one pilot
 unit before fan-out. Delegate every implementation unit using create/launch in
 a separate worktree; native subagent calls are read-only investigations/reviews.
-Launch defaults to a preview; --execute intentionally starts model work. Do not
-pass --auto, --yolo, or an invented worktree argument to OpenCode2.
+Launch defaults to a preview; --execute intentionally starts model work. The
+board requires an explicit commit authorization value, which is copied into
+every generated brief and launch prompt. Do not pass --auto, --yolo, or an
+invented worktree argument to OpenCode2.
 
-Maintain a rolling bounded queue. Inspect collect/status without waking idle
-agents; refill as independent units finish. Relay dependencies and corrective
-instructions in new complete briefs. Prefer fresh sessions over long resume
-chains. Do not exceed the configured concurrent window. Give each worker a
-timebox. Stop refilling if a shared premise or environment is broken; diagnose
-it instead of repeatedly spending tokens on the same failure.
+Maintain a rolling bounded queue. After dispatch, stay in this coordinator turn
+and call `Scripts/vaelen-agents wait` to block for and collect the next receipt.
+That foreground wait returns control to this conversation on completion; do not
+end the turn after launch. Reconcile receipts and refill ready independent work
+before waiting for slower peers. Relay dependencies and corrective instructions
+in new complete briefs. Prefer fresh sessions over long resume chains. Do not
+exceed the configured concurrent window. Give each worker a timebox. Stop
+refilling if a shared premise or environment is broken; diagnose it instead of
+repeatedly spending tokens on the same failure.
 
 Review every diff for scope. Request a fresh independent reviewer; implementer
 self-report is not verification. Record checks and exact clean SHA. No passing
 receipt for dirty state or type-check-only behavioral work. Preserve failed and
 blocked findings; do not relabel them as passes. Delegate integration to the
-named integrator after approval; never impersonate it via helper --owner.
+named integrator under the board authorization; never impersonate it via helper
+--owner. Same-base commits use an explicit non-fast-forward merge and remain
+`integrated-needs-check` until focused checks verify the combined exact head.
 
 For small tasks, use one owner plus independent review rather than artificial
 fan-out. For large tasks, use sub-coordinators only when a real track needs
@@ -92,5 +99,9 @@ Operational lessons from the completed OpenCode2 pilot:
 - Use the actual installed OpenCode tool schema; do not invent tool names or
   arguments. Process exit 0 means only that it returned, not that implementation
   succeeded or was accepted.
-- Report background permission failures honestly. Never add blanket auto-approval
-  or treat a denied operation as completed.
+- Routine scoped development commands are allowed by the worker role. Protected
+  live operations, publishing, and destructive commands remain denied. A denial
+  is local to that operation and does not cancel unrelated authorized work.
+- A process return is not test success, a review verdict, or accepted work.
+  Receipts, source checks, reviewer acceptance, and combined integration checks
+  are separate transitions in the helper.

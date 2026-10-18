@@ -12,7 +12,7 @@ permission:
   external_directory: ask
   task: deny
   bash:
-    "*": deny
+    "*": allow
     "pwd": allow
     "git status*": allow
     "git diff*": allow
@@ -21,8 +21,19 @@ permission:
     "git rev-parse*": allow
     "git ls-files*": allow
     "python3 Tests/AgentOrchestrationTests.py": allow
-    "swift test --filter *": ask
-    "swift test --package-path * --filter *": ask
+    "swift test --filter *": allow
+    "swift test --package-path * --filter *": allow
+    "git commit*": deny
+    "git push*": deny
+    "git tag*": deny
+    "git reset*": deny
+    "git rebase*": deny
+    "git clean*": deny
+    "sudo *": deny
+    "val *": deny
+    "./Scripts/vaelen-dev*": deny
+    "launchctl *": deny
+    "pfctl *": deny
   webfetch: allow
   websearch: allow
   lsp: allow

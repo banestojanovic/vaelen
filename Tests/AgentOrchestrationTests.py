@@ -30,7 +30,7 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "fixture baseline")
         self.base = self.git("rev-parse", "HEAD")
-        self.call("init", "--integration-owner", "fixture-integrator", "--window", "1")
+        self.call("init", "--integration-owner", "fixture-integrator", "--authorization", "commits-forbidden", "--window", "1")
         self.brief = Path(self.temp.name) / "brief.md"
         self.brief.write_text("\n".join(section + " fixture requirement" for section in SECTIONS))
 
@@ -79,6 +79,24 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.call("create", "unit", "--scope", "feature.txt", "--brief", str(self.brief), ok=False)
         self.assertEqual(self.git("branch", "--list", "codex/orch-*"), "")
 
+    def test_launch_restores_assignment_and_authorization_after_brief_rewrite(self):
+        unit = self.create()
+        brief = Path(unit["brief"])
+        brief.write_text("rewritten body with required sections\n" + "\n".join(SECTIONS))
+        binary_dir = self.root / ".build/fake-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        self.call("launch", "unit", env=env)
+        rewritten = brief.read_text()
+        self.assertIn("Owned paths: feature.txt", rewritten)
+        self.assertIn("Commit authorization: commits-forbidden", rewritten)
+        self.assertIn("Respect owned paths", rewritten)
+        preview = json.loads(self.call("launch", "unit", env=env).stdout)
+        self.assertIn("Do not commit", preview["argv"][-1])
+
     def test_glob_scopes_are_rejected_before_creating_worktrees(self):
         for index, scope in enumerate(("Sources/*", "Sources/?.swift", "Sources/[AB].swift", "Sources/]name")):
             with self.subTest(scope=scope):
@@ -112,8 +130,14 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.call("integrate", "unit", "--owner", "wrong-owner", "--execute", ok=False)
         self.call("integrate", "unit", "--owner", "fixture-integrator")
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
-        self.call("integrate", "unit", "--owner", "fixture-integrator", "--execute")
-        self.assertEqual(self.git("rev-parse", "HEAD"), sha)
+        merged = self.call("integrate", "unit", "--owner", "fixture-integrator", "--execute")
+        integrated = json.loads(merged.stdout)
+        combined_head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(combined_head, sha)
+        self.assertEqual(integrated["state"], "integrated-needs-check")
+        report = Path(self.temp.name) / "combined.md"
+        report.write_text("Focused combined source check\nHead: " + combined_head + "\n")
+        self.call("accept-integration", "--head", combined_head, "--report", str(report), "--check", "combined-fixture")
         self.assertEqual(json.loads(self.call("status").stdout)["units"][0]["state"], "integrated")
 
     def test_new_head_invalidates_prior_verdict(self):
@@ -124,6 +148,9 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.git("add", "feature.txt", root=unit["worktree"])
         self.git("commit", "-qm", "second fixture change", root=unit["worktree"])
         self.call("integrate", "unit", "--owner", "fixture-integrator", "--execute", ok=False)
+        status = json.loads(self.call("status").stdout)
+        self.assertEqual(status["units"][0]["state"], "needs-review")
+        self.assertEqual(len(json.loads((self.root / ".build/agent-orchestration/fixture/board.json").read_text())["units"]["unit"]["ledger"]), 1)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
 
     def test_type_check_only_and_dirty_target_cannot_land(self):
@@ -145,7 +172,7 @@ class AgentOrchestrationTests(unittest.TestCase):
         binary_dir.mkdir(parents=True)
         marker = self.root / ".build/fake-cli-called"
         fake = binary_dir / "opencode2"
-        fake.write_text("#!/bin/sh\nprintf 'fixture native run\\n'\ntouch '" + str(marker) + "'\n")
+        fake.write_text("#!/bin/sh\nprintf 'fixture native run\\n'\nprintf 'accepted fixture\\n' > feature.txt\ntouch '" + str(marker) + "'\n")
         fake.chmod(0o755)
         env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
         preview = json.loads(self.call("launch", "unit", env=env).stdout)
@@ -155,6 +182,7 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertNotIn("--auto", preview["argv"])
         self.assertEqual(preview["argv"][1:3], ["run", "--standalone"])
         launch = json.loads(self.call("launch", "unit", "--execute", env=env).stdout)
+        self.call("launch", "unit", "--execute", env=env, ok=False)
         for _ in range(100):
             if Path(launch["receipt"]).exists():
                 break
@@ -163,7 +191,51 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertTrue(marker.exists())
         collected = json.loads(self.call("collect").stdout)
         self.assertEqual(collected["units"][0]["state"], "needs-review")
+        self.assertEqual(collected["completions"][0]["role"], "worker")
+        self.assertEqual(collected["completions"][0]["result"]["exit_code"], 0)
         self.call("integrate", "unit", "--owner", "fixture-integrator", "--execute", ok=False)
+
+    def test_receipt_reconciles_running_board_and_role_retries_are_independent(self):
+        unit = self.create()
+        board_path = self.root / ".build/agent-orchestration/fixture/board.json"
+        board = json.loads(board_path.read_text())
+        board["units"]["unit"]["state"] = "running"
+        board["units"]["unit"]["runs"] = [{"role": "worker", "receipt": str(Path(self.temp.name) / "already.json")}]
+        receipt = Path(self.temp.name) / "already.json"
+        receipt.write_text(json.dumps({"status": "returned", "exit_code": 0, "finished": "now"}))
+        board_path.write_text(json.dumps(board))
+        status = json.loads(self.call("status").stdout)
+        self.assertEqual(status["units"][0]["state"], "failed")
+        self.assertTrue(json.loads(board_path.read_text())["units"]["unit"]["replan_required"])
+        self.call("launch", "unit", ok=False)
+        board = json.loads(board_path.read_text())
+        board["units"]["unit"]["state"] = "planned"
+        board["units"]["unit"].pop("replan_required", None)
+        board["units"]["unit"]["attempts"] = {"worker": 3, "reviewer": 0}
+        board_path.write_text(json.dumps(board))
+        binary_dir = self.root / ".build/fake-bin"
+        binary_dir.mkdir(parents=True)
+        (binary_dir / "opencode2").write_text("#!/bin/sh\nexit 0\n")
+        (binary_dir / "opencode2").chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        reviewer = self.call("launch", "unit", "--role", "reviewer", "--execute", env=env)
+        self.assertEqual(json.loads(reviewer.stdout)["unit"], "unit")
+        board = json.loads(board_path.read_text())
+        self.assertEqual(board["units"]["unit"]["attempts"], {"worker": 3, "reviewer": 1})
+
+    def test_timeout_kills_only_owned_process_group_and_preserves_return_fact(self):
+        sleeper = Path(self.temp.name) / "sleep.sh"
+        sleeper.write_text("#!/bin/sh\nsleep 30\n")
+        sleeper.chmod(0o755)
+        spec = Path(self.temp.name) / "timeout.spec.json"
+        receipt = Path(self.temp.name) / "timeout.json"
+        log = Path(self.temp.name) / "timeout.log"
+        spec.write_text(json.dumps({"argv": [str(sleeper)], "cwd": str(self.root), "timeout": 1,
+                                   "receipt": str(receipt), "log": str(log)}))
+        subprocess.run(["python3", str(HELPER), "_run", str(spec)], check=True, timeout=8)
+        result = json.loads(receipt.read_text())
+        self.assertEqual(result["exit_code"], 124)
+        self.assertEqual(result["status"], "failed")
 
     def test_abandon_preserves_work_and_handoff(self):
         unit = self.create()
@@ -180,7 +252,7 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertIn("Concurrency window: 1", empty)
         self.assertIn("no units yet", empty)
         unit = self.create()
-        expected = {"program", "integration_owner", "window", "units"}
+        expected = {"program", "integration_owner", "authorization", "window", "units"}
         default = json.loads(self.call("status").stdout)
         self.assertEqual(set(default), expected)
         self.assertEqual(set(default["units"][0]), {"id", "state", "branch", "head", "worktree"})
