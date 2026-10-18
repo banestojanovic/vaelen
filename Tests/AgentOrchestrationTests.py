@@ -237,6 +237,36 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 124)
         self.assertEqual(result["status"], "failed")
 
+    def test_wait_collects_reviews_and_refills_ready_unit_before_slow_peer(self):
+        board_path = self.root / ".build/agent-orchestration/fixture/board.json"
+        board = json.loads(board_path.read_text())
+        board["window"] = 3
+        board_path.write_text(json.dumps(board))
+        for name in ("pilot-alpha", "pilot-beta", "pilot-gamma"):
+            brief = Path(self.temp.name) / (name + ".md")
+            brief.write_text("\n".join(section + " fixture" for section in SECTIONS))
+            self.call("create", name, "--scope", name + ".txt", "--brief", str(brief))
+        binary_dir = self.root / ".build/scheduler-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\ncase \"$PWD\" in *pilot-beta) sleep 2;; esac\ncase \"$*\" in *vaelen-worker*) file=\"$PWD/$(basename \"$PWD\").txt\"; printf 'artifact\\n' > \"$file\"; git add \"$file\"; git commit -m 'fixture scoped artifact' -q;; esac\nexit 0\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        self.call("launch", "pilot-alpha", "--execute", env=env)
+        self.call("launch", "pilot-beta", "--execute", env=env)
+        result = json.loads(self.call("wait", "--timeout", "30", "--schedule", "--run-timeout", "30", env=env).stdout)
+        self.assertTrue(result["completions"])
+        scheduled = {(item["unit"], item["role"]) for item in result["scheduled"]}
+        self.assertIn((result["completions"][0]["unit"], "reviewer"), scheduled)
+        self.assertIn(("pilot-gamma", "worker"), scheduled)
+        board = json.loads(board_path.read_text())
+        self.assertEqual(board["units"]["pilot-beta"]["state"], "running")
+        self.assertEqual(board["units"]["pilot-gamma"]["state"], "running")
+        self.call("wait", "--timeout", "15")
+        for name in ("pilot-alpha", "pilot-beta", "pilot-gamma"):
+            worktree = board["units"][name]["worktree"]
+            self.git("worktree", "remove", "--force", worktree)
+
     def test_abandon_preserves_work_and_handoff(self):
         unit = self.create()
         self.call("abandon", "unit", "--reason", "fixture concluded")

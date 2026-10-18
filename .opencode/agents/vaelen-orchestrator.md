@@ -58,12 +58,12 @@ every generated brief and launch prompt. Do not pass --auto, --yolo, or an
 invented worktree argument to OpenCode2.
 
 Maintain a rolling bounded queue. After dispatch, stay in this coordinator turn
-and call `Scripts/vaelen-agents wait` to block for and collect the next receipt.
-That foreground wait returns control to this conversation on completion; do not
-end the turn after launch. Reconcile receipts and refill ready independent work
-before waiting for slower peers. Relay dependencies and corrective instructions
-in new complete briefs. Prefer fresh sessions over long resume chains. Do not
-exceed the configured concurrent window. Give each worker a timebox. Stop
+and call `Scripts/vaelen-agents wait --schedule` to block for and collect the
+next receipt. That foreground wait returns control to this conversation on
+completion; do not end the turn after launch. The helper starts the completed
+unit's reviewer and refills independent planned work within the configured
+window before returning. Relay dependency results in new complete briefs.
+Prefer fresh sessions over long resume chains. Give each worker a timebox. Stop
 refilling if a shared premise or environment is broken; diagnose it instead of
 repeatedly spending tokens on the same failure.
 

@@ -5,6 +5,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -294,15 +295,37 @@ def collect(board):
     return collected
 
 
-def wait_for_completion(board, timeout):
+def wait_for_completion(root, directory, board, timeout, schedule):
     import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         completed = collect(board)
         if completed:
-            return completed
+            launched = []
+            if schedule:
+                from types import SimpleNamespace
+                for item in completed:
+                    unit = board["units"][item["unit"]]
+                    if item["role"] == "worker" and unit["state"] == "needs-review":
+                        try:
+                            clean(unit["worktree"])
+                            with contextlib.redirect_stdout(io.StringIO()) as output:
+                                launch(root, directory, board, SimpleNamespace(unit=unit["id"], role="reviewer",
+                                       binary=schedule["binary"], timeout=schedule["timeout"], execute=True))
+                            launched.append({**json.loads(output.getvalue()), "role": "reviewer"})
+                        except (ValueError, subprocess.CalledProcessError) as error:
+                            unit["review_schedule_error"] = str(error)
+                while sum(unit["state"] == "running" for unit in board["units"].values()) < board["window"]:
+                    ready = next((unit for unit in board["units"].values() if unit["state"] == "planned"), None)
+                    if ready is None:
+                        break
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        launch(root, directory, board, SimpleNamespace(unit=ready["id"], role="worker",
+                               binary=schedule["binary"], timeout=schedule["timeout"], execute=True))
+                    launched.append({**json.loads(output.getvalue()), "role": "worker"})
+            return {"completions": completed, "scheduled": launched}
         if not any(unit["state"] == "running" for unit in board["units"].values()):
-            return []
+            return {"completions": [], "scheduled": []}
         time.sleep(0.2)
     fail("Timed out waiting for completion. Running processes remain owned by their recorded sessions.")
 
@@ -444,6 +467,9 @@ def main():
     commands.add_parser("collect", help="Read completed native-run receipts without waking agents")
     wait_parser = commands.add_parser("wait", help="Wait for and collect the next worker completion in this coordinator turn")
     wait_parser.add_argument("--timeout", type=int, choices=range(1, 14401), default=1800)
+    wait_parser.add_argument("--schedule", action="store_true", help="After collection, launch independent review and refill ready units to the rolling window")
+    wait_parser.add_argument("--binary", choices=("opencode", "opencode2"), default="opencode2")
+    wait_parser.add_argument("--run-timeout", type=int, choices=range(30, 14401), default=1800)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--human", action="store_true", help="Print readable queue status")
     commands.add_parser("handoff", help="Print durable state and next actions for another engine/session")
@@ -490,12 +516,16 @@ def main():
         elif args.command in {"collect", "wait", "status", "handoff"}:
             completions = []
             if args.command == "wait":
-                completions = wait_for_completion(board, args.timeout)
+                schedule = {"binary": args.binary, "timeout": args.run_timeout} if args.schedule else None
+                completion_result = wait_for_completion(root, directory, board, args.timeout, schedule)
+                completions = completion_result["completions"]
             elif args.command in {"collect", "status", "handoff"}:
                 completions = collect(board)
             output = status(board)
             if args.command in {"collect", "wait"}:
                 output["completions"] = completions
+                if args.command == "wait":
+                    output["scheduled"] = completion_result["scheduled"]
             if args.command == "handoff":
                 output.update(board=str(directory / "board.json"), integration_head=head(root),
                     dirty_integration=bool(git(root, "status", "--porcelain")), runtime_owner="PM only; re-observe before installed operations",

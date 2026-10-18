@@ -83,7 +83,7 @@ STANDING: Current user preferences and preservation/runtime-slot rules.
 ./Scripts/vaelen-agents --program php-polish create progress-copy --scope App/Vaelen/Vaelen/VaelenApp.swift --brief .build/agent-orchestration/php-polish/progress-copy.md
 ./Scripts/vaelen-agents --program php-polish launch progress-copy
 ./Scripts/vaelen-agents --program php-polish launch progress-copy --execute
-./Scripts/vaelen-agents --program php-polish wait
+./Scripts/vaelen-agents --program php-polish wait --schedule
 ./Scripts/vaelen-agents --program php-polish status
 ./Scripts/vaelen-agents --program php-polish status --human
 ```
@@ -112,9 +112,12 @@ The helper observes a bounded concurrent window and timebox. Output goes to
 one per-run log and completion receipt. An expired run is terminated only
 through the process group this runner created. No unknown sessions are killed.
 
-`wait` is a foreground bounded collection operation. It waits for the next
-receipt, reconciles the board, and returns control to the initiating coordinator
-turn. A coordinator must use it rather than end its turn after dispatch.
+`wait --schedule` is a foreground bounded collection operation. It waits for the
+next receipt, reconciles the board, starts independent review for eligible
+completed work, and refills ready planned units within the rolling window before
+returning control to the initiating coordinator turn. A coordinator must use it
+rather than end its turn after dispatch. `wait` without `--schedule` only
+collects.
 `collect` is nonblocking. Process return means needs-review, never verified.
 Worker and reviewer retries are counted separately and prior runs remain in the
 ledger. Refill ready work as each unit completes; do not wait for the slowest
