@@ -155,7 +155,7 @@ def create(root, directory, board, args):
     git(root, "worktree", "add", "-b", branch, str(worktree), base)
     brief_path = directory / "briefs" / (unit_id + ".md")
     brief_path.parent.mkdir(parents=True, exist_ok=True)
-    brief_path.write_text(brief + f"\nASSIGNMENT\nBase: {base}\nWorktree: {worktree}\nBranch: {branch}\nOwned paths: {', '.join(scopes)}\nPinned upstream: {root / '.build/agent-tools/pstack/pstack'}\n")
+    brief_path.write_text(brief + f"\nASSIGNMENT\nBase: {base}\nWorktree: {worktree}\nBranch: {branch}\nOwned paths: {', '.join(scopes)}\nPinned upstream: {root / '.build/agent-tools/pstack/pstack'}\n\nMANDATORY WORKTREE AND EVIDENCE PRACTICE\n- Use absolute assigned-worktree paths for all native file reads and edits. Explicitly set the assigned worktree as the workdir for every shell call.\n- For exact-SHA review, inspect authoritative committed objects (for example, git show EXACT_SHA:path), and verify the SHA; do not trust a relative native read to select a checkout.\n- Run permitted identity checks separately: pwd; git rev-parse --show-toplevel; git rev-parse --abbrev-ref HEAD; git rev-parse HEAD; git status --short. Use native file-reading tools for instructions rather than bundling unapproved shell commands.\n- Use the actual installed OpenCode tool schema. Report permission failures honestly; do not bypass denials or use blanket auto-approval. Exit 0 means only that a process returned, not that implementation succeeded or was accepted.\n")
     board["units"][unit_id] = {"id": unit_id, "state": "planned", "scope": scopes,
         "base": base, "branch": branch, "worktree": str(worktree), "brief": str(brief_path),
         "attempt": 0, "runs": [], "ledger": []}

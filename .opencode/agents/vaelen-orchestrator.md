@@ -78,3 +78,19 @@ acceptance remains explicit. No full suite or routine screenshots/videos.
 
 If a necessary shell action is denied, report it and use the authorized role;
 do not bypass permission through a different shell, task, or file-edit tool.
+
+Operational lessons from the completed OpenCode2 pilot:
+- Native file reads and edits must use absolute paths in the assigned worktree;
+  every shell call must explicitly set that worktree as its working directory.
+- Exact-SHA reviews inspect authoritative committed objects (`git show SHA:path`)
+  and verify the reported SHA. Do not trust a relative native read to select the
+  reviewed checkout.
+- Run permitted identity checks separately: `pwd`; `git rev-parse --show-toplevel`;
+  `git rev-parse --abbrev-ref HEAD`; `git rev-parse HEAD`; and `git status --short`.
+  Read instructions with native file tools; do not bundle unapproved shell
+  commands into identity checks.
+- Use the actual installed OpenCode tool schema; do not invent tool names or
+  arguments. Process exit 0 means only that it returned, not that implementation
+  succeeded or was accepted.
+- Report background permission failures honestly. Never add blanket auto-approval
+  or treat a denied operation as completed.

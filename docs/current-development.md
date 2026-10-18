@@ -1,5 +1,18 @@
 # Current development notes
 
+## OpenCode2 orchestration consolidation — 2026-10-18
+
+Accepted PHP/provider/ports work and the reviewed OpenCode2 orchestration setup
+were fast-forward integrated on `dev` at
+`1fbe36e69df78e1930e5c0afd7195fda561ffd25`. Pinned pstack bootstrap succeeded
+at `0b8e952052d482ee6de06deebf14d590d77b1b34` (plugin `0.15.26`). The focused
+`Tests/AgentOrchestrationTests.py` checks passed **13/13**; these are adapter
+tests, not Swift-suite or installed-product validation. Historical Swift-suite
+evidence is dated separately below and in README; it does not validate this
+integrated source. No build, install, runtime operation, or full Swift suite was
+performed for this consolidation. PHP 7.4 remains the requested family without
+an established compatible prepared CLI/FPM source.
+
 ## Accepted PHP provider distribution and standard ports
 
 The user accepted the PHP replacement and Settings experience after manual
