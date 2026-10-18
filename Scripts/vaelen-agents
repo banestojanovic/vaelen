@@ -293,6 +293,31 @@ def status(board):
             for u in board["units"].values()]}
 
 
+def human_status(output):
+    lines = [f"Program: {output['program']}",
+             f"Integration owner: {output['integration_owner']}",
+             f"Concurrency window: {output['window']}"]
+    if not output["units"]:
+        lines.append("no units yet")
+        return "\n".join(lines)
+    actions = {
+        "planned": "Launch the assigned worker when ready.",
+        "running": "Wait for completion, then collect the receipt.",
+        "needs-review": "Inspect the implementation and arrange independent verification.",
+        "failed": "Inspect the failure and scope a fresh fix attempt.",
+        "verified": "Review the exact verified head and await authorized integration.",
+        "integrated": "No further action unless follow-up work is needed.",
+        "abandoned": "Preserve the worktree; re-scope only if work resumes.",
+    }
+    for unit in output["units"]:
+        lines.extend(["", f"Unit: {unit['id']}", f"  State: {unit['state']}",
+                      f"  Branch: {unit['branch']}",
+                      f"  Latest role: {unit.get('role') or 'Not started'}",
+                      f"  Observed HEAD: {unit['head'][:7] if unit['head'] else 'Unknown'}",
+                      f"  Next action: {actions.get(unit['state'], 'Inspect current evidence and decide the next safe step.')}"])
+    return "\n".join(lines)
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "_run":
         run_spec(sys.argv[2])
@@ -317,7 +342,8 @@ def main():
     launch_parser.add_argument("--timeout", type=int, choices=range(30, 14401), default=1800)
     launch_parser.add_argument("--execute", action="store_true")
     commands.add_parser("collect", help="Read completed native-run receipts without waking agents")
-    commands.add_parser("status")
+    status_parser = commands.add_parser("status")
+    status_parser.add_argument("--human", action="store_true", help="Print readable queue status")
     commands.add_parser("handoff", help="Print durable state and next actions for another engine/session")
     abandon_parser = commands.add_parser("abandon", help="Close a stopped unit without deleting its worktree or branch")
     abandon_parser.add_argument("unit", type=name)
@@ -363,7 +389,13 @@ def main():
                 output.update(board=str(directory / "board.json"), integration_head=head(root),
                     dirty_integration=bool(git(root, "status", "--porcelain")), runtime_owner="PM only; re-observe before installed operations",
                     next="Collect receipts; inspect unit diffs/reports; verify current SHAs; integrate only with named owner and authorization.")
-            print(json.dumps(output, indent=2))
+            if args.command == "status" and args.human:
+                for unit in output["units"]:
+                    board_unit = board["units"][unit["id"]]
+                    unit["role"] = board_unit["runs"][-1]["role"] if board_unit.get("runs") else None
+                print(human_status(output))
+            else:
+                print(json.dumps(output, indent=2))
         elif args.command == "record":
             verify(directory, board, args)
         elif args.command == "integrate":

@@ -85,7 +85,16 @@ STANDING: Current user preferences and preservation/runtime-slot rules.
 ./Scripts/vaelen-agents --program php-polish launch progress-copy --execute
 ./Scripts/vaelen-agents --program php-polish collect
 ./Scripts/vaelen-agents --program php-polish status
+./Scripts/vaelen-agents --program php-polish status --human
 ```
+
+The default `status` output remains JSON. `status --human` prints the program,
+integration owner, concurrency window, and each unit's observed state and next
+action. Missing observations stay `Unknown`; a unit without a recorded run says
+`Not started`. The empty queue says `no units yet`.
+
+Read the selected pinned playbook at
+`.build/agent-tools/pstack/pstack/skills/poteto-mode/playbooks/feature.md`.
 
 `create` makes a branch and worktree in ignored `.build/agent-worktrees` from
 an exact committed base. Scopes are literal repository-relative file/directory

@@ -173,6 +173,37 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(handoff["units"][0]["state"], "abandoned")
         self.assertEqual(handoff["integration_head"], self.base)
 
+    def test_human_status_empty_and_preserves_json_shape(self):
+        empty = self.call("status", "--human").stdout
+        self.assertIn("Program: fixture", empty)
+        self.assertIn("Integration owner: fixture-integrator", empty)
+        self.assertIn("Concurrency window: 1", empty)
+        self.assertIn("no units yet", empty)
+        unit = self.create()
+        expected = {"program", "integration_owner", "window", "units"}
+        default = json.loads(self.call("status").stdout)
+        self.assertEqual(set(default), expected)
+        self.assertEqual(set(default["units"][0]), {"id", "state", "branch", "head", "worktree"})
+        self.assertEqual(json.loads(self.call("handoff").stdout)["units"][0]["state"], "planned")
+
+    def test_human_status_reports_actual_lifecycle_role_and_unknown_head(self):
+        unit = self.create()
+        board_path = self.root / ".build/agent-orchestration/fixture/board.json"
+        board = json.loads(board_path.read_text())
+        for state in ("planned", "running", "needs-review", "failed"):
+            board["units"]["unit"]["state"] = state
+            board["units"]["unit"]["runs"] = ([{"role": "reviewer"}] if state != "planned" else [])
+            board_path.write_text(json.dumps(board))
+            rendered = self.call("status", "--human").stdout
+            self.assertIn("Unit: unit", rendered)
+            self.assertIn("State: " + state, rendered)
+            self.assertIn("Latest role: " + ("Not started" if state == "planned" else "reviewer"), rendered)
+            self.assertIn("Observed HEAD: " + self.base[:7], rendered)
+            self.assertIn("Next action:", rendered)
+        board["units"]["unit"]["worktree"] = str(self.root / "missing-worktree")
+        board_path.write_text(json.dumps(board))
+        self.assertIn("Observed HEAD: Unknown", self.call("status", "--human").stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
