@@ -247,9 +247,13 @@ def launch(root, directory, board, args):
     gate = "  break\n" if allowed else "  echo 'task contract does not authorize git commit' >&2\n  exit 1\n"
     git_wrapper.write_text("#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = commit ]; then\n" + gate + "  fi\ndone\nexec " + repr(git_path) + " \"$@\"\n")
     git_wrapper.chmod(0o755)
+    starting_head = head(unit["worktree"])
+    starting_status = git(unit["worktree"], "status", "--porcelain", "--untracked-files=all")
     save(spec, {"argv": argv, "cwd": unit["worktree"], "timeout": args.timeout,
                 "receipt": str(receipt), "log": str(receipt.with_suffix(".log")),
                 "git_shim": str(shim), "base": unit["base"],
+                "starting_head": starting_head, "starting_status": starting_status,
+                "role": args.role,
                 "commits_authorized": allowed,
                 "reflog_before": git(unit["worktree"], "reflog", "--format=%H")})
     process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run", str(spec)],
@@ -287,9 +291,14 @@ def run_spec(path):
             if after != spec.get("reflog_before"):
                 result.update(status="failed", exit_code=125,
                               error="Run changed the worktree reflog without task-local commit authorization")
-        if "commits_authorized" in spec and not spec["commits_authorized"] and result["head"] != spec.get("base"):
+        if "commits_authorized" in spec and not spec["commits_authorized"] and result["head"] != spec.get("starting_head", spec.get("base")):
             result.update(status="failed", exit_code=125,
                           error="Run created a commit without task-local commit authorization")
+        if spec.get("role") == "reviewer":
+            ending_status = git(spec["cwd"], "status", "--porcelain", "--untracked-files=all")
+            if ending_status != spec.get("starting_status", ""):
+                result.update(status="failed", exit_code=125,
+                              error="Reviewer changed the worktree relative to its starting state")
     except Exception as error:
         result["error"] = str(error)
     result["finished"] = now()

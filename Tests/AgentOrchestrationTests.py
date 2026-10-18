@@ -60,6 +60,28 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.git("commit", "-qm", "fixture change", root=worktree)
         return self.git("rev-parse", "HEAD", root=worktree)
 
+    def create_committed_worker_artifact(self):
+        board_path = self.root / ".build/agent-orchestration/fixture/board.json"
+        board = json.loads(board_path.read_text())
+        board["authorization"] = "task-local-commits-authorized"
+        board_path.write_text(json.dumps(board))
+        unit = self.create()
+        binary_dir = self.root / ".build/reviewer-bin"
+        binary_dir.mkdir(parents=True)
+        fake = binary_dir / "opencode2"
+        fake.write_text("#!/bin/sh\nprintf 'reviewable artifact\\n' > feature.txt\ngit add feature.txt && git commit -m 'worker artifact' -q\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"])
+        launched = json.loads(self.call("launch", "unit", "--execute", env=env).stdout)
+        for _ in range(100):
+            if Path(launched["receipt"]).exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(Path(launched["receipt"]).exists())
+        self.call("collect")
+        self.assertEqual(json.loads(self.call("status").stdout)["units"][0]["state"], "needs-review")
+        return unit, binary_dir, fake, env, self.git("rev-parse", "HEAD", root=Path(unit["worktree"]))
+
     def record(self, sha, **kwargs):
         report = Path(self.temp.name) / "report.md"
         report.write_text("Independent fixture reviewer\nHead: " + sha + "\nCheck: fixture\n")
@@ -263,6 +285,43 @@ class AgentOrchestrationTests(unittest.TestCase):
         result = json.loads(Path(launched["receipt"]).read_text())
         self.assertEqual(result["status"], "failed")
         self.assertIn("reflog", result["error"])
+
+    def test_read_only_reviewer_succeeds_from_committed_worker_head(self):
+        unit, _, fake, env, worker_head = self.create_committed_worker_artifact()
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        launched = json.loads(self.call("launch", "unit", "--role", "reviewer", "--execute", env=env).stdout)
+        spec = json.loads(Path(launched["receipt"]).with_suffix(".spec.json").read_text())
+        self.assertEqual(spec["starting_head"], worker_head)
+        self.assertNotEqual(spec["starting_head"], spec["base"])
+        for _ in range(100):
+            if Path(launched["receipt"]).exists():
+                break
+            time.sleep(0.02)
+        result = json.loads(Path(launched["receipt"]).read_text())
+        self.assertEqual(result["status"], "returned", result)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["head"], worker_head)
+        self.call("collect")
+        self.assertEqual(json.loads(self.call("status").stdout)["units"][0]["state"], "needs-review")
+
+    def test_reviewer_absolute_unauthorized_commit_is_created_then_rejected(self):
+        unit, _, fake, env, worker_head = self.create_committed_worker_artifact()
+        fake.write_text("#!/bin/sh\n/usr/bin/git commit --allow-empty -m reviewer-bypass -q\n")
+        fake.chmod(0o755)
+        launched = json.loads(self.call("launch", "unit", "--role", "reviewer", "--execute", env=env).stdout)
+        for _ in range(100):
+            if Path(launched["receipt"]).exists():
+                break
+            time.sleep(0.02)
+        result = json.loads(Path(launched["receipt"]).read_text())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["exit_code"], 125)
+        self.assertIn("without task-local commit authorization", result["error"])
+        reviewer_head = self.git("rev-parse", "HEAD", root=Path(unit["worktree"]))
+        self.assertNotEqual(reviewer_head, worker_head, "the test must prove the absolute-path reviewer commit actually happened")
+        collected = json.loads(self.call("collect").stdout)
+        self.assertEqual(collected["units"][0]["state"], "failed")
 
     def test_authorized_worker_can_commit_through_per_run_guard(self):
         unit = self.create()
