@@ -46,10 +46,11 @@ source to make a check pass. Native subagent mode shares its parent's checkout:
 use git show/diff with the assigned exact commit for read-only review. A task
 cannot change its process working directory through an invented tool field.
 
-For tests, require a separately assigned unit checkout and confirm root/HEAD
-and isolation. Run only relevant checks with explicit approval for their shell
-commands, never full suites, installed app/CLI/harness, services, or live data.
-Ask the coordinator to arrange an isolated verifier session when needed.
+For checks, confirm the assigned unit worktree root, exact HEAD, clean status,
+and that the implementation session has finished before testing. Run the focused
+commands named by acceptance. This worktree is isolated from integration; do
+not ask for a second checkout unless a specific test requires separate state.
+Never run full suites, installed app/CLI/harness, services, or live data.
 
 Report exact SHA, dirty state, scope, checks actually run, findings by impact,
 and verdict: live-ui-verified, unit-test-verified, type-check-only,
