@@ -93,6 +93,19 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
         XCTAssertEqual(outcome.providerRouteObservations, 0, "PHP selections do not probe router routes")
     }
 
+    func testHumanLinksDetectsMissingExpectedProject() async throws {
+        do {
+            _ = try await runScenario(includePHPSelection: false, missingExpectedProjectName: "deliberately-absent-project")
+            XCTFail("the links output checker accepted a project that was not present in the output")
+        } catch {
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("deliberately-absent-project"), message)
+            XCTAssertTrue(message.contains("CLI exit=0"), message)
+            XCTAssertTrue(message.contains("CLI output:"), message)
+            print("[LinksBenchmark] expected-checker-rejection \(message)")
+        }
+    }
+
     private struct ScenarioOutcome {
         let projectNames: [String]
         let samples: [Double]
@@ -101,7 +114,7 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
         let providerRouteObservations: Int
     }
 
-    private func runScenario(includePHPSelection: Bool) async throws -> ScenarioOutcome {
+    private func runScenario(includePHPSelection: Bool, missingExpectedProjectName: String? = nil) async throws -> ScenarioOutcome {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("lb-\(UUID().uuidString.prefix(8))", isDirectory: true)
         let supportRoot = root.appendingPathComponent("s", isDirectory: true)
@@ -139,6 +152,7 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
                 serverStopped = true
             }
             if !preserveRoot, fm.fileExists(atPath: root.path) { try fm.removeItem(at: root) }
+            print("[LinksBenchmark] cleanup serverStopped=\(serverStopped) socketExists=\(fm.fileExists(atPath: paths.socketPath)) rootExists=\(fm.fileExists(atPath: root.path)) rootRemoved=\(!fm.fileExists(atPath: root.path))")
         }
         do {
             try fm.createDirectory(at: projectsRoot, withIntermediateDirectories: true)
@@ -193,9 +207,16 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
             for _ in 0..<200 where !fm.fileExists(atPath: paths.socketPath) { try await Task.sleep(for: .milliseconds(10)) }
             guard fm.fileExists(atPath: paths.socketPath) else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "isolated Core socket did not appear"]) }
 
+            let doctor = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: ClientIdentity(name: "links-benchmark-doctor", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))
+            try await doctor.connect()
+            let coreStatus = try await doctor.status()
+            await doctor.disconnect()
+            XCTAssertEqual(coreStatus.core.pid, Int32(getpid()), "isolated Core should report this test process as its expected PID")
+
             let source = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             let executable = source.appendingPathComponent(".build/debug/val")
             guard fm.isExecutableFile(atPath: executable.path) else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "assigned-worktree CLI missing at \(executable.path)"]) }
+            print("[LinksBenchmark] preflight handshake=validated coreVersion=\(coreStatus.core.version) protocol=\(coreStatus.protocolVersion) corePID=\(coreStatus.core.pid) expectedPID=\(getpid()) socket=\(paths.socketPath) testRoot=\(supportRoot.path) source=\(source.path) executable=\(executable.path) cliIdentity=val/\(VaelenBuildInfo.version)")
             func runLinks() throws -> (String, Double, Int32) {
                 let process = Process()
                 let outputURL = root.appendingPathComponent("cli-output-\(UUID().uuidString)")
@@ -243,12 +264,16 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
                 let duration = start.duration(to: .now)
                 let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
                 guard !process.isRunning else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "timed val links child exit was signaled but Process still reports it running"]) }
+                print("[LinksBenchmark] child-exit pid=\(process.processIdentifier) confirmed=true status=\(process.terminationStatus)")
                 return (String(decoding: data, as: UTF8.self), seconds, process.terminationStatus)
             }
 
             let warmup = try runLinks()
-            guard warmup.2 == 0, expectedNames.allSatisfy(warmup.0.contains), !includePHPSelection || (phpVersion.map(warmup.0.contains) ?? false) else {
-                throw NSError(domain: "LinkedProjectsPerformanceTests", code: 6, userInfo: [NSLocalizedDescriptionKey: "warm-up failed or omitted expected project/PHP output. Exit=\(warmup.2), output=\(warmup.0)"])
+            print("[LinksBenchmark] warmup transcript exit=\(warmup.2):\n\(warmup.0)")
+            let requiredNames = expectedNames + (missingExpectedProjectName.map { [$0] } ?? [])
+            let missingNames = requiredNames.filter { !warmup.0.contains($0) }
+            guard warmup.2 == 0, missingNames.isEmpty, !includePHPSelection || (phpVersion.map(warmup.0.contains) ?? false) else {
+                throw NSError(domain: "LinkedProjectsPerformanceTests", code: 6, userInfo: [NSLocalizedDescriptionKey: "warm-up failed or omitted expected project/PHP output. Missing=\(missingNames); CLI exit=\(warmup.2); CLI output:\n\(warmup.0)"])
             }
             var samples = [Double]()
             for _ in 0..<5 {
