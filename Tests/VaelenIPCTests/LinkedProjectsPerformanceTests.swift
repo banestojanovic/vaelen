@@ -45,14 +45,15 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
         let fixture = root.appendingPathComponent("fixture.sh")
         try "#!/bin/sh\nexec sleep 30\n".write(to: fixture, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        let unrelated = try Self.startUnrelatedChild()
+        defer { _ = kill(unrelated, SIGKILL); _ = waitpid(unrelated, nil, 0) }
+        XCTAssertEqual(kill(unrelated, 0), 0, "unrelated child must be running before owned-child timeout")
         XCTAssertThrowsError(try Self.capture(fixture.path, arguments: [], timeout: .milliseconds(100), terminationGrace: .milliseconds(100))) { error in
             XCTAssertTrue(error.localizedDescription.contains("timed out"))
             XCTAssertTrue(error.localizedDescription.contains("owned child was terminated"))
         }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
-        let unrelated = try Self.startUnrelatedChild()
-        defer { _ = kill(unrelated, SIGKILL); _ = waitpid(unrelated, nil, 0) }
         XCTAssertEqual(kill(unrelated, 0), 0, "timeout handling must not terminate an unrelated child")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.path), "the root remains available until test cleanup")
     }
 
