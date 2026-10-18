@@ -102,7 +102,9 @@ paths; glob patterns are rejected so overlap checks remain reliable. It refuses
 duplicate units, invalid briefs, path escapes, and overlapping unfinished scope.
 It does not modify the integration
 index or checkout. The scope audit later checks committed and uncommitted
-changes, including untracked files.
+changes, including untracked files. For Vaelen worktrees, it verifies the pinned
+pstack checkout and copies its read-only playbook tree into the isolated worker
+checkout; a worker will not be launched with a missing/mismatched playbook.
 
 `launch` is a preview unless `--execute` is present. Execution uses an actual
 separate `opencode2 run --standalone --agent vaelen-worker` process, with its cwd

@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -73,6 +74,23 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.call("create", "unit", "--scope", "feature.txt", "--brief", str(self.brief), ok=False)
         self.call("create", "overlap", "--scope", "feature.txt", "--brief", str(self.brief), ok=False)
         self.call("create", "escape", "--scope", "../outside", "--brief", str(self.brief), ok=False)
+
+    def test_worker_worktree_receives_verified_pinned_playbook(self):
+        (self.root / "opencode.json").write_text("{}\n")
+        source = self.root / ".build/agent-tools/pstack"
+        source.mkdir(parents=True)
+        (source / "pstack/skills").mkdir(parents=True)
+        (source / "pstack/skills/fixture.md").write_text("pinned fixture\n")
+        self.git("init", "-q", root=source)
+        self.git("config", "user.email", "fixture@example.invalid", root=source)
+        self.git("config", "user.name", "Disposable Fixture", root=source)
+        self.git("add", ".", root=source)
+        self.git("commit", "-qm", "pinned fixture", root=source)
+        pin = self.git("rev-parse", "HEAD", root=source)
+        module = runpy.run_path(str(HELPER))
+        module["install_worker_playbook"](self.root, Path(self.temp.name) / "worker", expected=pin)
+        copied = Path(self.temp.name) / "worker/.build/agent-tools/pstack/pstack/skills/fixture.md"
+        self.assertEqual(copied.read_text(), "pinned fixture\n")
 
     def test_invalid_brief_creates_no_ref(self):
         self.brief.write_text("GOAL only\n")

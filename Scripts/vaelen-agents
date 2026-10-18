@@ -115,6 +115,23 @@ MANDATORY WORKTREE AND EVIDENCE PRACTICE
     brief.write_text(body + "\n\n" + mandatory)
 
 
+def install_worker_playbook(root, worktree, expected=PIN):
+    if not (root / "opencode.json").exists():
+        return
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    common_root = common.parent
+    source = common_root / ".build/agent-tools/pstack"
+    if not source.exists():
+        with contextlib.redirect_stdout(io.StringIO()):
+            bootstrap(root)
+        source = root / ".build/agent-tools/pstack"
+    if head(source) != expected or git(source, "status", "--porcelain"):
+        fail("Pinned pstack source is missing, mismatched, or dirty; do not launch a worker without its playbook.")
+    destination = worktree / ".build/agent-tools/pstack"
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source / "pstack", destination / "pstack")
+
+
 @contextlib.contextmanager
 def board_at(root, program):
     directory = root / ".build/agent-orchestration" / name(program)
@@ -175,6 +192,7 @@ def create(root, directory, board, args):
     branch = "codex/orch-" + board["program"] + "-" + unit_id
     worktree.parent.mkdir(parents=True, exist_ok=True)
     git(root, "worktree", "add", "-b", branch, str(worktree), base)
+    install_worker_playbook(root, worktree)
     brief_path = directory / "briefs" / (unit_id + ".md")
     brief_path.parent.mkdir(parents=True, exist_ok=True)
     brief_path.write_text(brief)
