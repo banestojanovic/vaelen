@@ -103,7 +103,7 @@ Worktree: {unit['worktree']}
 Branch: {unit['branch']}
 Owned paths: {', '.join(unit['scope'])}
 Commit authorization: {authorization}
-Pinned upstream: {root / '.build/agent-tools/pstack/pstack'}
+Pinned upstream: {Path(unit['worktree']) / '.build/agent-tools/pstack/pstack'}
 
 MANDATORY WORKTREE AND EVIDENCE PRACTICE
 - Use absolute assigned-worktree paths and that worktree as cwd for every shell call.

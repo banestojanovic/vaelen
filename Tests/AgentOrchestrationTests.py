@@ -112,6 +112,7 @@ class AgentOrchestrationTests(unittest.TestCase):
         self.assertIn("Owned paths: feature.txt", rewritten)
         self.assertIn("Commit authorization: commits-forbidden", rewritten)
         self.assertIn("Respect owned paths", rewritten)
+        self.assertIn("Pinned upstream: " + str(Path(unit["worktree"]) / ".build/agent-tools/pstack/pstack"), rewritten)
         preview = json.loads(self.call("launch", "unit", env=env).stdout)
         self.assertIn("Do not commit", preview["argv"][-1])
 
