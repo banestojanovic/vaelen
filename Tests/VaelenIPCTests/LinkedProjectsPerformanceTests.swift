@@ -144,7 +144,11 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
             guard fm.isExecutableFile(atPath: executable.path) else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "assigned-worktree CLI missing at \(executable.path)"]) }
             func runLinks() throws -> (String, Double, Int32) {
                 let process = Process()
-                let output = Pipe()
+                let outputURL = root.appendingPathComponent("cli-output-\(UUID().uuidString)")
+                guard fm.createFile(atPath: outputURL.path, contents: nil) else {
+                    throw NSError(domain: "LinkedProjectsPerformanceTests", code: 8, userInfo: [NSLocalizedDescriptionKey: "could not create isolated CLI output file"])
+                }
+                let output = try FileHandle(forWritingTo: outputURL)
                 process.executableURL = executable
                 process.arguments = ["links"]
                 process.currentDirectoryURL = source
@@ -155,14 +159,31 @@ final class LinkedProjectsPerformanceTests: XCTestCase {
                 process.standardOutput = output
                 process.standardError = output
                 let start = ContinuousClock.now
-                try process.run()
-                let deadline = Date().addingTimeInterval(30)
-                while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
-                if process.isRunning { process.terminate(); process.waitUntilExit() }
-                let data = output.fileHandleForReading.readDataToEndOfFile()
+                let exited = DispatchSemaphore(value: 0)
+                process.terminationHandler = { _ in exited.signal() }
+                do {
+                    try process.run()
+                } catch {
+                    try? output.close()
+                    try? fm.removeItem(at: outputURL)
+                    throw error
+                }
+                var didExit = exited.wait(timeout: .now() + 30) == .success
+                if !didExit {
+                    process.terminate()
+                    didExit = exited.wait(timeout: .now() + 2) == .success
+                }
+                if !didExit {
+                    _ = kill(process.processIdentifier, SIGKILL)
+                    didExit = exited.wait(timeout: .now() + 2) == .success
+                }
+                if didExit { process.waitUntilExit() }
+                try output.close()
+                let data = try Data(contentsOf: outputURL)
+                try fm.removeItem(at: outputURL)
                 let duration = start.duration(to: .now)
                 let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
-                guard !process.isRunning else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "timed val links child did not terminate"]) }
+                guard didExit, !process.isRunning else { throw NSError(domain: "LinkedProjectsPerformanceTests", code: 5, userInfo: [NSLocalizedDescriptionKey: "timed val links child did not terminate within bounded termination window"]) }
                 return (String(decoding: data, as: UTF8.self), seconds, process.terminationStatus)
             }
 
