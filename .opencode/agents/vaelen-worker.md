@@ -22,6 +22,7 @@ permission:
     "git show*": allow
     "git rev-parse*": allow
     "git ls-files*": allow
+    "python3 Tests/AgentOrchestrationTests.py": allow
     "swift --version": allow
     "xcodebuild -version": allow
     "swift test --filter *": allow

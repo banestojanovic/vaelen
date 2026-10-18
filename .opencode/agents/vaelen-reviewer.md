@@ -20,6 +20,7 @@ permission:
     "git show*": allow
     "git rev-parse*": allow
     "git ls-files*": allow
+    "python3 Tests/AgentOrchestrationTests.py": allow
     "swift test --filter *": ask
     "swift test --package-path * --filter *": ask
   webfetch: allow
