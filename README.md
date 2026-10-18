@@ -95,10 +95,11 @@ is authorized:
 `restored-m13-product` at commit
 `328e2f1efc74dab9c41f411e914afe015a22d009`. Do not relax that guard.
 
-## Latest full-suite result
+## Historical full-suite result
 
-`swift test` completed on 2026-09-30: **472 tests reported across the IPC,
-DNS, Core, and CLI test bundles; 0 failures; 4 skipped**. The skips are
+`swift test` completed on 2026-09-30 against that historical source: **472 tests
+reported across the IPC, DNS, Core, and CLI test bundles; 0 failures; 4 skipped**.
+The skips are
 environment-gated acceptance tests, not failures:
 
 - `CaddyModuleTests.testOfficialDistributionWithDevelopmentCosign` — requires
@@ -113,3 +114,8 @@ environment-gated acceptance tests, not failures:
 The deterministic Caddy install/provenance and checksum-rejection tests run
 without those official-artifact prerequisites. Do not infer a full-suite pass
 from a build-only result.
+
+This result predates the current accepted PHP/provider and orchestration
+consolidation and is not validation of current source. See
+[`docs/current-development.md`](docs/current-development.md) for the current
+checkpoint and focused orchestration evidence.

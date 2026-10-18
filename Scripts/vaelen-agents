@@ -5,6 +5,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -93,6 +94,44 @@ def check_scope(unit):
     return changed
 
 
+def assigned_brief(unit, root, authorization):
+    brief = Path(unit["brief"])
+    body = brief.read_text().split("\n\nASSIGNMENT\n", 1)[0].rstrip()
+    mandatory = f"""ASSIGNMENT
+Base: {unit['base']}
+Worktree: {unit['worktree']}
+Branch: {unit['branch']}
+Owned paths: {', '.join(unit['scope'])}
+Commit authorization: {authorization}
+Pinned upstream: {Path(unit['worktree']) / '.build/agent-tools/pstack/pstack'}
+
+MANDATORY WORKTREE AND EVIDENCE PRACTICE
+- Use absolute assigned-worktree paths and that worktree as cwd for every shell call.
+- Verify assigned repository, branch, base, and status before editing.
+- Respect owned paths; command permissions do not create filesystem isolation.
+- Report process return, successful checks, accepted artifact, and integration separately.
+- Do not bypass permission denials. Never use installed Vaelen or live services/data.
+"""
+    brief.write_text(body + "\n\n" + mandatory)
+
+
+def install_worker_playbook(root, worktree, expected=PIN):
+    if not (root / "opencode.json").exists():
+        return
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    common_root = common.parent
+    source = common_root / ".build/agent-tools/pstack"
+    if not source.exists():
+        with contextlib.redirect_stdout(io.StringIO()):
+            bootstrap(root)
+        source = root / ".build/agent-tools/pstack"
+    if head(source) != expected or git(source, "status", "--porcelain"):
+        fail("Pinned pstack source is missing, mismatched, or dirty; do not launch a worker without its playbook.")
+    destination = worktree / ".build/agent-tools/pstack"
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source / "pstack", destination / "pstack")
+
+
 @contextlib.contextmanager
 def board_at(root, program):
     directory = root / ".build/agent-orchestration" / name(program)
@@ -153,12 +192,14 @@ def create(root, directory, board, args):
     branch = "codex/orch-" + board["program"] + "-" + unit_id
     worktree.parent.mkdir(parents=True, exist_ok=True)
     git(root, "worktree", "add", "-b", branch, str(worktree), base)
+    install_worker_playbook(root, worktree)
     brief_path = directory / "briefs" / (unit_id + ".md")
     brief_path.parent.mkdir(parents=True, exist_ok=True)
-    brief_path.write_text(brief + f"\nASSIGNMENT\nBase: {base}\nWorktree: {worktree}\nBranch: {branch}\nOwned paths: {', '.join(scopes)}\nPinned upstream: {root / '.build/agent-tools/pstack/pstack'}\n")
+    brief_path.write_text(brief)
     board["units"][unit_id] = {"id": unit_id, "state": "planned", "scope": scopes,
         "base": base, "branch": branch, "worktree": str(worktree), "brief": str(brief_path),
-        "attempt": 0, "runs": [], "ledger": []}
+        "attempts": {"worker": 0, "reviewer": 0}, "runs": [], "ledger": []}
+    assigned_brief(board["units"][unit_id], root, board["authorization"])
     print(json.dumps(board["units"][unit_id]))
 
 
@@ -166,8 +207,11 @@ def launch(root, directory, board, args):
     unit = board["units"][args.unit]
     if unit["state"] == "running":
         fail("Unit already has an active run; collect its receipt first.")
-    if unit["attempt"] >= 3:
-        fail("Three runs exhausted; record the failure and re-scope a fresh unit rather than looping.")
+    if unit.get("replan_required"):
+        fail("This unit needs a useful corrected brief or a fresh unit before another launch.")
+    attempts = unit.setdefault("attempts", {"worker": unit.get("attempt", 0), "reviewer": 0})
+    if attempts.get(args.role, 0) >= 3:
+        fail("Three runs for this role exhausted; replan with a fresh unit.")
     if sum(u["state"] == "running" for u in board["units"].values()) >= board["window"]:
         fail("Rolling worker window is full; collect a completion before refilling.")
     role = "vaelen-" + args.role
@@ -175,28 +219,44 @@ def launch(root, directory, board, args):
         fail("Agent definition absent from assigned base; commit the adapter before a write trial.")
     if git(unit["worktree"], "branch", "--show-current") != unit["branch"]:
         fail("Assigned worktree branch changed; inspect before launching.")
+    assigned_brief(unit, root, board["authorization"])
     check_scope(unit)
     native = shutil.which(args.binary)
     if not native:
         fail("OpenCode binary not found: " + args.binary)
+    may_commit = board["authorization"] == "task-local-commits-authorized"
+    worker_order = ("Task-local commits are explicitly authorized; commit only scoped accepted work. " if may_commit else "Do not commit; task contract does not authorize commits. ")
     argv = [native, "run", "--standalone", "--agent", role, "--format", "json", "--file", unit["brief"],
-            "Complete the attached scoped brief. Read .opencode/pstack-adapter.md first. Return an honest report; do not commit or use installed Vaelen."]
+            "Complete the attached scoped brief. Read .opencode/pstack-adapter.md first. " + worker_order +
+            "Return an honest report; never use installed Vaelen."]
     if args.role == "reviewer":
         argv[-1] = "Independently verify the attached unit at its current exact HEAD. Read .opencode/pstack-adapter.md. Do not edit, commit, or use installed Vaelen. Report commands, findings, exact SHA, and a verdict."
     if not args.execute:
         print(json.dumps({"cwd": unit["worktree"], "argv": argv, "executes_model": False}))
         return
-    unit["attempt"] += 1
-    receipt = directory / "runs" / f"{unit['id']}-{unit['attempt']}.json"
+    attempts[args.role] = attempts.get(args.role, 0) + 1
+    attempt = attempts[args.role]
+    receipt = directory / "runs" / f"{unit['id']}-{args.role}-{attempt}.json"
     receipt.parent.mkdir(parents=True, exist_ok=True)
     spec = receipt.with_suffix(".spec.json")
+    git_path = shutil.which("git")
+    shim = directory / "tool-shims" / f"{unit['id']}-{args.role}-{attempt}"
+    shim.mkdir(parents=True, exist_ok=True)
+    git_wrapper = shim / "git"
+    allowed = may_commit and args.role == "worker"
+    gate = "  break\n" if allowed else "  echo 'task contract does not authorize git commit' >&2\n  exit 1\n"
+    git_wrapper.write_text("#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = commit ]; then\n" + gate + "  fi\ndone\nexec " + repr(git_path) + " \"$@\"\n")
+    git_wrapper.chmod(0o755)
     save(spec, {"argv": argv, "cwd": unit["worktree"], "timeout": args.timeout,
-                "receipt": str(receipt), "log": str(receipt.with_suffix(".log"))})
+                "receipt": str(receipt), "log": str(receipt.with_suffix(".log")),
+                "git_shim": str(shim), "base": unit["base"],
+                "commits_authorized": allowed,
+                "reflog_before": git(unit["worktree"], "reflog", "--format=%H")})
     process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run", str(spec)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
     unit.update(state="running", pid=process.pid)
-    unit["runs"].append({"role": args.role, "receipt": str(receipt), "started": now()})
+    unit["runs"].append({"role": args.role, "attempt": attempt, "receipt": str(receipt), "started": now(), "process_return": None})
     print(json.dumps({"unit": unit["id"], "pid": process.pid, "receipt": str(receipt)}))
 
 
@@ -205,8 +265,11 @@ def run_spec(path):
     result = {"started": now(), "cwd": spec["cwd"], "status": "failed"}
     try:
         with open(spec["log"], "w") as log:
+            env = dict(os.environ)
+            if spec.get("git_shim"):
+                env["PATH"] = spec["git_shim"] + os.pathsep + env.get("PATH", "")
             process = subprocess.Popen(spec["argv"], cwd=spec["cwd"], stdin=subprocess.DEVNULL,
-                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
             try:
                 code = process.wait(timeout=spec["timeout"])
             except subprocess.TimeoutExpired:
@@ -219,6 +282,14 @@ def run_spec(path):
                 code = 124
             result.update(exit_code=code, status="returned" if code == 0 else "failed")
         result["head"] = head(spec["cwd"])
+        if "commits_authorized" in spec and not spec["commits_authorized"]:
+            after = git(spec["cwd"], "reflog", "--format=%H")
+            if after != spec.get("reflog_before"):
+                result.update(status="failed", exit_code=125,
+                              error="Run changed the worktree reflog without task-local commit authorization")
+        if "commits_authorized" in spec and not spec["commits_authorized"] and result["head"] != spec.get("base"):
+            result.update(status="failed", exit_code=125,
+                          error="Run created a commit without task-local commit authorization")
     except Exception as error:
         result["error"] = str(error)
     result["finished"] = now()
@@ -226,11 +297,82 @@ def run_spec(path):
 
 
 def collect(board):
+    collected = []
     for unit in board["units"].values():
-        if unit["state"] == "running" and Path(unit["runs"][-1]["receipt"]).exists():
-            result = read(Path(unit["runs"][-1]["receipt"]))
-            unit["state"] = "needs-review" if result["status"] == "returned" else "failed"
-            unit["last_result"] = result
+        for run in unit.get("runs", []):
+            if not run.get("receipt"):
+                continue
+            receipt = Path(run["receipt"])
+            if run.get("collected") or not receipt.exists():
+                continue
+            result = read(receipt)
+            run.update(collected=True, process_return=result.get("exit_code"), finished=result.get("finished"))
+            if unit.get("runs") and run is unit["runs"][-1] and unit["state"] == "running":
+                if result.get("status") == "returned":
+                    try:
+                        artifact = check_scope(unit)
+                        unit["state"] = "needs-review" if artifact else "failed"
+                        if not artifact:
+                            result["acceptance"] = "no-scoped-artifact; replan required"
+                    except ValueError as error:
+                        unit["state"] = "failed"
+                        result["scope_error"] = str(error)
+                else:
+                    unit["state"] = "failed"
+                    unit["replan_required"] = True
+                if unit["state"] == "failed":
+                    unit["replan_required"] = True
+                unit["last_result"] = result
+            collected.append({"unit": unit["id"], "role": run["role"], "result": result})
+        if unit.get("ledger"):
+            try:
+                current = head(unit["worktree"])
+            except (OSError, subprocess.CalledProcessError):
+                current = None
+            if current != unit["ledger"][-1]["head"]:
+                unit["state"] = "needs-review"
+                unit["verification_invalidated_at"] = now()
+    return collected
+
+
+def wait_for_completion(root, directory, board, timeout, schedule):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        completed = collect(board)
+        if completed:
+            launched = []
+            if schedule:
+                from types import SimpleNamespace
+                for item in completed:
+                    unit = board["units"][item["unit"]]
+                    if item["role"] == "worker" and unit["state"] == "needs-review":
+                        try:
+                            clean(unit["worktree"])
+                            with contextlib.redirect_stdout(io.StringIO()) as output:
+                                launch(root, directory, board, SimpleNamespace(unit=unit["id"], role="reviewer",
+                                       binary=schedule["binary"], timeout=schedule["timeout"], execute=True))
+                            launched.append({**json.loads(output.getvalue()), "role": "reviewer"})
+                        except (ValueError, subprocess.CalledProcessError) as error:
+                            unit["review_schedule_error"] = str(error)
+                refill_allowed = all(item["role"] != "worker" or
+                                     (item["result"].get("status") == "returned" and
+                                      "acceptance" not in item["result"] and
+                                      not item["result"].get("scope_error"))
+                                     for item in completed)
+                while refill_allowed and sum(unit["state"] == "running" for unit in board["units"].values()) < board["window"]:
+                    ready = next((unit for unit in board["units"].values() if unit["state"] == "planned"), None)
+                    if ready is None:
+                        break
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        launch(root, directory, board, SimpleNamespace(unit=ready["id"], role="worker",
+                               binary=schedule["binary"], timeout=schedule["timeout"], execute=True))
+                    launched.append({**json.loads(output.getvalue()), "role": "worker"})
+            return {"completions": completed, "scheduled": launched}
+        if not any(unit["state"] == "running" for unit in board["units"].values()):
+            return {"completions": [], "scheduled": []}
+        time.sleep(0.2)
+    fail("Timed out waiting for completion. Running processes remain owned by their recorded sessions.")
 
 
 def verify(directory, board, args):
@@ -263,6 +405,8 @@ def verify(directory, board, args):
 def integrate(root, board, args):
     if args.owner != board["integration_owner"]:
         fail("Only the program's named integration owner may integrate.")
+    if board.get("authorization") != "task-local-commits-authorized":
+        fail("This integration creates a local merge commit; task-local commits are not authorized.")
     unit = board["units"][args.unit]
     if unit["state"] != "verified":
         fail("Unit is not in verified state; finish current work/review before integration.")
@@ -272,13 +416,35 @@ def integrate(root, board, args):
     if not unit["ledger"] or unit["ledger"][-1]["head"] != current or unit["ledger"][-1]["verdict"] not in PASS:
         fail("Current exact head lacks a passing independent verification receipt.")
     check_scope(unit)
-    git(root, "merge-base", "--is-ancestor", "HEAD", current)
     if not args.execute:
-        print(json.dumps({"integration": str(root), "from": head(root), "to": current, "executes_git_merge": False}))
+        print(json.dumps({"integration": str(root), "from": head(root), "to": current, "strategy": "explicit-non-ff-merge", "executes_git_merge": False}))
         return
-    git(root, "merge", "--ff-only", current)
-    unit.update(state="integrated", integrated_head=head(root), integrated_at=now())
-    print(json.dumps({"unit": args.unit, "head": head(root)}))
+    git(root, "merge", "--no-ff", "--no-edit", current)
+    unit.update(state="integrated-needs-check", integrated_head=head(root), integrated_at=now())
+    print(json.dumps({"unit": args.unit, "head": head(root), "state": unit["state"], "combined_check_required": True}))
+
+
+def accept_integration(root, directory, board, args):
+    clean(root)
+    current = head(root)
+    if current != args.head:
+        fail("Combined verification head is stale; provide the exact current integration SHA.")
+    pending = [unit for unit in board["units"].values() if unit["state"] == "integrated-needs-check"]
+    if not pending:
+        fail("No integrated artifact is awaiting combined verification.")
+    text = Path(args.report).resolve().read_text()
+    if current not in text:
+        fail("Combined verification report must identify the exact integration SHA.")
+    entry = {"head": current, "report": str(args.report), "report_sha256": hashlib.sha256(text.encode()).hexdigest(),
+             "checks": args.check, "at": now()}
+    receipt = directory / "verification" / ("integration-" + str(len(board.get("integration_ledger", [])) + 1) + ".md")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(text)
+    entry["report"] = str(receipt)
+    board.setdefault("integration_ledger", []).append(entry)
+    for unit in pending:
+        unit.update(state="integrated", combined_verified_head=current)
+    print(json.dumps(entry))
 
 
 def status(board):
@@ -288,6 +454,7 @@ def status(board):
         except (OSError, subprocess.CalledProcessError):
             return None
     return {"program": board["program"], "integration_owner": board["integration_owner"],
+            "authorization": board["authorization"],
             "window": board["window"], "units": [{"id": u["id"], "state": u["state"],
             "branch": u["branch"], "head": observed_head(u), "worktree": u["worktree"]}
             for u in board["units"].values()]}
@@ -296,6 +463,7 @@ def status(board):
 def human_status(output):
     lines = [f"Program: {output['program']}",
              f"Integration owner: {output['integration_owner']}",
+             f"Authorization: {output['authorization']}",
              f"Concurrency window: {output['window']}"]
     if not output["units"]:
         lines.append("no units yet")
@@ -306,6 +474,7 @@ def human_status(output):
         "needs-review": "Inspect the implementation and arrange independent verification.",
         "failed": "Inspect the failure and scope a fresh fix attempt.",
         "verified": "Review the exact verified head and await authorized integration.",
+        "integrated-needs-check": "Run focused checks on the combined integration head and record its exact SHA.",
         "integrated": "No further action unless follow-up work is needed.",
         "abandoned": "Preserve the worktree; re-scope only if work resumes.",
     }
@@ -329,6 +498,7 @@ def main():
     commands.add_parser("bootstrap", help="Fetch and verify the pinned upstream plugin in ignored build storage")
     init = commands.add_parser("init")
     init.add_argument("--integration-owner", required=True)
+    init.add_argument("--authorization", choices=("commits-forbidden", "task-local-commits-authorized"), required=True)
     init.add_argument("--window", type=int, choices=range(1, 9), default=3)
     create_parser = commands.add_parser("create", help="Create one isolated writer worktree from a committed base")
     create_parser.add_argument("unit", type=name)
@@ -342,6 +512,11 @@ def main():
     launch_parser.add_argument("--timeout", type=int, choices=range(30, 14401), default=1800)
     launch_parser.add_argument("--execute", action="store_true")
     commands.add_parser("collect", help="Read completed native-run receipts without waking agents")
+    wait_parser = commands.add_parser("wait", help="Wait for and collect the next worker completion in this coordinator turn")
+    wait_parser.add_argument("--timeout", type=int, choices=range(1, 14401), default=1800)
+    wait_parser.add_argument("--schedule", action="store_true", help="After collection, launch independent review and refill ready units to the rolling window")
+    wait_parser.add_argument("--binary", choices=("opencode", "opencode2"), default="opencode2")
+    wait_parser.add_argument("--run-timeout", type=int, choices=range(30, 14401), default=1800)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--human", action="store_true", help="Print readable queue status")
     commands.add_parser("handoff", help="Print durable state and next actions for another engine/session")
@@ -359,6 +534,10 @@ def main():
     integrate_parser.add_argument("unit", type=name)
     integrate_parser.add_argument("--owner", required=True)
     integrate_parser.add_argument("--execute", action="store_true")
+    combined_parser = commands.add_parser("accept-integration", help="Accept a clean exact combined artifact after focused checks")
+    combined_parser.add_argument("--head", required=True)
+    combined_parser.add_argument("--report", required=True)
+    combined_parser.add_argument("--check", action="append", required=True)
     args = parser.parse_args()
     root = Path(git(args.repo.resolve(), "rev-parse", "--show-toplevel"))
     if args.command == "bootstrap":
@@ -372,7 +551,7 @@ def main():
             if (directory / "board.json").exists():
                 fail("Program already exists; use status/handoff instead of resetting it.")
             save(directory / "board.json", {"program": args.program, "integration": str(root),
-                 "integration_owner": args.integration_owner, "window": args.window,
+                 "integration_owner": args.integration_owner, "authorization": args.authorization, "window": args.window,
                  "upstream": PIN, "created": now(), "units": {}})
         print(str(directory))
         return
@@ -381,10 +560,19 @@ def main():
             create(root, directory, board, args)
         elif args.command == "launch":
             launch(root, directory, board, args)
-        elif args.command in {"collect", "status", "handoff"}:
-            if args.command == "collect":
-                collect(board)
+        elif args.command in {"collect", "wait", "status", "handoff"}:
+            completions = []
+            if args.command == "wait":
+                schedule = {"binary": args.binary, "timeout": args.run_timeout} if args.schedule else None
+                completion_result = wait_for_completion(root, directory, board, args.timeout, schedule)
+                completions = completion_result["completions"]
+            elif args.command in {"collect", "status", "handoff"}:
+                completions = collect(board)
             output = status(board)
+            if args.command in {"collect", "wait"}:
+                output["completions"] = completions
+                if args.command == "wait":
+                    output["scheduled"] = completion_result["scheduled"]
             if args.command == "handoff":
                 output.update(board=str(directory / "board.json"), integration_head=head(root),
                     dirty_integration=bool(git(root, "status", "--porcelain")), runtime_owner="PM only; re-observe before installed operations",
@@ -400,6 +588,8 @@ def main():
             verify(directory, board, args)
         elif args.command == "integrate":
             integrate(root, board, args)
+        elif args.command == "accept-integration":
+            accept_integration(root, directory, board, args)
         elif args.command == "abandon":
             unit = board["units"][args.unit]
             if unit["state"] in {"running", "integrated"}:

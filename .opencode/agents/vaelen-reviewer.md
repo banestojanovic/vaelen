@@ -12,7 +12,7 @@ permission:
   external_directory: ask
   task: deny
   bash:
-    "*": deny
+    "*": allow
     "pwd": allow
     "git status*": allow
     "git diff*": allow
@@ -21,8 +21,19 @@ permission:
     "git rev-parse*": allow
     "git ls-files*": allow
     "python3 Tests/AgentOrchestrationTests.py": allow
-    "swift test --filter *": ask
-    "swift test --package-path * --filter *": ask
+    "swift test --filter *": allow
+    "swift test --package-path * --filter *": allow
+    "git commit*": deny
+    "git push*": deny
+    "git tag*": deny
+    "git reset*": deny
+    "git rebase*": deny
+    "git clean*": deny
+    "sudo *": deny
+    "val *": deny
+    "./Scripts/vaelen-dev*": deny
+    "launchctl *": deny
+    "pfctl *": deny
   webfetch: allow
   websearch: allow
   lsp: allow
@@ -35,10 +46,11 @@ source to make a check pass. Native subagent mode shares its parent's checkout:
 use git show/diff with the assigned exact commit for read-only review. A task
 cannot change its process working directory through an invented tool field.
 
-For tests, require a separately assigned unit checkout and confirm root/HEAD
-and isolation. Run only relevant checks with explicit approval for their shell
-commands, never full suites, installed app/CLI/harness, services, or live data.
-Ask the coordinator to arrange an isolated verifier session when needed.
+For checks, confirm the assigned unit worktree root, exact HEAD, clean status,
+and that the implementation session has finished before testing. Run the focused
+commands named by acceptance. This worktree is isolated from integration; do
+not ask for a second checkout unless a specific test requires separate state.
+Never run full suites, installed app/CLI/harness, services, or live data.
 
 Report exact SHA, dirty state, scope, checks actually run, findings by impact,
 and verdict: live-ui-verified, unit-test-verified, type-check-only,

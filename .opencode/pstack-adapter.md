@@ -21,7 +21,7 @@ delegation; the named integrator alone owns integration writes.
 | `poteto-agent` | `vaelen-worker`, which reads this mapping and the relevant upstream playbook. |
 | Independent verifier | Fresh `vaelen-reviewer` task; or `launch --role reviewer --execute` in the unit checkout when isolated tests are required. It must not be the implementation session. |
 | `environment: cloud`, `cloud_base_branch` | Local Git worktree at a named committed base. Vaelen needs macOS/Xcode; no claim of cloud parity. |
-| `run_in_background` | Separate run managed by the helper; `collect` ingests completion receipts. Native subagent background behavior follows the actual tool schema only. |
+| `run_in_background` | Separate run managed by the helper; `wait` blocks the initiating coordinator tool call until one completion receipt arrives, then reconciles board state. Detached launch alone does not wake an idle conversation. |
 | Model defaults / `/setup-pstack` | Omit model fields and `--model`; use current configured OpenAI model. Never invent Grok/Claude entitlement. Different-model review is optional only when independently authorized and available; disclose same-model review. |
 | AskQuestion / TodoWrite | Native question/todowrite when available; otherwise concise questions and durable task state. |
 | Cursor store / `orch` | Ignored `.build/agent-orchestration/<program>/board.json`, briefs, run receipts, exact-SHA ledger, handoff. Helper handles bookkeeping, not reasoning. |
@@ -60,17 +60,21 @@ workers. PM alone schedules any necessary installed validation and releases the
 existing exclusive operation slot afterward. Worktrees do not isolate the live
 database, services, ports, TLS, or installed app.
 
-Commit permission is not implied by delegation. Workers return uncommitted work
-when no commit approval exists; independent review can inspect it, but the helper
-will not issue a passing exact-SHA receipt for a dirty tree. After an explicitly
-authorized snapshot commit, verify that immutable SHA. Only the named integrator
-lands verified commits; publishing/tagging/force-push need separate authorization.
+The board requires explicit `commits-forbidden` or
+`task-local-commits-authorized` authorization. The helper propagates that field
+to briefs and role prompts. A local task commit is allowed only under the latter.
+Workers remain limited by assigned worktree and helper-enforced changed-path
+scope; command patterns do not create filesystem isolation. Independent review
+must inspect a clean exact SHA. Only the named integrator lands verified commits.
+Publishing, tagging, force-push, live operations, and destructive actions remain
+outside this authorization.
 A new commit or changed integration result invalidates previous verification.
 
 Do not treat exit code zero, reviewer agreement, or a ledger row as product
 acceptance. Record exact checks and remaining uncertainty. Human acceptance is
-separate. The helper's integration command is fast-forward-only; non-linear work
-goes to the integrator for explicit reconciliation and fresh verification.
+separate. Integration uses an explicit non-fast-forward merge for same-base
+commits and remains pending until focused checks inspect and record the combined
+exact head. A source change invalidates previous verification.
 
 ## Resuming and switching engines
 
