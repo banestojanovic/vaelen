@@ -50,6 +50,7 @@ enum CLICommand {
     case phpDefaultSet(String)
     case phpUse(String)
     case phpExec(version: String?, effective: Bool, arguments: [String])
+    case composer(arguments: [String])
     case phpResolvePath
     case isolated
     case phpINI(version: String?)
@@ -252,7 +253,7 @@ struct VaelenCLIMain {
                 printHelp(usage)
                 exit(0)
             }
-            if arguments.last == "--help" || arguments.last == "-h" {
+            if arguments.first != "composer", arguments.last == "--help" || arguments.last == "-h" {
                 printHelp(CLIDocumentation.focusedText(for: Array(arguments.dropLast()).filter { $0 != "help" }))
                 exit(0)
             }
@@ -289,6 +290,13 @@ struct VaelenCLIMain {
             let paths = CoreEndpointPaths()
             let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
             try await client.connect()
+            if case .composer(let arguments) = command {
+                let phpPath = try await client.resolvePHPExecutable(workingDirectory: FileManager.default.currentDirectoryPath).cliPath
+                let script = try ComposerScriptLocator.resolve(path: ProcessInfo.processInfo.environment["PATH"], workingDirectory: FileManager.default.currentDirectoryPath)
+                let plan = ComposerCommand.executionPlan(phpExecutable: phpPath, scriptURL: script, arguments: arguments)
+                await client.disconnect()
+                try ComposerCommand.replaceProcess(with: plan)
+            }
             try await execute(command, client: client, workingDirectory: FileManager.default.currentDirectoryPath)
             await client.disconnect()
             exit(0)
@@ -314,6 +322,9 @@ struct VaelenCLIMain {
                 fail("\(command) exited with status \(status).", code: siteInfoProcessExitCode(status))
             }
         } catch {
+            if let composerError = error as? ComposerScriptError {
+                fail(composerError.localizedDescription ?? "Unable to locate a compatible Composer script.", code: 1)
+            }
             fail(message(for: error), code: 1)
         }
     }
@@ -446,6 +457,8 @@ struct VaelenCLIMain {
             case "resolve": guard args.count == 3, args[2] == "--path" else { throw CLIError.usage }; return .phpResolvePath
              default: throw CLIError.usage
               }
+        case "composer":
+            return .composer(arguments: Array(args.dropFirst()))
         case "shell":
             if args.count == 1 { return .help(path: [first]) }
             guard args.count == 2 else { throw CLIError.usage }
@@ -999,6 +1012,8 @@ struct VaelenCLIMain {
             if result.exitStatus != 0 { exit(result.exitStatus) }
         case .phpResolvePath:
             print(try await resolvePHPPath(client: client, workingDirectory: workingDirectory))
+        case .composer:
+            throw CLIError.message("Composer execution did not enter the process replacement path.")
         case .phpINI(let requestedVersion):
             let version: String
             if let requestedVersion { version = requestedVersion }
