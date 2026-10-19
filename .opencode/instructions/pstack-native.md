@@ -16,6 +16,8 @@ The local TUI plugin uses OpenCode's supported attention notification API once f
 
 The project permission policy allows routine development shell execution by default for the trusted primary and implementation roles. This includes repository inspection, edits, local worktrees and commits, builds, focused tests, and normal diagnostics. Do not add command-by-command exceptions. Keep approval boundaries for credentials, privileged system changes, installation, live Vaelen changes, publishing, pushes, destructive operations outside disposable task state, and unrelated external paths. Reviewers remain read-only and shell-restricted.
 
+Before independent review, the parent provides the exact base and candidate commits, a readable complete diff, relevant source context, and focused verification commands and results. Reviewers remain read-only and need no shell access; selected-file review is not a complete branch review.
+
 OpenCode permissions are not an OS sandbox. Use only paths assigned by the Luna parent and honor the safety boundaries even when a command is technically allowed. The reviewed Swift check is `swift test --filter VaelenCoreTests.ProjectSiteURLTests`; `swift build` is also allowed.
 
 Use only the current task's session IDs when exporting records. Confirm actual model IDs and parent relationships from OpenCode session exports, not agent self-reports. Never include credential files or unrelated session data in evidence.

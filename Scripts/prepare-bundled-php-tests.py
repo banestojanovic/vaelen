@@ -61,9 +61,14 @@ class PreparationTests(unittest.TestCase):
     def write_descriptor(self):
         (self.resources / "bundled-runtime.json").write_text(json.dumps(self.descriptor))
 
-    def run_preparation(self, success=True):
+    def run_preparation(self, success=True, local_sources=None):
+        arguments = [sys.executable, str(SCRIPT), "--offline", "--resources", str(self.resources), "--cache", str(self.cache)]
+        if local_sources is None:
+            local_sources = [self.root / "no-local-source"]
+        for source in local_sources:
+            arguments.extend(["--local-source", str(source)])
         process = subprocess.run(
-            [sys.executable, str(SCRIPT), "--offline", "--resources", str(self.resources), "--cache", str(self.cache)],
+            arguments,
             capture_output=True, text=True,
         )
         if success:
@@ -71,6 +76,68 @@ class PreparationTests(unittest.TestCase):
         else:
             self.assertNotEqual(process.returncode, 0, process.stdout)
         return process
+
+    def remove_archives(self):
+        for archive in self.cache.rglob("*.tar.gz"):
+            archive.unlink()
+
+    def write_local_source(self, source, cli=None, fpm=None):
+        source.mkdir()
+        for kind, name, mode, contents in (
+            ("cli", "php", 0o751, self.data["cli"] if cli is None else cli),
+            ("fpm", "php-fpm", 0o710, self.data["fpm"] if fpm is None else fpm),
+        ):
+            path = source / name
+            path.write_bytes(contents)
+            path.chmod(mode)
+
+    def test_offline_preparation_recovers_from_matching_local_binary_pair(self):
+        source = self.root / "installed-app-resources"
+        self.write_local_source(source)
+        self.remove_archives()
+        descriptor_before = (self.resources / "bundled-runtime.json").read_bytes()
+
+        result = self.run_preparation(local_sources=[source])
+
+        self.assertIn("from matching local binaries", result.stdout)
+        for name, expected, mode in (("php", self.data["cli"], 0o751), ("php-fpm", self.data["fpm"], 0o710)):
+            binary = self.resources / name
+            self.assertEqual(binary.read_bytes(), expected)
+            self.assertEqual(binary.stat().st_mode & 0o777, mode)
+        self.assertEqual((self.resources / "bundled-runtime.json").read_bytes(), descriptor_before)
+        self.assertFalse(list(self.resources.glob(".prepare-*")))
+
+    def test_mismatched_local_pair_is_refused_before_publishing_either_binary(self):
+        source = self.root / "mismatched-app-resources"
+        self.write_local_source(source, fpm=b"wrong pinned FPM bytes\n")
+        existing_cli = self.resources / "php"
+        existing_cli.write_bytes(self.data["cli"])
+        existing_cli.chmod(0o755)
+        original_stat = existing_cli.stat()
+        self.remove_archives()
+
+        result = self.run_preparation(success=False, local_sources=[source])
+
+        self.assertIn("does not match both pinned binaries", result.stderr)
+        self.assertIn("Pinned archive is not cached", result.stderr)
+        self.assertEqual(existing_cli.read_bytes(), self.data["cli"])
+        self.assertEqual(existing_cli.stat().st_mtime_ns, original_stat.st_mtime_ns)
+        self.assertFalse((self.resources / "php-fpm").exists())
+
+    def test_verified_generated_pair_stays_usable_when_local_source_mismatches(self):
+        source = self.root / "mismatched-app-resources"
+        self.write_local_source(source, fpm=b"wrong pinned FPM bytes\n")
+        for kind, binary in self.descriptor["binaries"].items():
+            path = self.resources / binary["file"]
+            path.write_bytes(self.data[kind])
+            path.chmod(0o755)
+        before = {p.name: (p.stat().st_mtime_ns, p.stat().st_mode & 0o777) for p in self.resources.iterdir()}
+        self.remove_archives()
+
+        result = self.run_preparation(local_sources=[source])
+
+        self.assertIn("already verified", result.stdout)
+        self.assertEqual(before, {p.name: (p.stat().st_mtime_ns, p.stat().st_mode & 0o777) for p in self.resources.iterdir()})
 
     def test_verified_resource_cache_hit_needs_no_archives(self):
         for kind, binary in self.descriptor["binaries"].items():

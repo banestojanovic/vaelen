@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -21,6 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 RESOURCE_PATH = Path("Sources/VaelenCore/Resources/PHPBundledRuntime")
 KINDS = ("cli", "fpm")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+INSTALLED_APP_RESOURCES = Path(
+    "/Applications/Vaelen.app/Contents/Resources/Vaelen_VaelenCore.bundle/Contents/Resources"
+)
 
 
 class PreparationError(Exception):
@@ -139,7 +143,34 @@ def extract_binary(archive, expected_name, destination, expected_digest):
     destination.chmod(0o755)
 
 
-def prepare(resources, cache, offline):
+def matches_local_source(source, descriptor):
+    present = source.exists() or source.is_symlink()
+    if not present:
+        return False
+    if source.is_symlink() or not source.is_dir():
+        print("Ignoring invalid local PHP source: " + str(source), file=sys.stderr)
+        return False
+    for kind in KINDS:
+        binary = descriptor["binaries"][kind]
+        path = source / binary["file"]
+        if not matches(path, binary["sha256"]) or stat.S_IMODE(path.stat().st_mode) & 0o111 == 0:
+            print("Ignoring local PHP source that does not match both pinned binaries: " + str(source), file=sys.stderr)
+            return False
+    return True
+
+
+def copy_local_binaries(source, stage, descriptor):
+    for kind in KINDS:
+        binary = descriptor["binaries"][kind]
+        original = source / binary["file"]
+        destination = stage / binary["file"]
+        shutil.copy2(original, destination)
+        require(stat.S_IMODE(destination.stat().st_mode) == stat.S_IMODE(original.stat().st_mode),
+                "Could not preserve local binary permissions: " + binary["file"])
+        require(matches(destination, binary["sha256"]), "Local binary checksum mismatch after copy: " + binary["file"])
+
+
+def prepare(resources, cache, offline, local_sources=None):
     require(resources.is_dir() and not resources.is_symlink(), "Bundled resource directory is missing or a symlink")
     descriptor = load_descriptor(resources)
     cache.mkdir(parents=True, exist_ok=True)
@@ -151,23 +182,33 @@ def prepare(resources, cache, offline):
                and os.access(resources / descriptor["binaries"][kind]["file"], os.X_OK) for kind in KINDS):
             print("Bundled PHP " + descriptor["phpVersion"] + " already verified")
             return
+        sources = [INSTALLED_APP_RESOURCES] if local_sources is None else list(local_sources)
+        source = next((candidate for candidate in sources if matches_local_source(candidate, descriptor)), None)
         with tempfile.TemporaryDirectory(dir=resources, prefix=".prepare-") as temporary:
             stage = Path(temporary)
-            for kind in KINDS:
-                binary = descriptor["binaries"][kind]
-                artifact = descriptor["manifest"]["artifacts"][kind]
-                size = descriptor["manifest"].get("verifiedArtifactSizes", {}).get(kind)
-                archive = verified_archive(cache, artifact, size, offline)
-                extract_binary(archive, binary["file"], stage / binary["file"], binary["sha256"])
+            if source is not None:
+                copy_local_binaries(source, stage, descriptor)
+            else:
+                for kind in KINDS:
+                    binary = descriptor["binaries"][kind]
+                    artifact = descriptor["manifest"]["artifacts"][kind]
+                    size = descriptor["manifest"].get("verifiedArtifactSizes", {}).get(kind)
+                    archive = verified_archive(cache, artifact, size, offline)
+                    extract_binary(archive, binary["file"], stage / binary["file"], binary["sha256"])
             # Validate the complete pair before publishing either resource. Each
             # rename is atomic, and interrupted preparation is rechecked next run.
             for kind in KINDS:
                 name = descriptor["binaries"][kind]["file"]
+                require(matches(stage / name, descriptor["binaries"][kind]["sha256"]),
+                        "Staged binary checksum mismatch: " + name)
                 require(not (resources / name).is_symlink(), "Generated binary must not be a symlink")
+                require(not (resources / name).exists() or (resources / name).is_file(),
+                        "Generated binary destination is not a regular file: " + str(resources / name))
             for kind in KINDS:
                 name = descriptor["binaries"][kind]["file"]
                 os.replace(stage / name, resources / name)
-        print("Prepared bundled PHP " + descriptor["phpVersion"] + " from pinned archives")
+        source_description = "matching local binaries from " + str(source) if source is not None else "pinned archives"
+        print("Prepared bundled PHP " + descriptor["phpVersion"] + " from " + source_description)
 
 
 def main():
@@ -175,9 +216,11 @@ def main():
     parser.add_argument("--offline", action="store_true", help="use only verified resources or cached pinned archives")
     parser.add_argument("--resources", type=Path, default=ROOT / RESOURCE_PATH, help="resource directory (isolated fixture override)")
     parser.add_argument("--cache", type=Path, default=ROOT / ".build/php-provider", help="archive cache directory")
+    parser.add_argument("--local-source", type=Path, action="append",
+                        help="read-only directory containing both pinned php and php-fpm binaries; may be repeated")
     args = parser.parse_args()
     try:
-        prepare(args.resources, args.cache, args.offline)
+        prepare(args.resources, args.cache, args.offline, args.local_source)
     except (PreparationError, OSError, ValueError, KeyError, tarfile.TarError) as error:
         print("prepare-bundled-php: " + str(error), file=sys.stderr)
         return 1
