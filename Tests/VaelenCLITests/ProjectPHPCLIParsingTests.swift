@@ -39,4 +39,12 @@ final class ProjectPHPCLIParsingTests: XCTestCase {
         guard case .shellUninstall = try VaelenCLIMain.parse(["shell", "uninstall"]) else { return XCTFail("shell uninstall did not parse") }
         XCTAssertThrowsError(try VaelenCLIMain.parse(["shell", "unknown"]))
     }
+
+    func testComposerForwardsEveryTokenWithoutTreatingHelpAsVaelenHelp() throws {
+        guard case .composer(let arguments) = try VaelenCLIMain.parse(["composer", "--help", "-h", "--", "", "install"]) else {
+            return XCTFail("Composer arguments should be forwarded unchanged")
+        }
+        XCTAssertEqual(arguments, ["--help", "-h", "--", "", "install"])
+        XCTAssertTrue(VaelenCLIMain.helpText(for: ["composer"]).contains("PATH Composer PHP script"))
+    }
 }

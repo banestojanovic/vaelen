@@ -21,6 +21,14 @@ From the worktree root, execute:
 
 This executable builds only the unsigned `val` product, compiles and lists tests without executing the full suite, then selects exactly three checks. It records every Swift command and exit status. It uses `--skip-update --disable-automatic-resolution` for build and discovery. The harness requires the default `.build/debug/val`; do not override the scratch path or reuse a binary from another worktree.
 
+For the Composer passthrough, execute:
+
+```bash
+.agents/skills/verify-vaelen/scripts/prove-composer.sh
+```
+
+This builds only `val`, discovers the suite without running it, and selects exactly six locator checks, one parser check, and one private-Core end-to-end journey. That journey compiles two controlled arm64 Mach-O PHP stand-ins with different reported versions, seeds one linked override and one inherited default, then invokes the actual worktree CLI. It also checks an outside-root invocation, PATH lookup errors, unavailable selected PHP with a default still present, unavailable Core, exact argv/cwd/stdin/stdout/stderr/status, support-file snapshots, and bounded cleanup. The stand-ins are not PHP, and the PHP script candidates are fixture stubs; this proves selection and process forwarding, not Composer behavior or package installation.
+
 The drive starts an in-process production `DaemonServer` with a private Unix socket and disposable SQLite registry containing six projects. There is no persistent shared verification server to launch separately. Readiness and teardown occur within each test invocation.
 
 ## Doctor
@@ -44,6 +52,8 @@ The fixture confines `VAELEN_TEST_SUPPORT_ROOT_ENABLED=1` and `VAELEN_TEST_SUPPO
 The helper prints a unique `/private/tmp/vaelen-verify-evidence.*` directory. Keep it. Inspect `source.txt`, `commands.txt`, `status.txt`, `doctor.log`, and `drive.log`. Require exactly three selected and passed tests, zero skips, the specific controlled mismatch, successful private-Core doctor, CLI output and exit, and cleanup confirmation. Test discovery compiles other tests but does not execute them. Record discovered count separately from selected and passed counts.
 
 The root, socket, and CLI output in `drive.log` establish the action and observed output. The SQLite seed uses the real `ProjectRegistry` and store; this is listing pre-seeded projects, not CLI link creation or persistence across a product restart. Request accounting printed by the historical benchmark is partly inferred. Do not report its elapsed times as installed-product performance.
+
+For Composer, inspect `composer-drive.log` and require all eight exact checks to pass, including the in-process private Core PID, distinct override/default fixture labels, the expected unavailable-PHP and Core errors, exact stream/argument output, unchanged support snapshot, and confirmed cleanup. Its controlled native executables exercise Core's existing package metadata and file validation; they do not emulate PHP parsing, Composer resolution, or dependency installation.
 
 Router, DNS responder, TLS trust, and privileged ports boundaries are disabled or simulated. No real route reconciliation, DNS listener, TLS trust change, or port forwarding is tested. The optional synthetic-PHP companion reuses a local `php -v` executable as both metadata paths and creates synthetic hashes/default metadata. It supplies neither a genuine package nor PHP-FPM coverage. See [links](features/links.md).
 
