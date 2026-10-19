@@ -120,7 +120,7 @@ public struct CoreLogCatalog: Sendable {
         let ownedLogsPath = layout.logsDirectoryURL.resolvingSymlinksInPath().standardizedFileURL.path
         let filePath = definition.url.resolvingSymlinksInPath().standardizedFileURL.path
         guard isDescendant(rootPath, of: ownedLogsPath), isDescendant(filePath, of: rootPath) else { throw CoreLogError.unsafePath(definition.id.rawValue) }
-        let fd = open(filePath, O_RDONLY | O_NOFOLLOW)
+        let fd = open(filePath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else {
             if errno == ENOENT || errno == ENOTDIR { throw CoreLogError.missing(definition.id.rawValue) }
             throw CoreLogError.unreadable(definition.id.rawValue)

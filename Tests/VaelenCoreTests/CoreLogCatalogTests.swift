@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import VaelenCore
 
@@ -46,6 +47,20 @@ final class CoreLogCatalogTests: XCTestCase {
         try Data("secret\n".utf8).write(to: outside)
         try FileManager.default.createSymbolicLink(at: layout.caddyLogsDirectoryURL.appendingPathComponent("caddy.log"), withDestinationURL: outside)
         XCTAssertThrowsError(try CoreLogCatalog(layout: layout).tail(id: "caddy", lines: 1)) { XCTAssertEqual($0 as? CoreLogError, .unsafePath("caddy")) }
+        try FileManager.default.removeItem(at: root)
+    }
+
+    func testNonRegularLogIsUnreadableWithoutBlocking() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("core-logs-\(UUID())", isDirectory: true)
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        try FileManager.default.createDirectory(at: layout.caddyLogsDirectoryURL, withIntermediateDirectories: true)
+        let log = layout.caddyLogsDirectoryURL.appendingPathComponent("caddy.log")
+        XCTAssertEqual(mkfifo(log.path, 0o600), 0)
+        let catalog = CoreLogCatalog(layout: layout)
+        XCTAssertEqual(catalog.list().first { $0.id == "caddy" }?.status, .unreadable)
+        XCTAssertThrowsError(try catalog.tail(id: "caddy", lines: 1)) {
+            XCTAssertEqual($0 as? CoreLogError, .unreadable("caddy"))
+        }
         try FileManager.default.removeItem(at: root)
     }
 

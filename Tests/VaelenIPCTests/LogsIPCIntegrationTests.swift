@@ -37,9 +37,22 @@ final class LogsIPCIntegrationTests: XCTestCase {
             XCTAssertEqual(list.status, 0, list.output)
             XCTAssertTrue(list.output.contains("\"id\":\"mysql\""), list.output)
             XCTAssertTrue(list.output.contains("\"status\":\"available\""), list.output)
+            let humanList = try runVal(valPath, arguments: ["logs"], root: root)
+            XCTAssertEqual(humanList.status, 0, humanList.output)
+            XCTAssertTrue(humanList.output.contains("mysql\tMySQL\tavailable"), humanList.output)
+            XCTAssertEqual(humanList.error, "")
+            let defaultTail = try runVal(valPath, arguments: ["logs", "mailpit"], root: root)
+            XCTAssertEqual(defaultTail.status, 0, defaultTail.output)
+            XCTAssertEqual(defaultTail.output, "mailpit-one\n")
+            XCTAssertEqual(defaultTail.error, "")
+            let humanTail = try runVal(valPath, arguments: ["logs", "mysql", "--lines", "2"], root: root)
+            XCTAssertEqual(humanTail.status, 0, humanTail.output)
+            XCTAssertEqual(humanTail.output, "mysql-two\nmysql-three\n")
+            XCTAssertEqual(humanTail.error, "[truncated] Returned 2 lines within the bounded log tail.\n")
             let tail = try runVal(valPath, arguments: ["logs", "mysql", "--lines", "2", "--json"], root: root)
             XCTAssertEqual(tail.status, 0, tail.output)
             XCTAssertTrue(tail.output.contains("mysql-two\\nmysql-three"), tail.output)
+            XCTAssertEqual(tail.error, "")
             XCTAssertEqual(try snapshot(layout.logsDirectoryURL), logsBefore)
             XCTAssertEqual(try snapshot(layout.stateDirectoryURL), stateBefore)
 
@@ -60,16 +73,16 @@ final class LogsIPCIntegrationTests: XCTestCase {
         try FileManager.default.removeItem(at: root)
     }
 
-    private func runVal(_ path: String, arguments: [String], root: URL) throws -> (status: Int32, output: String) {
+    private func runVal(_ path: String, arguments: [String], root: URL) throws -> (status: Int32, output: String, error: String) {
         let process = Process(); process.executableURL = URL(fileURLWithPath: path); process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["VAELEN_TEST_SUPPORT_ROOT_ENABLED"] = "1"
         environment["VAELEN_TEST_SUPPORT_ROOT"] = root.path
         environment["NO_COLOR"] = "1"
         process.environment = environment
-        let output = Pipe(); process.standardOutput = output; process.standardError = output
-        try process.run(); let bytes = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: bytes, as: UTF8.self))
+        let output = Pipe(); let error = Pipe(); process.standardOutput = output; process.standardError = error
+        try process.run(); let bytes = output.fileHandleForReading.readDataToEndOfFile(); let errorBytes = error.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: bytes, as: UTF8.self), String(decoding: errorBytes, as: UTF8.self))
     }
 
     private func snapshot(_ directory: URL) throws -> [String: Data] {
