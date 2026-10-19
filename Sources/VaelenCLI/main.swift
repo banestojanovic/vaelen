@@ -20,6 +20,7 @@ enum CLICommand {
     case help(path: [String])
     case version
     case status(json: Bool)
+    case logs(id: String?, lines: Int, json: Bool)
     case doctor(json: Bool)
     case routeTLS(hostname: String?, secure: Bool)
     case link(path: String?, hostname: String?)
@@ -361,6 +362,22 @@ struct VaelenCLIMain {
             guard args.count == 1 || args.count == 2 else { throw CLIError.commandUsage("ini") }
             return .phpINI(version: args.count == 2 ? args[1] : nil)
         case "status": return .status(json: try listJSONOption(args))
+        case "logs":
+            var id: String?; var lines = 100; var linesSpecified = false; var json = false; var index = 1
+            while index < args.count {
+                switch args[index] {
+                case "--json": guard !json else { throw CLIError.commandUsage("logs") }; json = true
+                case "--lines":
+                    guard index + 1 < args.count, let value = Int(args[index + 1]), (1...CoreLogCatalog.maxLines).contains(value) else { throw CLIError.commandUsage("logs") }
+                    lines = value; linesSpecified = true; index += 1
+                default:
+                    guard !args[index].hasPrefix("-"), args[index].utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 122) || $0 == 45 || $0 == 46 }), id == nil else { throw CLIError.commandUsage("logs") }
+                    id = args[index]
+                }
+                index += 1
+            }
+            guard id != nil || !linesSpecified else { throw CLIError.commandUsage("logs") }
+            return .logs(id: id, lines: lines, json: json)
         case "doctor": return .doctor(json: try listJSONOption(args))
         case "secure", "unsecure":
             guard args.count <= 2 else { throw CLIError.usage }
@@ -674,6 +691,19 @@ struct VaelenCLIMain {
                     ("Version", status.core.version), ("PID", String(status.core.pid)),
                     ("Protocol", String(status.protocolVersion))
                 ]))
+            }
+        case .logs(let id, let lines, let json):
+            if let id {
+                let tail = try await client.logsTail(id: id, lines: lines)
+                if json { print(String(decoding: try IPCCodec.encode(LogsTailResult(tail: tail)), as: UTF8.self)) }
+                else { print(tail.text, terminator: tail.text.isEmpty ? "" : "\n"); if tail.truncated { FileHandle.standardError.write(Data("[truncated] Returned \(tail.linesReturned) lines within the bounded log tail.\n".utf8)) } }
+            } else {
+                let logs = try await client.logsCatalog()
+                if json { print(String(decoding: try IPCCodec.encode(LogsCatalogResult(logs: logs)), as: UTF8.self)) }
+                else {
+                    print(HumanOutput.heading("Vaelen logs"))
+                    for log in logs { print("\(log.id)\t\(log.service)\t\(log.status.rawValue)\t\(log.sizeBytes.map(String.init) ?? "-") bytes\t\(log.title)") }
+                }
             }
         case .link(let path, let requestedHostname):
             let workingPath = URL(fileURLWithPath: workingDirectory).standardizedFileURL.resolvingSymlinksInPath().path

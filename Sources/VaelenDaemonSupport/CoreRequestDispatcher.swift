@@ -46,6 +46,7 @@ public actor CoreRequestDispatcher {
     private let dns: DNSCapability
     private let tls: TLSCapability
     private let ports: StandardPortsCapability
+    private let logs: CoreLogCatalog
     private let serviceIntents: ServiceIntentStore
     private let shutdownTimingLogger = Logger(subsystem: "dev.vaelen.daemon", category: "shutdown-timing")
     private var restorationStarted = false
@@ -60,8 +61,8 @@ public actor CoreRequestDispatcher {
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil) throws {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.logs = logs; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
         let persistedRoutes = try routeRepository?.all() ?? []
         _ = try routeRepository?.pendingTransitions()
         self.routeIntents = Dictionary(uniqueKeysWithValues: persistedRoutes.map { ($0.route.id, $0) })
@@ -446,6 +447,11 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .tlsTrust(.init(result: try await tls.removeLocalCATrust()))), true)
             case .portsStatus:
                 return (.init(id: request.id, result: .portsStatus(.init(ports: await ports.status()))), true)
+            case .logsCatalog:
+                return (.init(id: request.id, result: .logsCatalog(.init(logs: logs.list()))), true)
+            case .logsTail:
+                guard case .logsTail(let params)? = request.params else { throw IPCErrorPayload(code: .invalidRequest, message: "A log ID and line count are required.") }
+                return (.init(id: request.id, result: .logsTail(.init(tail: try logs.tail(id: params.id, lines: params.lines)))), true)
             case .portsInstall:
                 standardPortsLogger.info("IPC ports.install entered; persisting desired Standard Ports state ON")
                 try serviceIntents.set("standard-ports", enabled: true)
@@ -467,6 +473,14 @@ public actor CoreRequestDispatcher {
             return (.init(id: request.id, error: map(error)), true)
         } catch let error as IPCErrorPayload {
             return (.init(id: request.id, error: error), true)
+        } catch let error as CoreLogError {
+            switch error {
+            case .unknownLog(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Unknown Vaelen log ID '\(id)'. Run 'val logs' to list supported logs.")), true)
+            case .invalidLineCount: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Line count must be between 1 and \(CoreLogCatalog.maxLines).")), true)
+            case .missing(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Log '\(id)' is missing.")), true)
+            case .unreadable(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Log '\(id)' is unreadable.")), true)
+            case .unsafePath(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Log '\(id)' resolves outside Vaelen's owned log directory.")), true)
+            }
         } catch let error as StandardPortsError {
             standardPortsLogger.error("IPC Standard Ports request returned an error payload: \(String(describing: error), privacy: .public)")
             switch error {

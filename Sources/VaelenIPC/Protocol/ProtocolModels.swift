@@ -7,7 +7,7 @@ public enum ProtocolVersion: Int, Codable, Sendable {
 
 public enum IPCCompatibility {
     // Increment when an existing client/Core pair can no longer share command models or semantics.
-    public static let schemaVersion = 6
+    public static let schemaVersion = 7
 }
 
 public struct ClientIdentity: Codable, Equatable, Sendable {
@@ -126,6 +126,8 @@ public enum CoreMethod: String, Sendable {
     case portsStatus = "ports.status"
     case portsInstall = "ports.install"
     case portsRemove = "ports.remove"
+    case logsCatalog = "logs.catalog"
+    case logsTail = "logs.tail"
 }
 
 public enum RequestParams: Codable, Equatable, Sendable {
@@ -146,6 +148,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case routeAssociation(RouteProjectAssociationRequest)
     case routePHPTargetUpdate(RoutePHPTargetUpdateRequest)
     case dnsInstall(DNSInstallRequest)
+    case logsTail(LogsTailRequest)
     case empty
     case raw(JSONValue)
 
@@ -168,6 +171,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .routeAssociation(let value): try value.encode(to: encoder)
         case .routePHPTargetUpdate(let value): try value.encode(to: encoder)
         case .dnsInstall(let value): try value.encode(to: encoder)
+        case .logsTail(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
@@ -188,6 +192,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
             if fields["workingDirectory"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPResolveRequest.self, from: IPCCodec.encode(value)) { self = .phpResolve(params); return }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
+            if fields["id"] != nil, fields["lines"] != nil, let params = try? IPCCodec.decode(LogsTailRequest.self, from: IPCCodec.encode(value)) { self = .logsTail(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, fields["expectedCurrentSocket"] != nil, let params = try? IPCCodec.decode(RoutePHPTargetUpdateRequest.self, from: IPCCodec.encode(value)) { self = .routePHPTargetUpdate(params); return }
         }
@@ -514,6 +519,9 @@ public struct DNSStatusResult: Codable, Equatable, Sendable { public let dns: DN
 public struct TLSStatusResult: Codable, Equatable, Sendable { public let tls: TLSStatus; public init(tls: TLSStatus) { self.tls = tls } }
 public struct TLSTrustResultWire: Codable, Equatable, Sendable { public let result: TLSTrustResult; public init(result: TLSTrustResult) { self.result = result } }
 public struct PortsStatusResult: Codable, Equatable, Sendable { public let ports: StandardPortsStatus; public init(ports: StandardPortsStatus) { self.ports = ports } }
+public struct LogsTailRequest: Codable, Equatable, Sendable { public let id: String; public let lines: Int; public init(id: String, lines: Int) { self.id = id; self.lines = lines } }
+public struct LogsCatalogResult: Codable, Equatable, Sendable { public let logs: [CoreLogEntry]; public init(logs: [CoreLogEntry]) { self.logs = logs } }
+public struct LogsTailResult: Codable, Equatable, Sendable { public let tail: CoreLogTail; public init(tail: CoreLogTail) { self.tail = tail } }
 
 public enum ResponseResult: Codable, Equatable, Sendable {
     case handshake(HandshakeResult)
@@ -552,6 +560,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case tlsStatus(TLSStatusResult)
     case tlsTrust(TLSTrustResultWire)
     case portsStatus(PortsStatusResult)
+    case logsCatalog(LogsCatalogResult)
+    case logsTail(LogsTailResult)
     case raw(JSONValue)
 
     public func encode(to encoder: Encoder) throws {
@@ -592,6 +602,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .tlsStatus(let value): try value.encode(to: encoder)
         case .tlsTrust(let value): try value.encode(to: encoder)
         case .portsStatus(let value): try value.encode(to: encoder)
+        case .logsCatalog(let value): try value.encode(to: encoder)
+        case .logsTail(let value): try value.encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
     }
@@ -639,6 +651,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
          else if fields["result"] != nil, let result = try? IPCCodec.decode(TLSTrustResultWire.self, from: data) { self = .tlsTrust(result) }
          else if fields["tls"] != nil, let result = try? IPCCodec.decode(TLSStatusResult.self, from: data) { self = .tlsStatus(result) }
         else if fields["ports"] != nil, let result = try? IPCCodec.decode(PortsStatusResult.self, from: data) { self = .portsStatus(result) }
+        else if fields["logs"] != nil, let result = try? IPCCodec.decode(LogsCatalogResult.self, from: data) { self = .logsCatalog(result) }
+        else if fields["tail"] != nil, let result = try? IPCCodec.decode(LogsTailResult.self, from: data) { self = .logsTail(result) }
         else { self = .raw(value) }
     }
 }

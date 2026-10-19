@@ -302,6 +302,8 @@ public actor VaelenCoreClient {
     public func portsStatus() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsStatus))) else { throw CoreClientError.invalidResponse }; return result.ports }
     public func portsInstall() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsInstall))) else { throw CoreClientError.invalidResponse }; return result.ports }
     public func portsRemove() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsRemove))) else { throw CoreClientError.invalidResponse }; return result.ports }
+    public func logsCatalog() async throws -> [CoreLogEntry] { guard case .logsCatalog(let result) = try result(from: await send(IPCRequest(method: .logsCatalog))) else { throw CoreClientError.invalidResponse }; return result.logs }
+    public func logsTail(id: String, lines: Int) async throws -> CoreLogTail { guard case .logsTail(let result) = try result(from: await send(IPCRequest(method: .logsTail, params: .logsTail(.init(id: id, lines: lines))))) else { throw CoreClientError.invalidResponse }; return result.tail }
 
     public func disconnect() async {
         connected = false

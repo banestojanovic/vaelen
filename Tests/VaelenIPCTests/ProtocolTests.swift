@@ -4,7 +4,7 @@ import XCTest
 
 final class ProtocolTests: XCTestCase {
     func testProjectObservationSnapshotAndReferenceRoundTrip() throws {
-        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 6)
+        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 7)
         let snapshotID = UUID()
         let begin = IPCRequest(method: .projectObservationSnapshot)
         let decodedBegin = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(begin))
@@ -44,7 +44,7 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testProjectPHPSelectionsRoundTripsThroughJSON() throws {
-        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 6)
+        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 7)
         let request = IPCRequest(method: .projectPHPSelections)
         let decodedRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
         XCTAssertEqual(decodedRequest.knownMethod, .projectPHPSelections)
