@@ -2,7 +2,7 @@
 
 The normal OpenCode2 TUI is the entry point. Use the installed pstack skills through the project's `skills` setting. Do not run nested OpenCode CLIs, detached agents, `Scripts/vaelen-agents`, another orchestrator, or unconfigured model IDs.
 
-`vaelen-primary` on GPT-6 Luna Medium owns each task. It owns delegation, result collection, verification, correction, and final reporting. Keep small tasks direct. For a larger task, it may start two independent Luna workers with disjoint read-only scopes or isolated worktrees. Collect every child result before reporting completion. Do not use concurrent writers in one working tree.
+`vaelen-primary` owns each task’s delegation, result collection, verification, correction, and final reporting. GPT-6 Luna is the default, but the primary must honor the model selected for the active TUI session if the user changes it with the model picker. Report the actual model used. Keep small tasks direct. For a larger task, it may start two independent Luna workers with disjoint read-only scopes or isolated worktrees. Collect every child result before reporting completion. Do not use concurrent writers in one working tree.
 
 Use `vaelen-judgment` on GPT-6.1 Sol Medium for architecture, ambiguity, and difficult decisions. The Luna parent is the approved recovery if that child fails. Workers and fresh reviewers use GPT-6 Luna Medium. `vaelen-reviewer` is read-only. Panels are reduced to one worker or reviewer by the model sheet.
 
