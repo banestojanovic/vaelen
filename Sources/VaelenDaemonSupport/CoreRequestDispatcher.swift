@@ -612,7 +612,9 @@ public actor CoreRequestDispatcher {
                 throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(normalizedHostname) is removed from saved routing, but Caddy cleanup is pending. Retry ‘val proxy remove \(normalizedHostname)’ after checking Caddy.")
             }
         } else if routerState.state == .stopped {
-            try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route)
+            guard try await completeProxyDeletionsIfConverged() else {
+                throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(normalizedHostname) is removed from saved routing, but ownership cleanup is pending. Retry after checking routing state.")
+            }
         } else {
             throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(normalizedHostname) is removed from saved routing, but Caddy is degraded and removal is not confirmed. Retry after checking Caddy.")
         }
@@ -658,16 +660,26 @@ public actor CoreRequestDispatcher {
     }
 
     private func completeProxyDeletionsIfConverged() async throws -> Bool {
-        guard let localProxyRepository else { return true }
+        guard let localProxyRepository, let routeRepository else { return false }
         let records = try localProxyRepository.list().filter { $0.phase == .deleting }
         guard !records.isEmpty else { return true }
+        let persistedRoutes = try routeRepository.all()
+        for record in records {
+            if let intent = persistedRoutes.first(where: { $0.route.id == record.routeID }) {
+                guard intent.route == record.route, intent.projectID == nil, intent.projectPath == nil else {
+                    throw LocalProxyError.recordMismatch
+                }
+            }
+        }
         let state = await router.status()
         if state.state == .stopped {
-            for record in records { try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route) }
-            return true
+            for record in records where !persistedRoutes.contains(where: { $0.route.id == record.routeID }) {
+                try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route)
+            }
+            return try localProxyRepository.list().allSatisfy { $0.phase != .deleting }
         }
         guard state.state == .running && state.health == .healthy, let observed = try? await router.observedRoutes() else { return false }
-        for record in records where !observed.contains(where: { $0.hostname == record.route.hostname }) {
+        for record in records where !persistedRoutes.contains(where: { $0.route.id == record.routeID }) && !observed.contains(where: { $0.hostname == record.route.hostname }) {
             try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route)
         }
         return try localProxyRepository.list().allSatisfy { $0.phase != .deleting }
