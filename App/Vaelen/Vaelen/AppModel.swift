@@ -1107,9 +1107,19 @@ final class AppModel {
     }
 
     func openProjectRoute(_ route: RouteIntent) {
-        let scheme = route.route.tls == .local ? "https" : "http"
-        guard let url = URL(string: "\(scheme)://\(route.route.hostname)") else { return }
+        guard let url = projectRouteURL(route) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private func projectRouteURL(_ route: RouteIntent) -> URL? {
+        let scheme = route.route.tls == .local ? "https" : "http"
+        return URL(string: "\(scheme)://\(route.route.hostname)")
+    }
+
+    func copyProjectRouteURL(_ route: RouteIntent) {
+        guard let url = projectRouteURL(route) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
     func tablePlusAction(_ report: ProjectEnvironmentReport) -> ProjectDatabaseViewerAction {

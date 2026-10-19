@@ -310,7 +310,7 @@ struct ProjectCard: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(project.path)
-            if let routes, routes.count > 1 {
+            if let routes {
                 ForEach(routes, id: \.route.id) { route in
                     HStack(spacing: 6) {
                         Image(systemName: route.route.tls == .local ? "lock.fill" : "globe")
@@ -318,6 +318,8 @@ struct ProjectCard: View {
                         Text(route.route.hostname).font(.caption.weight(.medium)).lineLimit(1)
                         Spacer(minLength: 4)
                         Button("Open") { model.openProjectRoute(route) }
+                            .buttonStyle(.bordered).controlSize(.mini)
+                        Button("Copy URL") { model.copyProjectRouteURL(route) }
                             .buttonStyle(.bordered).controlSize(.mini)
                     }
                 }
