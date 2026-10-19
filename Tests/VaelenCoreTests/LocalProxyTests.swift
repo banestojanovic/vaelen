@@ -5,9 +5,10 @@ import SQLite3
 final class LocalProxyTests: XCTestCase {
     func testConfigurationAllowsOnlyLoopbackHTTPAndNormalizesHost() throws {
         XCTAssertEqual(try LocalProxyConfiguration(hostname: "app.test", upstreamURL: "http://LOCALHOST:8080/").upstreamURL.absoluteString, "http://localhost:8080/")
+        XCTAssertEqual(try LocalProxyConfiguration(hostname: "App.Test", upstreamURL: "http://localhost:8080").hostname, "app.test")
         XCTAssertNoThrow(try LocalProxyConfiguration(hostname: "app.test", upstreamURL: "http://127.42.0.1:65535"))
         XCTAssertNoThrow(try LocalProxyConfiguration(hostname: "app.test", upstreamURL: "http://[::1]:8080"))
-        for hostname in ["App.test", "app.local", "-app.test", "app..test"] {
+        for hostname in ["app.local", "-app.test", "app..test"] {
             XCTAssertThrowsError(try LocalProxyConfiguration(hostname: hostname, upstreamURL: "http://localhost:8080"))
         }
         for url in ["https://localhost:8080", "http://localhost", "http://localhost:0", "http://localhost:65536", "http://user@localhost:80", "http://localhost:80/path", "http://localhost:80?x=1", "http://example.com:80", "http://127.0.0.1.evil:80"] {
@@ -44,6 +45,8 @@ final class LocalProxyTests: XCTestCase {
         XCTAssertThrowsError(try repository.createPrepared(route: changed, expectedRoute: route)) { XCTAssertEqual($0 as? LocalProxyError, .routeNotEligible) }
         XCTAssertThrowsError(try repository.activate(routeID: RouteID(), expectedRoute: route)) { XCTAssertEqual($0 as? LocalProxyError, .recordNotFound) }
         XCTAssertThrowsError(try repository.createPrepared(route: Route(hostname: "app.test", target: .http(host: "127.0.0.1", port: 80)), expectedRoute: Route(hostname: "app.test", target: .http(host: "127.0.0.1", port: 80))))
+        let remote = Route(hostname: "remote.test", target: .http(host: "example.com", port: 80), tls: .disabled)
+        XCTAssertThrowsError(try repository.createPrepared(route: remote, expectedRoute: remote)) { XCTAssertEqual($0 as? LocalProxyError, .routeNotEligible) }
     }
 
     func testMalformedStoredRecordFailsClosed() throws {

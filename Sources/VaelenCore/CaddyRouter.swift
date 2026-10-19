@@ -102,8 +102,8 @@ public actor CaddyRouter: Router {
                         let root = (handlers.first(where: { ($0["handler"] as? String) == "vars" })?["root"] as? String) ?? ""
                         guard !root.isEmpty else { throw RouterError.invalidRoute("Caddy runtime configuration is unreadable") }
                         route = Route(hostname: hostname, target: .fastCGI(socketPath: String(dial.dropFirst("unix//".count)), documentRoot: root), tls: tls)
-                    } else if let separator = dial.lastIndex(of: ":"), let port = Int(dial[dial.index(after: separator)...]) {
-                        route = Route(hostname: hostname, target: .http(host: String(dial[..<separator]), port: port), tls: tls)
+                    } else if let (host, port) = Self.httpUpstream(from: dial) {
+                        route = Route(hostname: hostname, target: .http(host: host, port: port), tls: tls)
                     } else {
                         throw RouterError.invalidRoute("Caddy runtime configuration is unreadable")
                     }
@@ -191,6 +191,23 @@ public actor CaddyRouter: Router {
         return try JSONEncoder.caddy.encode(configuration)
     }
 
+    private static func httpUpstream(from dial: String) -> (String, Int)? {
+        let host: Substring
+        let portText: Substring
+        if dial.first == "[", let closingBracket = dial.firstIndex(of: "]"), dial.index(after: closingBracket) < dial.endIndex,
+           dial[dial.index(after: closingBracket)] == ":" {
+            host = dial[dial.index(after: dial.startIndex)..<closingBracket]
+            portText = dial[dial.index(closingBracket, offsetBy: 2)...]
+        } else if let separator = dial.lastIndex(of: ":") {
+            host = dial[..<separator]
+            portText = dial[dial.index(after: separator)...]
+        } else {
+            return nil
+        }
+        guard !host.isEmpty, let port = Int(portText), (1...65535).contains(port) else { return nil }
+        return (String(host), port)
+    }
+
     private static func isOneLevelSubdomain(_ hostname: String, of parent: String) -> Bool {
         guard hostname.hasSuffix(".\(parent)") else { return false }
         return hostname.dropLast(parent.count + 1).contains(".") == false
@@ -206,7 +223,8 @@ public actor CaddyRouter: Router {
         case .staticFiles(let documentRoot):
             handlers = [.fileServer(root: documentRoot)]
         case .http(let host, let port):
-            handlers = [.reverseProxy(upstream: "\(host):\(port)")]
+            let dial = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+            handlers = [.reverseProxy(upstream: dial)]
         case .fastCGI(let socketPath, let documentRoot):
             // Existing scripts at any depth go to FPM unchanged.
             let phpRoute = CaddyRoute(match: [matcher(path: ["*.php"])], handle: [.variables(root: documentRoot), .fastCGI(socketPath: socketPath)], terminal: true)

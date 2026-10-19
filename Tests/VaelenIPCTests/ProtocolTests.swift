@@ -4,7 +4,7 @@ import XCTest
 
 final class ProtocolTests: XCTestCase {
     func testProjectObservationSnapshotAndReferenceRoundTrip() throws {
-        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 6)
+        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 7)
         let snapshotID = UUID()
         let begin = IPCRequest(method: .projectObservationSnapshot)
         let decodedBegin = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(begin))
@@ -44,7 +44,7 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testProjectPHPSelectionsRoundTripsThroughJSON() throws {
-        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 6)
+        XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 7)
         let request = IPCRequest(method: .projectPHPSelections)
         let decodedRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
         XCTAssertEqual(decodedRequest.knownMethod, .projectPHPSelections)
@@ -71,6 +71,19 @@ final class ProtocolTests: XCTestCase {
         guard case .routeObservedList(let unavailable)? = decodedMissing.result else { return XCTFail("Unavailable route list did not decode") }
         XCTAssertNil(unavailable.observedRoutes)
         XCTAssertEqual(unavailable.unavailableReason, "Router is stopped")
+    }
+
+    func testLocalProxyRequestsAndObservationsRoundTrip() throws {
+        let add = IPCRequest(method: .localProxyAdd, params: .localProxyCreate(.init(hostname: "frontend.test", upstreamURL: "http://127.0.0.1:3000")))
+        let restoredRequest = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(add))
+        XCTAssertEqual(restoredRequest.knownMethod, .localProxyAdd)
+        XCTAssertEqual(try restoredRequest.params?.decode(LocalProxyCreateRequest.self), .init(hostname: "frontend.test", upstreamURL: "http://127.0.0.1:3000"))
+
+        let proxy = LocalProxyWire(routeID: "route-id", hostname: "frontend.test", upstreamURL: "http://127.0.0.1:3000", caddyObservation: .observed, upstreamReachability: .reachable)
+        let response = IPCResponse(id: add.id, result: .localProxyList(.init(proxies: [proxy])))
+        let restored = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+        guard case .localProxyList(let list)? = restored.result else { return XCTFail("local proxy list did not decode") }
+        XCTAssertEqual(list.proxies, [proxy])
     }
     func testUnknownProtocolVersionSurvivesEnvelopeDecoding() throws {
         let request = IPCRequest(rawMethod: "core.status", protocolVersion: 2)

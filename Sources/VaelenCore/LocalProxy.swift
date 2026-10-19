@@ -18,8 +18,9 @@ public struct LocalProxyConfiguration: Equatable, Sendable {
     public let upstreamURL: URL
 
     public init(hostname: String, upstreamURL: String) throws {
-        guard hostname == hostname.lowercased(), hostname.hasSuffix(".test"), Self.validTestHostname(hostname) else {
-            throw LocalProxyError.invalidHostname("Use a lowercase hostname ending in .test.")
+        let normalizedHostname = hostname.lowercased()
+        guard Self.validTestHostname(normalizedHostname) else {
+            throw LocalProxyError.invalidHostname("Use a valid local hostname ending in .test.")
         }
         guard let components = URLComponents(string: upstreamURL), components.scheme?.lowercased() == "http",
               components.user == nil, components.password == nil,
@@ -33,7 +34,7 @@ public struct LocalProxyConfiguration: Equatable, Sendable {
         var normalized = components
         normalized.scheme = "http"
         if !rawHost.hasPrefix("[") { normalized.host = rawHost.lowercased() }
-        self.hostname = hostname
+        self.hostname = normalizedHostname
         guard let url = normalized.url else { throw LocalProxyError.invalidUpstreamURL("The upstream URL could not be normalized.") }
         self.upstreamURL = url
     }
@@ -61,6 +62,13 @@ public struct LocalProxyConfiguration: Equatable, Sendable {
         }
         return false
     }
+
+    fileprivate static func validates(route: Route) -> Bool {
+        guard case .http(let host, let port) = route.target,
+              let configuration = try? LocalProxyConfiguration(hostname: route.hostname, upstreamURL: "http://\(host.contains(":") ? "[\(host)]" : host):\(port)") else { return false }
+        return configuration.hostname == route.hostname && configuration.upstreamURL.host?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")) == host.lowercased()
+            && configuration.upstreamURL.port == port && route.tls == .disabled
+    }
 }
 
 public enum LocalProxyPhase: String, Codable, Sendable { case prepared, active, deleting }
@@ -77,29 +85,43 @@ public struct LocalProxyRecord: Codable, Equatable, Sendable {
     }
 }
 
-public final class LocalProxyRepository {
+// SQLite serializes access to this repository's FULLMUTEX connection.
+public final class LocalProxyRepository: @unchecked Sendable {
     private let database: OpaquePointer?
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
 
     public init(databaseURL: URL) throws {
         try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: databaseURL.deletingLastPathComponent().path)
         var handle: OpaquePointer?
         guard sqlite3_open_v2(databaseURL.path, &handle, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
             throw LocalProxyError.persistence("Could not open local proxy ownership database.")
         }
+        guard let handle else { throw LocalProxyError.persistence("Could not open local proxy ownership database.") }
         database = handle
-        try run("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
-        let version = try scalar("SELECT value FROM metadata WHERE key = 'version'")
-        if let version, version != "1" { throw LocalProxyError.invalidRecord }
-        if version == nil { try run("INSERT INTO metadata (key,value) VALUES ('version','1')") }
-        try run("CREATE TABLE IF NOT EXISTS proxies (route_id TEXT PRIMARY KEY NOT NULL, route_json BLOB NOT NULL, phase TEXT NOT NULL CHECK (phase IN ('prepared','active','deleting')))")
+        do {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
+            try run("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
+            let version = try scalar("SELECT value FROM metadata WHERE key = 'version'")
+            if let version, version != "1" { throw LocalProxyError.invalidRecord }
+            if version == nil { try run("INSERT INTO metadata (key,value) VALUES ('version','1')") }
+            try run("CREATE TABLE IF NOT EXISTS proxies (route_id TEXT PRIMARY KEY NOT NULL, route_json BLOB NOT NULL, phase TEXT NOT NULL CHECK (phase IN ('prepared','active','deleting')))")
+        } catch {
+            sqlite3_close(handle)
+            throw error
+        }
     }
 
     deinit { sqlite3_close(database) }
 
     public func createPrepared(route: Route, expectedRoute: Route) throws {
         guard route == expectedRoute, route.id == expectedRoute.id,
-              case .http = route.target, route.tls == .disabled else { throw LocalProxyError.routeNotEligible }
+              LocalProxyConfiguration.validates(route: route) else { throw LocalProxyError.routeNotEligible }
         guard (try? route.validated()) == route, route.hostname == route.hostname.lowercased() else { throw LocalProxyError.routeNotEligible }
         try insert(route, phase: .prepared)
     }
@@ -120,7 +142,8 @@ public final class LocalProxyRepository {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "SELECT route_id,route_json,phase FROM proxies ORDER BY route_id", -1, &statement, nil) == SQLITE_OK else { throw failure() }
         defer { sqlite3_finalize(statement) }
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
             guard let rawID = sqlite3_column_text(statement, 0), let blob = sqlite3_column_blob(statement, 1),
                   let phaseRaw = sqlite3_column_text(statement, 2), let uuid = UUID(uuidString: String(cString: rawID)),
                   let phase = LocalProxyPhase(rawValue: String(cString: phaseRaw)) else { throw LocalProxyError.invalidRecord }
@@ -128,13 +151,15 @@ public final class LocalProxyRepository {
             guard let route = try? JSONDecoder().decode(Route.self, from: data), route.id.rawValue == uuid,
                   (try? route.validated()) == route, case .http = route.target, route.tls == .disabled else { throw LocalProxyError.invalidRecord }
             result.append(LocalProxyRecord(route: route, phase: phase))
+            step = sqlite3_step(statement)
         }
+        guard step == SQLITE_DONE else { throw failure() }
         return result
     }
 
     private func insert(_ route: Route, phase: LocalProxyPhase) throws {
         guard try list().allSatisfy({ $0.routeID != route.id }) else { throw LocalProxyError.ownershipConflict }
-        let data = try JSONEncoder().encode(route)
+        let data = try encoder.encode(route)
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "INSERT INTO proxies (route_id,route_json,phase) VALUES (?,?,?)", -1, &statement, nil) == SQLITE_OK else { throw failure() }
         defer { sqlite3_finalize(statement) }
@@ -159,7 +184,7 @@ public final class LocalProxyRepository {
         var index: Int32 = 1
         if let phase { sqlite3_bind_text(statement, index, phase.rawValue, -1, transient); index += 1 }
         sqlite3_bind_text(statement, index, id.description, -1, transient); index += 1
-        let data = try JSONEncoder().encode(route)
+        let data = try encoder.encode(route)
         _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32(data.count), transient) }
         if let prior { sqlite3_bind_text(statement, index + 1, prior.rawValue, -1, transient) }
         guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }

@@ -3,6 +3,12 @@ import OSLog
 import VaelenCore
 import VaelenIPC
 
+private final class LocalProxyProbeRedirectPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 private struct ParkedProjectCandidate {
     let parentPath: String
     let project: Project
@@ -43,6 +49,7 @@ public actor CoreRequestDispatcher {
     private let mailpit: MailpitModule?
     private let router: any Router
     private let routeRepository: RouteIntentRepository?
+    private let localProxyRepository: LocalProxyRepository?
     private let dns: DNSCapability
     private let tls: TLSCapability
     private let ports: StandardPortsCapability
@@ -60,9 +67,33 @@ public actor CoreRequestDispatcher {
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil) throws {
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
-        let persistedRoutes = try routeRepository?.all() ?? []
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil) throws {
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.localProxyRepository = localProxyRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
+        var persistedRoutes = try routeRepository?.all() ?? []
+        if let localProxyRepository {
+            guard let routeRepository else { throw LocalProxyError.persistence("Proxy ownership requires the durable Core route repository.") }
+            for record in try localProxyRepository.list() {
+                let current = persistedRoutes.first { $0.route.id == record.routeID }
+                switch record.phase {
+                case .active:
+                    guard current?.route == record.route, current?.projectID == nil, current?.projectPath == nil else { throw LocalProxyError.recordMismatch }
+                case .prepared:
+                    if let current {
+                        guard current.route == record.route, current.projectID == nil, current.projectPath == nil else { throw LocalProxyError.recordMismatch }
+                        try localProxyRepository.activate(routeID: record.routeID, expectedRoute: record.route)
+                    } else {
+                        try localProxyRepository.markDeleting(routeID: record.routeID, expectedRoute: record.route)
+                        try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route)
+                    }
+                case .deleting:
+                    if let current {
+                        guard current.route == record.route, current.projectID == nil, current.projectPath == nil else { throw LocalProxyError.recordMismatch }
+                        try routeRepository.remove(id: record.routeID)
+                        persistedRoutes.removeAll { $0.route.id == record.routeID }
+                    }
+                }
+            }
+        }
         _ = try routeRepository?.pendingTransitions()
         self.routeIntents = Dictionary(uniqueKeysWithValues: persistedRoutes.map { ($0.route.id, $0) })
     }
@@ -365,11 +396,20 @@ public actor CoreRequestDispatcher {
             case .routingStatus:
                 return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routingStart:
-                try serviceIntents.set("caddy", enabled: true); try await router.start(); try await router.reconcile(routes: routeIntents.values.map(\.route)); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
+                try serviceIntents.set("caddy", enabled: true); try await router.start(); try await router.reconcile(routes: routeIntents.values.map(\.route)); _ = try await completeProxyDeletionsIfConverged(); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routingStop:
                 try serviceIntents.set("caddy", enabled: false); try await router.stop(); return (.init(id: request.id, result: .routingStatus(.init(router: await router.status()))), true)
             case .routeList:
                 return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
+            case .localProxyList:
+                return (.init(id: request.id, result: .localProxyList(.init(proxies: try await localProxyList()))), true)
+            case .localProxyAdd:
+                guard let params = try request.params?.decode(LocalProxyCreateRequest.self) else { throw IPCErrorPayload(code: .invalidRequest, message: "Proxy hostname and upstream URL are required.") }
+                return (.init(id: request.id, result: .localProxyMutation(try await createLocalProxy(hostname: params.hostname, upstreamURL: params.upstreamURL))), true)
+            case .localProxyRemove:
+                guard let params = try request.params?.decode(LocalProxyRemoveRequest.self) else { throw IPCErrorPayload(code: .invalidRequest, message: "A proxy hostname is required.") }
+                try await removeLocalProxy(hostname: params.hostname)
+                return (.init(id: request.id, result: .localProxyList(.init(proxies: try await localProxyList()))), true)
             case .routeObservedList:
                 let status = await router.status()
                 guard status.state == .running, status.health == .healthy else {
@@ -391,6 +431,16 @@ public actor CoreRequestDispatcher {
                     projectPath = projectPath ?? project.rootPath.string
                 }
                 let normalized = RouteIntent(route: validated, projectID: intent.projectID, projectPath: projectPath)
+                let proxyOwnerships = try localProxyRepository?.list() ?? []
+                if proxyOwnerships.contains(where: { $0.routeID == validated.id }) {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "This route is explicitly owned by a local proxy. Manage it with ‘val proxy’.")
+                }
+                if proxyOwnerships.contains(where: { $0.route.hostname == validated.hostname }) {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Hostname \(validated.hostname) has a pending local-proxy ownership record; resolve that proxy operation before adding another route.")
+                }
+                if let conflict = routeIntents.values.first(where: { $0.route.id != validated.id && $0.route.hostname == validated.hostname }) {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Hostname \(validated.hostname) is already owned by route \(conflict.route.id); no route was changed.")
+                }
                 try repository.upsert(normalized); routeIntents[validated.id] = normalized
                 if (await router.status()).state == .running { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
                 return (.init(id: request.id, result: .routeMutation(normalized)), true)
@@ -398,6 +448,9 @@ public actor CoreRequestDispatcher {
                 guard let repository = routeRepository else { throw IPCErrorPayload(code: .internalError, message: "Route persistence is unavailable.") }
                 let params = try request.params?.decode(RouteRemoveRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route ID is required.") }()
                 guard routeIntents[params.id] != nil else { throw RouterError.routeNotFound(params.id) }
+                if try localProxyRepository?.list().contains(where: { $0.routeID == params.id }) == true {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Route \(params.id) is explicitly owned by a local proxy; remove it with ‘val proxy remove <hostname>’.")
+                }
                 try repository.remove(id: params.id); routeIntents.removeValue(forKey: params.id)
                 if (await router.status()).state == .running { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
                 return (.init(id: request.id, result: .routeList(.init(routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname }))), true)
@@ -405,6 +458,9 @@ public actor CoreRequestDispatcher {
                 guard let repository = routeRepository else { throw IPCErrorPayload(code: .internalError, message: "Route persistence is unavailable.") }
                 let params = try request.params?.decode(RouteProjectAssociationRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Route association parameters are required.") }()
                 guard let intent = routeIntents[params.routeID] else { throw IPCErrorPayload(code: .invalidRequest, message: "The requested route does not exist.") }
+                if try localProxyRepository?.list().contains(where: { $0.routeID == params.routeID }) == true {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "A local-proxy route cannot be associated with a project.")
+                }
                 guard let project = try await registry.linkedProject(id: params.projectID) else { throw IPCErrorPayload(code: .invalidRequest, message: "Route association requires a registered linked project.") }
                 if intent.projectID == params.projectID.rawValue {
                     return (.init(id: request.id, result: .routeAssociation(.init(route: intent, state: .satisfied))), true)
@@ -480,9 +536,171 @@ public actor CoreRequestDispatcher {
             }
         } catch let error as TLSError {
             return (.init(id: request.id, error: map(error)), true)
+        } catch let error as LocalProxyError {
+            return (.init(id: request.id, error: .init(code: .invalidRequest, message: localProxyErrorMessage(error))), true)
         } catch {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
             return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
+        }
+    }
+
+    private func createLocalProxy(hostname: String, upstreamURL: String) async throws -> LocalProxyMutationResult {
+        guard let localProxyRepository, let routeRepository else { throw LocalProxyError.persistence("Local proxy persistence is unavailable.") }
+        let configuration = try LocalProxyConfiguration(hostname: hostname, upstreamURL: upstreamURL)
+        guard let upstreamHost = configuration.upstreamURL.host?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")),
+              let port = configuration.upstreamURL.port else { throw LocalProxyError.invalidUpstreamURL("The upstream URL is missing its normalized host or port.") }
+        let target = RouteTarget.http(host: upstreamHost.lowercased(), port: port)
+        let ownerships = try localProxyRepository.list()
+        if let existing = routeIntents.values.first(where: { $0.route.hostname == configuration.hostname }) {
+            guard let owned = ownerships.first(where: { $0.routeID == existing.route.id }), owned.route == existing.route,
+                  existing.projectID == nil, existing.projectPath == nil,
+                  existing.route.target == target, existing.route.tls == .disabled else {
+                throw IPCErrorPayload(code: .invalidRequest, message: "Hostname \(configuration.hostname) is already owned by another route or uses a different upstream. No route was changed.")
+            }
+            guard owned.phase != .deleting else { throw IPCErrorPayload(code: .invalidRequest, message: "Proxy removal for \(configuration.hostname) is still pending. Retry ‘val proxy remove \(configuration.hostname)’ before creating it again.") }
+            if owned.phase == .prepared { try localProxyRepository.activate(routeID: owned.routeID, expectedRoute: owned.route) }
+            if (await router.status()).state == .running {
+                do { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
+                catch { throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(configuration.hostname) is saved, but Caddy did not apply it. Start or retry Vaelen routing; the upstream was not started.") }
+            }
+            let proxy = try await localProxyList().first(where: { $0.routeID == owned.routeID.description }) ?? { throw LocalProxyError.recordMismatch }()
+            return LocalProxyMutationResult(proxy: proxy, created: false)
+        }
+        if let owned = ownerships.first(where: { $0.route.hostname == configuration.hostname }) {
+            guard owned.phase == .prepared, routeIntents[owned.routeID] == nil else { throw LocalProxyError.recordMismatch }
+            try localProxyRepository.markDeleting(routeID: owned.routeID, expectedRoute: owned.route)
+            try localProxyRepository.removeRecord(routeID: owned.routeID, expectedRoute: owned.route)
+        }
+
+        let route = Route(hostname: configuration.hostname, target: target, tls: .disabled)
+        let intent = RouteIntent(route: route)
+        try localProxyRepository.createPrepared(route: route, expectedRoute: route)
+        try routeRepository.upsert(intent)
+        routeIntents[route.id] = intent
+        try localProxyRepository.activate(routeID: route.id, expectedRoute: route)
+        if (await router.status()).state == .running {
+            do { try await router.reconcile(routes: routeIntents.values.map(\.route)) }
+            catch { throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(route.hostname) is saved, but Caddy did not apply it. Start or retry Vaelen routing; the upstream was not started.") }
+        }
+        let proxy = try await localProxyList().first(where: { $0.routeID == route.id.description }) ?? { throw LocalProxyError.recordMismatch }()
+        return LocalProxyMutationResult(proxy: proxy, created: true)
+    }
+
+    private func removeLocalProxy(hostname: String) async throws {
+        guard let localProxyRepository, let routeRepository else { throw LocalProxyError.persistence("Local proxy persistence is unavailable.") }
+        let normalizedHostname = try LocalProxyConfiguration(hostname: hostname, upstreamURL: "http://127.0.0.1:1").hostname
+        guard let record = try localProxyRepository.list().first(where: { $0.route.hostname == normalizedHostname }) else {
+            throw IPCErrorPayload(code: .invalidRequest, message: "No explicitly proxy-owned route exists for \(normalizedHostname). Other route types were not changed.")
+        }
+        if record.phase != .deleting { try localProxyRepository.markDeleting(routeID: record.routeID, expectedRoute: record.route) }
+        if let current = routeIntents[record.routeID] {
+            guard current.route == record.route, current.projectID == nil, current.projectPath == nil else { throw LocalProxyError.recordMismatch }
+            try routeRepository.remove(id: record.routeID)
+            routeIntents.removeValue(forKey: record.routeID)
+        } else if record.phase != .deleting {
+            throw LocalProxyError.recordMismatch
+        }
+        let routerState = await router.status()
+        if routerState.state == .running {
+            do {
+                try await router.reconcile(routes: routeIntents.values.map(\.route))
+                guard try await completeProxyDeletionsIfConverged() else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(normalizedHostname) is removed from saved routing, but Caddy has not confirmed removal. Retry after checking Caddy.")
+                }
+            } catch {
+                if let error = error as? IPCErrorPayload { throw error }
+                throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(normalizedHostname) is removed from saved routing, but Caddy cleanup is pending. Retry ‘val proxy remove \(normalizedHostname)’ after checking Caddy.")
+            }
+        } else if routerState.state == .stopped {
+            try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route)
+        } else {
+            throw IPCErrorPayload(code: .invalidRequest, message: "Proxy \(normalizedHostname) is removed from saved routing, but Caddy is degraded and removal is not confirmed. Retry after checking Caddy.")
+        }
+    }
+
+    private func localProxyList() async throws -> [LocalProxyWire] {
+        guard let localProxyRepository else { throw LocalProxyError.persistence("Local proxy persistence is unavailable.") }
+        _ = try await completeProxyDeletionsIfConverged()
+        let records = try localProxyRepository.list()
+        for record in records {
+            if let intent = routeIntents[record.routeID] {
+                guard intent.route == record.route, intent.projectID == nil, intent.projectPath == nil else { throw LocalProxyError.recordMismatch }
+            } else if record.phase != .deleting && record.phase != .prepared {
+                throw LocalProxyError.recordMismatch
+            }
+        }
+        let routerStatus = await router.status()
+        let observedRoutes: [Route]?
+        if routerStatus.state == .running && routerStatus.health == .healthy {
+            observedRoutes = try? await router.observedRoutes()
+        } else {
+            observedRoutes = nil
+        }
+        var reachability = [RouteID: LocalProxyUpstreamReachability]()
+        await withTaskGroup(of: (RouteID, LocalProxyUpstreamReachability).self) { group in
+            for record in records {
+                group.addTask { (record.routeID, await Self.probeLocalProxyUpstream(record.route)) }
+            }
+            for await (id, value) in group { reachability[id] = value }
+        }
+        return records.map { record in
+            let observed = observedRoutes?.contains(where: {
+                $0.hostname == record.route.hostname && $0.target == record.route.target && $0.tls == record.route.tls
+            })
+            let caddy: LocalProxyCaddyObservation
+            if observedRoutes == nil { caddy = .unavailable }
+            else { caddy = observed == true ? .observed : .notObserved }
+            return LocalProxyWire(routeID: record.routeID.description, hostname: record.route.hostname,
+                upstreamURL: Self.upstreamURL(for: record.route), caddyObservation: caddy,
+                upstreamReachability: reachability[record.routeID] ?? .unknown,
+                ownershipPhase: LocalProxyOwnershipPhase(rawValue: record.phase.rawValue) ?? .prepared)
+        }.sorted { $0.hostname < $1.hostname }
+    }
+
+    private func completeProxyDeletionsIfConverged() async throws -> Bool {
+        guard let localProxyRepository else { return true }
+        let records = try localProxyRepository.list().filter { $0.phase == .deleting }
+        guard !records.isEmpty else { return true }
+        let state = await router.status()
+        if state.state == .stopped {
+            for record in records { try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route) }
+            return true
+        }
+        guard state.state == .running && state.health == .healthy, let observed = try? await router.observedRoutes() else { return false }
+        for record in records where !observed.contains(where: { $0.hostname == record.route.hostname }) {
+            try localProxyRepository.removeRecord(routeID: record.routeID, expectedRoute: record.route)
+        }
+        return try localProxyRepository.list().allSatisfy { $0.phase != .deleting }
+    }
+
+    private static func upstreamURL(for route: Route) -> String {
+        guard case .http(let host, let port) = route.target else { return "" }
+        let address = host.contains(":") ? "[\(host)]" : host
+        return "http://\(address):\(port)/"
+    }
+
+    private static func probeLocalProxyUpstream(_ route: Route) async -> LocalProxyUpstreamReachability {
+        guard let url = URL(string: upstreamURL(for: route)) else { return .unknown }
+        var request = URLRequest(url: url, timeoutInterval: 1)
+        request.httpMethod = "HEAD"
+        let session = URLSession(configuration: .ephemeral, delegate: LocalProxyProbeRedirectPolicy(), delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (_, response) = try await session.data(for: request)
+            return response is HTTPURLResponse ? .reachable : .unknown
+        } catch {
+            return .unreachable
+        }
+    }
+
+    private func localProxyErrorMessage(_ error: LocalProxyError) -> String {
+        switch error {
+        case .invalidHostname(let message), .invalidUpstreamURL(let message): return message
+        case .routeNotEligible: return "A local proxy must be an HTTP loopback route ending in .test, with TLS disabled."
+        case .ownershipConflict: return "A proxy ownership record already exists for this exact route. No route was changed."
+        case .recordNotFound: return "No exact proxy ownership record exists. Other routes were not changed."
+        case .recordMismatch, .invalidRecord: return "Proxy ownership evidence is missing or inconsistent. Core refused to change the route."
+        case .persistence(let detail): return "Local proxy persistence failed: \(detail)"
         }
     }
 

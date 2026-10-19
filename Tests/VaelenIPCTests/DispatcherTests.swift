@@ -219,6 +219,48 @@ private actor StartupRaceDNSHelper: PrivilegedDNSHelper {
 }
 
 final class DispatcherTests: XCTestCase {
+    @MainActor
+    func testLocalProxyCreatePersistsAndRemovePreservesUnrelatedSameHostRoute() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("local-proxy-dispatcher-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let routeRepository = RouteIntentRepository(store: store)
+        let proxyRepository = try LocalProxyRepository(databaseURL: root.appendingPathComponent("state/proxies.sqlite"))
+        let router = ParkReconciliationTestRouter()
+        func makeDispatcher() throws -> CoreRequestDispatcher {
+            try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router,
+                routeRepository: routeRepository, localProxyRepository: proxyRepository)
+        }
+        let dispatcher = try makeDispatcher()
+        let add = await dispatcher.dispatch(IPCRequest(method: .localProxyAdd,
+            params: .localProxyCreate(.init(hostname: "preview.test", upstreamURL: "http://127.0.0.1:1"))), handshaken: true)
+        XCTAssertNil(add.response.error)
+        XCTAssertEqual(try routeRepository.all().count, 1)
+        XCTAssertEqual(try proxyRepository.list().count, 1)
+
+        let recoveredDispatcher = try makeDispatcher()
+        let list = await recoveredDispatcher.dispatch(IPCRequest(method: .localProxyList), handshaken: true)
+        guard case .localProxyList(let result)? = list.response.result else { return XCTFail("persisted proxy was not listed") }
+        XCTAssertEqual(result.proxies.map(\.hostname), ["preview.test"])
+        XCTAssertEqual(result.proxies.first?.ownershipPhase, .active)
+
+        let remove = await recoveredDispatcher.dispatch(IPCRequest(method: .localProxyRemove,
+            params: .localProxyRemove(.init(hostname: "preview.test"))), handshaken: true)
+        XCTAssertNil(remove.response.error)
+        XCTAssertTrue(try routeRepository.all().isEmpty)
+        XCTAssertTrue(try proxyRepository.list().isEmpty)
+
+        let unrelated = RouteIntent(route: Route(hostname: "preview.test", target: .staticFiles(documentRoot: root.path), tls: .disabled))
+        try routeRepository.upsert(unrelated)
+        let conflictDispatcher = try makeDispatcher()
+        let conflict = await conflictDispatcher.dispatch(IPCRequest(method: .localProxyAdd,
+            params: .localProxyCreate(.init(hostname: "preview.test", upstreamURL: "http://127.0.0.1:1"))), handshaken: true)
+        XCTAssertNotNil(conflict.response.error)
+        XCTAssertEqual(try routeRepository.all(), [unrelated])
+        XCTAssertTrue(try proxyRepository.list().isEmpty)
+    }
+
     func testParkReconcileReportsAndSkipsDuplicateChildNamesAcrossParents() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-name-collision-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }

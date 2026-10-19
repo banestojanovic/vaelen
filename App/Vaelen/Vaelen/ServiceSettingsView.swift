@@ -611,6 +611,8 @@ struct NetworkSecuritySettingsView: View {
     let model: AppModel
     @State private var action: NetworkAction?
     @State private var showingTrustDetails = false
+    @State private var proxyHostname = ""
+    @State private var proxyUpstreamURL = ""
     private var status: (DNSStatus?, TLSStatus?, StandardPortsStatus?) {
         if case .running(_, _, _, _, let dns, let tls, let ports, _, _) = model.state {
             return (model.isServiceReadPending("DNS") ? nil : dns,
@@ -657,8 +659,9 @@ struct NetworkSecuritySettingsView: View {
                         if control.canTrust { Button("Trust Local CA…") { action = .trust }.buttonStyle(.borderedProminent) }
                         if control.canRemove { Button("Remove Vaelen Trust…", role: .destructive) { action = .removeTrust }.buttonStyle(.bordered).settingsDestructiveTint() }
                         if control.canManageTrust { Button("Manage Trust Details…") { showingTrustDetails = true }.buttonStyle(.bordered) }
-                    } else if !model.isServiceReadPending("TLS") { Button("Refresh HTTPS Status") { Task { await model.refresh() } } }
+                     } else if !model.isServiceReadPending("TLS") { Button("Refresh HTTPS Status") { Task { await model.refresh() } } }
                 }
+                    localProxiesCard
                     if let operation = model.serviceOperation { Label(operation, systemImage: "arrow.triangle.2.circlepath").font(.caption).foregroundStyle(.secondary) }
                     if let error = model.serviceError ?? model.trustError { Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true).padding(12).background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8)) }
                 }.frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity, alignment: .topLeading).padding(22)
@@ -672,6 +675,53 @@ struct NetworkSecuritySettingsView: View {
                 LocalTrustDetailsSheet(details: details)
             }
         }
+    }
+
+    private var localProxiesCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.left.arrow.right").foregroundStyle(Color.accentColor).frame(width: 28, height: 28).background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
+                Text("Local Proxies").font(.headline)
+                Spacer()
+                if let proxies = model.localProxies { SettingsStateBadge(title: "\(proxies.count) configured", tone: .neutral) }
+                else { SettingsStateBadge(title: "Unavailable", tone: .attention) }
+            }
+            Text("Serve a loopback development server through a local .test hostname. Vaelen does not start the upstream server.").font(.subheadline).foregroundStyle(.secondary)
+            HStack {
+                TextField("frontend.test", text: $proxyHostname).textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Proxy hostname")
+                TextField("http://127.0.0.1:3000", text: $proxyUpstreamURL).textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("HTTP loopback upstream URL")
+                Button("Add Proxy") {
+                    let hostname = proxyHostname
+                    let upstreamURL = proxyUpstreamURL
+                    Task { await model.addLocalProxy(hostname: hostname, upstreamURL: upstreamURL) }
+                }.buttonStyle(.borderedProminent).disabled(proxyHostname.isEmpty || proxyUpstreamURL.isEmpty || model.localProxies == nil)
+            }
+            if model.localProxies == nil {
+                Label(model.localProxiesError ?? "Core has not confirmed local proxy state.", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            } else if let proxies = model.localProxies, proxies.isEmpty {
+                Text("No local proxies configured.").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(model.localProxies ?? [], id: \.routeID) { proxy in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(proxy.hostname).font(.subheadline.weight(.semibold))
+                        Spacer()
+                        if let route = model.localProxyRoute(proxy) {
+                            Button("Open", systemImage: "arrow.up.right.square") { model.openProjectRoute(route) }.buttonStyle(.borderless)
+                            Button("Copy URL", systemImage: "doc.on.doc") { model.copyProjectRouteURL(route) }.buttonStyle(.borderless)
+                        }
+                        Button("Remove", systemImage: "trash", role: .destructive) { Task { await model.removeLocalProxy(hostname: proxy.hostname) } }.buttonStyle(.borderless)
+                    }
+                    Text(proxy.upstreamURL).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("Caddy: \(proxy.caddyObservation.rawValue) · Upstream: \(proxy.upstreamReachability.rawValue)").font(.caption).foregroundStyle(.secondary)
+                }.padding(10).background(Color(nsColor: .windowBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
+            }
+            if let error = model.localProxiesError, model.localProxies != nil {
+                Label(error, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+        }.padding(14).background(Color(nsColor: .controlBackgroundColor).opacity(0.62), in: RoundedRectangle(cornerRadius: 9))
     }
 
     private func capability<Action: View>(title: String, symbol: String, readKey: String, description: String, status: String, detail: String?, @ViewBuilder actions: () -> Action) -> some View {

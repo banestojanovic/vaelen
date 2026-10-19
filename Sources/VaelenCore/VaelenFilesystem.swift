@@ -36,6 +36,7 @@ public struct VaelenFilesystemLayout: Sendable {
 
     public var stateDirectoryURL: URL { rootURL.appendingPathComponent("state", isDirectory: true) }
     public var databaseURL: URL { stateDirectoryURL.appendingPathComponent("vaelen.sqlite") }
+    public var localProxyDatabaseURL: URL { stateDirectoryURL.appendingPathComponent("local-proxy-ownership.sqlite") }
     public var packagesDirectoryURL: URL { rootURL.appendingPathComponent("packages", isDirectory: true) }
     public var phpPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("php", isDirectory: true) }
     public var caddyPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }

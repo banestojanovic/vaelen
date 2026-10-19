@@ -78,6 +78,9 @@ enum CLICommand {
     case routingStart
     case routingStop
     case routeList(json: Bool)
+    case localProxyList(json: Bool)
+    case localProxyAdd(hostname: String, upstreamURL: String)
+    case localProxyRemove(hostname: String)
     case routeAdd(hostname: String, documentRoot: String, socketPath: String?, projectID: UUID?, tls: Bool)
     case routeRemove(RouteID)
     case routeAssociate(RouteID, ProjectID)
@@ -514,6 +517,19 @@ struct VaelenCLIMain {
             case "associate":
                 guard args.count == 4, let routeUUID = UUID(uuidString: args[2]), let projectUUID = UUID(uuidString: args[3]) else { throw CLIError.usage }
                 return .routeAssociate(RouteID(rawValue: routeUUID), ProjectID(rawValue: projectUUID))
+            default: throw CLIError.usage
+            }
+        case "proxy":
+            if args.count == 1 { return .help(path: [first]) }
+            guard args.count >= 2 else { throw CLIError.usage }
+            switch args[1] {
+            case "list": return .localProxyList(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            case "add":
+                guard args.count == 4 else { throw CLIError.usage }
+                return .localProxyAdd(hostname: args[2], upstreamURL: args[3])
+            case "remove":
+                guard args.count == 3 else { throw CLIError.usage }
+                return .localProxyRemove(hostname: args[2])
             default: throw CLIError.usage
             }
         case "mailpit":
@@ -1063,6 +1079,21 @@ struct VaelenCLIMain {
                 let rows = routes.map { [String(describing: $0.route.id), $0.route.hostname, targetDescription($0.route.target), $0.route.tls.rawValue] }
                 print(rows.isEmpty ? "No routes configured." : HumanOutput.table(rows, headers: ["ID", "Hostname", "Target", "TLS"]))
             }
+        case .localProxyList(let json):
+            let proxies = try await client.localProxyList()
+            if json { print(String(decoding: try IPCCodec.encode(LocalProxyListResult(proxies: proxies)), as: UTF8.self)) }
+            else {
+                print(HumanOutput.heading("Local Proxies"))
+                let rows = proxies.map { [$0.hostname, $0.upstreamURL, $0.caddyObservation.rawValue, $0.upstreamReachability.rawValue] }
+                print(rows.isEmpty ? "No local proxies configured." : HumanOutput.table(rows, headers: ["Hostname", "Upstream", "Caddy", "Upstream reachability"]))
+            }
+        case .localProxyAdd(let hostname, let upstreamURL):
+            let result = try await client.localProxyAdd(hostname: hostname, upstreamURL: upstreamURL)
+            print(HumanOutput.success("\(result.created ? "Added" : "Already configured") local proxy \(result.proxy.hostname) → \(result.proxy.upstreamURL)"))
+            print(HumanOutput.aligned([("Caddy", result.proxy.caddyObservation.rawValue), ("Upstream", result.proxy.upstreamReachability.rawValue)]))
+        case .localProxyRemove(let hostname):
+            _ = try await client.localProxyRemove(hostname: hostname)
+            print(HumanOutput.success("Removed local proxy \(hostname.lowercased())"))
         case .routeTLS(let hostname, let secure):
             let routes = try await client.routeList()
             let intent: RouteIntent

@@ -82,7 +82,7 @@ final class HumanOutputTests: XCTestCase {
 
     func testEveryImplementedTopLevelParserCommandHasCatalogCoverage() {
         let implemented: Set<String> = [
-            "help", "list", "--version", "-V", "status", "doctor", "secure", "unsecure", "links", "edit", "parks", "paths", "parked", "sites", "open", "db", "site", "project", "link", "unlink", "park", "unpark", "php", "use", "isolate", "unisolate", "isolated", "which-php", "ini", "shell", "mysql", "routing", "route", "mailpit", "dns", "tls", "ports", "web", "runtime", "networking"
+            "help", "list", "--version", "-V", "status", "doctor", "secure", "unsecure", "links", "edit", "parks", "paths", "parked", "sites", "open", "db", "site", "project", "link", "unlink", "park", "unpark", "php", "use", "isolate", "unisolate", "isolated", "which-php", "ini", "shell", "mysql", "routing", "route", "proxy", "mailpit", "dns", "tls", "ports", "web", "runtime", "networking"
         ]
         let documented = Set(CLIDocumentation.entries.flatMap { entry in
             entry.forms.compactMap { form -> String? in
@@ -110,10 +110,22 @@ final class HumanOutputTests: XCTestCase {
         for invalid in [
             ["status", "--unknown"], ["status", "--json", "--unknown"],
             ["php", "versions", "--json", "extra"], ["mysql", "status", "--no"],
-            ["mailpit", "status", "--json", "extra"], ["route", "list", "--json", "extra"],
+            ["mailpit", "status", "--json", "extra"], ["route", "list", "--json", "extra"], ["proxy", "list", "--json", "extra"],
             ["dns", "install", "--takeover", "extra"], ["tls", "status", "--no"],
             ["ports", "status", "--no"]
         ] {
+            XCTAssertThrowsError(try VaelenCLIMain.parse(invalid), "Accepted invalid arguments: \(invalid)")
+        }
+    }
+
+    func testProxyCommandsParseOnlySupportedForms() throws {
+        guard case .localProxyAdd(let host, let upstream) = try VaelenCLIMain.parse(["proxy", "add", "frontend.test", "http://127.0.0.1:3000"]) else { return XCTFail("proxy add did not parse") }
+        XCTAssertEqual(host, "frontend.test")
+        XCTAssertEqual(upstream, "http://127.0.0.1:3000")
+        guard case .localProxyList(json: true) = try VaelenCLIMain.parse(["proxy", "list", "--json"]) else { return XCTFail("proxy list --json did not parse") }
+        guard case .localProxyRemove(let removed) = try VaelenCLIMain.parse(["proxy", "remove", "frontend.test"]) else { return XCTFail("proxy remove did not parse") }
+        XCTAssertEqual(removed, "frontend.test")
+        for invalid in [["proxy", "add", "frontend.test"], ["proxy", "remove"], ["proxy", "list", "--json", "extra"]] {
             XCTAssertThrowsError(try VaelenCLIMain.parse(invalid), "Accepted invalid arguments: \(invalid)")
         }
     }
