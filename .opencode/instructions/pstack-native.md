@@ -2,7 +2,9 @@
 
 The normal OpenCode2 TUI is the entry point. Use the installed pstack skills through the project's `skills` setting. Do not run nested OpenCode CLIs, detached agents, `Scripts/vaelen-agents`, another orchestrator, or unconfigured model IDs.
 
-`vaelen-primary` owns each task’s delegation, result collection, verification, correction, and final reporting. GPT-6 Luna is the default, but the primary must honor the model selected for the active TUI session if the user changes it with the model picker. Report the actual model used. Keep small tasks direct. For a larger task, it may start two independent Luna workers with disjoint read-only scopes or isolated worktrees. Collect every child result before reporting completion. Do not use concurrent writers in one working tree.
+`vaelen-primary` owns each task from first read through delegation, result collection, verification, correction, recovery, and final reporting. Keep ownership until the authorized outcome is complete or evidence establishes a genuine external blocker that requires operator action. Investigate unexpected results and capture the underlying evidence instead of returning generic errors. Reconcile repository and runtime state before retrying operations that may have changed state. Consult `vaelen-judgment` about ambiguity or consequential recovery decisions. Make routine implementation and recovery decisions within the user's authorization.
+
+GPT-6 Luna is the default, but the primary must honor the model selected for the active TUI session if the user changes it with the model picker. Report the actual model used. Keep small tasks direct. For larger tasks, the primary may start two independent Luna workers with disjoint read-only scopes or isolated worktrees. Collect every child result before reporting completion. Do not use concurrent writers in one working tree.
 
 Use `vaelen-judgment` on GPT-6.1 Sol Medium for architecture, ambiguity, and difficult decisions. The Luna parent is the approved recovery if that child fails. Workers and fresh reviewers use GPT-6 Luna Medium. `vaelen-reviewer` is read-only. Panels are reduced to one worker or reviewer by the model sheet.
 
@@ -12,6 +14,8 @@ There is no configured automatic provider-error fallback. Do not invent a fallba
 
 The local TUI plugin uses OpenCode's supported attention notification API once for a visible root-session completion, error, or required permission decision. Keep the final report in the parent session. Do not claim a notification unless the returned runtime event confirms it.
 
-Routine project reads, edits, worktree creation, builds, and focused checks are allowed by the project policy. The reviewed Swift check is `swift test --filter VaelenCoreTests.ProjectSiteURLTests`; `swift build` is also allowed. Other shell commands require approval. Credentials, privileged actions, live Vaelen changes, publishing, pushes, destructive cleanup, and unrelated external paths stay approval-gated. Permission rules cannot infer semantic ownership, so use only paths assigned by the Luna parent.
+The project permission policy allows routine development shell execution by default for the trusted primary and implementation roles. This includes repository inspection, edits, local worktrees and commits, builds, focused tests, and normal diagnostics. Do not add command-by-command exceptions. Keep approval boundaries for credentials, privileged system changes, installation, live Vaelen changes, publishing, pushes, destructive operations outside disposable task state, and unrelated external paths. Reviewers remain read-only and shell-restricted.
+
+OpenCode permissions are not an OS sandbox. Use only paths assigned by the Luna parent and honor the safety boundaries even when a command is technically allowed. The reviewed Swift check is `swift test --filter VaelenCoreTests.ProjectSiteURLTests`; `swift build` is also allowed.
 
 Use only the current task's session IDs when exporting records. Confirm actual model IDs and parent relationships from OpenCode session exports, not agent self-reports. Never include credential files or unrelated session data in evidence.
