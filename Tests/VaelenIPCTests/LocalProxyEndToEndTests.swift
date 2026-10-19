@@ -18,6 +18,8 @@ private actor LocalProxyFixtureRouter: Router {
 }
 
 final class LocalProxyEndToEndTests: XCTestCase {
+    private struct CLIProcessDidNotStop: Error {}
+
     private struct CLIResult {
         let status: Int32
         let stdout: String
@@ -136,6 +138,8 @@ final class LocalProxyEndToEndTests: XCTestCase {
             redirectServer = try OwnedChildProcess.launch(executable: URL(fileURLWithPath: "/usr/bin/python3"),
                 arguments: ["-c", redirectFixture, String(redirectSourcePort), String(redirectTargetPort), redirectMarker.path, String(redirectTargetPort)],
                 label: "local proxy redirect probe fixture")
+            for _ in 0..<100 where !canConnectTCP(port: redirectSourcePort) { usleep(10_000) }
+            XCTAssertTrue(canConnectTCP(port: redirectSourcePort), "redirect source listener did not start")
             let redirectAdd = try runCLI(["proxy", "add", "redirect.test", "http://127.0.0.1:\(redirectSourcePort)"], root: root, support: support)
             XCTAssertEqual(redirectAdd.status, 0, redirectAdd.stderr)
             let redirectProbe = try runCLI(["proxy", "list", "--json"], root: root, support: support)
@@ -178,6 +182,7 @@ final class LocalProxyEndToEndTests: XCTestCase {
             serverTask = nil
             if !preserveRoot { try FileManager.default.removeItem(at: root) }
         } catch {
+            if error is CLIProcessDidNotStop { preserveRoot = true }
             if let process = redirectServer {
                 if process.terminateAndWait(timeout: 2) { redirectServer = nil }
                 else { preserveRoot = true }
@@ -201,8 +206,14 @@ final class LocalProxyEndToEndTests: XCTestCase {
         environment["VAELEN_TEST_SUPPORT_ROOT"] = support.path
         environment["NO_COLOR"] = "1"
         let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
+        let stdoutURL = root.appendingPathComponent("cli-stdout-\(UUID().uuidString)")
+        let stderrURL = root.appendingPathComponent("cli-stderr-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: stdoutURL.path, contents: nil),
+              FileManager.default.createFile(atPath: stderrURL.path, contents: nil),
+              let stdout = FileHandle(forWritingAtPath: stdoutURL.path),
+              let stderr = FileHandle(forWritingAtPath: stderrURL.path) else {
+            throw NSError(domain: "LocalProxyEndToEndTests", code: 8, userInfo: [NSLocalizedDescriptionKey: "could not create isolated CLI output files"])
+        }
         process.executableURL = binary
         process.arguments = arguments
         process.currentDirectoryURL = root
@@ -211,10 +222,23 @@ final class LocalProxyEndToEndTests: XCTestCase {
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
-        process.waitUntilExit()
+        let child = OwnedChildProcess(process: process, label: "local proxy acceptance CLI")
+        let deadline = Date().addingTimeInterval(30)
+        while process.isRunning && Date() < deadline { usleep(10_000) }
+        if process.isRunning {
+            var stopped = child.terminateAndWait(timeout: 2)
+            if !stopped { stopped = child.terminateAndWait(timeout: 2, signal: SIGKILL, waitForDescendants: false) }
+            stdout.closeFile()
+            stderr.closeFile()
+            guard stopped else { throw CLIProcessDidNotStop() }
+            throw NSError(domain: "LocalProxyEndToEndTests", code: 9, userInfo: [NSLocalizedDescriptionKey: "CLI timed out after 30 seconds and was terminated"])
+        }
+        _ = child.isRunningAndReapedIfExited()
+        stdout.closeFile()
+        stderr.closeFile()
         return CLIResult(status: process.terminationStatus,
-            stdout: String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
-            stderr: String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+            stdout: try String(contentsOf: stdoutURL, encoding: .utf8),
+            stderr: try String(contentsOf: stderrURL, encoding: .utf8))
     }
 
     private func availablePort() throws -> Int {
@@ -232,5 +256,21 @@ final class LocalProxyEndToEndTests: XCTestCase {
         let result = withUnsafeMutablePointer(to: &address) { pointer in pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) } }
         guard result == 0 else { throw NSError(domain: "LocalProxyEndToEndTests", code: 6, userInfo: [NSLocalizedDescriptionKey: "could not read the ephemeral loopback port"])}
         return Int(UInt16(bigEndian: address.sin_port))
+    }
+
+    private func canConnectTCP(port: Int) -> Bool {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(port).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        return withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
     }
 }
