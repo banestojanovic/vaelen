@@ -29,7 +29,7 @@ Designed phases:
 - [ ] Verify native interactive work, overlapping children, results collection, and exported model identities. Partial: both children were launched concurrently and one returned; the other did not complete. Exported primary variant is `default`, despite merged agent config specifying `medium`.
 - [ ] Exercise focused Swift permission, correction on a failing check, failure recovery, and completion notification. Focused Swift check ran 14 tests without a permission prompt. The failure and notification paths were not proven; provider-error fallback is unsupported by this runtime.
 - [x] Inspect diff and preservation evidence.
-- [ ] Create the scoped local commit and capture its identity.
+- [x] Create the scoped local commit and capture its identity: `ed7e11f` (`Replace OpenCode2 orchestration with native pstack`).
 
 ### Phase D trail
 
