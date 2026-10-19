@@ -3,6 +3,14 @@ import XCTest
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
+    func testManagedLogErrorsRetainDistinctWireCodes() throws {
+        for code in [IPCErrorCode.logMissing, .logUnreadable, .logUnsafePath] {
+            let response = IPCResponse(id: UUID(), error: IPCErrorPayload(code: code, message: "managed log error"))
+            let decoded = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response))
+            XCTAssertEqual(decoded.error?.code, code)
+        }
+    }
+
     func testProjectObservationSnapshotAndReferenceRoundTrip() throws {
         XCTAssertEqual(VaelenBuildInfo.schemaCompatibilityVersion, 7)
         let snapshotID = UUID()

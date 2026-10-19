@@ -477,9 +477,9 @@ public actor CoreRequestDispatcher {
             switch error {
             case .unknownLog(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Unknown Vaelen log ID '\(id)'. Run 'val logs' to list supported logs.")), true)
             case .invalidLineCount: return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Line count must be between 1 and \(CoreLogCatalog.maxLines).")), true)
-            case .missing(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Log '\(id)' is missing.")), true)
-            case .unreadable(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Log '\(id)' is unreadable.")), true)
-            case .unsafePath(let id): return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Log '\(id)' resolves outside Vaelen's owned log directory.")), true)
+            case .missing(let id): return (.init(id: request.id, error: .init(code: .logMissing, message: "Log '\(id)' is missing.")), true)
+            case .unreadable(let id): return (.init(id: request.id, error: .init(code: .logUnreadable, message: "Log '\(id)' is unreadable.")), true)
+            case .unsafePath(let id): return (.init(id: request.id, error: .init(code: .logUnsafePath, message: "Log '\(id)' resolves outside Vaelen's owned log directory.")), true)
             }
         } catch let error as StandardPortsError {
             standardPortsLogger.error("IPC Standard Ports request returned an error payload: \(String(describing: error), privacy: .public)")
