@@ -1,28 +1,126 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "openai/gpt-6-luna",
-  "default_agent": "vaelen-pm",
-  "experimental": {
-    "subagent_depth": 2
+  "default_agent": "vaelen-primary",
+  "providers": {
+    "openai": {
+      "models": {
+        "gpt-6-luna": {
+          "settings": { "reasoningEffort": "medium" }
+        },
+        "gpt-6.1-sol": {
+          "settings": { "reasoningEffort": "medium" }
+        }
+      }
+    }
   },
   "worktree": {
     "directory": "../vaelen-agent-worktrees"
   },
-  "instructions": [
-    ".opencode/instructions/vaelen.md"
+  "skills": [
+    "/Users/banes/.codex/plugins/cache/pstack-claude/pstack/0.9.93/skills"
   ],
-  "agent": {
-    "build": {
-      "disable": true
+  "instructions": [
+    ".opencode/instructions/vaelen.md",
+    ".opencode/pstack-models.md",
+    ".opencode/instructions/pstack-native.md"
+  ],
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "ask" },
+    { "action": "read", "resource": "*", "effect": "allow" },
+    { "action": "read", "resource": "*.env", "effect": "ask" },
+    { "action": "read", "resource": "*.env.*", "effect": "ask" },
+    { "action": "read", "resource": "*auth.json", "effect": "ask" },
+    { "action": "read", "resource": "*credentials*", "effect": "ask" },
+    { "action": "read", "resource": "*.pem", "effect": "ask" },
+    { "action": "read", "resource": "*.key", "effect": "ask" },
+    { "action": "read", "resource": "*/.ssh/*", "effect": "ask" },
+    { "action": "read", "resource": "*/.aws/*", "effect": "ask" },
+    { "action": "glob", "resource": "*", "effect": "allow" },
+    { "action": "grep", "resource": "*", "effect": "allow" },
+    { "action": "skill", "resource": "*", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "allow" },
+    { "action": "edit", "resource": "*.env", "effect": "ask" },
+    { "action": "edit", "resource": "*.env.*", "effect": "ask" },
+    { "action": "edit", "resource": "*auth.json", "effect": "ask" },
+    { "action": "edit", "resource": "*credentials*", "effect": "ask" },
+    { "action": "edit", "resource": "*.pem", "effect": "ask" },
+    { "action": "edit", "resource": "*.key", "effect": "ask" },
+    { "action": "edit", "resource": "*/.ssh/*", "effect": "ask" },
+    { "action": "edit", "resource": "*/.aws/*", "effect": "ask" },
+    { "action": "edit", "resource": ".git/*", "effect": "ask" },
+    { "action": "external_directory", "resource": "*", "effect": "ask" },
+    { "action": "external_directory", "resource": "/Users/banes/.codex/plugins/cache/pstack-claude/pstack/0.9.93/skills/*", "effect": "allow" },
+    { "action": "edit", "resource": "/Users/banes/.codex/plugins/cache/pstack-claude/pstack/0.9.93/skills/*", "effect": "deny" },
+    { "action": "external_directory", "resource": "/Users/banes/Code/apps/vaelen-agent-worktrees/*", "effect": "allow" },
+    { "action": "shell", "resource": "swift build", "effect": "allow" },
+    { "action": "shell", "resource": "swift test --filter VaelenCoreTests.ProjectSiteURLTests", "effect": "allow" },
+    { "action": "shell", "resource": "git status *", "effect": "allow" },
+    { "action": "shell", "resource": "git diff *", "effect": "allow" },
+    { "action": "shell", "resource": "git log *", "effect": "allow" },
+    { "action": "shell", "resource": "git show *", "effect": "allow" },
+    { "action": "shell", "resource": "git rev-parse *", "effect": "allow" },
+    { "action": "shell", "resource": "git ls-files *", "effect": "allow" },
+    { "action": "shell", "resource": "git branch --show-current", "effect": "allow" },
+    { "action": "shell", "resource": "git worktree list", "effect": "allow" },
+    { "action": "shell", "resource": "git worktree add *", "effect": "allow" },
+    { "action": "shell", "resource": "git add -- *", "effect": "allow" },
+    { "action": "shell", "resource": "git add -- .", "effect": "ask" },
+    { "action": "shell", "resource": "git add -A*", "effect": "ask" },
+    { "action": "shell", "resource": "git add --all*", "effect": "ask" },
+    { "action": "shell", "resource": "git commit --only -m *", "effect": "allow" },
+    { "action": "shell", "resource": "git commit * --amend*", "effect": "ask" },
+    { "action": "shell", "resource": "git commit * --no-verify*", "effect": "ask" },
+    { "action": "browser", "resource": "*", "effect": "ask" }
+  ],
+  "policies": [
+    { "action": "tool.use", "resource": "worktree_remove:*", "effect": "deny" }
+  ],
+  "agents": {
+    "build": { "disabled": true },
+    "plan": { "disabled": true },
+    "general": { "disabled": true },
+    "explore": { "disabled": true },
+    "vaelen-primary": {
+      "description": "Luna owns the task from first read through collected results, verification, correction, and final report.",
+      "mode": "primary",
+      "model": "openai/gpt-6-luna#medium",
+      "system": "You are the Vaelen task owner on GPT-6 Luna Medium. Follow poteto-mode and the project instructions. Handle small tasks directly. For larger tasks, use two independent native Luna workers only when their scopes can proceed independently, then collect both results before you finish. Use the one Sol judgment agent for architecture, ambiguity, or difficult decisions. If that child cannot answer, recover the judgment in this Luna parent. Workers and reviewers use fresh native child sessions. Keep verification, correction, and final reporting in this parent. A failing check must lead to a correction or an honest failure report, never a success claim. Reconcile repository and runtime state before retrying any operation that may have changed state. Never substitute a model that is not selected in this project configuration.",
+      "permissions": [
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "vaelen-judgment", "effect": "allow" },
+        { "action": "subagent", "resource": "vaelen-worker", "effect": "allow" },
+        { "action": "subagent", "resource": "vaelen-reviewer", "effect": "allow" }
+      ]
     },
-    "plan": {
-      "disable": true
+    "vaelen-judgment": {
+      "description": "One Sol Medium judgment role for architecture, ambiguity, and difficult decisions. The Luna parent owns action and recovery.",
+      "mode": "subagent",
+      "model": "openai/gpt-6.1-sol#medium",
+      "system": "Read the relevant pstack skill and project instructions. Give the Luna parent a concise judgment with evidence, assumptions, and risks. Do not implement changes or delegate. If a model request fails, report the failure and last completed action. The Luna parent is the approved recovery path. Never retry a state-changing operation until its result has been reconciled.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
     },
-    "general": {
-      "disable": true
+    "vaelen-worker": {
+      "description": "Fresh Luna Medium worker for a bounded implementation, exploration, or verification assignment.",
+      "mode": "subagent",
+      "model": "openai/gpt-6-luna#medium",
+      "system": "Read the relevant pstack skill and project instructions. Follow the parent’s exact scope and path ownership. Do not delegate. Do not use a different model. Report the exact files read or changed, checks and results, child completion status, and any uncertainty. If a provider failure follows a possible side effect, report the last action and evidence. Do not retry until the parent has reconciled that state.",
+      "permissions": [
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
     },
-    "explore": {
-      "disable": true
+    "vaelen-reviewer": {
+      "description": "Fresh Luna Medium reviewer. Read-only and independent of the writer.",
+      "mode": "subagent",
+      "model": "openai/gpt-6-luna#medium",
+      "system": "Read the relevant pstack skill and project instructions. Independently inspect the actual change. Do not edit or delegate. Run only the named focused checks. Report concrete findings with file locations, PASS, FAIL, or BLOCKED, and residual risks.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
     }
   }
 }

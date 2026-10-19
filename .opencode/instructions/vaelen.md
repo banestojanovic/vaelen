@@ -36,22 +36,29 @@
 - Prefer the smallest mechanism satisfying proven requirements.
 - Implementation success does not freeze architecture.
 - ADR and release freeze occur only after explicit acceptance.
-- Commit, tag, push, and freeze require explicit user instruction.
+- Task-scoped local branch creation and commits may proceed when the current
+  task authorizes them. Inspect the entire staged path list first. Stage only
+  owned paths and use a path-limited `git commit --only` to preserve unrelated
+  staged changes. Tag, push, freeze, history rewriting, and integration into
+  existing branches require separate explicit user instruction.
 - M13 must not start until explicitly authorized.
-- Parallel write agents use separate, named Git worktrees with explicit path
-  ownership. `vaelen-pm` names one integration owner; agents never write into
-  the shared integration checkout unless specifically assigned as that owner.
+- The Luna primary assigns explicit path ownership. Native children share
+  the active working directory. Use one scoped writer at a time in that checkout.
+  Parallel writers require separately proven native worktree isolation.
 
 ## Worktree and operation coordination
 
-- OpenCode subagents do not automatically receive isolated worktrees, and the
-  subagent tool has no worktree/working-directory argument. Keep it read-only;
-  create one worktree per parallel writer and launch a separate `opencode run`
-  session from its exact worktree before it can edit. Verify working directory,
-  Git root, branch, and status.
-- Only one named session at a time may use the installed app, installed CLI,
-  service controls, or runtime-mutating harness operations. The PM coordinates
-  the exclusive operation owner and explicit handoff; parallel writers do not
+- Delegate through the native OpenCode2 `subagent` tool. Foreground calls return
+  the child result to the parent. Collect every required result before finalizing.
+  Use fresh Luna children for scoped implementation, exploration, verification,
+  and independent review. Sol retains architecture and difficult decisions.
+  Never launch detached workers or use `Scripts/vaelen-agents` for orchestration.
+  Verify the active working directory, Git root, branch, and local changes.
+- Live operations require explicit user authorization. The Luna task owner
+  names one operation owner. Only one named session at a time may use the
+  installed app, installed CLI, service controls, or runtime-mutating harness
+  operations. The Luna owner coordinates the exclusive operation owner and
+  explicit handoff; parallel writers do not
   use those paths or mutate live projects, routes, services, certificates, or
   databases.
 - Keep `./Scripts/vaelen-dev clean-install` restricted to its existing exact

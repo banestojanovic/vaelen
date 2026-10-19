@@ -1,0 +1,1459 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openai/gpt-6.1-sol",
+  "default_agent": "vaelen-orchestrator",
+  "experimental": {
+    "subagent_depth": 2
+  },
+  "worktree": {
+    "directory": "../vaelen-agent-worktrees"
+  },
+  "instructions": [
+    ".opencode/instructions/vaelen.md",
+    ".opencode/pstack-models.md",
+    ".opencode/instructions/pstack-native.md"
+  ],
+  "agents": {
+    "build": {
+      "disabled": true
+    },
+    "plan": {
+      "disabled": true
+    },
+    "general": {
+      "disabled": true
+    },
+    "explore": {
+      "disabled": true
+    },
+    "vaelen-orchestrator": {
+      "description": "Sol coordinates native pstack work, architecture, difficult decisions, and final assessment.",
+      "mode": "primary",
+      "model": "openai/gpt-6.1-sol",
+      "system": "Read the published poteto-mode skill before nontrivial work and follow its relevant playbook. The user task and project safety restrictions take precedence. Use only the native OpenCode2 subagent tool for delegation. Its foreground call returns the child result. Launch independent work through direct native subagent calls and await every result. The execute catalog does not expose subagent. Do not invent a wrapper. If using background mode, collect each native completion before finalizing. Never run another OpenCode process, Scripts/vaelen-agents, a custom scheduler, or pstack orchestration scripts. No installation, publishing, destructive actions, privileged operations, or live Vaelen changes without explicit user authorization. Preserve local changes and authentication. Shell allowlists are convenience rules, not filesystem isolation. Never use an allowed command to bypass an approval boundary. Give children complete briefs with owned paths, acceptance, focused checks, prohibitions, and required report. Fresh children have no sibling context. Native children share the working directory. Use one writer at a time unless native isolation is separately proven. Collect actual findings, inspect the resulting diff, and report limitations honestly. You own coordination and final assessment. Delegate scoped implementation to vaelen-worker. Use fresh vaelen-reviewer sessions for exploration, verification, and independent review. Keep difficult implementation and ambiguous decisions on Sol. Collect all results and deliver the final outcome in the same turn without asking for continue. Do not claim model identity from agent self-report. Repository inspection and reviewed project verification are routine. Read the verifier source and .opencode/instructions/pstack-native.md before executing a verification script. Only the listed reviewed entry points are preapproved; new or changed scripts need renewed review. Task-scoped local commits are authorized only when the user task grants them. Before staging, inspect the complete staged path list and record unrelated staged paths. Stage only explicit owned pathspecs with git add --. Use git commit --only -m MESSAGE -- OWNED_PATHS to exclude unrelated staged changes. Never amend, bypass hooks, stage the entire tree, or switch existing branches without approval. Use opencode2 session list and opencode2 session export SESSION_ID for the current task or IDs cited in its evidence. Do not browse unrelated sessions or raw data/auth stores. Native session exports are local evidence, not permission to transmit their contents elsewhere. Everyday entry is the normal opencode2 interactive app. After configuration edits explicitly reload the shared service and open a fresh session; existing sessions retain their own selected model and agent.",
+      "permissions": [
+        {
+          "action": "subagent",
+          "resource": "vaelen-worker",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "vaelen-reviewer",
+          "effect": "allow"
+        }
+      ]
+    },
+    "vaelen-worker": {
+      "description": "Luna implements a bounded change in the explicitly assigned workspace paths and runs focused checks.",
+      "mode": "subagent",
+      "model": "openai/gpt-6-luna",
+      "system": "Read the published poteto-mode skill before nontrivial work and follow its relevant playbook. The user task and project safety restrictions take precedence. Use only the native OpenCode2 subagent tool for delegation. Its foreground call returns the child result. Launch independent work through direct native subagent calls and await every result. The execute catalog does not expose subagent. Do not invent a wrapper. If using background mode, collect each native completion before finalizing. Never run another OpenCode process, Scripts/vaelen-agents, a custom scheduler, or pstack orchestration scripts. No installation, publishing, destructive actions, privileged operations, or live Vaelen changes without explicit user authorization. Preserve local changes and authentication. Shell allowlists are convenience rules, not filesystem isolation. Never use an allowed command to bypass an approval boundary. Give children complete briefs with owned paths, acceptance, focused checks, prohibitions, and required report. Fresh children have no sibling context. Native children share the working directory. Use one writer at a time unless native isolation is separately proven. Collect actual findings, inspect the resulting diff, and report limitations honestly. You implement only the assigned scope. Do not delegate or touch sibling paths. Return changed files, exact focused checks and results, and remaining uncertainty. Your self-review is not the independent review. Repository inspection and reviewed project verification are routine. Read the verifier source and .opencode/instructions/pstack-native.md before executing a verification script. Only the listed reviewed entry points are preapproved; new or changed scripts need renewed review. Task-scoped local commits are authorized only when the user task grants them. Before staging, inspect the complete staged path list and record unrelated staged paths. Stage only explicit owned pathspecs with git add --. Use git commit --only -m MESSAGE -- OWNED_PATHS to exclude unrelated staged changes. Never amend, bypass hooks, stage the entire tree, or switch existing branches without approval. Use opencode2 session list and opencode2 session export SESSION_ID for the current task or IDs cited in its evidence. Do not browse unrelated sessions or raw data/auth stores. Native session exports are local evidence, not permission to transmit their contents elsewhere. Everyday entry is the normal opencode2 interactive app. After configuration edits explicitly reload the shared service and open a fresh session; existing sessions retain their own selected model and agent.",
+      "permissions": [
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        }
+      ]
+    },
+    "vaelen-reviewer": {
+      "description": "Fresh Luna read-only exploration, focused verification, or independent review. Never writes the implementation.",
+      "mode": "subagent",
+      "model": "openai/gpt-6-luna",
+      "system": "Read the published poteto-mode skill before nontrivial work and follow its relevant playbook. The user task and project safety restrictions take precedence. Use only the native OpenCode2 subagent tool for delegation. Its foreground call returns the child result. Launch independent work through direct native subagent calls and await every result. The execute catalog does not expose subagent. Do not invent a wrapper. If using background mode, collect each native completion before finalizing. Never run another OpenCode process, Scripts/vaelen-agents, a custom scheduler, or pstack orchestration scripts. No installation, publishing, destructive actions, privileged operations, or live Vaelen changes without explicit user authorization. Preserve local changes and authentication. Shell allowlists are convenience rules, not filesystem isolation. Never use an allowed command to bypass an approval boundary. Give children complete briefs with owned paths, acceptance, focused checks, prohibitions, and required report. Fresh children have no sibling context. Native children share the working directory. Use one writer at a time unless native isolation is separately proven. Collect actual findings, inspect the resulting diff, and report limitations honestly. You are read-only. Independently read the actual artifact and run only named focused checks. Never edit files or use shell to mutate source. Report concrete evidence with file locations and PASS, FAIL, or BLOCKED. Do not delegate. Repository inspection and reviewed project verification are routine. Read the verifier source and .opencode/instructions/pstack-native.md before executing a verification script. Only the listed reviewed entry points are preapproved; new or changed scripts need renewed review. Task-scoped local commits are authorized only when the user task grants them. Before staging, inspect the complete staged path list and record unrelated staged paths. Stage only explicit owned pathspecs with git add --. Use git commit --only -m MESSAGE -- OWNED_PATHS to exclude unrelated staged changes. Never amend, bypass hooks, stage the entire tree, or switch existing branches without approval. Use opencode2 session list and opencode2 session export SESSION_ID for the current task or IDs cited in its evidence. Do not browse unrelated sessions or raw data/auth stores. Native session exports are local evidence, not permission to transmit their contents elsewhere. Everyday entry is the normal opencode2 interactive app. After configuration edits explicitly reload the shared service and open a fresh session; existing sessions retain their own selected model and agent.",
+      "permissions": [
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "git switch -c codex/*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "git switch -c chore/*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "git checkout -b codex/*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "git checkout -b chore/*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "git add -- *",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "git commit --only -m *",
+          "effect": "deny"
+        }
+      ]
+    }
+  },
+  "permissions": [
+    {
+      "action": "*",
+      "resource": "*",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "glob",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "grep",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "execute",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "webfetch",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "websearch",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "edit",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "question",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "external_directory",
+      "resource": "*",
+      "effect": "ask"
+    },
+    {
+      "action": "external_directory",
+      "resource": "/Users/banes/.codex/plugins/cache/pstack-claude/pstack/0.9.93/*",
+      "effect": "allow"
+    },
+    {
+      "action": "edit",
+      "resource": "/Users/banes/.codex/plugins/cache/pstack-claude/pstack/0.9.93/*",
+      "effect": "deny"
+    },
+    {
+      "action": "read",
+      "resource": "*.env",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*.env.*",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*auth.json",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*credentials*",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*.pem",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*.key",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*/.ssh/*",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*/.aws/*",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*.env",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*.env.*",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*auth.json",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*credentials*",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*.pem",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*.key",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*/.ssh/*",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*/.aws/*",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": "*/.git/*",
+      "effect": "ask"
+    },
+    {
+      "action": "edit",
+      "resource": ".git/*",
+      "effect": "ask"
+    },
+    {
+      "action": "read",
+      "resource": "*.env.example",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "pwd",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "ls *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "rg *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "cat *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "head *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "tail *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "wc *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "file *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "stat *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git status *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git diff *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git log *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git show *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git rev-parse *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git ls-files *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git ls-tree *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git cat-file *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git describe *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git for-each-ref *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git check-ignore *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git name-rev *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git reflog show *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch --show-current",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch --list *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -a",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -r",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -v",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -vv",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch --all",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch --remotes",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen status *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen diff *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen log *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen show *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen rev-parse *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen ls-files *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen ls-tree *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen cat-file *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen describe *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen for-each-ref *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen check-ignore *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen name-rev *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen reflog show *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch --show-current",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch --list *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -a",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -r",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -v",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -vv",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch --all",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch --remotes",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . status *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . diff *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . log *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . show *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . rev-parse *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . ls-files *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . ls-tree *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . cat-file *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . describe *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . for-each-ref *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . check-ignore *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . name-rev *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . reflog show *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch --show-current",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch --list *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -a",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -r",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -v",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -vv",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch --all",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch --remotes",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 .opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -B .opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -B /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -u .opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -u /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python .opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -B .opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -B /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -u .opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -u /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/verify_evidence.py *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git switch -c codex/*",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git switch -c chore/*",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git checkout -b codex/*",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git checkout -b chore/*",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git add -- *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit --only -m *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "git add .",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git add -- .",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git add -- * .",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git add --all *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git add -A *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git add -u *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit -a *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit *--amend*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit *--no-verify*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit *-a *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git switch *--discard-changes*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git checkout *--force*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git checkout *-f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *-d*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *-D*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git *--output*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 *",
+      "effect": "deny"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 session list *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 session export ses_*",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 debug paths *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 debug agents",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 debug config",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 models",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 *--server*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 *--standalone*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 *--file*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode2 *--data*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode session list *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode session export ses_*",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode debug paths *",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode debug agents",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode debug config",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode models",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode *--server*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode *--standalone*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode *--file*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "opencode *--data*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*Scripts/vaelen-agents*",
+      "effect": "deny"
+    },
+    {
+      "action": "subagent",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "browser",
+      "resource": "*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*.env*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*auth.json*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*credentials*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*.pem*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*.key*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*/.ssh/*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*/.aws/*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*--git-dir*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "*--work-tree*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git *--config-env*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit * -- .",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit * -- * .",
+      "effect": "ask"
+    },
+    {
+      "action": "external_directory",
+      "resource": "/Users/banes/.local/share/opencode/shell/c26e9f9ced4da4c639b33c90f1f0a6da11857dff/*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "resource": "/Users/banes/.local/share/opencode/shell/c26e9f9ced4da4c639b33c90f1f0a6da11857dff/*",
+      "effect": "allow"
+    },
+    {
+      "action": "edit",
+      "resource": "/Users/banes/.local/share/opencode/shell/c26e9f9ced4da4c639b33c90f1f0a6da11857dff/*",
+      "effect": "deny"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--delete*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--move*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--copy*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--set-upstream*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--unset-upstream*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--edit-description*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--force*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch *--no-list*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -d *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -d *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -D *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -D *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -m *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -m *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -M *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -M *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -C *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -C *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch -f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git branch * -f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--delete*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--move*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--copy*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--set-upstream*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--unset-upstream*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--edit-description*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--force*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch *--no-list*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -d *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -d *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -D *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -D *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -m *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -m *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -M *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -M *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -C *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -C *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch -f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C /Users/banes/Code/apps/vaelen branch * -f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--delete*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--move*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--copy*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--set-upstream*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--unset-upstream*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--edit-description*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--force*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch *--no-list*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -d *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -d *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -D *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -D *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -m *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -m *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -M *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -M *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -c *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -C *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -C *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch -f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git -C . branch * -f *",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit * -n*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit * -vn*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit * -nv*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "git commit * --no-verify*",
+      "effect": "ask"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest discover -s .opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest discover -v -s .opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest -v discover -s .opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest discover -s .opencode/evidence/native-pstack-2026-10-18/fixture -v",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest discover -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest discover -v -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest -v discover -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python3 -m unittest discover -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture -v",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest discover -s .opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest discover -v -s .opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest -v discover -s .opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest discover -s .opencode/evidence/native-pstack-2026-10-18/fixture -v",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest discover -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest discover -v -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest -v discover -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture",
+      "effect": "allow"
+    },
+    {
+      "action": "shell",
+      "resource": "python -m unittest discover -s /Users/banes/Code/apps/vaelen/.opencode/evidence/native-pstack-2026-10-18/fixture -v",
+      "effect": "allow"
+    }
+  ],
+  "skills": [
+    "/Users/banes/.codex/plugins/cache/pstack-claude/pstack/0.9.93/skills"
+  ]
+}
