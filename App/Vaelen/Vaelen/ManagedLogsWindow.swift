@@ -50,7 +50,7 @@ struct ManagedLogsWindow: View {
         case .text(let text, let truncated, let linesReturned):
             VStack(alignment: .leading, spacing: 8) {
                 if truncated {
-                    Label("Core omitted the beginning to stay within its byte limit. Showing the last \(linesReturned) available lines.", systemImage: "arrow.down.to.line")
+                    Label("Showing the last \(linesReturned) lines. Earlier content was omitted.", systemImage: "arrow.down.to.line")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 ScrollView([.vertical, .horizontal]) {
