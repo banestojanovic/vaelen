@@ -18,7 +18,7 @@ enum CaddyTestSupport {
         }
     }
 
-    private static func availablePort() throws -> Int {
+    static func availablePort() throws -> Int {
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw CaddyRuntimeError.processFailed("socket") }
         defer { close(descriptor) }

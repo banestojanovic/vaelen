@@ -3,6 +3,48 @@ import Darwin
 @testable import VaelenCore
 
 final class CaddyRouterTests: XCTestCase {
+    func testOfficialCaddyForwardsLocalHTTPProxyPathQueryAndErrorStatus() async throws {
+        let root = URL(fileURLWithPath: "/private/var/tmp/vaelen-proxy-caddy-\(UUID().uuidString)", isDirectory: true)
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let package = try resolveCaddyPackage()
+        let configuration = try CaddyTestSupport.configuration()
+        let upstreamPort = try CaddyTestSupport.availablePort()
+        let upstream = try OwnedChildProcess.launch(executable: URL(fileURLWithPath: "/usr/bin/python3"), arguments: ["-c", "from http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):\n  body=self.path.encode(); status=418 if self.path.startswith('/teapot') else 200; self.send_response(status); self.end_headers(); self.wfile.write(body)\n def log_message(self,*args): pass\nHTTPServer(('127.0.0.1',int(__import__('sys').argv[1])),H).serve_forever()", String(upstreamPort)], label: "local proxy upstream fixture")
+        for _ in 0..<100 where !canConnectTCP(host: "127.0.0.1", port: upstreamPort) { usleep(10_000) }
+        XCTAssertTrue(canConnectTCP(host: "127.0.0.1", port: upstreamPort), "controlled upstream did not start")
+
+        let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
+        await supervisor.installPackage(package)
+        let router = CaddyRouter(layout: layout, supervisor: supervisor)
+        addTeardownBlock {
+            let routerStopped: Bool
+            do {
+                try await router.stop()
+                routerStopped = true
+            } catch {
+                XCTFail("isolated Caddy did not stop; preserving its fixture root: \(error)")
+                routerStopped = false
+            }
+            let upstreamStopped = upstream.terminateAndWait(timeout: 2)
+            XCTAssertTrue(upstreamStopped, "controlled upstream must stop before the fixture root is removed")
+            guard routerStopped && upstreamStopped else { return }
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await router.start()
+        let proxy = Route(hostname: "frontend.test", target: .http(host: "127.0.0.1", port: upstreamPort), tls: .disabled)
+        try await router.reconcile(routes: [proxy])
+
+        let forwarded = try runHTTP(host: proxy.hostname, port: configuration.httpPort, path: "/nested/item?mode=proxy")
+        XCTAssertEqual(forwarded.status, 200)
+        XCTAssertEqual(forwarded.body, "/nested/item?mode=proxy")
+        let upstreamError = try runHTTP(host: proxy.hostname, port: configuration.httpPort, path: "/teapot?reason=fixture")
+        XCTAssertEqual(upstreamError.status, 418)
+        XCTAssertEqual(upstreamError.body, "/teapot?reason=fixture")
+        let observedRoutes = try await router.observedRoutes()
+        XCTAssertEqual(observedRoutes.map(\.hostname), [proxy.hostname])
+        try await router.stop()
+    }
+
     func testOfficialCaddyServesMultipleStaticRoutesAndRemovesOne() async throws {
         let root = URL(fileURLWithPath: "/tmp/vaelen-router-\(UUID().uuidString)", isDirectory: true)
         let alphaRoot = root.appendingPathComponent("alpha", isDirectory: true)
@@ -197,6 +239,17 @@ final class CaddyRouterTests: XCTestCase {
             let data = try JSONSerialization.data(withJSONObject: configuration)
             XCTAssertThrowsError(try CaddyRouter.decodeObservedRoutes(data))
         }
+    }
+
+    func testObservedHTTPUpstreamParsesBracketedIPv6Loopback() throws {
+        let route: [String: Any] = [
+            "match": [["host": ["frontend.test"]]],
+            "handle": [["handler": "reverse_proxy", "upstreams": [["dial": "[::1]:3000"]]]]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: ["apps": ["http": ["servers": ["vaelen-http": ["routes": [route]]]]]])
+        let observed = try CaddyRouter.decodeObservedRoutes(data)
+        XCTAssertEqual(observed.count, 1)
+        XCTAssertEqual(observed[0].target, .http(host: "::1", port: 3000))
     }
 
     func testOfficialCaddyReachesSyncproofLaravelFrontController() async throws {

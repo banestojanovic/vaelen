@@ -102,13 +102,15 @@ private actor ParkReconciliationTestRouter: Router {
     private var running = true
     private var routes: [Route]
     private var failNextReconcile = false
-    private let failObservations: Bool
+    private var failObservations: Bool
     private var statusCalls = 0
     private var observedRouteCalls = 0
 
     init(routes: [Route] = [], failObservations: Bool = false) { self.routes = routes; self.failObservations = failObservations }
     func start() async throws { running = true }
     func stop() async throws { running = false }
+    func replaceObservedRoutes(_ routes: [Route]) { self.routes = routes }
+    func setFailObservations(_ value: Bool) { failObservations = value }
     func status() async -> RouterStatus { statusCalls += 1; return .init(provider: "park-reconciliation-test", state: running ? .running : .stopped, health: running ? .healthy : .unknown, routeCount: routes.count) }
     func health() async -> RouterHealth { running ? .healthy : .unhealthy }
     func failNextApply() { failNextReconcile = true }
@@ -219,6 +221,139 @@ private actor StartupRaceDNSHelper: PrivilegedDNSHelper {
 }
 
 final class DispatcherTests: XCTestCase {
+    @MainActor
+    func testLocalProxyCreatePersistsAndRemovePreservesUnrelatedSameHostRoute() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("local-proxy-dispatcher-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let routeRepository = RouteIntentRepository(store: store)
+        let proxyRepository = try LocalProxyRepository(databaseURL: root.appendingPathComponent("state/proxies.sqlite"))
+        let router = ParkReconciliationTestRouter()
+        func makeDispatcher() throws -> CoreRequestDispatcher {
+            try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router,
+                routeRepository: routeRepository, localProxyRepository: proxyRepository)
+        }
+        let dispatcher = try makeDispatcher()
+        let add = await dispatcher.dispatch(IPCRequest(method: .localProxyAdd,
+            params: .localProxyCreate(.init(hostname: "preview.test", upstreamURL: "http://127.0.0.1:1"))), handshaken: true)
+        XCTAssertNil(add.response.error)
+        XCTAssertEqual(try routeRepository.all().count, 1)
+        XCTAssertEqual(try proxyRepository.list().count, 1)
+
+        let recoveredDispatcher = try makeDispatcher()
+        let list = await recoveredDispatcher.dispatch(IPCRequest(method: .localProxyList), handshaken: true)
+        guard case .localProxyList(let result)? = list.response.result else { return XCTFail("persisted proxy was not listed") }
+        XCTAssertEqual(result.proxies.map(\.hostname), ["preview.test"])
+        XCTAssertEqual(result.proxies.first?.ownershipPhase, .active)
+
+        let remove = await recoveredDispatcher.dispatch(IPCRequest(method: .localProxyRemove,
+            params: .localProxyRemove(.init(hostname: "preview.test"))), handshaken: true)
+        XCTAssertNil(remove.response.error)
+        XCTAssertTrue(try routeRepository.all().isEmpty)
+        XCTAssertTrue(try proxyRepository.list().isEmpty)
+
+        let unrelated = RouteIntent(route: Route(hostname: "preview.test", target: .staticFiles(documentRoot: root.path), tls: .disabled))
+        try routeRepository.upsert(unrelated)
+        let conflictDispatcher = try makeDispatcher()
+        let conflict = await conflictDispatcher.dispatch(IPCRequest(method: .localProxyAdd,
+            params: .localProxyCreate(.init(hostname: "preview.test", upstreamURL: "http://127.0.0.1:1"))), handshaken: true)
+        XCTAssertNotNil(conflict.response.error)
+        XCTAssertEqual(try routeRepository.all(), [unrelated])
+        XCTAssertTrue(try proxyRepository.list().isEmpty)
+    }
+
+    func testLocalProxyDeletionCleanupRetainsOwnershipWhileRouteIntentRemains() async throws {
+        for stopped in [true, false] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("local-proxy-delete-recovery-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+            let registry = ProjectRegistry(store: store)
+            let routeRepository = RouteIntentRepository(store: store)
+            let proxyRepository = try LocalProxyRepository(databaseURL: root.appendingPathComponent("state/proxies.sqlite"))
+            let router = ParkReconciliationTestRouter()
+            let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router,
+                routeRepository: routeRepository, localProxyRepository: proxyRepository)
+            let unrelated = RouteIntent(route: Route(hostname: "unrelated.test", target: .staticFiles(documentRoot: root.path), tls: .disabled))
+            try routeRepository.upsert(unrelated)
+            let add = await dispatcher.dispatch(IPCRequest(method: .localProxyAdd,
+                params: .localProxyCreate(.init(hostname: "recover.test", upstreamURL: "http://127.0.0.1:1"))), handshaken: true)
+            XCTAssertNil(add.response.error)
+            let proxy = try XCTUnwrap(proxyRepository.list().first)
+
+            try store.execute("CREATE TRIGGER reject_proxy_route_delete BEFORE DELETE ON route_intents WHEN OLD.id = '\(proxy.routeID.description)' BEGIN SELECT RAISE(ABORT, 'fixture blocks route deletion'); END")
+            let remove = await dispatcher.dispatch(IPCRequest(method: .localProxyRemove,
+                params: .localProxyRemove(.init(hostname: "recover.test"))), handshaken: true)
+            XCTAssertNotNil(remove.response.error, "the injected persistence failure must surface to the caller")
+            XCTAssertEqual(try routeRepository.all().first(where: { $0.route.id == proxy.routeID }), RouteIntent(route: proxy.route))
+            XCTAssertEqual(try proxyRepository.list().first?.phase, .deleting)
+
+            if stopped {
+                try await router.stop()
+            } else {
+                await router.replaceObservedRoutes([])
+            }
+            let cleanupAttempt = await dispatcher.dispatch(IPCRequest(method: .localProxyList), handshaken: true)
+            XCTAssertNil(cleanupAttempt.response.error)
+            guard case .localProxyList(let result)? = cleanupAttempt.response.result else { return XCTFail("deleting proxy should remain visible for retry") }
+            XCTAssertEqual(result.proxies.map(\.hostname), ["recover.test"])
+            XCTAssertEqual(result.proxies.first?.ownershipPhase, .deleting)
+            let retainedRoutes = try routeRepository.all()
+            XCTAssertEqual(retainedRoutes.count, 2)
+            XCTAssertTrue(retainedRoutes.contains(where: { $0.route.id == proxy.routeID }))
+            XCTAssertTrue(retainedRoutes.contains(where: { $0.route.id == unrelated.route.id }))
+            XCTAssertEqual(try proxyRepository.list().map(\.routeID), [proxy.routeID])
+
+            try store.execute("DROP TRIGGER reject_proxy_route_delete")
+            let retry = await dispatcher.dispatch(IPCRequest(method: .localProxyRemove,
+                params: .localProxyRemove(.init(hostname: "recover.test"))), handshaken: true)
+            XCTAssertNil(retry.response.error)
+            XCTAssertEqual(try routeRepository.all().map(\.route.id), [unrelated.route.id])
+            XCTAssertTrue(try proxyRepository.list().isEmpty)
+        }
+    }
+
+    func testStartupReconcilesDeletingProxyBeforeReleasingOwnership() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("local-proxy-startup-recovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let routeRepository = RouteIntentRepository(store: store)
+        let proxyRepository = try LocalProxyRepository(databaseURL: root.appendingPathComponent("state/proxies.sqlite"))
+        let proxyRoute = Route(hostname: "recover.test", target: .http(host: "127.0.0.1", port: 8080), tls: .disabled)
+        let unrelated = RouteIntent(route: Route(hostname: "ordinary.test", target: .staticFiles(documentRoot: root.path), tls: .disabled))
+        try routeRepository.upsert(RouteIntent(route: proxyRoute))
+        try routeRepository.upsert(unrelated)
+        try proxyRepository.createPrepared(route: proxyRoute, expectedRoute: proxyRoute)
+        try proxyRepository.activate(routeID: proxyRoute.id, expectedRoute: proxyRoute)
+        try proxyRepository.markDeleting(routeID: proxyRoute.id, expectedRoute: proxyRoute)
+        let router = ParkReconciliationTestRouter(routes: [proxyRoute, unrelated.route])
+
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry,
+            router: router, routeRepository: routeRepository, localProxyRepository: proxyRepository)
+        XCTAssertEqual(try routeRepository.all(), [unrelated], "restart recovery removes only the proxy's persisted intent")
+        XCTAssertEqual(try proxyRepository.list().first?.phase, .deleting, "ownership remains until provider removal is confirmed")
+
+        await router.failNextApply()
+        do {
+            try await dispatcher.reconcilePersistedRoutesOnStartup()
+            XCTFail("failed provider apply must not release deleting ownership")
+        } catch {
+            XCTAssertEqual(try proxyRepository.list().first?.phase, .deleting)
+        }
+
+        await router.setFailObservations(true)
+        try await dispatcher.reconcilePersistedRoutesOnStartup()
+        XCTAssertEqual(try proxyRepository.list().first?.phase, .deleting, "an unavailable observation retains ownership for retry")
+
+        await router.setFailObservations(false)
+        try await dispatcher.reconcilePersistedRoutesOnStartup()
+        XCTAssertTrue(try proxyRepository.list().isEmpty, "confirmed provider absence releases the deleting record")
+        XCTAssertEqual(try routeRepository.all(), [unrelated], "unrelated route intents remain unchanged")
+        let observedAfterRecovery = try await router.observedRoutes()
+        XCTAssertEqual(observedAfterRecovery, [unrelated.route], "startup reconciliation forwards only retained routes")
+    }
+
     func testParkReconcileReportsAndSkipsDuplicateChildNamesAcrossParents() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("park-name-collision-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }

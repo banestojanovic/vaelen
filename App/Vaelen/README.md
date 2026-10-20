@@ -16,7 +16,7 @@ without network access. No PHP compilation or catalog refresh occurs.
 The compact popover provides quick project and service operations. Deeper
 project and service configuration belongs in the native Settings window. The
 app does not own managed runtime state: Core is authoritative, and the app and
-CLI use its typed IPC (protocol v1, compatibility schema 6; SQLite schema 7).
+CLI use its typed IPC (protocol v1, compatibility schema 7; SQLite schema 7).
 
 At launch, the app reuses a compatible running Core or starts its embedded
 Core when IPC is unavailable. On quit it stops only the Core process it

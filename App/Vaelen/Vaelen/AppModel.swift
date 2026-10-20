@@ -117,6 +117,8 @@ final class AppModel {
     private(set) var linkedProjects: [ProjectWire] = []
     private(set) var configuredRoutes: [RouteIntent]?
     private(set) var configuredRoutesError: String?
+    private(set) var localProxies: [LocalProxyWire]?
+    private(set) var localProxiesError: String?
     private(set) var trustError: String?
     private(set) var serviceOperation: String?
     private(set) var serviceError: String?
@@ -431,12 +433,23 @@ final class AppModel {
                 configuredRoutes = nil
                 configuredRoutesError = error.localizedDescription
             }
+            let localProxies: [LocalProxyWire]?
+            let localProxiesError: String?
+            do {
+                localProxies = try await client.localProxyList()
+                localProxiesError = nil
+            } catch {
+                localProxies = nil
+                localProxiesError = error.localizedDescription
+            }
             let phpCatalog = try? await client.phpCatalog()
             phpCatalogReadPending = false
             let phpOperation = try? await client.phpOperation()
             guard generation == refreshGeneration else { await client.disconnect(); return }
             self.configuredRoutes = configuredRoutes
             self.configuredRoutesError = configuredRoutesError
+            self.localProxies = localProxies
+            self.localProxiesError = localProxiesError
             if relationshipGeneration == relationshipSnapshotGeneration {
                 self.linkedProjects = linkedProjects
                 self.parkedFolders = parkedFolders
@@ -1121,6 +1134,30 @@ final class AppModel {
         guard let url = projectRouteURL(route) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url.absoluteString, forType: .string)
+    }
+
+    func localProxyRoute(_ proxy: LocalProxyWire) -> RouteIntent? {
+        configuredRoutes?.first { $0.route.id.description == proxy.routeID }
+    }
+
+    func addLocalProxy(hostname: String, upstreamURL: String) async {
+        do {
+            guard let client else { throw CoreClientError.coreUnavailable }
+            _ = try await client.localProxyAdd(hostname: hostname, upstreamURL: upstreamURL)
+            await refresh()
+        } catch {
+            localProxiesError = error.localizedDescription
+        }
+    }
+
+    func removeLocalProxy(hostname: String) async {
+        do {
+            guard let client else { throw CoreClientError.coreUnavailable }
+            _ = try await client.localProxyRemove(hostname: hostname)
+            await refresh()
+        } catch {
+            localProxiesError = error.localizedDescription
+        }
     }
 
     func tablePlusAction(_ report: ProjectEnvironmentReport) -> ProjectDatabaseViewerAction {

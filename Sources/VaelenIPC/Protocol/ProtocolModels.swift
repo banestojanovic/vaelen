@@ -115,6 +115,9 @@ public enum CoreMethod: String, Sendable {
     case routeRemove = "route.remove"
     case routeProjectAssociationAttach = "route.project-association.attach"
     case routePHPTargetUpdate = "route.php-target.update"
+    case localProxyList = "localProxy.list"
+    case localProxyAdd = "localProxy.add"
+    case localProxyRemove = "localProxy.remove"
     case dnsStatus = "dns.status"
     case dnsInstall = "dns.install"
     case dnsRemove = "dns.remove"
@@ -147,6 +150,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case routeRemove(RouteRemoveRequest)
     case routeAssociation(RouteProjectAssociationRequest)
     case routePHPTargetUpdate(RoutePHPTargetUpdateRequest)
+    case localProxyCreate(LocalProxyCreateRequest)
+    case localProxyRemove(LocalProxyRemoveRequest)
     case dnsInstall(DNSInstallRequest)
     case logsTail(LogsTailRequest)
     case empty
@@ -170,6 +175,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .routeRemove(let value): try value.encode(to: encoder)
         case .routeAssociation(let value): try value.encode(to: encoder)
         case .routePHPTargetUpdate(let value): try value.encode(to: encoder)
+        case .localProxyCreate(let value): try value.encode(to: encoder)
+        case .localProxyRemove(let value): try value.encode(to: encoder)
         case .dnsInstall(let value): try value.encode(to: encoder)
         case .logsTail(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
@@ -195,6 +202,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
             if fields["id"] != nil, fields["lines"] != nil, let params = try? IPCCodec.decode(LogsTailRequest.self, from: IPCCodec.encode(value)) { self = .logsTail(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, fields["expectedCurrentSocket"] != nil, let params = try? IPCCodec.decode(RoutePHPTargetUpdateRequest.self, from: IPCCodec.encode(value)) { self = .routePHPTargetUpdate(params); return }
+            if fields["hostname"] != nil, fields["upstreamURL"] != nil, let params = try? IPCCodec.decode(LocalProxyCreateRequest.self, from: IPCCodec.encode(value)) { self = .localProxyCreate(params); return }
+            if fields["hostname"] != nil, fields.count == 1, let params = try? IPCCodec.decode(LocalProxyRemoveRequest.self, from: IPCCodec.encode(value)) { self = .localProxyRemove(params); return }
         }
         self = .raw(value)
     }
@@ -507,6 +516,24 @@ public struct RouterStatusResult: Codable, Equatable, Sendable { public let rout
 public struct RouteRemoveRequest: Codable, Equatable, Sendable { public let id: RouteID; public init(id: RouteID) { self.id = id } }
 public struct RouteProjectAssociationRequest: Codable, Equatable, Sendable { public let routeID: RouteID; public let projectID: ProjectID; public init(routeID: RouteID, projectID: ProjectID) { self.routeID = routeID; self.projectID = projectID } }
 public struct RoutePHPTargetUpdateRequest: Codable, Equatable, Sendable { public let routeID: RouteID; public let projectID: ProjectID; public let expectedCurrentSocket: String; public init(routeID: RouteID, projectID: ProjectID, expectedCurrentSocket: String) { self.routeID = routeID; self.projectID = projectID; self.expectedCurrentSocket = expectedCurrentSocket } }
+public struct LocalProxyCreateRequest: Codable, Equatable, Sendable { public let hostname: String; public let upstreamURL: String; public init(hostname: String, upstreamURL: String) { self.hostname = hostname; self.upstreamURL = upstreamURL } }
+public struct LocalProxyRemoveRequest: Codable, Equatable, Sendable { public let hostname: String; public init(hostname: String) { self.hostname = hostname } }
+public enum LocalProxyCaddyObservation: String, Codable, Equatable, Sendable { case observed, notObserved, unavailable }
+public enum LocalProxyUpstreamReachability: String, Codable, Equatable, Sendable { case reachable, unreachable, unknown }
+public enum LocalProxyOwnershipPhase: String, Codable, Equatable, Sendable { case prepared, active, deleting }
+public struct LocalProxyWire: Codable, Equatable, Sendable {
+    public let routeID: String
+    public let hostname: String
+    public let upstreamURL: String
+    public let caddyObservation: LocalProxyCaddyObservation
+    public let upstreamReachability: LocalProxyUpstreamReachability
+    public let ownershipPhase: LocalProxyOwnershipPhase
+    public init(routeID: String, hostname: String, upstreamURL: String, caddyObservation: LocalProxyCaddyObservation, upstreamReachability: LocalProxyUpstreamReachability, ownershipPhase: LocalProxyOwnershipPhase = .active) {
+        self.routeID = routeID; self.hostname = hostname; self.upstreamURL = upstreamURL; self.caddyObservation = caddyObservation; self.upstreamReachability = upstreamReachability; self.ownershipPhase = ownershipPhase
+    }
+}
+public struct LocalProxyListResult: Codable, Equatable, Sendable { public let proxies: [LocalProxyWire]; public init(proxies: [LocalProxyWire]) { self.proxies = proxies } }
+public struct LocalProxyMutationResult: Codable, Equatable, Sendable { public let proxy: LocalProxyWire; public let created: Bool; public init(proxy: LocalProxyWire, created: Bool) { self.proxy = proxy; self.created = created } }
 public enum RouteAssociationMutationState: String, Codable, Equatable, Sendable { case associated, satisfied }
 public struct RouteProjectAssociationResult: Codable, Equatable, Sendable { public let route: RouteIntent; public let state: RouteAssociationMutationState; public init(route: RouteIntent, state: RouteAssociationMutationState) { self.route = route; self.state = state } }
 public enum RoutePHPTargetMutationState: String, Codable, Equatable, Sendable { case satisfied, updated, pending }
@@ -559,6 +586,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case routeMutation(RouteIntent)
     case routeAssociation(RouteProjectAssociationResult)
     case routePHPTargetUpdate(RoutePHPTargetUpdateResult)
+    case localProxyList(LocalProxyListResult)
+    case localProxyMutation(LocalProxyMutationResult)
     case dnsStatus(DNSStatusResult)
     case tlsStatus(TLSStatusResult)
     case tlsTrust(TLSTrustResultWire)
@@ -601,6 +630,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .routeMutation(let value): try value.encode(to: encoder)
         case .routeAssociation(let value): try value.encode(to: encoder)
         case .routePHPTargetUpdate(let value): try value.encode(to: encoder)
+        case .localProxyList(let value): try value.encode(to: encoder)
+        case .localProxyMutation(let value): try value.encode(to: encoder)
         case .dnsStatus(let value): try value.encode(to: encoder)
         case .tlsStatus(let value): try value.encode(to: encoder)
         case .tlsTrust(let value): try value.encode(to: encoder)
@@ -649,6 +680,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["observedRoutes"] != nil || fields["unavailableReason"] != nil, let result = try? IPCCodec.decode(RouteObservedListResult.self, from: data) { self = .routeObservedList(result) }
         else if fields["route"] != nil, fields["state"] != nil, let result = try? IPCCodec.decode(RouteProjectAssociationResult.self, from: data) { self = .routeAssociation(result) }
         else if fields["observation"] != nil, let result = try? IPCCodec.decode(RoutePHPTargetUpdateResult.self, from: data) { self = .routePHPTargetUpdate(result) }
+        else if fields["proxies"] != nil, let result = try? IPCCodec.decode(LocalProxyListResult.self, from: data) { self = .localProxyList(result) }
+        else if fields["proxy"] != nil, fields["created"] != nil, let result = try? IPCCodec.decode(LocalProxyMutationResult.self, from: data) { self = .localProxyMutation(result) }
         else if fields["route"] != nil, let result = try? IPCCodec.decode(RouteIntent.self, from: data) { self = .routeMutation(result) }
         else if fields["dns"] != nil, let result = try? IPCCodec.decode(DNSStatusResult.self, from: data) { self = .dnsStatus(result) }
          else if fields["result"] != nil, let result = try? IPCCodec.decode(TLSTrustResultWire.self, from: data) { self = .tlsTrust(result) }
