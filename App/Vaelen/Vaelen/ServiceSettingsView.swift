@@ -13,6 +13,7 @@ private enum ManagedSettingsService: String, CaseIterable, Identifiable, Hashabl
 
 struct ServicesSettingsView: View {
     let model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @State private var selected: ManagedSettingsService = .mysql
     @State private var available = false
     @State private var preserveSelectionOnTabChange = false
@@ -52,6 +53,12 @@ struct ServicesSettingsView: View {
                     .help("Installed includes confirmed installed packages and Vaelen built-in services and capabilities.")
                 Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless).help("Refresh service state")
+                Button("View Logs", systemImage: "doc.text.magnifyingglass") {
+                    openWindow(id: "service-logs")
+                    DispatchQueue.main.async { SettingsWindowActivation.activateApplication() }
+                }
+                .controlSize(.small)
+                .accessibilityLabel("View managed service logs")
             }.padding(.horizontal, 22).padding(.top, 44).padding(.bottom, 16)
             Divider()
             HStack(spacing: 0) {

@@ -34,6 +34,12 @@ struct VaelenApp: App {
         .defaultSize(width: 1_060, height: 720)
         .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unifiedCompact)
+
+        Window("Service Logs", id: "service-logs") {
+            ManagedLogsWindow(model: model.managedLogViewer)
+        }
+        .defaultSize(width: 820, height: 560)
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 SettingsMenuCommand()

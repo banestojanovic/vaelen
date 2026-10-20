@@ -19,6 +19,7 @@ final class AppModel {
     }
 
     private(set) var state: State = .connecting
+    let managedLogViewer = ManagedLogViewerModel(client: CoreManagedLogsClient())
     private(set) var serviceReadiness: CoreServiceReadiness = .checking
     private(set) var earlyProjectList: [ProjectWire]?
     private(set) var projectReports: [ProjectEnvironmentReport] = []
