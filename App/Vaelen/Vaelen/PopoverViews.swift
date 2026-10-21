@@ -384,9 +384,9 @@ struct StatusView: View {
         let isFocused = focusedSection == section
         return Button { selectedSection = section } label: {
             Label(title, systemImage: symbol)
-                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 7)
+                .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 5)
                 .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
