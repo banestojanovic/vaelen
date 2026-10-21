@@ -293,7 +293,7 @@ struct StatusView: View {
             if reduceTransparency {
                 colorScheme == .light ? Color.white : Color(nsColor: .windowBackgroundColor)
             } else if #available(macOS 26.0, *) {
-                Color.clear
+                Rectangle().fill(.thickMaterial)
             } else {
                 ZStack {
                     Rectangle().fill(.ultraThinMaterial)
@@ -317,17 +317,30 @@ struct StatusView: View {
         .padding(2)
         .fixedSize()
         .background {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(colorScheme == .light ? Color(hex: 0xF4F6F8).opacity(0.86) : Color(hex: 0x45474D).opacity(0.92))
+            if #available(macOS 26.0, *), !reduceTransparency {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.clear)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else if reduceTransparency {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(colorScheme == .light ? Color.white : Color(nsColor: .windowBackgroundColor))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.15), lineWidth: 0.7)
+                    }
+            } else {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(colorScheme == .light ? Color(hex: 0xF4F6F8).opacity(0.86) : Color(hex: 0x45474D).opacity(0.92))
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.15), lineWidth: 0.7)
+                    }
+                    .shadow(color: Color.black.opacity(colorScheme == .light ? 0.035 : 0.09), radius: 2, x: 0, y: 1)
                 }
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(colorScheme == .light ? Color.white.opacity(0.82) : Color.white.opacity(0.15), lineWidth: 0.7)
-                }
-                .shadow(color: Color.black.opacity(colorScheme == .light ? 0.035 : 0.09), radius: 2, x: 0, y: 1)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Vaelen section")
