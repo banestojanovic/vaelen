@@ -270,16 +270,15 @@ struct StatusView: View {
                 Button {
                     Task { await model.quitVaelen() }
                 } label: {
-                    let isHighlighted = footerControlIsHighlighted(.quit)
                     HStack(spacing: 5) {
                         Image(systemName: "power")
-                            .foregroundStyle(Color.red)
+                            .foregroundStyle(Color.secondary)
                         Text(model.isQuitting ? "Quitting Vaelen…" : "Quit Vaelen")
-                            .foregroundStyle(isHighlighted ? Color.red : Color.primary.opacity(0.82))
+                            .foregroundStyle(Color.primary.opacity(0.82))
                     }
                 }
                 .controlSize(.small)
-                .buttonStyle(PopoverFooterControlStyle(isEmphasized: footerControlIsHighlighted(.quit), isDanger: true))
+                .buttonStyle(PopoverFooterControlStyle(isEmphasized: footerControlIsHighlighted(.quit)))
                 .focused($focusedFooterControl, equals: .quit)
                 .onHover { hoveredFooterControl = $0 ? .quit : nil }
                 .accessibilityLabel(model.isQuitting ? "Quitting Vaelen" : "Quit Vaelen")
@@ -429,7 +428,6 @@ struct StatusView: View {
 private struct PopoverFooterControlStyle: ButtonStyle {
     @Environment(\.colorScheme) private var colorScheme
     var isEmphasized = false
-    var isDanger = false
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -444,9 +442,7 @@ private struct PopoverFooterControlStyle: ButtonStyle {
             .overlay {
                 if isEmphasized {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(isDanger
-                                      ? Color.red.opacity(0.26)
-                                      : Color.primary.opacity(colorScheme == .light ? 0.10 : 0.18), lineWidth: 0.6)
+                        .strokeBorder(Color.primary.opacity(colorScheme == .light ? 0.10 : 0.18), lineWidth: 0.6)
                 }
             }
             .scaleEffect(configuration.isPressed ? 0.99 : 1)
@@ -456,11 +452,6 @@ private struct PopoverFooterControlStyle: ButtonStyle {
 
     private func backgroundColor(configuration: Configuration) -> Color {
         guard isEmphasized else { return .clear }
-        if isDanger {
-            return Color.red.opacity(configuration.isPressed
-                                    ? (colorScheme == .light ? 0.15 : 0.23)
-                                    : (colorScheme == .light ? 0.075 : 0.13))
-        }
         return Color.primary.opacity(configuration.isPressed
                                      ? (colorScheme == .light ? 0.075 : 0.16)
                                      : (colorScheme == .light ? 0.045 : 0.10))

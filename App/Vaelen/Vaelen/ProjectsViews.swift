@@ -12,8 +12,31 @@ struct ProjectsView: View {
 
     var body: some View {
         if projects.isEmpty {
-            VaelenEmptyState(title: "No Projects", systemImage: "folder", message: "Known Core projects will appear here.")
-                .frame(minHeight: 180)
+            VStack(spacing: VaelenUI.spacing10) {
+                VaelenEmptyState(title: "No Projects", systemImage: "folder", message: "Link a project folder to see its site and services here.")
+                Button("Link Project…", systemImage: "link") {
+                    guard !model.relationshipMutationInFlight,
+                          let path = chooseDirectory(title: "Choose a Project to Link", prompt: "Link Project") else { return }
+                    Task { await model.linkProject(at: path) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.relationshipMutationInFlight)
+                if let operation = model.relationshipOperation {
+                    HStack(spacing: 7) {
+                        ProgressView().controlSize(.small)
+                        Text(operation).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let error = model.relationshipError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .frame(minHeight: 180)
+            .frame(maxWidth: .infinity)
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {

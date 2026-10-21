@@ -51,14 +51,14 @@ struct ServicesSettingsView: View {
                 }.pickerStyle(.segmented).labelsHidden().frame(width: 220)
                     .accessibilityLabel("Service inventory")
                     .help("Installed includes confirmed installed packages and Vaelen built-in services and capabilities.")
-                Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("Refresh service state")
                 Button("View Logs", systemImage: "doc.text.magnifyingglass") {
                     openWindow(id: "service-logs")
                     DispatchQueue.main.async { SettingsWindowActivation.activateApplication() }
                 }
                 .controlSize(.small)
                 .accessibilityLabel("View managed service logs")
+                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                    .buttonStyle(.borderless).help("Refresh service state")
             }.padding(.horizontal, 22).padding(.top, 44).padding(.bottom, 16)
             Divider()
             HStack(spacing: 0) {
@@ -110,17 +110,16 @@ struct ServicesSettingsView: View {
                 if available {
                     sectionHeading("AVAILABLE PACKAGES")
                     if availablePackages.isEmpty {
-                        Text(packageInventoryKnown ? "No additional supported packages are available." : packageInventoryPending ? "Checking package availability…" : "Available package state is unknown. Refresh to retry.")
+                        Text(packageInventoryKnown ? "No additional supported packages are available." : packageInventoryPending ? "Checking package availability…" : "Available package state is unknown. Use Refresh in the page header to retry.")
                             .font(.caption).foregroundStyle(packageInventoryKnown || packageInventoryPending ? Color.secondary : Color.orange)
                             .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 14).padding(.vertical, 10)
                     }
                     ForEach(availablePackages, id: \.id) { serviceRow($0) }
                     if !packageInventoryKnown && !availablePackages.isEmpty { inventoryNote }
-                    if !packageInventoryKnown && availablePackages.isEmpty { inventoryRefreshAction }
                 } else {
                     sectionHeading("INSTALLED PACKAGES")
                     if installedPackages.isEmpty {
-                        Text(packageInventoryKnown ? "No managed service packages are installed." : packageInventoryPending ? "Checking installed package state…" : "No confirmed package installs; some package states are unknown.")
+                        Text(packageInventoryKnown ? "No managed service packages are installed." : packageInventoryPending ? "Checking installed package state…" : "No confirmed package installs; some package states are unknown. Use Refresh in the page header to retry.")
                             .font(.caption).foregroundStyle(packageInventoryKnown || packageInventoryPending ? Color.secondary : Color.orange)
                             .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 14).padding(.vertical, 8)
                     }
@@ -211,20 +210,13 @@ struct ServicesSettingsView: View {
         }.font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 14).padding(.vertical, 5)
     }
-    private var inventoryRefreshAction: some View {
-        Group {
-            if !packageInventoryPending {
-                Button("Refresh Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
-                    .buttonStyle(.borderless).padding(.horizontal, 14).padding(.top, 2)
-            }
-        }
-    }
     private func sectionHeading(_ title: String) -> some View {
         Text(title).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
             .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 5)
     }
     private func serviceRow(_ service: ManagedSettingsService) -> some View {
         let summary = rowSummary(service)
+        let detail = rowDetail(service)
         return Button { selected = service } label: {
             HStack(spacing: 10) {
                 Image(systemName: service.symbol).foregroundStyle(selected == service ? Color.accentColor : Color.secondary).frame(width: 18)
@@ -239,6 +231,8 @@ struct ServicesSettingsView: View {
             .contentShape(Rectangle())
         }.buttonStyle(.plain).padding(.horizontal, 7)
             .accessibilityAddTraits(selected == service ? .isSelected : [])
+            .help(detail ?? summary)
+            .accessibilityHint(detail ?? summary)
     }
 
     private func rowSummary(_ service: ManagedSettingsService) -> String {
@@ -264,6 +258,15 @@ struct ServicesSettingsView: View {
         }
     }
     private var isConnecting: Bool { ifConnecting(model.state) }
+    private func rowDetail(_ service: ManagedSettingsService) -> String? {
+        guard !model.isServiceReadPending(readKey(service)) else { return nil }
+        guard let o = observation else { return nil }
+        switch service {
+        case .dns: return o.3.flatMap { dnsPresentation($0).detail }
+        case .ports: return o.5.flatMap { portsPresentation($0).detail }
+        default: return nil
+        }
+    }
     private func ifConnecting(_ state: AppModel.State) -> Bool { if case .connecting = state { true } else { false } }
     private func readKey(_ service: ManagedSettingsService) -> String {
         switch service { case .mysql: "MySQL"; case .mailpit: "Mailpit"; case .caddy: "routing"; case .dns: "DNS"; case .https: "TLS"; case .ports: "standard-ports" }
@@ -295,7 +298,7 @@ struct ServicesSettingsView: View {
                 if pending { ProgressView().controlSize(.small) }
                 Text(pending ? "Waiting for Core to confirm observed package and service state." : "Core did not provide an authoritative report. No healthy or stopped state is inferred.")
                     .font(.subheadline).foregroundStyle(.secondary)
-                if !pending { Button("Refresh Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } } }
+                if !pending { Text("Use Refresh in the page header to retry.").font(.caption).foregroundStyle(.secondary) }
             }
         }
     }
@@ -312,8 +315,7 @@ struct ServicesSettingsView: View {
             } else if !packageInventoryKnown {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Package state partially unavailable", systemImage: "exclamationmark.triangle").font(.headline).foregroundStyle(.orange)
-                    Text("Unknown packages are listed separately under Installed. Core must confirm a package as not installed before it is offered here.").font(.subheadline).foregroundStyle(.secondary)
-                    Button("Refresh Status") { Task { await model.refresh() } }
+                    Text("Unknown packages are listed separately under Installed. Core must confirm a package as not installed before it is offered here. Use Refresh in the page header to retry.").font(.subheadline).foregroundStyle(.secondary)
                 }
             } else if availablePackages.isEmpty {
                 Text("No additional supported packages are available. Built-in capabilities are managed under Installed.").font(.subheadline).foregroundStyle(.secondary)
@@ -343,10 +345,9 @@ struct ServicesSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Label(pending ? "Checking \(title) package state…" : "\(title) package state unknown", systemImage: pending ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle")
                 .font(.headline).foregroundStyle(pending ? Color.secondary : Color.orange)
-            Text(pending ? "Showing the selected item while Core refreshes its package observation. No install or removal action is offered until the result is confirmed." : "The service observation does not prove that a package is installed or available. No package action is offered.")
+            Text(pending ? "Showing the selected item while Core refreshes its package observation. No install or removal action is offered until the result is confirmed." : "The service observation does not prove that a package is installed or available. No package action is offered. Use Refresh in the page header to retry.")
                 .font(.subheadline).foregroundStyle(.secondary)
             if pending { ProgressView().controlSize(.small) }
-            else { Button("Refresh Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } } }
         }
     }
 
@@ -357,7 +358,7 @@ struct ServicesSettingsView: View {
                 if s.state == .notInstalled {
                     Button("Install MySQL", systemImage: "arrow.down.circle.fill") { Task { await model.installMySQL() } }.buttonStyle(.borderedProminent)
                 } else if s.state == .running {
-                    Button("Stop MySQL", systemImage: "stop.fill", role: .destructive) { confirmation = .stopMySQL }.buttonStyle(.bordered).settingsDestructiveTint()
+                    Button("Stop MySQL", systemImage: "stop.fill") { confirmation = .stopMySQL }.buttonStyle(.bordered)
                 } else if s.state == .stopped || s.state == .installed || s.state == .unhealthy {
                     if s.health == "not-initialized" {
                         Button("Initialize & Start…", systemImage: "play.fill") { confirmation = .initializeMySQL }.buttonStyle(.borderedProminent)
@@ -369,12 +370,14 @@ struct ServicesSettingsView: View {
                     let action = MySQLDatabaseViewerAction.tablePlus(mysql: s, tablePlusInstalled: model.isTablePlusInstalled)
                     Button("Open in TablePlus", systemImage: "cylinder.split.1x2") { model.openMySQLInTablePlus(s) }.buttonStyle(.bordered).disabled(!action.isEnabled).help(action.reason)
                 }
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
-            }
-            if let version = s.installedVersion, [.running, .stopped, .installed].contains(s.state) {
-                Button("Remove MySQL Package…", systemImage: "trash", role: .destructive) { confirmation = .removeMySQL(version) }
-                    .buttonStyle(.bordered).settingsDestructiveTint()
-                    .disabled(model.serviceOperation != nil)
+                Spacer()
+                if let version = s.installedVersion, [.running, .stopped, .installed].contains(s.state) {
+                    Menu("More", systemImage: "ellipsis") {
+                        Button("Remove MySQL Package…", systemImage: "trash", role: .destructive) { confirmation = .removeMySQL(version) }
+                            .settingsDestructiveTint()
+                            .disabled(model.serviceOperation != nil)
+                    }
+                }
             }
             if s.state == .conflict || s.state == .unhealthy || s.health != "healthy" && s.state == .running {
                 attention("MySQL is \(s.health). Check its port and process state, then retry Start when safe.")
@@ -400,15 +403,17 @@ struct ServicesSettingsView: View {
             HStack {
                 if s.state == .notInstalled { Button("Install Mailpit", systemImage: "arrow.down.circle.fill") { Task { await model.installMailpit() } }.buttonStyle(.borderedProminent) }
                 else if s.state == .running {
-                    Button("Stop Mailpit", systemImage: "stop.fill", role: .destructive) { confirmation = .stopMailpit }.buttonStyle(.bordered).settingsDestructiveTint()
+                    Button("Stop Mailpit", systemImage: "stop.fill") { confirmation = .stopMailpit }.buttonStyle(.bordered)
                     Button("Open Mailpit", systemImage: "arrow.up.right.square") { Task { await model.openMailpit() } }.buttonStyle(.borderedProminent)
                 } else { Button("Start Mailpit", systemImage: "play.fill") { Task { await model.startMailpit() } }.buttonStyle(.borderedProminent) }
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
-            }
-            if let version = s.installedVersion, [.running, .stopped, .installed].contains(s.state) {
-                Button("Remove Mailpit Package…", systemImage: "trash", role: .destructive) { confirmation = .removeMailpit(version) }
-                    .buttonStyle(.bordered).settingsDestructiveTint()
-                    .disabled(model.serviceOperation != nil)
+                Spacer()
+                if let version = s.installedVersion, [.running, .stopped, .installed].contains(s.state) {
+                    Menu("More", systemImage: "ellipsis") {
+                        Button("Remove Mailpit Package…", systemImage: "trash", role: .destructive) { confirmation = .removeMailpit(version) }
+                            .settingsDestructiveTint()
+                            .disabled(model.serviceOperation != nil)
+                    }
+                }
             }
             if s.state == .conflict || s.state == .unhealthy { attention("Mailpit health is \(s.health). Retry after reviewing the service status.") }
             SettingsInsetCard {
@@ -424,9 +429,8 @@ struct ServicesSettingsView: View {
         VStack(alignment: .leading, spacing: 16) {
             serviceHeader(.caddy, state: "\(s.state) · \(s.health)")
             HStack {
-                if s.state == .running { Button("Stop Caddy", systemImage: "stop.fill", role: .destructive) { confirmation = .stopCaddy }.buttonStyle(.bordered).settingsDestructiveTint() }
+                if s.state == .running { Button("Stop Caddy", systemImage: "stop.fill") { confirmation = .stopCaddy }.buttonStyle(.bordered) }
                 else { Button("Start Caddy", systemImage: "play.fill") { Task { await model.startRouting() } }.buttonStyle(.borderedProminent) }
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
             }
             if s.health != .healthy { attention("Caddy health is \(s.health). Routing actions are available through Core; external services are not adopted.") }
             detailRows([("Observed", "\(s.state) · \(s.health)"), ("Version", s.providerVersion ?? "Unavailable"), ("Routes", "\(s.routeCount) configured")])
@@ -442,11 +446,10 @@ struct ServicesSettingsView: View {
                 switch p.action {
                 case .enable: Button("Enable DNS…", systemImage: "power") { confirmation = .enableDNS }.buttonStyle(.borderedProminent)
                 case .retry: Button("Retry DNS…", systemImage: "arrow.clockwise") { confirmation = .retryDNS }.buttonStyle(.borderedProminent)
-                case .stop, .disable: Button("Stop DNS", systemImage: "stop.fill", role: .destructive) { confirmation = .stopDNS }.buttonStyle(.bordered).settingsDestructiveTint()
+                case .stop, .disable: Button("Stop DNS", systemImage: "stop.fill") { confirmation = .stopDNS }.buttonStyle(.bordered)
                 case nil: EmptyView()
                 }
                 if p.canDisable && p.action == .retry { Button("Disable DNS…") { confirmation = .disableDNS }.buttonStyle(.borderless) }
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
             }
             detailRows([("Observed", "\(s.state.rawValue) · \(s.responderState.rawValue) · \(s.health)"), ("Ownership", s.ownership.rawValue), ("Port", "\(s.port)"), ("Resolver", "/etc/resolver/test")])
         }
@@ -460,9 +463,14 @@ struct ServicesSettingsView: View {
                 .font(.subheadline).foregroundStyle(.secondary)
             HStack {
                 if trust.canTrust { Button("Trust Local CA…", systemImage: "lock.shield") { confirmation = .trustCA }.buttonStyle(.borderedProminent) }
-                if trust.canRemove { Button("Remove Vaelen CA Trust…", systemImage: "lock.slash", role: .destructive) { confirmation = .removeTrust }.buttonStyle(.bordered).settingsDestructiveTint() }
                 if trust.canManageTrust { Button("Manage Trust Details…", systemImage: "info.circle") { trustDetails = trust.manageTrustDetails(caFingerprint: s.caFingerprint, certificatePath: s.caCertificatePath); showingTrustDetails = trustDetails != nil }.buttonStyle(.bordered) }
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
+                if trust.canRemove {
+                    Spacer()
+                    Menu("More", systemImage: "ellipsis") {
+                        Button("Remove Vaelen CA Trust…", systemImage: "lock.slash", role: .destructive) { confirmation = .removeTrust }
+                            .settingsDestructiveTint()
+                    }
+                }
             }
             if let detail = s.detail { attention(detail) }
             detailRows([("Observed trust", s.trustObserved ? "Trusted" : "Not trusted"), ("Provenance", s.trustProvenance.rawValue), ("CA SHA-256", s.caFingerprint ?? "Unavailable"), ("Certificate", s.caCertificatePath ?? "Unavailable"), ("TLS port", "\(s.tlsPort)")])
@@ -478,11 +486,10 @@ struct ServicesSettingsView: View {
                 switch p.action {
                 case .enable: Button("Enable Standard Ports…", systemImage: "power") { confirmation = .enablePorts }.buttonStyle(.borderedProminent)
                 case .retry: Button("Retry Port Setup…", systemImage: "arrow.clockwise") { confirmation = .retryPorts }.buttonStyle(.borderedProminent)
-                case .disable: Button("Disable Standard Ports…", systemImage: "stop.fill", role: .destructive) { confirmation = .disablePorts }.buttonStyle(.bordered).settingsDestructiveTint()
+                case .disable: Button("Disable Standard Ports…", systemImage: "stop.fill") { confirmation = .disablePorts }.buttonStyle(.bordered)
                 case .stop: EmptyView()
                 case nil: EmptyView()
                 }
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless)
             }
             detailRows([("HTTP", "127.0.0.1:\(s.httpPort)"), ("HTTPS", "127.0.0.1:\(s.httpsPort)"), ("Observed", "\(s.state.rawValue) · \(s.ownership?.rawValue ?? "unknown")"), ("Details", s.detail ?? s.conflict ?? "No diagnostic reported")])
         }
@@ -566,7 +573,7 @@ struct ServicesSettingsView: View {
             Label(pending ? "Checking \(name) status…" : "\(name) status unavailable", systemImage: pending ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle").font(.headline)
             if pending { ProgressView().controlSize(.small) }
             Text(pending ? "Core is checking this capability. The previous observed value is not presented as current." : "Core did not provide an authoritative status. No healthy or stopped state is inferred.").font(.subheadline).foregroundStyle(.secondary)
-            if !pending { Button("Retry Status", systemImage: "arrow.clockwise") { Task { await model.refresh() } } }
+            if !pending { Text("Use Refresh in the page header to retry.").font(.caption).foregroundStyle(.secondary) }
         }
     }
     private func perform(_ action: ServiceConfirmation) {
@@ -631,7 +638,7 @@ struct NetworkSecuritySettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             SettingsPageHeader("Network & Security", subtitle: "Local domains, web ports, and HTTPS trust on this Mac.") {
-                Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.borderless).help("Refresh network status")
+                Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless).help("Refresh network status")
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -642,11 +649,11 @@ struct NetworkSecuritySettingsView: View {
                         switch control.action {
                         case .enable: Button("Enable DNS…") { action = .dnsEnable }.buttonStyle(.borderedProminent)
                         case .retry: Button("Retry DNS…") { action = .dnsRetry }.buttonStyle(.borderedProminent)
-                        case .stop, .disable: Button("Stop DNS…", role: .destructive) { action = .dnsStop }.buttonStyle(.bordered).settingsDestructiveTint()
+                        case .stop, .disable: Button("Stop DNS…") { action = .dnsStop }.buttonStyle(.bordered)
                         case nil: EmptyView()
                         }
-                        if control.canDisable && control.action == .retry { Button("Disable DNS…", role: .destructive) { action = .dnsDisable }.buttonStyle(.borderless).settingsDestructiveTint() }
-                    } else if !model.isServiceReadPending("DNS") { Button("Refresh DNS Status") { Task { await model.refresh() } } }
+                        if control.canDisable && control.action == .retry { Button("Disable DNS…") { action = .dnsDisable }.buttonStyle(.bordered) }
+                    } else if !model.isServiceReadPending("DNS") { Text("Use Refresh in the page header to retry.").font(.caption).foregroundStyle(.secondary) }
                 }
                     capability(title: "Standard Ports", symbol: "cable.connector", readKey: "standard-ports", description: "Route local HTTP and HTTPS through ports 80 and 443.", status: status.2.map(portsPresentation) ?? readState("standard-ports"), detail: status.2.map { "HTTP :\($0.httpPort) · HTTPS :\($0.httpsPort) · ownership \($0.ownership?.rawValue ?? "unknown") · \($0.detail ?? $0.conflict ?? "No conflict reported.")" } ?? readDetail("standard-ports")) {
                     if let ports = status.2 {
@@ -654,19 +661,25 @@ struct NetworkSecuritySettingsView: View {
                         switch control.action {
                         case .enable: Button("Enable Standard Ports…") { action = .portsEnable }.buttonStyle(.borderedProminent)
                         case .retry: Button("Retry Port Setup…") { action = .portsRetry }.buttonStyle(.borderedProminent)
-                        case .disable: Button("Disable Standard Ports…", role: .destructive) { action = .portsDisable }.buttonStyle(.bordered).settingsDestructiveTint()
+                        case .disable: Button("Disable Standard Ports…") { action = .portsDisable }.buttonStyle(.bordered)
                         case .stop: EmptyView()
                         case nil: EmptyView()
                         }
-                    } else if !model.isServiceReadPending("standard-ports") { Button("Refresh Port Status") { Task { await model.refresh() } } }
+                    } else if !model.isServiceReadPending("standard-ports") { Text("Use Refresh in the page header to retry.").font(.caption).foregroundStyle(.secondary) }
                 }
-                    capability(title: "Local HTTPS", symbol: "lock.shield", readKey: "TLS", description: "Use Vaelen’s local certificate authority for HTTPS on .test sites.", status: status.1.map { TLSTrustControlPresentation($0).title } ?? readState("TLS"), detail: status.1.map { "Trust \($0.trustObserved ? "observed" : "not observed") · provenance \($0.trustProvenance.rawValue) · SHA-256 \($0.caFingerprint ?? "unavailable") · certificate \($0.caCertificatePath ?? "path unavailable") · \($0.detail ?? "Local .test certificate authority")" } ?? readDetail("TLS")) {
+                    capability(title: "Local HTTPS", symbol: "lock.shield", readKey: "TLS", description: "Use Vaelen’s local certificate authority for HTTPS on .test sites.", status: status.1.map { TLSTrustControlPresentation($0).title } ?? readState("TLS"), detail: status.1.map { ["Trust: \($0.trustObserved ? "observed" : "not observed")", "Provenance: \($0.trustProvenance.rawValue)", "CA SHA-256: \($0.caFingerprint ?? "unavailable")", "Certificate: \($0.caCertificatePath ?? "path unavailable")", $0.detail ?? "Local .test certificate authority"].joined(separator: "\n") } ?? readDetail("TLS")) {
                     if let tls = status.1 {
                         let control = TLSTrustControlPresentation(tls)
                         if control.canTrust { Button("Trust Local CA…") { action = .trust }.buttonStyle(.borderedProminent) }
-                        if control.canRemove { Button("Remove Vaelen Trust…", role: .destructive) { action = .removeTrust }.buttonStyle(.bordered).settingsDestructiveTint() }
                         if control.canManageTrust { Button("Manage Trust Details…") { showingTrustDetails = true }.buttonStyle(.bordered) }
-                     } else if !model.isServiceReadPending("TLS") { Button("Refresh HTTPS Status") { Task { await model.refresh() } } }
+                        if control.canRemove {
+                            Spacer()
+                            Menu("More", systemImage: "ellipsis") {
+                                Button("Remove Vaelen Trust…", role: .destructive) { action = .removeTrust }
+                                    .settingsDestructiveTint()
+                            }
+                        }
+                     } else if !model.isServiceReadPending("TLS") { Text("Use Refresh in the page header to retry.").font(.caption).foregroundStyle(.secondary) }
                 }
                     localProxiesCard
                     if let operation = model.serviceOperation { Label(operation, systemImage: "arrow.triangle.2.circlepath").font(.caption).foregroundStyle(.secondary) }
@@ -694,11 +707,20 @@ struct NetworkSecuritySettingsView: View {
                 else { SettingsStateBadge(title: "Unavailable", tone: .attention) }
             }
             Text("Serve a loopback development server through a local .test hostname. Vaelen does not start the upstream server.").font(.subheadline).foregroundStyle(.secondary)
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Hostname").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                    TextField("frontend.test", text: $proxyHostname).textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("Proxy hostname")
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Upstream URL").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                    TextField("http://127.0.0.1:3000", text: $proxyUpstreamURL).textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("HTTP loopback upstream URL")
+                }
+            }
             HStack {
-                TextField("frontend.test", text: $proxyHostname).textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("Proxy hostname")
-                TextField("http://127.0.0.1:3000", text: $proxyUpstreamURL).textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("HTTP loopback upstream URL")
+                Spacer()
                 Button("Add Proxy") {
                     let hostname = proxyHostname
                     let upstreamURL = proxyUpstreamURL
@@ -719,7 +741,10 @@ struct NetworkSecuritySettingsView: View {
                             Button("Open", systemImage: "arrow.up.right.square") { model.openProjectRoute(route) }.buttonStyle(.borderless)
                             Button("Copy URL", systemImage: "doc.on.doc") { model.copyProjectRouteURL(route) }.buttonStyle(.borderless)
                         }
-                        Button("Remove", systemImage: "trash", role: .destructive) { Task { await model.removeLocalProxy(hostname: proxy.hostname) } }.buttonStyle(.borderless)
+                        Menu("More", systemImage: "ellipsis") {
+                            Button("Remove", systemImage: "trash", role: .destructive) { Task { await model.removeLocalProxy(hostname: proxy.hostname) } }
+                                .settingsDestructiveTint()
+                        }
                     }
                     Text(proxy.upstreamURL).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                     Text("Caddy: \(proxy.caddyObservation.rawValue) · Upstream: \(proxy.upstreamReachability.rawValue)").font(.caption).foregroundStyle(.secondary)
@@ -745,7 +770,7 @@ struct NetworkSecuritySettingsView: View {
             Text(description).font(.subheadline).foregroundStyle(.secondary)
             if checking, let detail { Text("Current read is pending. Last report: \(detail)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
             else if let detail { Text(detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
-            HStack(spacing: 9) { if !checking { actions(); Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.refresh() } }.buttonStyle(.borderless) } }
+            HStack(spacing: 9) { if !checking { actions() } }
         }.padding(14).background(Color(nsColor: .controlBackgroundColor).opacity(0.62), in: RoundedRectangle(cornerRadius: 9))
     }
     private func readState(_ key: String) -> String {

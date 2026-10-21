@@ -507,13 +507,13 @@ struct PHPSettingsView: View {
                 Spacer()
                 SettingsStateBadge(title: runtimeStateTitle(runtime), tone: runtimeTone(runtime))
             }
-            HStack(spacing: 8) {
-                if runtime.isDefault { Label("Default runtime", systemImage: "star.fill").font(.caption).foregroundStyle(.secondary) }
-                if runtime.usedByProjectCount > 0 { Text("Used by \(runtime.usedByProjectCount) projects").font(.caption).foregroundStyle(.secondary) }
+            if runtime.usedByProjectCount > 0 {
+                Text("Used by \(runtime.usedByProjectCount) projects").font(.caption).foregroundStyle(.secondary)
             }
             runtimeActionRow(runtime)
+            runtimeDefaultRow(runtime)
             runtimeStopWarning(runtime)
-            Text("The default runtime is used by projects without a PHP version override. Making this runtime the default starts its PHP-FPM and refreshes those projects; other runtimes are not stopped.")
+            Text("Making this runtime the default starts its PHP-FPM and refreshes projects without an override. Other runtimes are not stopped.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let config {
                 SettingsInsetCard {
@@ -572,10 +572,6 @@ struct PHPSettingsView: View {
         }.padding(.top, 8)
     }
 
-    /// One compact action row near the selected runtime's header: Start or Stop
-    /// by confirmed state, Update when a newer patch is available, Make Default
-    /// and Remove as icon controls. Unknown running state enables no
-    /// start/stop/remove action.
     private func runtimeActionRow(_ runtime: PHPRuntimeVersion) -> some View {
         let busy = model.phpRequestTarget == runtime.version
         let blocked = model.phpRequestInFlight || model.phpConfigurationSaving || !coreConnected || phpChecking
@@ -584,6 +580,8 @@ struct PHPSettingsView: View {
                 Button(busy && model.phpOperation?.kind == .start ? "Starting…" : "Start", systemImage: "play.fill") {
                     Task { await model.startPHPRuntime(runtime.version) }
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
                 .help("Start PHP \(runtime.version)")
                 .accessibilityLabel("Start PHP \(runtime.version)")
                 .disabled(blocked || model.serviceOperation != nil)
@@ -593,7 +591,8 @@ struct PHPSettingsView: View {
                     if runtime.usedByProjectCount > 0 { stopConfirmation = runtime }
                     else { Task { await model.stopPHPRuntime(runtime.version) } }
                 }
-                .settingsDestructiveTint()
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 .help("Stop PHP \(runtime.version)")
                 .accessibilityLabel("Stop PHP \(runtime.version)")
                 .disabled(blocked || model.serviceOperation != nil)
@@ -604,37 +603,53 @@ struct PHPSettingsView: View {
                 Button(busy && model.phpOperation?.kind == .update ? "Updating…" : "Update", systemImage: "arrow.triangle.2.circlepath") {
                     Task { await model.updatePHP(latest, replacing: runtime.version) }
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 .help("Update PHP \(runtime.version) to \(latest)")
                 .accessibilityLabel("Update PHP \(runtime.version) to \(latest)")
                 .disabled(blocked)
             }
             Spacer(minLength: 4)
-            if !runtime.isDefault {
-                Button {
-                    Task { await model.setDefaultPHP(runtime.version) }
-                } label: {
-                    Image(systemName: busy && model.phpOperation?.kind == .defaultSelection ? "star.fill" : "star")
-                        .frame(minWidth: 28, minHeight: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(busy && model.phpOperation?.kind == .defaultSelection ? "Switching default to PHP \(runtime.version)…" : "Make PHP \(runtime.version) the default for projects without a version override")
-                .accessibilityLabel("Make PHP \(runtime.version) the default")
-                .disabled(blocked || runtime.running == nil)
-            }
             if runtime.running == false && !runtime.isDefault {
-                Button {
-                    removalVersion = runtime.version
+                Menu {
+                    Button("Remove PHP \(runtime.version)…", systemImage: "trash", role: .destructive) {
+                        removalVersion = runtime.version
+                    }
+                    .settingsDestructiveTint()
+                    .disabled(blocked)
                 } label: {
-                    Image(systemName: "trash")
-                        .foregroundStyle(.red)
+                    Image(systemName: "ellipsis")
                         .frame(minWidth: 28, minHeight: 28)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .help("Remove PHP \(runtime.version)")
-                .accessibilityLabel("Remove PHP \(runtime.version)")
-                .disabled(blocked)
+                .menuStyle(.borderlessButton)
+                .help("More actions for PHP \(runtime.version)")
+                .accessibilityLabel("More actions for PHP \(runtime.version)")
+            }
+        }
+    }
+
+    private func runtimeDefaultRow(_ runtime: PHPRuntimeVersion) -> some View {
+        let busy = model.phpRequestTarget == runtime.version
+        let blocked = model.phpRequestInFlight || model.phpConfigurationSaving || !coreConnected || phpChecking
+        return SettingsInsetCard {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Project default").font(.subheadline.weight(.medium))
+                    Text("Used by projects without a PHP version override.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                if runtime.isDefault {
+                    SettingsStateBadge(title: "Current default", tone: .healthy)
+                } else {
+                    Button("Make Default", systemImage: busy && model.phpOperation?.kind == .defaultSelection ? "star.fill" : "star") {
+                        Task { await model.setDefaultPHP(runtime.version) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(blocked || runtime.running == nil)
+                }
             }
         }
     }
@@ -1223,10 +1238,6 @@ struct ProjectSettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             SettingsPageHeader("Projects", subtitle: "Your workspaces, runtime choices, and local sites.") {
-                Button("Add Folder…", systemImage: "plus") {
-                    guard let path = chooseDirectory(title: "Choose a Workspace Folder", prompt: "Add Workspace Folder") else { return }
-                    Task { await model.parkFolder(at: path) }
-                }.disabled(model.relationshipMutationInFlight)
                 Button("Link Project…", systemImage: "link") {
                     guard let path = chooseDirectory(title: "Choose a Project to Link", prompt: "Link Project") else { return }
                     Task { await model.linkProject(at: path) }
@@ -1280,7 +1291,22 @@ struct ProjectSettingsView: View {
     private var projectList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 2) {
-                Text("WORKSPACE FOLDERS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
+                HStack {
+                    Text("WORKSPACE FOLDERS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary)
+                    Spacer(minLength: 4)
+                    Button("Add", systemImage: "plus") {
+                        guard let path = chooseDirectory(title: "Choose a Workspace Folder", prompt: "Add Workspace Folder") else { return }
+                        Task { await model.parkFolder(at: path) }
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .disabled(model.relationshipMutationInFlight)
+                    .help("Add a workspace folder")
+                    .accessibilityLabel("Add workspace folder")
+                }
+                .padding(.horizontal, 13)
+                .padding(.top, 14)
+                .padding(.bottom, 4)
                 if model.parkedFolders.isEmpty {
                     Text(coreHasSnapshot ? "No folders added" : coreConnecting ? "Checking folders…" : "Workspace folders unavailable")
                         .font(.caption).foregroundStyle(coreHasSnapshot || coreConnecting ? Color.secondary : Color.orange).padding(.horizontal, 13).padding(.vertical, 8)
@@ -1347,7 +1373,6 @@ private struct ProjectSelectedDetail: View {
                     Button("Unlink Project…", systemImage: "link.badge.minus", role: .destructive) { confirmUnlink = true }.settingsDestructiveTint()
                         .disabled(model.relationshipMutationInFlight)
                 } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }.menuStyle(.borderlessButton).accessibilityLabel("Project actions")
-                Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }.disabled(!model.canOpenProjectFolder(project))
             }
             HStack(spacing: 10) {
                 projectMetric("Runtime", projectPHPText, report == nil ? "Checking with Core" : (model.phpCatalogReadPending ? "Checking runtime catalog" : projectPHPMode))
@@ -1358,6 +1383,7 @@ private struct ProjectSelectedDetail: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Project actions").font(.headline)
                     HStack(spacing: 8) {
+                        Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }.disabled(!model.canOpenProjectFolder(project))
                         if let routes, routes.count == 1, let route = routes.first {
                             Button("Open Site", systemImage: "safari") { model.openProjectRoute(route) }.disabled(route.route.hostname.isEmpty)
                         } else if let routes, routes.count > 1 {
@@ -1642,7 +1668,7 @@ private func folderDetail(_ folder: ParkedPathWire, discoveredCount: Int) -> Str
 }
 
 @MainActor
-private func chooseDirectory(title: String, prompt: String) -> String? {
+func chooseDirectory(title: String, prompt: String) -> String? {
     let panel = NSOpenPanel()
     panel.title = title
     panel.prompt = prompt

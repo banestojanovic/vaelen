@@ -5,6 +5,7 @@
 - Browse installed and available PHP runtimes.
 - Inspect runtime configuration and default selection.
 - Review update status.
+- Inspect the separate project-default row and grouped secondary removal action.
 
 ## How to get to it (user POV)
 
