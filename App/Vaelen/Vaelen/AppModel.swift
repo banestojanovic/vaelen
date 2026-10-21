@@ -267,7 +267,20 @@ final class AppModel {
     }
 
     func startupIssue(for service: String) -> String? { startupServiceIssues[service] }
-    func isServiceReadPending(_ service: String) -> Bool { pendingServiceReads.contains(service) }
+    func isServiceReadPending(_ service: String) -> Bool {
+        guard pendingServiceReads.contains(service) else { return false }
+        guard case .running(_, _, let php, let routing, let dns, let tls, let ports, let mysql, let mailpit) = state else { return true }
+        switch service {
+        case "PHP": return php == nil
+        case "routing": return routing == nil
+        case "DNS": return dns == nil
+        case "TLS": return tls == nil
+        case "standard-ports": return ports == nil
+        case "MySQL": return mysql == nil
+        case "Mailpit": return mailpit == nil
+        default: return true
+        }
+    }
 
     private func updateFixturePackages(mysql: MySQLStatus? = nil, mailpit: MailpitStatus? = nil) {
         guard isSettingsFixture,
@@ -500,17 +513,18 @@ final class AppModel {
 
     private func beginServiceReadinessCheck(generation: Int) {
         serviceCheckTimeoutTask?.cancel()
-        serviceReadiness = .checking
+        let preserveReadinessOnTimeout = isShowingRunningSnapshot && serviceReadiness != .checking
+        if !preserveReadinessOnTimeout { serviceReadiness = .checking }
         serviceCheckStartedAt = .now
         pendingServiceReads = []
         serviceCheckTimeoutTask = Task { @MainActor [weak self] in
             do { try await Task.sleep(for: .seconds(12)) } catch { return }
-            guard let self, self.refreshGeneration == generation, self.serviceReadiness == .checking else { return }
+            guard let self, self.refreshGeneration == generation, self.serviceCheckStartedAt != nil else { return }
             let outstanding = self.pendingServiceReads.sorted().joined(separator: ",")
             let elapsed = self.serviceCheckStartedAt.map(Self.elapsedMilliseconds(since:)) ?? 12_000
             Self.startupLogger.error("startup milestone=service-state-timeout elapsed_ms=\(elapsed) outstanding=\(outstanding, privacy: .public)")
             let unavailable = CoreServiceReadiness.resolve(serviceIssues: self.startupServiceIssues, requiredReadCount: 7, completedReadCount: 0, successfulReadCount: 0, timedOut: true)
-            self.finishServiceReadinessCheck(unavailable)
+            if !preserveReadinessOnTimeout { self.finishServiceReadinessCheck(unavailable) }
         }
     }
 
