@@ -21,7 +21,7 @@ swift test --skip-build --filter ProjectPHPCLIParsingTests
 swift test --skip-build --filter ProjectPHPSelectionsTests
 ```
 
-Require six discovered and passed tests for each filter, record the counts, and report any skips. The CLI tests cover strict `--json` parsing, sorted output, inherited exclusion, unavailable selections, the empty result, and batch error propagation. They call the output helper directly and do not launch a CLI child. `testBatchUsesClientWireAndKeepsHealthySelectionsWhenOtherProjectsAreBad` uses the real client codec and dispatcher over `InMemoryTransport`. It compares selections, excludes the removed directory, and checks that observation does not mutate default bytes or stale process metadata. `testMissingSingleProjectErrorDoesNotPreventFollowingBatch` requires `.projectNotFound` followed by an empty successful batch.
+Require every discovered test for each filter to pass with zero skips, record the discovered and passed counts, and report any skips. The CLI tests cover strict `--json` parsing, sorted output, inherited exclusion, unavailable selections, the empty result, and batch error propagation. They call the output helper directly and do not launch a CLI child. `testBatchUsesClientWireAndKeepsHealthySelectionsWhenOtherProjectsAreBad` uses the real client codec and dispatcher over `InMemoryTransport`. It compares selections, excludes the removed directory, and checks that observation does not mutate default bytes or stale process metadata. `testMissingSingleProjectErrorDoesNotPreventFollowingBatch` requires `.projectNotFound` followed by an empty successful batch.
 
 ## Gotchas
 
