@@ -292,6 +292,8 @@ struct StatusView: View {
         .background {
             if reduceTransparency {
                 colorScheme == .light ? Color.white : Color(nsColor: .windowBackgroundColor)
+            } else if #available(macOS 26.0, *) {
+                Color.clear
             } else {
                 ZStack {
                     Rectangle().fill(.ultraThinMaterial)
