@@ -1,0 +1,2 @@
+Process identity OK: pid=88649 bundle=dev.vaelen.app fixture=php-settings page=services
+The doctor confirmed the recorded process identity before UI inspection. Cleanup later confirmed its exit.

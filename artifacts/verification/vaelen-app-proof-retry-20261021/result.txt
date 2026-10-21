@@ -1,0 +1,16 @@
+Vaelen app verification skill run
+Date: 2026-10-21
+
+Build: PASS
+The generated launcher built the Debug Vaelen app using an offline-verified PHP 8.5.9 runtime and launched it through LaunchServices with the `php-settings` fixture on Services.
+
+Doctor: PASS
+The doctor matched PID 88649 to the exact app executable, `dev.vaelen.app`, `php-settings` fixture, and Services initial page.
+
+UI drive: NOT VERIFIED
+CUA app selection by exact built app path returned: "Computer Use was not approved to use Vaelen". This remained blocked after the user's request to run the suggested task. No before/after screenshot or accessibility snapshot was captured, and no sidebar interaction was performed. Do not count PHP navigation or rendered runtime labels as passed.
+
+Cleanup: PASS
+The skill cleanup helper stopped the recorded fixture process, unregistered the temporary app bundle, removed its unique DerivedData directory, and retained `run.txt`, `doctor.txt`, build/preflight output, and this result.
+
+Required follow-up: no personal-account app-access control for this denial was identified. Keep the UI journey unverified unless CUA provides an approval flow or the host's app-access policy changes. Then rerun the Drive steps in `.agents/skills/verify-vaelen-app/SKILL.md` and update this result with actual before/after CUA evidence.

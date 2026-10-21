@@ -1,0 +1,6 @@
+pid=88649
+run_root=/private/tmp/vaelen-app-verify.4rwIW2
+app=/private/tmp/vaelen-app-verify.4rwIW2/DerivedData/Build/Products/Debug/Vaelen.app
+bundle_id=dev.vaelen.app
+fixture=php-settings
+page=services
