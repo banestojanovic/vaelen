@@ -9,4 +9,4 @@ These are native macOS Settings journeys. A fixture-backed journey covers visibl
 | [Projects](projects.md) | Project settings page opens; the popover offers a direct link action when Core confirms no projects | Fixture project inventory is not persisted or Core-backed; the popover empty state requires live Core |
 | [Network & Security](network-security.md) | Network and security page opens with visible state and grouped controls | Fixture data does not exercise DNS, routing, trust, or privileged operations |
 
-The initial PHP Settings run built and launched the isolated app, and the doctor confirmed the fixture PID, executable path, and arguments. CUA refused app access with `Computer Use was not approved to use Vaelen`, so sidebar navigation and the rendered PHP state remain unverified. See `artifacts/verification/vaelen-app-proof-retry-20261021/` for retained launch and cleanup evidence.
+The isolated fixture build did not complete, and CUA refused app access with `Computer Use was not approved to use Vaelen`. Sidebar navigation and the rendered PHP state remain unverified.

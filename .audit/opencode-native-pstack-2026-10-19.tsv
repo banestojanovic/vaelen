@@ -1,6 +1,0 @@
-ts	phase	decision	why	evidence	result
-2026-10-19T09:00+02:00	A	Use installed OpenCode2 V2 schema only	Installed runtime is 2.0.32 and V2 docs describe the native APIs	`opencode2 --version`; V2 docs; `opencode2 debug config`	Confirmed
-2026-10-19T09:01+02:00	A	Do not configure Muse Spark fallback	Exact model is absent from live model catalog; silent substitution forbidden	`opencode2 models`	No Muse fallback configured
-2026-10-19T09:02+02:00	B	Use native foreground/background subagent tool	V2 TUI session exposed native subagent calls	Export `ses_ead0736edffeF8yHseIJRV6lpD`	Two Luna children launched; only one completed
-2026-10-19T09:04+02:00	C	Treat focused check as pass only with matching tests	Exit success alone is insufficient	Parent export includes 14 `ProjectSiteURLTests`, zero failures	Focused check passed
-2026-10-19T09:06+02:00	E	Do not claim full acceptance	Parent variant, second child, failure path, fallback path, and notification remain unproved	`.opencode/evidence/native-pstack-2026-10-19.md`	Report limits explicitly

@@ -1,4 +1,0 @@
-- Blocking first steps: read pstack model routing, the app verification skill, and the PHP feature entry; verify the pinned PHP runtime offline. Done.
-- Independent workstreams: n/a. The proof drives one GUI process and one Settings journey.
-- Shared mutable state: n/a. Only one isolated app fixture runs, and it skips Core monitoring.
-- Smallest safe decomposition: keep launch, doctor, UI interaction, review, and cleanup in the lead; this is a verification run, not an implementation task.
