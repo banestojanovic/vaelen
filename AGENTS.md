@@ -19,4 +19,4 @@ Do not create explorer or verification subagents automatically. Implementation a
 
 ### Tests
 
-Run tests through `scripts/test.sh`. It keeps successful output quiet and retains the full log only when a run fails.
+Run tests through `Scripts/test.sh`. It keeps successful output quiet and retains the full log only when a run fails.
