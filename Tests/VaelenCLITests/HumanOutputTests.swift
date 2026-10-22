@@ -82,7 +82,7 @@ final class HumanOutputTests: XCTestCase {
 
     func testEveryImplementedTopLevelParserCommandHasCatalogCoverage() {
         let implemented: Set<String> = [
-            "help", "list", "--version", "-V", "status", "doctor", "secure", "unsecure", "links", "edit", "parks", "paths", "parked", "sites", "open", "db", "site", "project", "link", "unlink", "park", "unpark", "php", "use", "isolate", "unisolate", "isolated", "which-php", "ini", "shell", "mysql", "routing", "route", "proxy", "mailpit", "dns", "tls", "ports", "web", "runtime", "networking"
+            "help", "list", "--version", "-V", "status", "doctor", "secure", "unsecure", "links", "edit", "parks", "paths", "parked", "sites", "open", "db", "site", "project", "link", "unlink", "park", "unpark", "php", "use", "isolate", "unisolate", "isolated", "which-php", "shell", "mysql", "mailpit", "service", "routing", "route", "proxy", "dns", "tls", "ports", "web", "runtime", "networking"
         ]
         let documented = Set(CLIDocumentation.entries.flatMap { entry in
             entry.forms.compactMap { form -> String? in
@@ -148,7 +148,7 @@ final class HumanOutputTests: XCTestCase {
             ["mysql", "versions"], ["mysql", "install", "8.4"], ["mysql", "use", "8.4"],
             ["mysql", "initialize"], ["mysql", "start"], ["mysql", "stop"], ["mysql", "status"],
             ["mailpit", "versions"], ["mailpit", "install", "latest"], ["mailpit", "start"], ["mailpit", "stop"],
-            ["mailpit", "status"], ["mailpit", "open"], ["routing", "status"], ["routing", "start"], ["routing", "stop"],
+            ["mailpit", "status"], ["mailpit", "open"], ["service", "list"], ["service", "list", "--json"], ["routing", "status"], ["routing", "start"], ["routing", "stop"],
             ["route", "list"], ["route", "add", "demo.test", "/tmp/public"],
             ["route", "add", "demo.test", "/tmp/public", "--tls"],
             ["route", "remove", "00000000-0000-0000-0000-000000000001"],
@@ -170,7 +170,7 @@ final class HumanOutputTests: XCTestCase {
             ["project", "php", "--version"], ["php", "versions", "--bad"], ["php", "install", "8.4", "extra"],
             ["php", "status", "8.4", "--bad"], ["php", "exec", "-v"], ["php", "resolve", "--bad"],
             ["shell", "status", "extra"], ["mysql", "status", "--bad"], ["mysql", "start", "extra"],
-            ["mailpit", "versions", "extra"], ["routing", "status", "extra"], ["route", "list", "--bad"],
+            ["mailpit", "versions", "extra"], ["service", "available"], ["service", "list", "--bad"], ["service", "list", "x"], ["routing", "status", "extra"], ["route", "list", "--bad"],
             ["route", "add", "demo.test", "/tmp/public", "--bad"], ["dns", "install", "--takeover", "--bad"],
             ["tls", "status", "--bad"], ["ports", "status", "--bad"], ["not-a-command"]
         ]

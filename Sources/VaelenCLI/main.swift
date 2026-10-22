@@ -75,6 +75,7 @@ enum CLICommand {
     case mailpitStop
     case mailpitStatus(json: Bool)
     case mailpitOpen
+    case serviceList(json: Bool)
     case routingStatus
     case routingStart
     case routingStop
@@ -293,7 +294,15 @@ struct VaelenCLIMain {
             }
             let paths = CoreEndpointPaths()
             let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: .init(name: "val", version: VaelenBuildInfo.version))
-            try await client.connect()
+            do {
+                try await client.connect()
+            } catch {
+                if case .serviceList(let json) = command {
+                    let inventory = ServiceInventory.unavailableCore(error.localizedDescription)
+                    print(try ServiceInventoryFormatter.render(inventory, json: json))
+                }
+                throw error
+            }
             if case .composer(let arguments) = command {
                 let phpPath = try await client.resolvePHPExecutable(workingDirectory: FileManager.default.currentDirectoryPath).cliPath
                 let script = try ComposerScriptLocator.resolve(path: ProcessInfo.processInfo.environment["PATH"], workingDirectory: FileManager.default.currentDirectoryPath)
@@ -560,6 +569,10 @@ struct VaelenCLIMain {
             case "open": guard args.count == 2 else { throw CLIError.usage }; return .mailpitOpen
             default: throw CLIError.usage
             }
+        case "service":
+            guard args.count >= 2 else { return .help(path: [first]) }
+            guard args[1] == "list" else { throw CLIError.usage }
+            return .serviceList(json: try optionalJSONOption(Array(args.dropFirst(2))))
         case "dns":
             if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2 else { throw CLIError.usage }
@@ -1093,6 +1106,18 @@ struct VaelenCLIMain {
           case .mailpitStart: let result = try await client.mailpitStart(); print(HumanOutput.report("Mailpit", rows: [("State", HumanOutput.state(result.state.rawValue)), ("Health", HumanOutput.state(result.health)), ("SMTP", "127.0.0.1:\(result.smtpPort)"), ("Web UI", result.uiEndpoint)]))
           case .mailpitStop: let result = try await client.mailpitStop(); print(HumanOutput.report("Mailpit", rows: [("State", HumanOutput.state(result.state.rawValue))]))
          case .mailpitStatus(let json): let result = try await client.mailpitStatus(); if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print(HumanOutput.heading("Mailpit") + "\n" + HumanOutput.aligned([("State", HumanOutput.state(result.state.rawValue)), ("Version", result.installedVersion ?? "none"), ("PID", result.pid.map(String.init) ?? "none"), ("SMTP", "127.0.0.1:\(result.smtpPort)"), ("UI", result.uiEndpoint), ("Database", displayPath(result.database)), ("Health", HumanOutput.state(result.health))])) }
+        case .serviceList(let json):
+            let mysql: ServiceObservation<MySQLStatus>
+            do { mysql = .available(try await client.mysqlStatus()) }
+            catch { mysql = .unavailable(error.localizedDescription) }
+            let mailpit: ServiceObservation<MailpitStatus>
+            do { mailpit = .available(try await client.mailpitStatus()) }
+            catch { mailpit = .unavailable(error.localizedDescription) }
+            let inventory = ServiceInventory(mysql: mysql, mailpit: mailpit)
+            print(try ServiceInventoryFormatter.render(inventory, json: json))
+            guard inventory.complete else {
+                throw CLIError.message("Service inventory is incomplete because one or more status observations failed.")
+            }
          case .mailpitOpen:
              let result = try await client.mailpitStatus(); guard result.state == .running else { throw CLIError.message("Mailpit is not healthy; start it before opening \(result.uiEndpoint).") }; let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/open"); process.arguments = [result.uiEndpoint]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw CLIError.message("Unable to open \(result.uiEndpoint).") }
         case .routingStatus:
