@@ -238,6 +238,28 @@ struct StatusView: View {
                     ServicesView(status: status, php: php, routing: routing, dns: dns, tls: tls, ports: ports, mysql: mysql, mailpit: mailpit, model: model)
                 }
             }
+            if let update = model.phpInstallableUpdates.first {
+                phpUpdatePrompt(update)
+            }
+            if let error = model.phpError {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(error)
+                            .font(.caption)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Open Settings") { presentSettings() }
+                            .font(.caption.weight(.medium))
+                            .buttonStyle(.link)
+                    }
+                }
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.orange.opacity(colorScheme == .light ? 0.08 : 0.12)))
+                .accessibilityIdentifier("php-update-error")
+            }
             if let error = model.serviceError {
                 Text(error)
                     .font(.caption)
@@ -344,6 +366,49 @@ struct StatusView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Vaelen section")
+    }
+
+    private func phpUpdatePrompt(_ update: (from: PHPRuntimeVersion, to: String)) -> some View {
+        HStack(spacing: VaelenUI.spacing10) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("PHP update available")
+                    .font(.system(.subheadline, weight: .semibold))
+                Text("\(update.from.version) → \(update.to)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            Spacer(minLength: 4)
+            Button {
+                Task { await model.updatePHP(update.to, replacing: update.from.version) }
+            } label: {
+                if model.phpRequestInFlight {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.mini)
+                        Text(model.phpRequestTarget == update.to ? "Updating…" : "PHP busy…")
+                    }
+                } else {
+                    Text("Update")
+                }
+            }
+            .controlSize(.small)
+            .buttonStyle(.borderedProminent)
+            .disabled(model.phpRequestInFlight)
+            .accessibilityIdentifier("php-update-prompt-action")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.accentColor.opacity(colorScheme == .light ? 0.08 : 0.13))
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("php-update-prompt")
     }
 
     private var popoverHeight: CGFloat {

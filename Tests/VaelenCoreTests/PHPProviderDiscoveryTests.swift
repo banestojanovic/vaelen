@@ -45,6 +45,41 @@ final class PHPProviderDiscoveryTests: XCTestCase {
         XCTAssertTrue(try location.knownManifests().map(\.phpVersion).contains("8.4.24"))
     }
 
+    func testSecurityReleaseWithoutPreparedPackagesIsNotOffered() throws {
+        let shipped = try manifestFixture(version: "8.4.24", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
+        for additionalPackages in [[], ["8.4.27-cli"], ["8.4.27-fpm"]] {
+            let state = layout.stateDirectoryURL.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let feed = Self.feed(published: ["8.4.23-cli", "8.4.23-fpm", "8.4.24-cli", "8.4.24-fpm"] + additionalPackages)
+            let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: state, now: { Self.now }, fetchFeed: { feed })
+            let module = PHPModule(layout: layout, location: location, includesBundledCatalog: false)
+
+            try module.checkCatalogNow()
+
+            let catalog = try module.runtimeCatalog()
+            XCTAssertEqual(catalog.availableVersions, ["8.4.24"], "An upstream release requires both prepared macOS packages before it can be offered.")
+            XCTAssertEqual(catalog.catalogAvailability, .current)
+            XCTAssertFalse(catalog.availableVersions.contains("8.4.27"))
+        }
+    }
+
+    func testSecurityReleaseIsOfferedOnceBothPreparedPackagesArePublished() throws {
+        let shipped = try manifestFixture(version: "8.4.24", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
+        let feed = Self.feed(published: ["8.4.24-cli", "8.4.24-fpm", "8.4.27-cli", "8.4.27-fpm"])
+        let location = BundledPHPManifestLocation(catalog: PHPManifestCatalog(manifests: [shipped]), stateDirectory: layout.stateDirectoryURL, now: { Self.now }, fetchFeed: { feed })
+        let module = PHPModule(layout: layout, location: location, includesBundledCatalog: false)
+
+        try module.checkCatalogNow()
+
+        let catalog = try module.runtimeCatalog()
+        XCTAssertEqual(catalog.availableVersions, ["8.4.27", "8.4.24"])
+        XCTAssertEqual(catalog.catalogAvailability, .current)
+        XCTAssertEqual(PHPUpdateObservation(installedVersion: "8.4.24", latestVersion: try XCTUnwrap(catalog.availableVersions.first)).updateAvailable, true)
+        let discovered = try XCTUnwrap(location.discoveredManifests().first)
+        XCTAssertFalse(discovered.verification.isPinnedByReview)
+        XCTAssertEqual(discovered.artifacts["cli"]?.sha256, "")
+        XCTAssertEqual(discovered.artifacts["fpm"]?.sha256, "")
+    }
+
     func testModernAndArchivedCatalogFeedsAreCheckedIndependently() throws {
         let modern = try manifestFixture(version: "8.4.24", cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
         let legacy = PHPManifest(schemaVersion: 1, module: "php", phpVersion: "8.0.30", platform: "macos", architecture: "arm64",

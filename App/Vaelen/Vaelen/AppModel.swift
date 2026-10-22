@@ -210,15 +210,18 @@ final class AppModel {
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
                 let phpUpdateFixture = mode.hasPrefix("php-update")
                 let phpUpdateSuccess = mode == "php-update-success"
+                let phpUpdateReview = mode == "php-update-review"
+                let phpFixtureSourceVersion = phpUpdateReview ? "8.4.24" : "8.4.23"
+                let phpFixtureTargetVersion = phpUpdateReview ? "8.4.27" : "8.4.25"
                 let phpSettingsFixture = mode.hasPrefix("php-settings") || phpUpdateFixture
                 let fixtureVersions = phpSettingsFixture
-                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: "8.4.23", running: true, isDefault: mode != "php-settings-no-default" && !phpUpdateSuccess, updateAvailable: phpUpdateFixture && !phpUpdateSuccess ? true : nil, latestVersion: phpUpdateFixture && !phpUpdateSuccess ? "8.4.25" : nil), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)] + (phpUpdateFixture ? [PHPRuntimeVersion(version: "8.4.9", running: false), PHPRuntimeVersion(version: "8.3.29", running: false)] : []) + (phpUpdateSuccess ? [PHPRuntimeVersion(version: "8.4.25", running: false, isDefault: true)] : [])
+                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: phpFixtureSourceVersion, running: true, isDefault: mode != "php-settings-no-default" && !phpUpdateSuccess, updateAvailable: phpUpdateFixture && !phpUpdateSuccess ? true : nil, latestVersion: phpUpdateFixture && !phpUpdateSuccess ? phpFixtureTargetVersion : nil), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)] + (phpUpdateFixture ? [PHPRuntimeVersion(version: "8.4.9", running: false), PHPRuntimeVersion(version: "8.3.29", running: false)] : []) + (phpUpdateSuccess ? [PHPRuntimeVersion(version: "8.4.25", running: false, isDefault: true)] : [])
                 : [PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)]
                 model.phpCatalog = PHPRuntimeCatalog(
-                    availableVersions: phpUpdateFixture ? (phpUpdateSuccess ? ["8.5.1"] : ["8.4.25", "8.5.1"]) : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
+                    availableVersions: phpUpdateFixture ? (phpUpdateSuccess ? ["8.5.1"] : [phpFixtureTargetVersion, "8.5.1"]) : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
                     installedVersions: phpSettingsFixture ? fixtureVersions : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? fixtureVersions : [],
-                    defaultVersion: phpUpdateSuccess ? "8.4.25" : phpSettingsFixture && mode != "php-settings-no-default" ? "8.4.23" : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
-                    runningVersions: phpSettingsFixture ? ["8.4.23"] : [],
+                    defaultVersion: phpUpdateSuccess ? "8.4.25" : phpSettingsFixture && mode != "php-settings-no-default" ? phpFixtureSourceVersion : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
+                    runningVersions: phpSettingsFixture ? [phpFixtureSourceVersion] : [],
                     availableVersionsKnown: true,
                     catalogCheckedAt: phpUpdateFixture ? Date(timeIntervalSinceNow: -3_600) : nil,
                     catalogCheckError: mode == "php-update-check-failed" ? "The catalog could not be reached; showing the last verified versions." : nil
@@ -245,7 +248,7 @@ final class AppModel {
                     let overridden = PHPSettingsValues(uploadLimitMB: 128, memoryLimitMB: 512, maxExecutionTimeSeconds: 0, maxInputVariables: 4_000, postLimitMB: 129)
                     model.phpConfiguration = PHPConfigurationResult(defaultSettings: shared, versions: [
                         PHPVersionConfiguration(version: "8.3.22", settings: shared, inheritsDefault: true, cliIniPath: "/fixture/php/8.3.22/cli.ini", fpmIniPath: "/fixture/php/8.3.22/fpm.ini", fpmConfigurationPath: "/fixture/php/8.3.22/php-fpm.conf", fpmRunning: false),
-                        PHPVersionConfiguration(version: "8.4.23", settings: overridden, inheritsDefault: false, cliIniPath: "/fixture/php/8.4.23/cli.ini", fpmIniPath: "/fixture/php/8.4.23/fpm.ini", fpmConfigurationPath: "/fixture/php/8.4.23/php-fpm.conf", fpmRunning: true),
+                        PHPVersionConfiguration(version: phpFixtureSourceVersion, settings: overridden, inheritsDefault: false, cliIniPath: "/fixture/php/\(phpFixtureSourceVersion)/cli.ini", fpmIniPath: "/fixture/php/\(phpFixtureSourceVersion)/fpm.ini", fpmConfigurationPath: "/fixture/php/\(phpFixtureSourceVersion)/php-fpm.conf", fpmRunning: true),
                         PHPVersionConfiguration(version: "8.5.0", settings: shared, inheritsDefault: true, cliIniPath: "/fixture/php/8.5.0/cli.ini", fpmIniPath: "/fixture/php/8.5.0/fpm.ini", fpmConfigurationPath: "/fixture/php/8.5.0/php-fpm.conf", fpmRunning: false)
                     ], directory: "/fixture/php")
                     model.phpConfigurationError = mode == "php-settings-error" ? "Fixture: configuration save failed." : nil
