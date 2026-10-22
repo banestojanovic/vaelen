@@ -18,6 +18,34 @@ final class ServiceInventoryOutputTests: XCTestCase {
         XCTAssertTrue(CLIDocumentation.focusedText(for: ["service", "list"]).contains("val service list --json"))
     }
 
+    func testServiceVersionsAliasesParseStrictlyAndAppearInHelp() throws {
+        guard case .mysqlVersions(json: false) = try VaelenCLIMain.parse(["service", "versions", "mysql"]) else {
+            return XCTFail("service versions mysql did not map to MySQL versions")
+        }
+        guard case .mysqlVersions(json: true) = try VaelenCLIMain.parse(["service", "versions", "mysql", "--json"]) else {
+            return XCTFail("service versions mysql --json did not map to MySQL versions")
+        }
+        guard case .mailpitVersions(json: false) = try VaelenCLIMain.parse(["service", "versions", "mailpit"]) else {
+            return XCTFail("service versions mailpit did not map to Mailpit versions")
+        }
+        guard case .mailpitVersions(json: true) = try VaelenCLIMain.parse(["service", "versions", "mailpit", "--json"]) else {
+            return XCTFail("service versions mailpit --json did not map to Mailpit versions")
+        }
+
+        for args in [
+            ["service", "versions"],
+            ["service", "versions", "postgres"],
+            ["service", "versions", "mysql", "--json", "--json"],
+            ["service", "versions", "mailpit", "extra"]
+        ] {
+            XCTAssertThrowsError(try VaelenCLIMain.parse(args), "Expected rejection for \(args)")
+        }
+
+        let help = CLIDocumentation.focusedText(for: ["service", "versions"])
+        XCTAssertTrue(help.contains("val service versions <type>"))
+        XCTAssertTrue(help.contains("val service versions <type> --json"))
+    }
+
     func testInventoryPreservesBothStatusObservationsInJSONAndHumanOutput() throws {
         let inventory = ServiceInventory(mysql: .available(MySQLStatus(
             state: .running, health: "healthy", installedVersion: "8.4.2", selectedVersion: "8.4.2", pid: 123,

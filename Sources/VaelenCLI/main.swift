@@ -579,6 +579,16 @@ struct VaelenCLIMain {
             switch args[1] {
             case "list": return .serviceList(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "available": return .serviceAvailable(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            case "versions":
+                guard args.count == 3 || args.count == 4, args.count == 3 || args[3] == "--json" else {
+                    throw CLIError.message("Usage: val service versions <type> [--json].")
+                }
+                let json = args.count == 4
+                switch args[2] {
+                case "mysql": return .mysqlVersions(json: json)
+                case "mailpit": return .mailpitVersions(json: json)
+                default: throw CLIError.message("Unknown service type '\(args[2])'. Usage: val service versions <type> [--json].")
+                }
             default: throw CLIError.usage
             }
         case "dns":

@@ -135,6 +135,35 @@ final class ServiceListEndToEndTests: XCTestCase {
                 "web": "http://127.0.0.1:\(MailpitModule.httpPort)"
             ])
 
+            let coreClient = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: ClientIdentity(name: "service-versions-test", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))
+            try await coreClient.connect()
+            let expectedMySQL = try await coreClient.mysqlVersions()
+            let expectedMailpit = try await coreClient.mailpitVersions()
+            await coreClient.disconnect()
+
+            let mysqlJSON = try runVal(valPath, root: root, arguments: ["service", "versions", "mysql", "--json"], preserveRoot: &preserveRoot)
+            XCTAssertEqual(mysqlJSON.status, 0, "stdout: \(mysqlJSON.output)\nstderr: \(mysqlJSON.error)")
+            XCTAssertEqual(mysqlJSON.error, "")
+            let mysqlPayload = try IPCCodec.decode(MySQLVersionsPayload.self, from: Data(mysqlJSON.output.utf8))
+            XCTAssertEqual(mysqlPayload, expectedMySQL)
+            let mysqlObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(mysqlJSON.output.utf8)) as? [String: Any])
+            XCTAssertEqual(Set(mysqlObject.keys), expectedMySQL.default == nil ? ["available", "installed"] : ["available", "installed", "default"])
+
+            let mailpitJSON = try runVal(valPath, root: root, arguments: ["service", "versions", "mailpit", "--json"], preserveRoot: &preserveRoot)
+            XCTAssertEqual(mailpitJSON.status, 0, "stdout: \(mailpitJSON.output)\nstderr: \(mailpitJSON.error)")
+            XCTAssertEqual(mailpitJSON.error, "")
+            let mailpitPayload = try IPCCodec.decode(MailpitVersionsPayload.self, from: Data(mailpitJSON.output.utf8))
+            XCTAssertEqual(mailpitPayload, expectedMailpit)
+            let mailpitObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(mailpitJSON.output.utf8)) as? [String: Any])
+            XCTAssertEqual(Set(mailpitObject.keys), ["available", "installed"])
+
+            let mysqlHuman = try runVal(valPath, root: root, arguments: ["service", "versions", "mysql"], preserveRoot: &preserveRoot)
+            XCTAssertEqual(mysqlHuman.status, 0, "stdout: \(mysqlHuman.output)\nstderr: \(mysqlHuman.error)")
+            XCTAssertTrue(mysqlHuman.output.contains("MySQL versions"), mysqlHuman.output)
+            let mailpitHuman = try runVal(valPath, root: root, arguments: ["service", "versions", "mailpit"], preserveRoot: &preserveRoot)
+            XCTAssertEqual(mailpitHuman.status, 0, "stdout: \(mailpitHuman.output)\nstderr: \(mailpitHuman.error)")
+            XCTAssertTrue(mailpitHuman.output.contains("Mailpit versions"), mailpitHuman.output)
+
             let stopError = try await stopServer(paths: paths, serverTask: serverTask, serverExited: serverExited)
             serverStopped = true
             if let stopError { throw NSError(domain: "ServiceListEndToEndTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "Private Core exited with a shutdown error: \(stopError)"]) }
@@ -224,7 +253,7 @@ final class ServiceListEndToEndTests: XCTestCase {
         if !preserveRoot { try FileManager.default.removeItem(at: root) }
     }
 
-    private func runVal(_ path: String, root: URL, preserveRoot: inout Bool) throws -> (status: Int32, output: String, error: String) {
+    private func runVal(_ path: String, root: URL, arguments: [String] = ["service", "list", "--json"], preserveRoot: inout Bool) throws -> (status: Int32, output: String, error: String) {
         var environment = ProcessInfo.processInfo.environment
         environment["VAELEN_TEST_SUPPORT_ROOT_ENABLED"] = "1"
         environment["VAELEN_TEST_SUPPORT_ROOT"] = root.path
@@ -236,7 +265,7 @@ final class ServiceListEndToEndTests: XCTestCase {
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ["service", "list", "--json"]
+        process.arguments = arguments
         process.environment = environment
         let stdout = try FileHandle(forWritingTo: outputURL)
         let stderr = try FileHandle(forWritingTo: errorURL)
