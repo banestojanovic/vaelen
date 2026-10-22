@@ -22,13 +22,13 @@ struct VaelenApp: App {
                 .onAppear {
                     if !model.isSettingsFixture { model.startMonitoring() }
                     appDelegate.requestQuit = { Task { await model.quitVaelen() } }
-                    if model.isSettingsFixture { openWindow(id: "settings") }
+                    if model.isSettingsFixture || model.verificationOpenSettingsPage != nil { openWindow(id: "settings") }
                 }
         }
         .menuBarExtraStyle(.window)
 
         Window("Settings", id: "settings") {
-            SettingsView(model: model, initialPage: model.settingsFixturePage ?? .services)
+            SettingsView(model: model, initialPage: model.settingsFixturePage ?? model.verificationOpenSettingsPage ?? .services)
                 .preferredColorScheme(model.settingsFixtureDark ? .dark : model.settingsFixtureLight ? .light : nil)
         }
         .defaultSize(width: 1_060, height: 720)
@@ -342,6 +342,9 @@ struct PHPSettingsView: View {
                     .help(model.phpUpdateIndicatorHelp)
                     .padding(.horizontal, 13).padding(.top, 6).padding(.bottom, 2)
                 }
+                ForEach(model.phpReleaseNotices, id: \.family) { report in
+                    PHPReleaseNoticeView(report: report).padding(.horizontal, 8)
+                }
                 phpSectionHeader("Configuration", top: 14)
                 runtimeRow("shared", title: "Shared settings", subtitle: "Values inherited by PHP runtimes", state: model.phpConfiguration == nil ? .pending : .neutral)
                 phpSectionHeader("Installed", count: catalog == nil ? nil : installed.count, top: 12)
@@ -509,6 +512,14 @@ struct PHPSettingsView: View {
             }
             if runtime.usedByProjectCount > 0 {
                 Text("Used by \(runtime.usedByProjectCount) projects").font(.caption).foregroundStyle(.secondary)
+            }
+            if let report = catalog?.updateReports?.first(where: { $0.family == runtime.series }) {
+                PHPReleaseNoticeView(report: report)
+                if let error = report.source.error {
+                    Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                } else if report.source.lastSuccessfulAt == nil {
+                    Text("Official PHP releases have not been checked for this family.").font(.caption).foregroundStyle(.secondary)
+                }
             }
             runtimeActionRow(runtime)
             runtimeDefaultRow(runtime)
@@ -1231,9 +1242,21 @@ private enum PHPSeriesLabel {
 struct ProjectSettingsView: View {
     let model: AppModel
     @State private var selectedPath: String?
+    @State private var projectSearchText = ""
     private var coreHasSnapshot: Bool { if case .running = model.state { true } else { false } }
     private var coreConnecting: Bool { if case .connecting = model.state { true } else { false } }
-    private var selectedProject: ProjectWire? { model.linkedProjects.first { $0.path == selectedPath } }
+    private var filteredProjects: [ProjectWire] {
+        model.linkedProjects.filter { project in
+            ProjectSearch.matches(project: project, report: report(for: project), query: projectSearchText)
+        }
+    }
+    private var selectedProject: ProjectWire? { filteredProjects.first { $0.path == selectedPath } }
+    private var projectReportSearchSignature: String {
+        model.projectReports.map { report in
+            let php = report.observed.php
+            return [report.identity.path, php.resolvedVersion ?? "", php.overrideVersion ?? "", php.defaultVersion ?? ""].joined(separator: "\u{0}")
+        }.joined(separator: "\u{1}")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1267,9 +1290,14 @@ struct ProjectSettingsView: View {
                             ProjectSelectedDetail(project: selectedProject, model: model)
                         } else if coreHasSnapshot {
                             VStack(alignment: .leading, spacing: 10) {
-                                Text("Select a linked project").font(.title3.weight(.semibold))
-                                Text("Choose a project from the list, or link a project folder to manage its local site and runtime.").font(.subheadline).foregroundStyle(.secondary)
-                                VaelenEmptyState(title: "No Linked Projects", systemImage: "shippingbox", message: "Link a project to manage it directly.")
+                                if !model.linkedProjects.isEmpty && filteredProjects.isEmpty {
+                                    Text("No matching linked project").font(.title3.weight(.semibold))
+                                    Text("Try a different name, path, framework, or PHP version.").font(.subheadline).foregroundStyle(.secondary)
+                                } else {
+                                    Text("Select a linked project").font(.title3.weight(.semibold))
+                                    Text("Choose a project from the list, or link a project folder to manage its local site and runtime.").font(.subheadline).foregroundStyle(.secondary)
+                                    VaelenEmptyState(title: "No Linked Projects", systemImage: "shippingbox", message: "Link a project to manage it directly.")
+                                }
                             }
                             .padding(.top, 8)
                         } else {
@@ -1284,8 +1312,10 @@ struct ProjectSettingsView: View {
                 }
             }
         }
-        .task { selectFirstProjectIfNeeded() }
-        .onChange(of: model.linkedProjects.map(\.path)) { _, _ in selectFirstProjectIfNeeded() }
+        .task { selectVisibleProjectIfNeeded() }
+        .onChange(of: model.linkedProjects.map(\.path)) { _, _ in selectVisibleProjectIfNeeded() }
+        .onChange(of: projectSearchText) { _, _ in selectVisibleProjectIfNeeded() }
+        .onChange(of: projectReportSearchSignature) { _, _ in selectVisibleProjectIfNeeded() }
     }
 
     private var projectList: some View {
@@ -1328,15 +1358,42 @@ struct ProjectSettingsView: View {
                     .padding(.horizontal, 11).padding(.vertical, 7)
                 }
                 Text("LINKED PROJECTS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Name, path, framework, or PHP", text: $projectSearchText)
+                        .textFieldStyle(.plain)
+                        .accessibilityLabel("Search linked projects")
+                    if !projectSearchText.isEmpty {
+                        Button("Clear search", systemImage: "xmark.circle.fill") { projectSearchText = "" }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Clear linked project search")
+                    }
+                }
+                .font(.caption)
+                .padding(7)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 1))
+                .padding(.horizontal, 11)
+                .padding(.bottom, 5)
                 if model.linkedProjects.isEmpty {
                     Text(coreHasSnapshot ? "No linked projects" : coreConnecting ? "Waiting for Core…" : "Linked project state unavailable")
                         .font(.caption).foregroundStyle(coreHasSnapshot || coreConnecting ? Color.secondary : Color.orange).padding(.horizontal, 13).padding(.vertical, 8)
+                } else if filteredProjects.isEmpty {
+                    Text("No linked projects match “\(projectSearchText.trimmingCharacters(in: .whitespacesAndNewlines))”.")
+                        .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 13).padding(.vertical, 8)
                 }
-                ForEach(model.linkedProjects, id: \.path) { project in
+                ForEach(filteredProjects, id: \.path) { project in
                     Button { selectedPath = project.path } label: {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(project.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(1)
                             Text([project.detectedFramework, displayPath(project.path)].compactMap { $0 }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                            Text(projectPHPListSummary(for: project))
+                                .font(.caption2)
+                                .foregroundStyle(projectPHPListIsUnavailable(for: project) ? Color.orange : Color.secondary)
+                                .lineLimit(1)
+                                .accessibilityLabel(projectPHPListSummary(for: project))
                         }
                         .frame(maxWidth: .infinity, alignment: .leading).padding(10)
                         .background(selectedPath == project.path ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
@@ -1348,8 +1405,46 @@ struct ProjectSettingsView: View {
         }
     }
 
-    private func selectFirstProjectIfNeeded() {
-        if !model.linkedProjects.contains(where: { $0.path == selectedPath }) { selectedPath = model.linkedProjects.first?.path }
+    private func report(for project: ProjectWire) -> ProjectEnvironmentReport? {
+        model.projectReports.first { $0.identity.path == project.path }
+    }
+
+    private func selectVisibleProjectIfNeeded() {
+        if !filteredProjects.contains(where: { $0.path == selectedPath }) { selectedPath = filteredProjects.first?.path }
+    }
+
+    private func projectPHPListSummary(for project: ProjectWire) -> String {
+        guard let php = report(for: project)?.observed.php else {
+            if coreConnecting { return "PHP · Connecting to Core" }
+            if model.projectReportErrors[project.path] != nil { return "PHP · Report unavailable" }
+            if coreHasSnapshot { return "PHP · Loading" }
+            return "PHP · Core unavailable"
+        }
+        if let resolved = php.resolvedVersion {
+            return "PHP \(resolved) · \(php.overrideVersion == nil ? "Uses Default" : "Project Override")"
+        }
+        if let override = php.overrideVersion { return "PHP \(override) unavailable · Project Override" }
+        return php.defaultVersion == nil ? "PHP unavailable · Default unavailable" : "PHP unavailable · Uses Default"
+    }
+
+    private func projectPHPListIsUnavailable(for project: ProjectWire) -> Bool {
+        guard let php = report(for: project)?.observed.php else {
+            return !coreConnecting && (model.projectReportErrors[project.path] != nil || !coreHasSnapshot)
+        }
+        return php.resolvedVersion == nil
+    }
+}
+
+private enum ProjectSearch {
+    static func matches(project: ProjectWire, report: ProjectEnvironmentReport?, query: String) -> Bool {
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !terms.isEmpty else { return true }
+        let searchable = [project.name, project.path, project.detectedFramework ?? "", report?.observed.php.resolvedVersion ?? "", report?.observed.php.overrideVersion ?? ""]
+            .joined(separator: " ")
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        return terms.allSatisfy { term in
+            searchable.localizedStandardContains(term.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current))
+        }
     }
 }
 
@@ -1406,6 +1501,16 @@ private struct ProjectSelectedDetail: View {
                 HStack { Text("Project PHP").font(.headline); Spacer(); ProjectPHPMenu(project: project, report: report, model: model) }
                 Text("This runtime choice applies to this project only. Other projects keep their own override or inherit the shared default.").font(.caption).foregroundStyle(.secondary)
             }.padding(.vertical, 3)
+            SettingsInsetCard {
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack { Text("Project Node").font(.headline); Spacer(); ProjectNodeMenu(project: project, model: model) }
+                    Text("Vaelen selects this Node runtime for `val node exec` and, with the optional zsh integration installed, ordinary `node` and `npm` commands. Without it, shell commands use your invocation PATH.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if let error = model.nodeError {
+                        Label(error, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    }
+                }
+            }
             if let report {
                 SettingsInsetCard {
                     VStack(alignment: .leading, spacing: 9) {
@@ -1449,6 +1554,56 @@ private struct ProjectSelectedDetail: View {
     }
     private func projectFact(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline) { Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 92, alignment: .leading); Text(value).font(.caption).textSelection(.enabled); Spacer(minLength: 0) }
+    }
+}
+
+private struct ProjectNodeMenu: View {
+    let project: ProjectWire
+    let model: AppModel
+
+    private var selection: ProjectNodeSelection? {
+        guard let snapshot = model.nodeSnapshot else { return nil }
+        if let id = project.id { return snapshot.selections.first { $0.projectID.rawValue == id } }
+        return snapshot.selections.first { $0.path == project.path }
+    }
+
+    var body: some View {
+        Menu {
+            Button("Use invocation PATH", systemImage: "arrow.triangle.branch") {
+                Task { await model.setProjectNode(project, version: nil) }
+            }
+            Divider()
+            ForEach(model.nodeSnapshot?.releases ?? NodeRelease.reviewed, id: \.version.description) { release in
+                let installed = model.nodeSnapshot?.installedPackages.contains { $0.version == release.version } ?? false
+                let version = release.version.description
+                Button(installed ? "Node \(version) · Select" : "Node \(version) · Install and Select",
+                       systemImage: installed ? "checkmark.circle" : "arrow.down.circle") {
+                    Task { await model.setProjectNode(project, version: release.version) }
+                }
+            }
+        } label: {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(nodeTitle).font(.caption.weight(.medium))
+                Text(nodeDetail).font(.caption2).foregroundStyle(selection?.pinnedVersion != nil && selection?.runtimeAvailable == false ? Color.orange : Color.secondary)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("Node runtime for \(project.name)")
+        .accessibilityValue(Text("\(nodeTitle). \(nodeDetail)"))
+        .disabled(model.isSettingsFixture || model.relationshipMutationInFlight || model.nodeSnapshot == nil)
+    }
+
+    private var nodeTitle: String {
+        guard let selection else { return "Node state unavailable" }
+        guard let pinned = selection.pinnedVersion else { return "Inherits invocation PATH" }
+        return "Node \(pinned)"
+    }
+
+    private var nodeDetail: String {
+        guard let selection else { return model.nodeError == nil ? "Checking with Core" : "Unavailable" }
+        guard let pinned = selection.pinnedVersion else { return "No project pin" }
+        guard selection.runtimeAvailable else { return "Pinned runtime unavailable" }
+        return "Project pin · \(pinned)"
     }
 }
 

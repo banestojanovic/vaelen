@@ -6,6 +6,18 @@ value() { awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1);
 pid="$(value pid)"
 run_root="$(value run_root)"
 app="$(value app)"
+bundle_id="$(value bundle_id)"
+fixture="$(value fixture)"
+page="$(value page)"
+[[ "$bundle_id" == dev.vaelen.app ]] || { echo "Unexpected bundle identity; refusing cleanup" >&2; exit 1; }
+case "$fixture" in
+  pending|unavailable|partial|empty|installed|all-installed|install-failed|remove-failed|php-settings|php-settings-no-default|php-settings-error|php-settings-invalid|php-settings-saving|php-update-review|php-update-progress|php-update-unknown-total|php-update-success|php-update-failed|php-update-checking|php-update-check-failed|php-release-security|php-release-coexist|php-release-stale|node-settings-selected|node-settings-unpinned|node-settings-unavailable) ;;
+  *) echo "Unexpected fixture identity; refusing cleanup" >&2; exit 1 ;;
+esac
+case "$page" in
+  services|projects|php|network|general) ;;
+  *) echo "Unexpected page identity; refusing cleanup" >&2; exit 1 ;;
+esac
 [[ "$run_root" == /private/tmp/vaelen-app-verify.* && "$app" == "$run_root/DerivedData/Build/Products/Debug/Vaelen.app" ]] || {
   echo "Run paths do not match the expected isolated build; refusing cleanup" >&2; exit 1;
 }
@@ -20,7 +32,7 @@ if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
   actual="$(ps -p "$pid" -o command= 2>/dev/null || true)"
   actual="${actual#"${actual%%[![:space:]]*}"}"
 fi
-expected="$app/Contents/MacOS/Vaelen --settings-fixture=php-settings --settings-page=services"
+expected="$app/Contents/MacOS/Vaelen --settings-fixture=$fixture --settings-page=$page"
 if [[ -n "$actual" ]]; then
   [[ "$actual" == "$expected" ]] || { echo "PID identity changed; leaving process and scratch state untouched" >&2; exit 1; }
   kill -TERM "$pid"

@@ -45,6 +45,8 @@ public actor CoreRequestDispatcher {
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
     private let php: PHPModule?
+    private let node: NodePackageManager
+    private var nodeInstallInFlight = false
     private let mysql: MySQLModule?
     private let mailpit: MailpitModule?
     private let router: any Router
@@ -68,7 +70,8 @@ public actor CoreRequestDispatcher {
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, node: NodePackageManager = .init(), mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
+        self.node = node
         self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.localProxyRepository = localProxyRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.logs = logs; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
         var persistedRoutes = try routeRepository?.all() ?? []
         if let localProxyRepository {
@@ -150,6 +153,9 @@ public actor CoreRequestDispatcher {
         }
         do {
             switch method {
+            case .nodeCommand:
+                let params = try request.params?.decode(NodeCommandParams.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Node parameters are required.") }()
+                return (.init(id: request.id, result: .nodeCommand(.init(try await nodeCommand(params.nodeRequest)))), true)
             case .status:
                 // The GUI uses this response to leave its bootstrap/loading
                 // presentation. Do not publish saved desired state before the
@@ -299,11 +305,20 @@ public actor CoreRequestDispatcher {
             case .phpVersions:
                 let module = try phpModule(); return (.init(id: request.id, result: .phpVersions(.init(available: (try? module.availableVersions()) ?? [], installed: module.installedVersions().map(PHPPackageWire.init), default: module.defaultVersion()))), true)
             case .phpCatalog:
-                let module = try phpModule(); _ = try? await Task.detached { try module.refreshCatalogIfNeeded() }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
+                let module = try phpModule()
+                await Task.detached {
+                    try? module.refreshCatalogIfNeeded()
+                    module.refreshOfficialReleaseAdvisories(force: false)
+                }.value
+                return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
             case .phpCatalogSnapshot:
                 return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(phpModule())))), true)
             case .phpCatalogCheck:
-                let module = try phpModule(); try await Task.detached { try module.checkCatalogNow() }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
+                let module = try phpModule(); try await Task.detached {
+                    let providerCheck = Result { try module.checkCatalogNow() }
+                    module.refreshOfficialReleaseAdvisories(force: true)
+                    try providerCheck.get()
+                }.value; return (.init(id: request.id, result: .phpCatalog(.init(catalog: try await phpCatalog(module)))), true)
             case .phpInstall:
                 let module = try phpModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "PHP version is required.") }(); _ = try await withPHPPackageOperation {
                     return try await Task.detached { try module.install(requestedVersion: params.version) }.value
@@ -1303,6 +1318,10 @@ public actor CoreRequestDispatcher {
             logShutdownTiming("waiting for PHP package operation")
             do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
         }
+        while nodeInstallInFlight {
+            logShutdownTiming("waiting for Node package installation")
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
+        }
         parkRouteMonitorTask?.cancel()
         if let parkRouteMonitorTask { await parkRouteMonitorTask.value }
         parkRouteMonitorTask = nil
@@ -1558,6 +1577,50 @@ public actor CoreRequestDispatcher {
     private func projectPHPSelection(_ project: Project) async throws -> ProjectPHPSelection {
         let report = try await projectEnvironmentReport(for: project)
         return projectPHPSelection(project, observed: report.observed.php)
+    }
+
+    private func nodeCommand(_ request: NodeCommandRequest) async throws -> NodeCommandSnapshot {
+        var installed: NodePackageIdentity?
+        switch request.action {
+        case .install:
+            guard let version = request.version, request.selector == nil else { throw IPCErrorPayload(code: .invalidRequest, message: "Node install requires one exact version.") }
+            guard !nodeInstallInFlight else { throw IPCErrorPayload(code: .invalidRequest, message: "A Node installation is already in progress.") }
+            nodeInstallInFlight = true
+            defer { nodeInstallInFlight = false }
+            let manager = node
+            installed = try await Task.detached { try manager.install(version) }.value
+        case .isolate, .useDefault:
+            guard (request.action == .isolate) == (request.version != nil) else { throw IPCErrorPayload(code: .invalidRequest, message: "Choose an exact Node version or Use Default.") }
+        case .list, .isolated:
+            guard request.version == nil, request.selector == nil else { throw IPCErrorPayload(code: .invalidRequest, message: "Node listing does not take a project or version.") }
+        }
+        let records = try await registry.nodeRecords()
+        let manager = node
+        let validation = await Task.detached {
+            manager.validationSnapshot(records: records, including: request.version.map { [$0] } ?? [])
+        }.value
+        var responseRecords = records
+        if request.action == .isolate || request.action == .useDefault {
+            let projectID: ProjectID
+            if let selector = request.selector {
+                let project = try await resolveProject(selector: selector, workingDirectory: request.workingDirectory)
+                guard project.registrationKind == .linked, let id = project.id else { throw ProjectRegistryError.projectNotFound }
+                projectID = id
+            } else {
+                guard let project = NodeProjectBoundary.select(records, workingDirectory: request.workingDirectory) else { throw ProjectRegistryError.projectNotFound }
+                projectID = project.id
+            }
+            if let version = request.version { _ = try validation.package(version) }
+            try await registry.setNodeOverride(request.version, for: projectID)
+            responseRecords = records.map { record in
+                record.id == projectID ? NodeProjectRecord(id: record.id, name: record.name, path: record.path, pin: request.version) : record
+            }
+        }
+        let selectedRecords = responseRecords
+        var selections = await Task.detached { validation.selections(selectedRecords) }.value
+        if request.action == .isolated { selections = selections.filter { $0.pinnedVersion != nil } }
+        let installedPackages = NodeRelease.reviewed.compactMap { try? validation.package($0.version) }
+        return .init(releases: NodeRelease.reviewed, selections: selections, installedPackages: installedPackages, installedPackage: installed)
     }
 
     private func projectPHPSelection(_ project: Project, observed: ProjectObservedPHP) -> ProjectPHPSelection {

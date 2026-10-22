@@ -6,9 +6,20 @@ EVIDENCE="${1:?usage: launch-fixture.sh <evidence-directory>}"
 case "$EVIDENCE" in /*) ;; *) EVIDENCE="$ROOT/$EVIDENCE" ;; esac
 mkdir -p "$EVIDENCE"
 EVIDENCE="$(cd "$EVIDENCE" && pwd -P)"
+BUILD_LOG="$EVIDENCE/build.log"
+FIXTURE="${VAELEN_SETTINGS_FIXTURE:-php-settings}"
+PAGE="${VAELEN_SETTINGS_PAGE:-services}"
+
+case "$FIXTURE" in
+  pending|unavailable|partial|empty|installed|all-installed|install-failed|remove-failed|php-settings|php-settings-no-default|php-settings-error|php-settings-invalid|php-settings-saving|php-update-review|php-update-progress|php-update-unknown-total|php-update-success|php-update-failed|php-update-checking|php-update-check-failed|php-release-security|php-release-coexist|php-release-stale|node-settings-selected|node-settings-unpinned|node-settings-unavailable) ;;
+  *) echo "Unsupported Settings fixture: $FIXTURE" >&2; exit 2 ;;
+esac
+case "$PAGE" in
+  services|projects|php|network|general) ;;
+  *) echo "Unsupported Settings page: $PAGE" >&2; exit 2 ;;
+esac
 RUN_ROOT="$(mktemp -d /private/tmp/vaelen-app-verify.XXXXXX)"
 APP="$RUN_ROOT/DerivedData/Build/Products/Debug/Vaelen.app"
-BUILD_LOG="$EVIDENCE/build.log"
 
 if pgrep -x Vaelen >/dev/null 2>&1; then
   echo "Refusing to launch: a Vaelen process is already running." >&2
@@ -36,14 +47,14 @@ if [[ ! -x "$APP/Contents/MacOS/Vaelen" ]]; then
   exit 1
 fi
 
-printf 'pid=unlaunched\nrun_root=%s\napp=%s\nbundle_id=dev.vaelen.app\nfixture=php-settings\npage=services\n' \
-  "$RUN_ROOT" "$APP" >"$EVIDENCE/run.txt"
-/usr/bin/open -n "$APP" --args --settings-fixture=php-settings --settings-page=services \
+printf 'pid=unlaunched\nrun_root=%s\napp=%s\nbundle_id=dev.vaelen.app\nfixture=%s\npage=%s\n' \
+  "$RUN_ROOT" "$APP" "$FIXTURE" "$PAGE" >"$EVIDENCE/run.txt"
+/usr/bin/open -n "$APP" --args "--settings-fixture=$FIXTURE" "--settings-page=$PAGE" \
   >"$EVIDENCE/launch.log" 2>&1
 APP_PID=""
 for _ in {1..50}; do
-  APP_PID="$(ps -axo pid=,command= | awk -v executable="$APP/Contents/MacOS/Vaelen" \
-    '$2 == executable && $3 == "--settings-fixture=php-settings" && $4 == "--settings-page=services" { print $1; exit }')"
+  APP_PID="$(ps -axo pid=,command= | awk -v executable="$APP/Contents/MacOS/Vaelen" -v fixture="--settings-fixture=$FIXTURE" -v page="--settings-page=$PAGE" \
+    '$2 == executable && $3 == fixture && $4 == page && !found { print $1; found = 1 }')"
   [[ -n "$APP_PID" ]] && break
   sleep 0.2
 done
@@ -52,7 +63,7 @@ if [[ -z "$APP_PID" ]]; then
   echo "LaunchServices did not leave the fixture running; run cleanup-fixture.sh for $RUN_ROOT" >&2
   exit 1
 fi
-printf 'pid=%s\nrun_root=%s\napp=%s\nbundle_id=dev.vaelen.app\nfixture=php-settings\npage=services\n' \
-  "$APP_PID" "$RUN_ROOT" "$APP" >"$EVIDENCE/run.txt"
+printf 'pid=%s\nrun_root=%s\napp=%s\nbundle_id=dev.vaelen.app\nfixture=%s\npage=%s\n' \
+  "$APP_PID" "$RUN_ROOT" "$APP" "$FIXTURE" "$PAGE" >"$EVIDENCE/run.txt"
 echo "BUILD SUCCEEDED"
-echo "LAUNCHED pid=$APP_PID app=$APP fixture=php-settings"
+echo "LAUNCHED pid=$APP_PID app=$APP fixture=$FIXTURE page=$PAGE"

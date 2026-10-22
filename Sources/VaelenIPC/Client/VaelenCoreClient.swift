@@ -145,6 +145,11 @@ public actor VaelenCoreClient {
         return result
     }
 
+    public func nodeCommand(_ request: NodeCommandRequest) async throws -> NodeCommandSnapshot {
+        guard case .nodeCommand(let result) = try result(from: await send(IPCRequest(method: .nodeCommand, params: .nodeCommand(.init(request))))) else { throw CoreClientError.invalidResponse }
+        return result.nodeResult
+    }
+
     public func projectPHPSelections() async throws -> [ProjectPHPSelection] {
         guard case .projectPHPSelections(let result) = try result(from: await send(IPCRequest(method: .projectPHPSelections))) else { throw CoreClientError.invalidResponse }
         return result.selections

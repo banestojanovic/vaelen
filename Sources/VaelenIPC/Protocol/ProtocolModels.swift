@@ -57,6 +57,7 @@ public struct CoreShutdownResponse: Codable, Equatable, Sendable {
 }
 
 public enum CoreMethod: String, Sendable {
+    case nodeCommand = "node.command"
     case handshake = "core.handshake"
     case status = "core.status"
     case shutdown = "core.shutdown"
@@ -134,6 +135,7 @@ public enum CoreMethod: String, Sendable {
 }
 
 public enum RequestParams: Codable, Equatable, Sendable {
+    case nodeCommand(NodeCommandParams)
     case handshake(HandshakeParams)
     case link(LinkProjectRequest)
     case unlink(UnlinkProjectRequest)
@@ -159,6 +161,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
 
     public func encode(to encoder: Encoder) throws {
         switch self {
+        case .nodeCommand(let value): try value.encode(to: encoder)
         case .handshake(let value): try value.encode(to: encoder)
         case .link(let value): try value.encode(to: encoder)
         case .unlink(let value): try value.encode(to: encoder)
@@ -187,6 +190,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let value = try JSONValue(from: decoder)
         if case .object(let fields) = value {
+            if fields["nodeRequest"] != nil, let params = try? IPCCodec.decode(NodeCommandParams.self, from: IPCCodec.encode(value)) { self = .nodeCommand(params); return }
             if fields["client"] != nil, let params = try? IPCCodec.decode(HandshakeParams.self, from: IPCCodec.encode(value)) {
                 self = .handshake(params); return
             }
@@ -554,6 +558,7 @@ public struct LogsCatalogResult: Codable, Equatable, Sendable { public let logs:
 public struct LogsTailResult: Codable, Equatable, Sendable { public let tail: CoreLogTail; public init(tail: CoreLogTail) { self.tail = tail } }
 
 public enum ResponseResult: Codable, Equatable, Sendable {
+    case nodeCommand(NodeCommandResult)
     case handshake(HandshakeResult)
     case status(CoreStatusResponse)
     case shutdown(CoreShutdownResponse)
@@ -601,6 +606,7 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .handshake(let value): try value.encode(to: encoder)
         case .status(let value): try value.encode(to: encoder)
         case .shutdown(let value): try value.encode(to: encoder)
+        case .nodeCommand(let value): try value.encode(to: encoder)
         case .projectMutation(let value): try value.encode(to: encoder)
         case .projectList(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
@@ -646,7 +652,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         let value = try JSONValue(from: decoder)
         let data = try IPCCodec.encode(value)
         guard case .object(let fields) = value else { self = .raw(value); return }
-        if fields["components"] != nil, let result = try? IPCCodec.decode(CoreShutdownResponse.self, from: data) { self = .shutdown(result) }
+        if fields["nodeResult"] != nil, let result = try? IPCCodec.decode(NodeCommandResult.self, from: data) { self = .nodeCommand(result) }
+        else if fields["components"] != nil, let result = try? IPCCodec.decode(CoreShutdownResponse.self, from: data) { self = .shutdown(result) }
         else if fields["core"] != nil, let result = try? IPCCodec.decode(CoreStatusResponse.self, from: data) { self = .status(result) }
         else if fields["coreVersion"] != nil, let result = try? IPCCodec.decode(HandshakeResult.self, from: data) { self = .handshake(result) }
         else if fields["projects"] != nil, let result = try? IPCCodec.decode(ProjectListResult.self, from: data) { self = .projectList(result) }

@@ -1,24 +1,32 @@
-# Vaelen PHP shell resolution
+# Vaelen PHP and Node shell integration
 
-Vaelen's zsh integration defines one stable `php` function. For each command,
-it asks a dedicated Vaelen CLI resolver for the managed PHP executable selected by
-Core, then forwards the original arguments to that executable. The resolver
-uses a linked project's PHP override when the current directory is inside a
-linked project; otherwise it uses the current global default. It does not put
-version-specific runtime paths into shell configuration.
+Vaelen's opt-in zsh integration defines `php`, `node`, and `npm` functions in
+one owned block. Each command uses the copied Vaelen CLI helper in
+`~/Library/Application Support/Vaelen/bin/vaelen-php-resolver`.
 
-Vaelen PHP shell resolution supports arm64 / Apple Silicon only; it has no
-Intel, Rosetta, or universal-binary fallback.
+The `php` function resolves the managed PHP executable for the current
+project, then forwards the original arguments to it. A linked project's PHP
+override takes precedence over the global default. Vaelen reports an error if
+Core or the selected managed runtime is unavailable. It does not select a
+different PHP runtime in that case.
 
-Build/install the resolver and add the block idempotently with:
+The `node` and `npm` functions call `val node exec -- node` or
+`val node exec -- npm`. A linked project's exact Node pin prepends its managed
+runtime to `PATH` for that command. Other projects use the invocation `PATH`.
+Unavailable project pins fail without falling back to another Node runtime.
+The helper does not connect to Core or migrate project state.
+
+The PHP shell integration supports arm64 / Apple Silicon only. It has no Intel,
+Rosetta, or universal-binary fallback.
+
+Build and install the helper, then add the block idempotently with:
 
 ```sh
 Scripts/install-php-shell-integration.sh
 ```
 
-Start a new zsh session or source `~/.zshrc`. The resolver lives at
-`~/Library/Application Support/Vaelen/bin/vaelen-php-resolver`; pass `php
-resolve --path` to inspect the selected executable. The integration reports an
-error rather than falling back to another PHP when Core or the selected
-managed runtime is unavailable. `val shell status`, `val shell install`, and
-`val shell uninstall` report and manage the same owned block.
+Start a new zsh session or source `~/.zshrc`. Pass `php resolve --path` to the
+helper to inspect the selected PHP executable. `val shell status`,
+`val shell install`, and `val shell uninstall` report and manage the same
+owned block. Shell configuration changes only when you run
+`val shell install`.

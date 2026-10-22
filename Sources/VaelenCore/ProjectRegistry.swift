@@ -106,6 +106,8 @@ public actor ProjectRegistry {
     public func linkedProject(id: ProjectID) throws -> Project? { try linkedProjects().first { $0.id == id } }
 
     public func phpOverride(for project: ProjectID) throws -> String? { try projects.phpOverride(for: project) }
+    public func nodeRecords() throws -> [NodeProjectRecord] { try projects.nodeRecords() }
+    public func setNodeOverride(_ version: NodeVersion?, for project: ProjectID) throws { try projects.setNodeOverride(version, for: project) }
     public func phpOverrides() throws -> [ProjectID: String] { try projects.phpOverrides() }
     public func setPHPOverride(_ version: String?, for project: ProjectID) throws { try projects.setPHPOverride(version, for: project) }
     public func parkedPaths() throws -> [ParkedPath] { try parked.all().map(makeParked) }

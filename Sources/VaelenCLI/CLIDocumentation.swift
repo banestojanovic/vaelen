@@ -32,6 +32,7 @@ enum CLIDocumentation {
     ]
 
     private static let groupOverviews: [String: [(String, String)]] = [
+        "node": [("list / versions", "List reviewed exact releases and project selections."), ("install", "Install a reviewed macOS arm64 release."), ("isolate / use-default", "Select project Node or resume invocation PATH."), ("isolated", "List explicit project Node pins."), ("exec -- COMMAND", "Run with project Node without connecting to Core.")],
         "web": [("link", "Link and serve a project."), ("links", "List linked projects and hosts."), ("sites", "List configured sites."), ("secure / unsecure", "Set local HTTPS for a host."), ("open", "Open a configured site."), ("site driver / info", "Inspect the site or run Laravel Artisan about.")],
         "runtime": [("php", "Manage PHP runtimes and project PHP."), ("mysql", "Manage the MySQL service."), ("mailpit", "Manage the Mailpit service."), ("use / which-php / ini", "PHP shell-selection and configuration shortcuts.")],
         "networking": [("routing", "Control managed Caddy."), ("route", "List and manage routes."), ("proxy", "Manage local HTTP reverse proxies."), ("dns", "Manage local DNS."), ("tls", "Manage local HTTPS trust."), ("ports", "Manage standard local ports.")],
@@ -47,10 +48,16 @@ enum CLIDocumentation {
         "dns": [("status", "Show local DNS state."), ("install [--takeover]", "Install managed local DNS."), ("remove", "Remove managed local DNS.")],
         "tls": [("status", "Show certificate and trust state."), ("install / remove", "Manage the local certificate authority."), ("trust / untrust", "Manage Keychain trust.")],
         "ports": [("status", "Show standard local port forwarding."), ("install / remove", "Manage standard local ports.")],
-        "shell": [("status", "Show PHP shell integration."), ("install / uninstall", "Manage shell integration.")]
+        "shell": [("status", "Show PHP and Node shell integration."), ("install / uninstall", "Manage shell integration.")]
     ]
 
     static let entries: [CLIHelpEntry] = [
+        command("Runtime", ["node", "list"], ["val node list [--json]", "val node versions [--json]"], "List reviewed exact Node releases, managed installations, and linked project selections.", notes: ["This first slice supports macOS arm64. Missing projects and unavailable pins remain visible."], parses: [["node", "list"], ["node", "versions", "--json"]]),
+        command("Runtime", ["node", "install"], ["val node install EXACT_VERSION [--json]"], "Install a reviewed official Node release without selecting it for a project.", examples: ["val node install 24.22.1"], parses: [["node", "install", "24.22.1"]]),
+        command("Runtime", ["node", "isolate"], ["val node isolate EXACT_VERSION [PROJECT] [--json]"], "Save an exact installed Node version for a linked project.", notes: ["Without PROJECT, the deepest containing linked root is selected. A nested unpinned linked root uses invocation PATH."], parses: [["node", "isolate", "24.22.1"]]),
+        command("Runtime", ["node", "use-default"], ["val node use-default [PROJECT] [--json]"], "Clear a project's Node pin and resume the invocation PATH choice.", parses: [["node", "use-default"]]),
+        command("Runtime", ["node", "isolated"], ["val node isolated [--json]"], "List explicit Node pins, including unavailable projects and packages.", parses: [["node", "isolated", "--json"]]),
+        command("Runtime", ["node", "exec"], ["val node exec -- COMMAND [ARGUMENT...]"], "Run a command with project Node prepended to PATH, without a Core handshake.", examples: ["val node exec -- node --version", "val node exec -- npm --version"], notes: ["This command reads existing compatible state without migration or repair. Unavailable selected runtimes fail without PATH fallback. Install shell integration to route ordinary shell node and npm commands through this command."], parses: [["node", "exec", "--", "node", "--version"]]),
         command("Help & version", [], ["val", "val help", "val --help", "val -h", "val list"], "Show a short command overview, or use val list for the complete reference.", examples: ["val", "val list"], parses: [[], ["help"], ["--help"], ["-h"], ["list"]]),
         command("Help & version", ["help"], ["val help [COMMAND ...]"], "Show root or focused command help.", examples: ["val help", "val help php install"], parses: [["help"], ["help", "php", "install"]]),
         command("Help & version", ["--version"], ["val --version", "val -V"], "Print the CLI version.", examples: ["val --version"], parses: [["--version"], ["-V"]]),
@@ -138,9 +145,9 @@ enum CLIDocumentation {
         command("Networking", ["ports", "status"], ["val ports status", "val ports status --json"], "Show standard local port forwarding state.", examples: ["val ports status"], parses: [["ports", "status"], ["ports", "status", "--json"]]),
         command("Networking", ["ports", "install"], ["val ports install"], "Install standard local port forwarding.", examples: ["val ports install"], parses: [["ports", "install"]]),
         command("Networking", ["ports", "remove"], ["val ports remove"], "Remove standard local port forwarding.", examples: ["val ports remove"], parses: [["ports", "remove"]]),
-        command("Integration", ["shell", "status"], ["val shell status"], "Show current PHP shell integration status.", examples: ["val shell status"], parses: [["shell", "status"]]),
-        command("Integration", ["shell", "install"], ["val shell install"], "Install Vaelen PHP shell integration in the user's shell configuration.", examples: ["val shell install"], parses: [["shell", "install"]]),
-        command("Integration", ["shell", "uninstall"], ["val shell uninstall"], "Remove Vaelen PHP shell integration from the user's shell configuration.", examples: ["val shell uninstall"], parses: [["shell", "uninstall"]])
+        command("Integration", ["shell", "status"], ["val shell status"], "Show current PHP and Node shell integration status.", examples: ["val shell status"], parses: [["shell", "status"]]),
+        command("Integration", ["shell", "install"], ["val shell install"], "Install Vaelen PHP and Node shell integration in the user's shell configuration.", examples: ["val shell install"], parses: [["shell", "install"]]),
+        command("Integration", ["shell", "uninstall"], ["val shell uninstall"], "Remove Vaelen PHP and Node shell integration from the user's shell configuration.", examples: ["val shell uninstall"], parses: [["shell", "uninstall"]])
     ]
 
     static func text(for path: [String], width: Int = HumanOutput.terminalWidth) -> String {

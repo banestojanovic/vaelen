@@ -93,7 +93,7 @@ final class HumanOutputTests: XCTestCase {
 
     func testEveryImplementedTopLevelParserCommandHasCatalogCoverage() {
         let implemented: Set<String> = [
-            "help", "list", "--version", "-V", "status", "doctor", "secure", "unsecure", "links", "edit", "parks", "paths", "parked", "sites", "open", "db", "site", "project", "link", "unlink", "park", "unpark", "php", "use", "isolate", "unisolate", "isolated", "which-php", "shell", "mysql", "mailpit", "service", "routing", "route", "proxy", "dns", "tls", "ports", "web", "runtime", "networking"
+            "help", "list", "--version", "-V", "status", "doctor", "secure", "unsecure", "links", "edit", "parks", "paths", "parked", "sites", "open", "db", "site", "project", "link", "unlink", "park", "unpark", "php", "use", "isolate", "unisolate", "isolated", "which-php", "ini", "shell", "mysql", "routing", "route", "proxy", "mailpit", "service", "dns", "tls", "ports", "web", "runtime", "networking"
         ]
         let documented = Set(CLIDocumentation.entries.flatMap { entry in
             entry.forms.compactMap { form -> String? in

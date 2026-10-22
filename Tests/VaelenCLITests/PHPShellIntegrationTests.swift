@@ -58,12 +58,30 @@ final class PHPShellIntegrationTests: XCTestCase {
         XCTAssertTrue(result.stderr.contains("Vaelen could not resolve an executable PHP runtime"))
     }
 
+    func testNodePassesArgumentsAndPropagatesOutputAndExitStatus() throws {
+        let result = try runShell(resolverExit: 0, resolverOutput: "", activity: "active", command: "node --trace-warnings 'argument with spaces'", helperExit: 23)
+
+        XCTAssertEqual(result.status, 23)
+        XCTAssertEqual(result.stdout, "helper <node> <exec> <--> <node> <--trace-warnings> <argument with spaces>\n")
+        XCTAssertEqual(result.stderr, "helper error\n")
+    }
+
+    func testNpmPassesArgumentsAndPropagatesOutputAndExitStatus() throws {
+        let result = try runShell(resolverExit: 0, resolverOutput: "", activity: "active", command: "npm install 'package with spaces'", helperExit: 24)
+
+        XCTAssertEqual(result.status, 24)
+        XCTAssertEqual(result.stdout, "helper <node> <exec> <--> <npm> <install> <package with spaces>\n")
+        XCTAssertEqual(result.stderr, "helper error\n")
+    }
+
     private func runShell(
         resolverExit: Int32,
         resolverOutput: String,
         activity: String?,
         createManagedPHP: Bool = false,
-        reportManagedConfiguration: Bool = false
+        reportManagedConfiguration: Bool = false,
+        command: String = "php --version",
+        helperExit: Int32? = nil
     ) throws -> (status: Int32, stdout: String, stderr: String) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-shell-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -75,6 +93,9 @@ final class PHPShellIntegrationTests: XCTestCase {
         let resolverPrint = createManagedPHP ? "printf '%s\\n' \"$HOME/Library/Application Support/Vaelen/packages/php/8.4.23/php\"" : "printf '%s\\n' '\(resolverOutput)'"
         try executable("#!/bin/sh\n\(resolverPrint)\nexit \(resolverExit)\n", at: resolver)
         try executable("#!/bin/sh\nprintf 'external'\nprintf ' %s' \"$@\"\nprintf '\\n'\n", at: bin.appendingPathComponent("php"))
+        if let helperExit {
+            try executable("#!/bin/sh\nprintf 'helper'; for arg in \"$@\"; do printf ' <%s>' \"$arg\"; done; printf '\\n'\nprintf 'helper error\\n' >&2\nexit \(helperExit)\n", at: resolver)
+        }
         let activityFile = root.appendingPathComponent("Library/Application Support/Vaelen/state/activity")
         if let activity {
             try FileManager.default.createDirectory(at: activityFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -91,7 +112,7 @@ final class PHPShellIntegrationTests: XCTestCase {
             try Data("memory_limit = 128M\n".utf8).write(to: ini)
         }
 
-        let script = PHPShellIntegration.shellBlock + "\nphp --version\n"
+        let script = PHPShellIntegration.shellBlock + "\n" + command + "\n"
         let process = Process()
         let stdout = Pipe()
         let stderr = Pipe()

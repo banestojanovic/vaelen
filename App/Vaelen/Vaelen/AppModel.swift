@@ -95,11 +95,14 @@ final class AppModel {
         return left > right
     }
 
+    var phpReleaseNotices: [PHPUpdateReport] { phpCatalog?.updateReports?.filter { $0.upstreamRelease != nil } ?? [] }
+    var hasPHPUpdateNotice: Bool { hasInstallablePHPUpdate || !phpReleaseNotices.isEmpty }
+
     var hasInstallablePHPUpdate: Bool { !phpInstallableUpdates.isEmpty }
 
     var phpUpdateIndicatorHelp: String {
         let updates = phpInstallableUpdates
-        guard let first = updates.first else { return "" }
+        guard let first = updates.first else { return phpReleaseNotices.map { "Official PHP \($0.upstreamRelease?.version ?? $0.family) release available" }.joined(separator: ", ") }
         if updates.count == 1 {
             return "Update available: PHP \(first.from.version) → \(first.to)"
         }
@@ -115,6 +118,8 @@ final class AppModel {
     private(set) var phpRequestTarget: String?
     private(set) var parkedFolders: [ParkedPathWire] = []
     private(set) var linkedProjects: [ProjectWire] = []
+    private(set) var nodeSnapshot: NodeCommandSnapshot?
+    private(set) var nodeError: String?
     private(set) var configuredRoutes: [RouteIntent]?
     private(set) var configuredRoutesError: String?
     private(set) var localProxies: [LocalProxyWire]?
@@ -133,6 +138,8 @@ final class AppModel {
     private var client: VaelenCoreClient?
     private var refreshGeneration = 0
     private var relationshipSnapshotGeneration = 0
+    private var nodeSnapshotGeneration = 0
+    private var nodeSelectionRefreshInFlight = false
     private var refreshInFlight = false
     private var refreshRequested = false
     private var monitorTask: Task<Void, Never>?
@@ -154,6 +161,7 @@ final class AppModel {
     private(set) var settingsFixturePHPSelection: String?
     private(set) var settingsFixturePage: SettingsPage?
     private(set) var settingsFixtureOperationFailure = false
+    private(set) var verificationOpenSettingsPage: SettingsPage?
 
     static func modelForApplicationLaunch(arguments: [String]) -> AppModel {
         #if VAELEN_SETTINGS_FIXTURES
@@ -165,7 +173,13 @@ final class AppModel {
             model.settingsFixtureDark = arguments.contains("--settings-fixture-dark")
             model.settingsFixtureLight = arguments.contains("--settings-fixture-light")
             if let pageArgument = arguments.first(where: { $0.hasPrefix("--settings-page=") }) {
-                model.settingsFixturePage = SettingsPage(rawValue: String(pageArgument.dropFirst("--settings-page=".count)))
+                let page = String(pageArgument.dropFirst("--settings-page=".count))
+                model.settingsFixturePage = SettingsPage(rawValue: page)
+                if model.settingsFixturePage == nil {
+                    model.state = .unavailable
+                    model.coreLaunchError = "Fixture: unsupported Settings page \(page)."
+                    return model
+                }
             }
             if let selectionArgument = arguments.first(where: { $0.hasPrefix("--settings-fixture-php-selection=") }) {
                 model.settingsFixturePHPSelection = String(selectionArgument.dropFirst("--settings-fixture-php-selection=".count))
@@ -179,7 +193,7 @@ final class AppModel {
             case "unavailable":
                 model.state = .unavailable
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
-            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed":
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
                 let mysqlState: MySQLState = mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
                 let mysqlVersion = (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
@@ -208,24 +222,97 @@ final class AppModel {
                 )
                 let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
+                if mode.hasPrefix("node-settings-") {
+                    let projectID = UUID(uuidString: "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!
+                    let project = ProjectWire(id: projectID, name: "Storefront", path: "/fixture/projects/storefront", registration: "linked", availability: "available", detectedFramework: "Next.js")
+                    let version = try! NodeVersion("24.22.1")
+                    let pin = mode == "node-settings-selected" ? version : mode == "node-settings-unavailable" ? try! NodeVersion("26.12.1") : nil
+                    let packageJSON = Data(#"{"version":"24.22.1","platform":"darwin","architecture":"arm64","artifactSHA256":"fixture","receiptVersion":1}"#.utf8)
+                    let package = try? JSONDecoder().decode(NodePackageIdentity.self, from: packageJSON)
+                    model.linkedProjects = [project]
+                    if mode == "node-settings-selected" {
+                        let projectDomain = Project(
+                            id: ProjectID(rawValue: projectID),
+                            name: project.name,
+                            rootPath: CanonicalPath(url: URL(fileURLWithPath: project.path, isDirectory: true)),
+                            registrationKind: .linked,
+                            availability: .available,
+                            detectedFramework: project.detectedFramework
+                        )
+                        let php = ProjectObservedPHP(
+                            installedVersions: ["8.3.22", "8.4.24"],
+                            runningVersions: [],
+                            resolvedVersion: "8.3.22",
+                            resolvedState: "not-running",
+                            defaultVersion: "8.4.24",
+                            overrideVersion: "8.3.22"
+                        )
+                        let observed = ProjectObservedEnvironment(
+                            php: php,
+                            mysql: nil,
+                            mailpit: nil,
+                            route: ProjectObservedRoute(intentExists: false, routerState: .stopped, routerHealth: .unknown),
+                            dns: DNSStatus(state: .notInstalled, ownership: .none, health: "not-installed"),
+                            tls: TLSStatus(state: .absent),
+                            standardPorts: StandardPortsStatus(state: .absent)
+                        )
+                        let derived = ProjectDerivedEnvironment(
+                            framework: ProjectFrameworkInspection(framework: "Next.js", confidence: .unknown, evidence: []),
+                            phpResolution: "resolved",
+                            dbEndpoint: ProjectEndpointObservation(configuredHost: nil, configuredPort: nil, expectedHost: nil, expectedPort: nil, matches: nil),
+                            mailEndpoint: ProjectEndpointObservation(configuredHost: nil, configuredPort: nil, expectedHost: nil, expectedPort: nil, matches: nil),
+                            mailAuthentication: ProjectMailAuthentication(requirement: .unknown),
+                            routeDocumentRootMatches: nil,
+                            configCache: ProjectConfigCacheObservation(state: "unknown", cachePath: "/fixture/projects/storefront/bootstrap/cache/config.php")
+                        )
+                        model.projectReports = [ProjectEnvironmentReport(
+                            identity: ProjectEnvironmentIdentity(project: projectDomain),
+                            desired: ProjectDesiredEnvironment(file: .absent),
+                            configured: ProjectConfiguredEnvironment(envFile: "/fixture/projects/storefront/.env", envFilePresent: false),
+                            observed: observed,
+                            derived: derived,
+                            secret: ProjectSecretEnvironment(databasePassword: .unknown, mailPassword: .unknown),
+                            diagnostics: []
+                        )]
+                    }
+                    let record = NodeProjectRecord(id: ProjectID(rawValue: projectID), name: project.name, path: project.path, pin: pin)
+                    model.nodeSnapshot = NodeCommandSnapshot(
+                        releases: NodeRelease.reviewed,
+                        selections: [ProjectNodeSelection(record: record, runtimeAvailable: mode != "node-settings-unavailable", detail: mode == "node-settings-unavailable" ? "The pinned Node package is missing." : nil)],
+                        installedPackages: package.map { [$0] } ?? []
+                    )
+                }
                 let phpUpdateFixture = mode.hasPrefix("php-update")
                 let phpUpdateSuccess = mode == "php-update-success"
-                let phpUpdateReview = mode == "php-update-review"
+                let phpProjectOverrideFixture = mode == "node-settings-selected"
+                let phpReleaseFixture = mode.hasPrefix("php-release")
+                let phpUpdateReview = mode == "php-update-review" || phpReleaseFixture
+                let phpPackageUpdateFixture = phpUpdateFixture || mode == "php-release-coexist"
                 let phpFixtureSourceVersion = phpUpdateReview ? "8.4.24" : "8.4.23"
-                let phpFixtureTargetVersion = phpUpdateReview ? "8.4.27" : "8.4.25"
-                let phpSettingsFixture = mode.hasPrefix("php-settings") || phpUpdateFixture
+                let phpFixtureTargetVersion = mode == "php-release-coexist" ? "8.4.26" : phpUpdateReview ? "8.4.27" : "8.4.25"
+                let phpSettingsFixture = mode.hasPrefix("php-settings") || phpUpdateFixture || phpReleaseFixture
                 let fixtureVersions = phpSettingsFixture
-                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: phpFixtureSourceVersion, running: true, isDefault: mode != "php-settings-no-default" && !phpUpdateSuccess, updateAvailable: phpUpdateFixture && !phpUpdateSuccess ? true : nil, latestVersion: phpUpdateFixture && !phpUpdateSuccess ? phpFixtureTargetVersion : nil), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)] + (phpUpdateFixture ? [PHPRuntimeVersion(version: "8.4.9", running: false), PHPRuntimeVersion(version: "8.3.29", running: false)] : []) + (phpUpdateSuccess ? [PHPRuntimeVersion(version: "8.4.25", running: false, isDefault: true)] : [])
-                : [PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)]
+                    ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: phpFixtureSourceVersion, running: true, isDefault: mode != "php-settings-no-default" && !phpUpdateSuccess, updateAvailable: phpPackageUpdateFixture && !phpUpdateSuccess ? true : nil, latestVersion: phpPackageUpdateFixture && !phpUpdateSuccess ? phpFixtureTargetVersion : nil), PHPRuntimeVersion(version: "8.5.0", running: false, isDefault: false)] + (phpUpdateFixture ? [PHPRuntimeVersion(version: "8.4.9", running: false), PHPRuntimeVersion(version: "8.3.29", running: false)] : []) + (phpUpdateSuccess ? [PHPRuntimeVersion(version: "8.4.25", running: false, isDefault: true)] : [])
+                    : phpProjectOverrideFixture
+                        ? [PHPRuntimeVersion(version: "8.3.22", running: false, isDefault: false), PHPRuntimeVersion(version: "8.4.24", running: false, isDefault: true)]
+                        : [PHPRuntimeVersion(version: "8.4.23", running: false, isDefault: true)]
                 model.phpCatalog = PHPRuntimeCatalog(
-                    availableVersions: phpUpdateFixture ? (phpUpdateSuccess ? ["8.5.1"] : [phpFixtureTargetVersion, "8.5.1"]) : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
-                    installedVersions: phpSettingsFixture ? fixtureVersions : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? fixtureVersions : [],
-                    defaultVersion: phpUpdateSuccess ? "8.4.25" : phpSettingsFixture && mode != "php-settings-no-default" ? phpFixtureSourceVersion : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
+                    availableVersions: phpReleaseFixture ? (mode == "php-release-coexist" ? ["8.4.26"] : []) : phpUpdateFixture ? (phpUpdateSuccess ? ["8.5.1"] : [phpFixtureTargetVersion, "8.5.1"]) : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? ["8.5.0"] : [],
+                    installedVersions: phpSettingsFixture || phpProjectOverrideFixture ? fixtureVersions : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? fixtureVersions : [],
+                    defaultVersion: phpUpdateSuccess ? "8.4.25" : phpSettingsFixture && mode != "php-settings-no-default" ? phpFixtureSourceVersion : phpProjectOverrideFixture ? "8.4.24" : mode == "partial" || mode == "installed" || mode == "install-failed" || mode == "remove-failed" ? "8.4.23" : nil,
                     runningVersions: phpSettingsFixture ? [phpFixtureSourceVersion] : [],
                     availableVersionsKnown: true,
                     catalogCheckedAt: phpUpdateFixture ? Date(timeIntervalSinceNow: -3_600) : nil,
                     catalogCheckError: mode == "php-update-check-failed" ? "The catalog could not be reached; showing the last verified versions." : nil
                 )
+                if phpReleaseFixture {
+                    let payload = Data(#"{"version":"8.4.27","date":"21 Oct 2026","tags":["security"]}"#.utf8)
+                    let release = try? PHPReleaseAdvisory.parse(payload, family: "8.4")
+                    let source = PHPReleaseSourceStatus(family: "8.4", release: release, lastAttemptAt: Date(), lastSuccessfulAt: Date(), error: mode == "php-release-stale" ? "Official PHP release check failed." : nil)
+                    let availableVersions = model.phpCatalog?.availableVersions ?? []
+                    let reports = PHPUpdateReport.project(installed: fixtureVersions, available: availableVersions, sources: [source])
+                    model.phpCatalog?.updateReports = reports
+                }
                 if mode == "php-update-progress" {
                     model.phpRequestInFlight = true
                     model.phpRequestTarget = "8.4.25"
@@ -255,13 +342,20 @@ final class AppModel {
                     model.phpConfigurationSaving = mode == "php-settings-saving"
                 } else { model.phpConfigurationReadPending = true }
             default:
-                model.isSettingsFixture = false
-                model.settingsFixtureMode = nil
+                model.state = .unavailable
+                model.coreLaunchError = "Fixture: unsupported Settings fixture \(mode)."
+                return model
             }
             return model
         }
         #endif
-        return AppModel()
+        let model = AppModel()
+        #if VAELEN_SETTINGS_FIXTURES
+        if let argument = arguments.first(where: { $0.hasPrefix("--verification-open-settings=") }) {
+            model.verificationOpenSettingsPage = SettingsPage(rawValue: String(argument.dropFirst("--verification-open-settings=".count)))
+        }
+        #endif
+        return model
     }
 
     var savedServiceIntents: Set<String>? {
@@ -345,6 +439,7 @@ final class AppModel {
                 try await client.connect()
             } catch let error as CoreClientError {
                 guard case .coreUnavailable = error else { throw error }
+                if VaelenTestRuntimePaths.isolatedSupportRoot() != nil { throw error }
                 let coreStarted = try await CoreStartupHelperGate.run(
                     reconcileHelper: { try await self.registerCurrentPrivilegedHelper() },
                     startCore: { try CoreProcessManager.shared.start() }
@@ -480,6 +575,9 @@ final class AppModel {
             state = .running(status, projects, php, routing, dns, tls, ports, mysql, mailpit)
             refreshError = nil
             await refreshPHPConfiguration()
+            if !hasRunningSnapshot, projectSettingsVisible, generation == refreshGeneration {
+                await refreshNodeSelections()
+            }
         } catch let error as CoreClientError {
             guard generation == refreshGeneration else { return }
             await client.disconnect()
@@ -935,9 +1033,14 @@ final class AppModel {
             let checkClient = makeCoreClient()
             try await checkClient.connect()
             defer { Task { await checkClient.disconnect() } }
-            phpCatalog = try await checkClient.checkPHPUpdates()
-            lastAutomaticPHPCheckRequestAt = phpCatalog?.catalogCheckedAt
-            phpCatalogCheckError = nil
+            do {
+                phpCatalog = try await checkClient.checkPHPUpdates()
+                lastAutomaticPHPCheckRequestAt = phpCatalog?.catalogCheckedAt
+                phpCatalogCheckError = nil
+            } catch {
+                phpCatalogCheckError = phpErrorMessage(error)
+                if let snapshot = try? await checkClient.phpCatalogSnapshot() { phpCatalog = snapshot }
+            }
         } catch {
             phpCatalogCheckError = phpErrorMessage(error)
         }
@@ -1264,7 +1367,7 @@ final class AppModel {
             try await reconcileProjectRelationships(using: commandClient)
             await commandClient.disconnect()
             finishRelationshipMutation()
-            Task { await refresh() }
+            Task { await refresh(); await refreshNodeSelections() }
         } catch {
             await commandClient.disconnect()
             finishRelationshipMutation(error: error)
@@ -1280,7 +1383,7 @@ final class AppModel {
             try await reconcileProjectRelationships(using: commandClient)
             await commandClient.disconnect()
             finishRelationshipMutation()
-            Task { await refresh() }
+            Task { await refresh(); await refreshNodeSelections() }
         } catch {
             await commandClient.disconnect()
             finishRelationshipMutation(error: error)
@@ -1295,6 +1398,61 @@ final class AppModel {
         catch { relationshipError = error.localizedDescription }
     }
 
+    func refreshNodeSelections() async {
+        guard !isSettingsFixture, !relationshipMutationInFlight, !nodeSelectionRefreshInFlight else { return }
+        nodeSelectionRefreshInFlight = true
+        defer { nodeSelectionRefreshInFlight = false }
+        nodeSnapshotGeneration += 1
+        let generation = nodeSnapshotGeneration
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            let snapshot = try await commandClient.nodeCommand(NodeCommandRequest(action: .list, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path))
+            if generation == nodeSnapshotGeneration, !relationshipMutationInFlight {
+                nodeSnapshot = snapshot
+                nodeError = nil
+            }
+            await commandClient.disconnect()
+        } catch {
+            await commandClient.disconnect()
+            if generation == nodeSnapshotGeneration, !relationshipMutationInFlight {
+                nodeError = error.localizedDescription
+            }
+        }
+    }
+
+    func setProjectNode(_ project: ProjectWire, version: NodeVersion?) async {
+        guard !isSettingsFixture else {
+            nodeError = "Node operations are disabled in isolated Settings fixtures."
+            return
+        }
+        let operation = version.map { "Selecting Node \($0) for \(project.name)…" } ?? "Using invocation PATH for \(project.name)…"
+        guard beginRelationshipMutation(operation) else { return }
+        nodeSnapshotGeneration += 1
+        nodeError = nil
+        let commandClient = makeCoreClient()
+        let selector = project.id?.uuidString ?? project.path
+        do {
+            try await commandClient.connect()
+            if let version, !(nodeSnapshot?.installedPackages.contains(where: { $0.version == version }) ?? false) {
+                nodeSnapshot = try await commandClient.nodeCommand(NodeCommandRequest(action: .install, version: version, workingDirectory: project.path))
+            }
+            let action: NodeCommandAction = version == nil ? .useDefault : .isolate
+            nodeSnapshot = try await commandClient.nodeCommand(NodeCommandRequest(action: action, version: version, selector: selector, workingDirectory: project.path))
+            await commandClient.disconnect()
+            finishRelationshipMutation()
+            nodeError = nil
+        } catch {
+            let message = error.localizedDescription
+            if let snapshot = try? await commandClient.nodeCommand(NodeCommandRequest(action: .list, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)) {
+                nodeSnapshot = snapshot
+            }
+            await commandClient.disconnect()
+            nodeError = message
+            finishRelationshipMutation(error: error)
+        }
+    }
+
     func startMonitoring() {
         guard !isSettingsFixture else { return }
         guard monitorTask == nil else { return }
@@ -1305,7 +1463,12 @@ final class AppModel {
         guard !isSettingsFixture else { return }
         guard projectSettingsVisible != visible else { return }
         projectSettingsVisible = visible
-        if visible { Task { await refreshProjectRelationships() } }
+        if visible {
+            Task {
+                await refreshProjectRelationships()
+                await refreshNodeSelections()
+            }
+        }
         else {
             relationshipSnapshotGeneration += 1
             projectRelationshipsRefreshRequested = false
@@ -1315,6 +1478,7 @@ final class AppModel {
     func refreshProjectRelationshipsIfVisible() async {
         guard projectSettingsVisible else { return }
         await refreshProjectRelationships()
+        await refreshNodeSelections()
     }
 
     private func refreshProjectRelationships() async {

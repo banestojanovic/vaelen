@@ -17,6 +17,8 @@ private struct PHPConfigurationEditorPreference: Codable {
 }
 
 enum CLICommand {
+    case node(action: NodeCommandAction, version: NodeVersion?, selector: String?, json: Bool)
+    case nodeExec(arguments: [String])
     case help(path: [String])
     case version
     case status(json: Bool)
@@ -259,7 +261,8 @@ struct VaelenCLIMain {
                 printHelp(usage)
                 exit(0)
             }
-            if arguments.first != "composer", arguments.last == "--help" || arguments.last == "-h" {
+            let forwardsNodeCommand = arguments.count >= 4 && arguments.first == "node" && arguments[1] == "exec" && arguments[2] == "--"
+            if arguments.first != "composer", !forwardsNodeCommand, arguments.last == "--help" || arguments.last == "-h" {
                 printHelp(CLIDocumentation.focusedText(for: Array(arguments.dropLast()).filter { $0 != "help" }))
                 exit(0)
             }
@@ -289,6 +292,9 @@ struct VaelenCLIMain {
                 exit(0)
             }
             switch command {
+            case .nodeExec(let arguments):
+                let plan = try NodeExecCommand.plan(arguments: arguments, workingDirectory: FileManager.default.currentDirectoryPath, environment: ProcessInfo.processInfo.environment, layout: .init())
+                try NodeExecCommand.replaceProcess(with: plan)
             case .shellStatus:
                 let status = try PHPShellIntegration.status()
                 let tint = status.contains("Enabled") ? 32 : status.contains("Broken") ? 31 : 90
@@ -340,6 +346,7 @@ struct VaelenCLIMain {
                 fail("\(command) exited with status \(status).", code: siteInfoProcessExitCode(status))
             }
         } catch {
+            if let nodeError = error as? NodeError { fail(nodeError.localizedDescription, code: 1) }
             if let composerError = error as? ComposerScriptError {
                 fail(composerError.localizedDescription ?? "Unable to locate a compatible Composer script.", code: 1)
             }
@@ -350,6 +357,30 @@ struct VaelenCLIMain {
     static func parse(_ args: [String]) throws -> CLICommand {
         guard let first = args.first else { throw CLIError.usage }
         switch first {
+        case "node":
+            guard args.count >= 2 else { return .help(path: ["node"]) }
+            if args[1] == "exec" {
+                guard args.count >= 4, args[2] == "--" else { throw CLIError.message("Usage: val node exec -- COMMAND [ARGUMENT...]") }
+                return .nodeExec(arguments: Array(args.dropFirst(3)))
+            }
+            let json = args.contains("--json")
+            guard args.filter({ $0 == "--json" }).count <= 1 else { throw CLIError.message("Pass --json only once.") }
+            let values = args.dropFirst(2).filter { $0 != "--json" }
+            switch args[1] {
+            case "list", "versions", "isolated":
+                guard values.isEmpty else { throw CLIError.message("Usage: val node \(args[1]) [--json]") }
+                return .node(action: args[1] == "isolated" ? .isolated : .list, version: nil, selector: nil, json: json)
+            case "install":
+                guard values.count == 1 else { throw CLIError.message("Usage: val node install EXACT_VERSION [--json]") }
+                return .node(action: .install, version: try NodeVersion(values[values.startIndex]), selector: nil, json: json)
+            case "isolate":
+                guard values.count == 1 || values.count == 2 else { throw CLIError.message("Usage: val node isolate EXACT_VERSION [PROJECT] [--json]") }
+                return .node(action: .isolate, version: try NodeVersion(values[values.startIndex]), selector: values.count == 2 ? values[values.index(after: values.startIndex)] : nil, json: json)
+            case "use-default":
+                guard values.count <= 1 else { throw CLIError.message("Usage: val node use-default [PROJECT] [--json]") }
+                return .node(action: .useDefault, version: nil, selector: values.first, json: json)
+            default: throw CLIError.message("Unknown Node command. Use list, install, isolate, use-default, isolated, or exec.")
+            }
         case "--version", "-V":
             guard args.count == 1 else { throw CLIError.usage }
             return .version
@@ -719,6 +750,10 @@ struct VaelenCLIMain {
 
     private static func execute(_ command: CLICommand, client: VaelenCoreClient, workingDirectory: String) async throws {
         switch command {
+        case .node(let action, let version, let selector, let json):
+            print(try nodeCommandOutput(await client.nodeCommand(.init(action: action, version: version, selector: selector, workingDirectory: workingDirectory)), json: json))
+        case .nodeExec:
+            throw CLIError.message("Node exec must run before connecting to Core.")
         case .version:
             print("Vaelen \(VaelenBuildInfo.version)")
         case .help(let path):

@@ -2,7 +2,7 @@ import Foundation
 import SQLite3
 
 public final class ProjectRepository: @unchecked Sendable {
-    private let store: SQLiteStateStore
+    internal let store: SQLiteStateStore
     public init(store: SQLiteStateStore) { self.store = store }
 
     public func upsert(_ record: LinkedProjectRecord) throws {

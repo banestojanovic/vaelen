@@ -35,6 +35,29 @@ private final class PausedPHPDownloader: @unchecked Sendable {
     func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
 }
 
+private final class PausedNodeAcquirer: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var entered = false
+    private var released = false
+    func acquire() throws {
+        condition.lock()
+        entered = true
+        condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock()
+        throw NodeError.unavailable("Controlled Node acquisition failure.")
+    }
+    func waitUntilEntered() async -> Bool {
+        for _ in 0..<200 {
+            if hasEntered() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+    private func hasEntered() -> Bool { condition.lock(); defer { condition.unlock() }; return entered }
+    func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+
 private final class CompletionFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
@@ -1024,6 +1047,51 @@ final class DispatcherTests: XCTestCase {
         _ = await shutdownTask.value
         XCTAssertEqual(module.operationState()?.phase, .failed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: layout.stagingDirectoryURL.path) && ((try? FileManager.default.contentsOfDirectory(atPath: layout.stagingDirectoryURL.path).isEmpty) == false), "staging artifacts must be cleaned")
+    }
+
+    func testNodeInstallShutdownWaitsForStagingCleanup() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("node-dispatch-shutdown-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support"), logsDirectoryURL: root.appendingPathComponent("logs"))
+        let release = NodeRelease(
+            version: try NodeVersion("24.22.1"),
+            architecture: NodePackageManager.hostArchitecture,
+            sha256: String(repeating: "0", count: 64),
+            npmVersion: "11.19.1",
+            contentManifestSHA256: String(repeating: "0", count: 64)
+        )
+        let gate = PausedNodeAcquirer()
+        defer { gate.release() }
+        let manager = NodePackageManager(layout: layout, catalog: [release]) { _, _ in try gate.acquire() }
+        let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
+        let dispatcher = try CoreRequestDispatcher(runtime: .init(version: "test", pid: 1), registry: ProjectRegistry(store: store), node: manager)
+        let installRequest = IPCRequest(method: .nodeCommand, params: .nodeCommand(.init(.init(action: .install, version: release.version, workingDirectory: root.path))))
+        let installTask = Task { await dispatcher.dispatch(installRequest, handshaken: true) }
+        guard await gate.waitUntilEntered() else {
+            gate.release()
+            _ = await installTask.value
+            return XCTFail("injected Node acquisition should pause during installation")
+        }
+        let stagesWhilePaused = try FileManager.default.contentsOfDirectory(atPath: manager.packagesURL.path).filter { $0.hasPrefix(".stage-") }
+        XCTAssertEqual(stagesWhilePaused.count, 1)
+
+        let shutdownFinished = CompletionFlag()
+        let shutdownTask = Task {
+            let result = await dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true)
+            shutdownFinished.markCompleted()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(shutdownFinished.isCompleted(), "shutdown must wait for the Node package operation and its cleanup")
+        gate.release()
+
+        let install = await installTask.value
+        XCTAssertNotNil(install.response.error, "controlled acquisition failure should be reported")
+        _ = await shutdownTask.value
+        XCTAssertTrue(shutdownFinished.isCompleted())
+        let remainingStages = try FileManager.default.contentsOfDirectory(atPath: manager.packagesURL.path).filter { $0.hasPrefix(".stage-") }
+        XCTAssertTrue(remainingStages.isEmpty, "shutdown must return only after temporary Node stages are removed")
     }
 
     func testPHPInstallProgressTravelsOverSeparateUnixIPCClient() async throws {

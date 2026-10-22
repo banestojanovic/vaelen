@@ -1125,8 +1125,9 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
     /// Versions the provider advertises that Vaelen has not yet recorded a
     /// verified package for, so they are not installable.
     public let advertisedUnverifiedVersions: [String]
+    public var updateReports: [PHPUpdateReport]?
 
-    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String], availableVersionsKnown: Bool = true, catalogCheckedAt: Date? = nil, catalogCheckError: String? = nil, catalogAvailability: PHPCatalogAvailability? = nil, advertisedUnverifiedVersions: [String] = []) {
+    public init(availableVersions: [String], installedVersions: [PHPRuntimeVersion], defaultVersion: String?, runningVersions: [String], availableVersionsKnown: Bool = true, catalogCheckedAt: Date? = nil, catalogCheckError: String? = nil, catalogAvailability: PHPCatalogAvailability? = nil, advertisedUnverifiedVersions: [String] = [], updateReports: [PHPUpdateReport]? = nil) {
         self.availableVersions = Self.sortedUnique(availableVersions).sorted { Self.versionSort($1, $0) }
         self.installedVersions = installedVersions.reduce(into: [String: PHPRuntimeVersion]()) { result, value in
             guard result[value.version] == nil else { return }
@@ -1138,6 +1139,7 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
         self.catalogCheckedAt = catalogCheckedAt
         self.catalogCheckError = catalogCheckError
         self.catalogAvailability = catalogAvailability
+        self.updateReports = updateReports
         self.advertisedUnverifiedVersions = advertisedUnverifiedVersions.sorted { Self.versionSort($1, $0) }
     }
 
@@ -1147,7 +1149,7 @@ public struct PHPRuntimeCatalog: Codable, Equatable, Sendable {
             let value = byVersion[runtime.version]
             return PHPRuntimeVersion(version: runtime.version, series: runtime.series, running: runtime.running, isDefault: runtime.isDefault, updateAvailable: runtime.updateAvailable, latestVersion: runtime.latestVersion, usedByProjectCount: value?.total ?? 0, explicitProjectCount: value?.explicit ?? 0, inheritedProjectCount: value?.inherited ?? 0)
         }
-        return PHPRuntimeCatalog(availableVersions: availableVersions, installedVersions: updated, defaultVersion: defaultVersion, runningVersions: runningVersions, availableVersionsKnown: availableVersionsKnown, catalogCheckedAt: catalogCheckedAt, catalogCheckError: catalogCheckError, catalogAvailability: catalogAvailability, advertisedUnverifiedVersions: advertisedUnverifiedVersions)
+        return PHPRuntimeCatalog(availableVersions: availableVersions, installedVersions: updated, defaultVersion: defaultVersion, runningVersions: runningVersions, availableVersionsKnown: availableVersionsKnown, catalogCheckedAt: catalogCheckedAt, catalogCheckError: catalogCheckError, catalogAvailability: catalogAvailability, advertisedUnverifiedVersions: advertisedUnverifiedVersions, updateReports: updateReports)
     }
 
     public init(availableVersions: [String], packages: [PHPPackage], statuses: [PHPStatus], defaultVersion: String?, updates: [PHPUpdateObservation] = []) {
@@ -1386,6 +1388,7 @@ public final class PHPModule: @unchecked Sendable {
     private let layout: VaelenFilesystemLayout
     private let location: any PHPManifestLocation
     private let includesBundledCatalog: Bool
+    private let officialReleaseStore: PHPReleaseAdvisoryStore?
     private let artifactTransfer: @Sendable (URL, URL, PHPArtifactProgressSink) throws -> Void
     private let manager = FileManager.default
     private let lock = NSLock()
@@ -1421,11 +1424,14 @@ public final class PHPModule: @unchecked Sendable {
 
     public init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false) {
         self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog
+        self.officialReleaseStore = nil
         self.artifactTransfer = { source, destination, progress in try Self.transferArtifact(source: source, destination: destination, progress: progress) }
     }
 
-    init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false, artifactTransfer: @escaping @Sendable (URL, URL, PHPArtifactProgressSink) throws -> Void) {
-        self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog; self.artifactTransfer = artifactTransfer
+    init(layout: VaelenFilesystemLayout, location: any PHPManifestLocation, includesBundledCatalog: Bool = false, officialReleaseStore: PHPReleaseAdvisoryStore? = nil, artifactTransfer: (@Sendable (URL, URL, PHPArtifactProgressSink) throws -> Void)? = nil) {
+        self.layout = layout; self.location = location; self.includesBundledCatalog = includesBundledCatalog
+        self.officialReleaseStore = officialReleaseStore
+        self.artifactTransfer = artifactTransfer ?? { source, destination, progress in try Self.transferArtifact(source: source, destination: destination, progress: progress) }
     }
 
     /// PHP as the installed product provides it: the catalog shipped inside the
@@ -1472,13 +1478,23 @@ public final class PHPModule: @unchecked Sendable {
         let availability = bundled?.catalogAvailability() ?? .unconfirmed
         let advertised = bundled?.advertisedUnverifiedVersions() ?? []
         if case .failure = availableResult {
-            return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: false, catalogCheckedAt: check.0, catalogCheckError: check.1, catalogAvailability: availability, advertisedUnverifiedVersions: advertised)
+            return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: false, catalogCheckedAt: check.0, catalogCheckError: check.1, catalogAvailability: availability, advertisedUnverifiedVersions: advertised, updateReports: PHPUpdateReport.project(installed: catalog.installedVersions, available: catalog.availableVersions, sources: officialReleases.snapshot(families: installedFamilies())))
         }
-        return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: true, catalogCheckedAt: check.0, catalogCheckError: check.1, catalogAvailability: availability, advertisedUnverifiedVersions: advertised)
+        return PHPRuntimeCatalog(availableVersions: catalog.availableVersions, installedVersions: catalog.installedVersions, defaultVersion: catalog.defaultVersion, runningVersions: catalog.runningVersions, availableVersionsKnown: true, catalogCheckedAt: check.0, catalogCheckError: check.1, catalogAvailability: availability, advertisedUnverifiedVersions: advertised, updateReports: PHPUpdateReport.project(installed: catalog.installedVersions, available: catalog.availableVersions, sources: officialReleases.snapshot(families: installedFamilies())))
     }
 
-    public func refreshCatalogIfNeeded() throws { try location.refreshCatalogIfNeeded() }
-    public func checkCatalogNow() throws { try location.checkCatalogNow() }
+    private var officialReleases: PHPReleaseAdvisoryStore { officialReleaseStore ?? PHPReleaseAdvisoryStore(directory: layout.stateDirectoryURL) }
+    private func installedFamilies() -> [String] { Array(Set(eligibleInstalledVersions().compactMap { PHPVersion($0.version)?.family })) }
+    public func refreshCatalogIfNeeded() throws {
+        try location.refreshCatalogIfNeeded()
+    }
+    public func checkCatalogNow() throws {
+        try location.checkCatalogNow()
+    }
+
+    public func refreshOfficialReleaseAdvisories(force: Bool) {
+        officialReleases.refresh(families: installedFamilies(), force: force)
+    }
 
     public func operationState() -> PHPOperationState? {
         lock.lock(); defer { lock.unlock() }; return activeOperation ?? lastOperation

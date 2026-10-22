@@ -26,8 +26,8 @@ struct SettingsView: View {
                         HStack(spacing: 5) {
                             Label("PHP", systemImage: "curlybraces")
                             Spacer(minLength: 2)
-                            if model.hasInstallablePHPUpdate {
-                                Image(systemName: "arrow.down.circle.fill")
+                            if model.hasPHPUpdateNotice {
+                                Image(systemName: model.hasInstallablePHPUpdate ? "arrow.down.circle.fill" : "exclamationmark.shield.fill")
                                     .font(.system(size: 10))
                                     .foregroundStyle(Color.accentColor)
                                     .help(model.phpUpdateIndicatorHelp)

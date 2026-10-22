@@ -238,6 +238,9 @@ struct StatusView: View {
                     ServicesView(status: status, php: php, routing: routing, dns: dns, tls: tls, ports: ports, mysql: mysql, mailpit: mailpit, model: model)
                 }
             }
+            ForEach(model.phpReleaseNotices, id: \.family) { report in
+                PHPReleaseNoticeView(report: report)
+            }
             if let update = model.phpInstallableUpdates.first {
                 phpUpdatePrompt(update)
             }
@@ -612,5 +615,30 @@ struct PopoverSectionHeading: View {
             .foregroundStyle(.secondary)
             .textCase(.uppercase)
             .tracking(0.45)
+    }
+}
+
+struct PHPReleaseNoticeView: View {
+    let report: PHPUpdateReport
+
+    var body: some View {
+        if let release = report.upstreamRelease {
+            VStack(alignment: .leading, spacing: 5) {
+                Label("PHP \(release.version) \(release.isSecurity ? "security release" : "released")", systemImage: release.isSecurity ? "exclamationmark.shield.fill" : "info.circle")
+                    .font(.caption.weight(.semibold)).foregroundStyle(release.isSecurity ? Color.orange : Color.accentColor)
+                Text("Official PHP release · \(release.formattedReleaseDate())")
+                    .font(.caption2).foregroundStyle(.secondary)
+                if !report.upstreamPackageAvailable {
+                    Text("A Vaelen package for PHP \(release.version) is not currently available.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if report.source.error != nil {
+                    Text("Showing the last confirmed official release. The latest check failed.")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
+                Link("Release notes on php.net", destination: release.announcementURL).font(.caption)
+            }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+        }
     }
 }

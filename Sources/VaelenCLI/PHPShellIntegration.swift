@@ -39,6 +39,12 @@ enum PHPShellIntegration {
       fi
       PHPRC="$_vaelen_php_ini" PHP_INI_SCAN_DIR="" "$_vaelen_php_path" "$@"
     }
+    function node() {
+      "$HOME/Library/Application Support/Vaelen/bin/vaelen-php-resolver" node exec -- node "$@"
+    }
+    function npm() {
+      "$HOME/Library/Application Support/Vaelen/bin/vaelen-php-resolver" node exec -- npm "$@"
+    }
     # <<< Vaelen PHP runtime resolution <<<
     """#
 
@@ -64,7 +70,7 @@ enum PHPShellIntegration {
         if scan.blocks.count > 1 { return "Shell integration: Broken (multiple Vaelen blocks in \(zshrcURL.path))" }
         guard let block = scan.blocks.first else { return "Shell integration: Disabled" }
         guard block == (try template()), resolverIsOwnedAndValid() else {
-            return "Shell integration: Broken (block or resolver is missing, modified, or not executable)"
+            return "Shell integration: Broken (block or helper is missing, modified, or not executable)"
         }
         return "Shell integration: Enabled (zsh)"
     }
@@ -158,7 +164,7 @@ enum PHPShellIntegration {
             throw CLIError.message("Refusing to replace an unowned file at \(resolverURL.path). Move it aside, then run `val shell install` again.")
         }
         guard let executable = Bundle.main.executableURL?.resolvingSymlinksInPath(), fileManager.isExecutableFile(atPath: executable.path) else {
-            throw CLIError.message("Unable to locate the Vaelen CLI executable to install the PHP resolver.")
+            throw CLIError.message("Unable to locate the Vaelen CLI executable to install the shell helper.")
         }
         try fileManager.createDirectory(at: resolverDirectory, withIntermediateDirectories: true)
         let temporary = resolverDirectory.appendingPathComponent(".vaelen-php-resolver.\(UUID().uuidString)")
@@ -187,14 +193,14 @@ enum PHPShellIntegration {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0, let line = String(data: data, encoding: .utf8), let digest = line.split(whereSeparator: \.isWhitespace).first else {
-            throw CLIError.message("Unable to verify the installed Vaelen PHP resolver.")
+            throw CLIError.message("Unable to verify the installed Vaelen shell helper.")
         }
         return String(digest)
     }
 
     private static func replace(_ temporary: URL, at destination: URL) throws {
         if rename(temporary.path, destination.path) != 0 {
-            throw CLIError.message("Unable to update the Vaelen PHP resolver at \(destination.path).")
+            throw CLIError.message("Unable to update the Vaelen shell helper at \(destination.path).")
         }
     }
 

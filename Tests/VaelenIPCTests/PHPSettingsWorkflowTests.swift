@@ -34,6 +34,46 @@ final class PHPSettingsWorkflowTests: XCTestCase {
         XCTAssertEqual(location.refreshCount, 1, "Automatic update discovery remains separate and supported")
     }
 
+    func testOfficialReleaseChecksStayOutOfStartupAndSnapshotPaths() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-official-boundary-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let liveRoot = VaelenFilesystemLayout().phpPackagesDirectoryURL
+        let metadata = (try? FileManager.default.contentsOfDirectory(at: liveRoot, includingPropertiesForKeys: nil)) ?? []
+        guard let live = metadata.filter({ $0.lastPathComponent.hasPrefix("8.4.") }).sorted(by: { $0.path < $1.path }).compactMap({
+            try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: $0.appendingPathComponent(".vaelen-package.json")))
+        }).first else {
+            throw XCTSkip("Read-only installed PHP 8.4 required for isolated eligibility check")
+        }
+        let directory = layout.phpPackagesDirectoryURL.appendingPathComponent(live.version)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let package = PHPPackage(version: live.version, architecture: live.architecture, packagePath: directory.path, cliPath: live.cliPath, fpmPath: live.fpmPath, source: live.source, cliSHA256: live.cliSHA256, fpmSHA256: live.fpmSHA256, installedAt: live.installedAt)
+        try JSONEncoder().encode(package).write(to: directory.appendingPathComponent(".vaelen-package.json"))
+        let fetches = OfficialReleaseFetchCounter()
+        let official = PHPReleaseAdvisoryStore(directory: layout.stateDirectoryURL, fetch: { _ in
+            fetches.record()
+            return Data(#"{"version":"8.4.27","date":"21 Oct 2026","tags":[]}"#.utf8)
+        })
+        let location = CountingPHPManifestLocation()
+        let module = PHPModule(layout: layout, location: location, officialReleaseStore: official)
+        XCTAssertEqual(module.eligibleInstalledVersions().count, 1)
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, php: module)
+        await dispatcher.restoreServicesOnStartup()
+        for _ in 0..<100 where location.refreshCount == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(location.refreshCount, 1)
+        XCTAssertEqual(fetches.count, 0, "Service restoration must not check official releases")
+        _ = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
+        _ = await dispatcher.dispatch(IPCRequest(method: .phpCatalogSnapshot), handshaken: true)
+        XCTAssertEqual(fetches.count, 0)
+        _ = await dispatcher.dispatch(IPCRequest(method: .phpCatalog), handshaken: true)
+        XCTAssertEqual(fetches.count, 1, "Automatic update checking must refresh official releases even when the provider fails")
+        let explicit = await dispatcher.dispatch(IPCRequest(method: .phpCatalogCheck), handshaken: true)
+        XCTAssertNotNil(explicit.response.error, "Provider failure must remain visible")
+        XCTAssertEqual(fetches.count, 2, "Explicit update checking must force the independent official source")
+        XCTAssertEqual(try module.runtimeCatalog().updateReports?.first?.upstreamRelease?.version, "8.4.27")
+    }
+
     func testCachedInstallPublishesCacheVerificationInstallAndCompletionPhases() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-cache-progress-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -221,4 +261,11 @@ private final class CountingPHPManifestLocation: PHPManifestLocation, @unchecked
         lock.lock(); count += 1; lock.unlock()
         throw PHPModuleError.manifestUnavailable
     }
+}
+
+private final class OfficialReleaseFetchCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func record() { lock.lock(); value += 1; lock.unlock() }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
 }
