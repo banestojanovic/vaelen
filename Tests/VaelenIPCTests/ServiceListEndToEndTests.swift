@@ -12,6 +12,7 @@ final class ServiceListEndToEndTests: XCTestCase {
             let instance: String
             let state: String
             let endpoints: [String: String]
+            let observationError: String?
         }
 
         let complete: Bool
@@ -146,6 +147,75 @@ final class ServiceListEndToEndTests: XCTestCase {
                 } catch {
                     preserveRoot = true
                     throw NSError(domain: "ServiceListEndToEndTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Private Core shutdown could not be confirmed; fixture preserved at \(root.path). Original failure: \(originalError). Shutdown failure: \(error)"])
+                }
+            }
+            if !preserveRoot { try? FileManager.default.removeItem(at: root) }
+            throw originalError
+        }
+        if !preserveRoot { try FileManager.default.removeItem(at: root) }
+    }
+
+    func testActualValChildReportsPartialInventoryWhenMySQLObservationFails() async throws {
+        guard let valPath = ProcessInfo.processInfo.environment["VAELEN_VAL_EXECUTABLE"] else {
+            throw XCTSkip("Set VAELEN_VAL_EXECUTABLE to the actual built val binary by running Scripts/tests/val-service-list-test.sh.")
+        }
+        let root = URL(fileURLWithPath: "/private/tmp/vsl-partial-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        try FileManager.default.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
+        let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
+        let registry = ProjectRegistry(store: store)
+        let dispatcher = try CoreRequestDispatcher(
+            runtime: CoreRuntime(version: "test", pid: getpid()),
+            registry: registry,
+            mysql: nil,
+            mailpit: MailpitModule(layout: layout),
+            serviceIntents: ServiceIntentStore(url: layout.stateDirectoryURL.appendingPathComponent("service-intents.json")),
+            logs: CoreLogCatalog(layout: layout)
+        )
+        let paths = CoreEndpointPaths(layout: layout)
+        let server = DaemonServer(paths: paths, dispatcher: dispatcher)
+        let serverExited = DispatchSemaphore(value: 0)
+        let serverTask = Task.detached {
+            defer { serverExited.signal() }
+            try server.run()
+        }
+        var serverStopped = false
+        var preserveRoot = false
+        do {
+            for _ in 0..<200 where !FileManager.default.fileExists(atPath: paths.socketPath) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: paths.socketPath))
+
+            let result = try runVal(valPath, root: root, preserveRoot: &preserveRoot)
+            XCTAssertNotEqual(result.status, 0, "stdout: \(result.output)\nstderr: \(result.error)")
+            XCTAssertFalse(result.error.isEmpty, "incomplete inventory should explain itself on stderr")
+            XCTAssertTrue(result.error.localizedCaseInsensitiveContains("incomplete"), result.error)
+            let inventory = try JSONDecoder().decode(Inventory.self, from: Data(result.output.utf8))
+            XCTAssertFalse(inventory.complete)
+            XCTAssertEqual(inventory.services.count, 2)
+            let mysql = try XCTUnwrap(inventory.services.first { $0.service == "mysql" })
+            XCTAssertEqual(mysql.state, "unavailable")
+            XCTAssertFalse(try XCTUnwrap(mysql.observationError).isEmpty)
+            let mailpit = try XCTUnwrap(inventory.services.first { $0.service == "mailpit" })
+            XCTAssertEqual(mailpit.state, "notInstalled")
+            XCTAssertEqual(mailpit.endpoints, [
+                "smtp": "127.0.0.1:\(MailpitModule.smtpPort)",
+                "web": "http://127.0.0.1:\(MailpitModule.httpPort)"
+            ])
+
+            let stopError = try await stopServer(paths: paths, serverTask: serverTask, serverExited: serverExited)
+            serverStopped = true
+            if let stopError { throw NSError(domain: "ServiceListEndToEndTests", code: 8, userInfo: [NSLocalizedDescriptionKey: "Private Core exited with a shutdown error: \(stopError)"]) }
+        } catch {
+            let originalError = error
+            if !serverStopped {
+                do {
+                    _ = try await stopServer(paths: paths, serverTask: serverTask, serverExited: serverExited)
+                    serverStopped = true
+                } catch {
+                    preserveRoot = true
+                    throw NSError(domain: "ServiceListEndToEndTests", code: 9, userInfo: [NSLocalizedDescriptionKey: "Private Core shutdown could not be confirmed; fixture preserved at \(root.path). Original failure: \(originalError). Shutdown failure: \(error)"])
                 }
             }
             if !preserveRoot { try? FileManager.default.removeItem(at: root) }
