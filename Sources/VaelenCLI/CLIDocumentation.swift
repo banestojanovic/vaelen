@@ -27,7 +27,7 @@ enum CLIDocumentation {
 
     private static let overviewCommands: [(String, [(String, String)])] = [
         ("Projects", [("val link", "Link and serve a project."), ("val links", "List linked projects and hosts."), ("val sites", "List configured sites."), ("val park", "Discover sites inside a workspace."), ("val project status", "Inspect a project's runtime state.")]),
-        ("Runtime", [("val php versions", "See available PHP runtimes."), ("val php use <version>", "Select shell PHP."), ("val composer [arguments...]", "Run Composer with the effective project PHP."), ("val service list", "List default MySQL and Mailpit status."), ("val mysql status", "Check managed MySQL."), ("val mailpit status", "Check Mailpit."), ("val logs [ID]", "List or read a bounded managed log tail.")]),
+        ("Runtime", [("val php versions", "See available PHP runtimes."), ("val php use <version>", "Select shell PHP."), ("val composer [arguments...]", "Run Composer with the effective project PHP."), ("val service available", "List CLI-supported default services."), ("val service list", "List default MySQL and Mailpit status."), ("val mysql status", "Check managed MySQL."), ("val mailpit status", "Check Mailpit."), ("val logs [ID]", "List or read a bounded managed log tail.")]),
         ("Web & networking", [("val secure [host]", "Enable local HTTPS."), ("val route list", "List configured routes."), ("val proxy list", "List local development proxies."), ("val dns status", "Check local DNS."), ("val doctor", "Check Core and managed services.")])
     ]
 
@@ -39,7 +39,7 @@ enum CLIDocumentation {
         "php": [("versions", "List available and installed PHP."), ("use / default", "Select shell PHP or server default."), ("install / update / remove", "Manage PHP packages."), ("start / stop / status", "Control and inspect PHP-FPM."), ("exec / resolve", "Run PHP or resolve project-effective PHP."), ("config", "Open managed PHP configuration.")],
         "mysql": [("versions", "List available and installed MySQL."), ("install / use", "Manage and select MySQL."), ("initialize", "Initialize the selected data directory."), ("start / stop / status", "Control and inspect MySQL.")],
         "mailpit": [("versions", "List available and installed Mailpit."), ("install", "Install a managed Mailpit version."), ("start / stop / status", "Control and inspect Mailpit."), ("open", "Open the Mailpit web interface.")],
-        "service": [("list", "List MySQL and Mailpit status observations.")],
+        "service": [("available", "List CLI-supported default services."), ("list", "List MySQL and Mailpit status observations.")],
         "site": [("driver", "Inspect framework evidence and configured routes."), ("info", "Run Laravel Artisan about with project PHP.")],
         "routing": [("status", "Show managed Caddy status."), ("start / stop", "Control managed Caddy.")],
         "route": [("list", "List configured routes."), ("add", "Add a route with an explicit target."), ("remove", "Remove a route by ID."), ("associate", "Associate a route with a project.")],
@@ -113,6 +113,7 @@ enum CLIDocumentation {
         command("Runtime", ["mailpit", "stop"], ["val mailpit stop"], "Stop managed Mailpit.", examples: ["val mailpit stop"], parses: [["mailpit", "stop"]]),
         command("Runtime", ["mailpit", "status"], ["val mailpit status", "val mailpit status --json"], "Show Mailpit runtime state.", examples: ["val mailpit status"], parses: [["mailpit", "status"], ["mailpit", "status", "--json"]]),
         command("Runtime", ["mailpit", "open"], ["val mailpit open"], "Open the Mailpit web interface when the service is running.", examples: ["val mailpit open"], parses: [["mailpit", "open"]]),
+        command("Runtime", ["service", "available"], ["val service available", "val service available --json"], "List CLI-supported service types and actions without checking installation or runtime status.", examples: ["val service available", "val service available --json"], notes: ["Only MySQL and Mailpit are supported, both for the default service only. This is an offline capability listing, not availability or health status."], parses: [["service", "available"], ["service", "available", "--json"]]),
         command("Runtime", ["service", "list"], ["val service list", "val service list --json"], "List the legacy default MySQL and Mailpit services without changing them.", examples: ["val service list", "val service list --json"], notes: ["MySQL and Mailpit are queried independently and sequentially. A failed observation remains as an unavailable row and makes the command exit nonzero after output. This is not an atomic snapshot."], parses: [["service", "list"], ["service", "list", "--json"]]),
         command("Networking", ["routing", "status"], ["val routing status"], "Show Caddy routing state.", examples: ["val routing status"], parses: [["routing", "status"]]),
         command("Networking", ["networking"], ["val networking"], "Show DNS, TLS, ports, router and route commands. Flat commands remain available.", examples: ["val networking"], parses: [["networking"]]),

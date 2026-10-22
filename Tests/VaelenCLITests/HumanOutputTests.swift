@@ -15,6 +15,17 @@ final class HumanOutputTests: XCTestCase {
         XCTAssertTrue(VaelenCLIMain.helpText(for: ["list"]).contains("Usage: val list"))
     }
 
+    func testServiceAvailableParsesOfflineFormsAndRejectsExtraArguments() throws {
+        guard case .serviceAvailable(json: false) = try VaelenCLIMain.parse(["service", "available"]) else {
+            return XCTFail("service available should parse without Core")
+        }
+        guard case .serviceAvailable(json: true) = try VaelenCLIMain.parse(["service", "available", "--json"]) else {
+            return XCTFail("service available --json should parse without Core")
+        }
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["service", "available", "mysql"]))
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["service", "available", "--json", "extra"]))
+    }
+
     func testDocumentedInvocationExamplesAreAcceptedByParserAndFocusedHelpExists() {
         for entry in CLIDocumentation.entries {
             XCTAssertFalse(entry.parserExamples.isEmpty, "No parser contract recorded for \(entry.forms)")
@@ -148,7 +159,7 @@ final class HumanOutputTests: XCTestCase {
             ["mysql", "versions"], ["mysql", "install", "8.4"], ["mysql", "use", "8.4"],
             ["mysql", "initialize"], ["mysql", "start"], ["mysql", "stop"], ["mysql", "status"],
             ["mailpit", "versions"], ["mailpit", "install", "latest"], ["mailpit", "start"], ["mailpit", "stop"],
-            ["mailpit", "status"], ["mailpit", "open"], ["service", "list"], ["service", "list", "--json"], ["routing", "status"], ["routing", "start"], ["routing", "stop"],
+            ["mailpit", "status"], ["mailpit", "open"], ["service", "list"], ["service", "list", "--json"], ["service", "available"], ["service", "available", "--json"], ["routing", "status"], ["routing", "start"], ["routing", "stop"],
             ["route", "list"], ["route", "add", "demo.test", "/tmp/public"],
             ["route", "add", "demo.test", "/tmp/public", "--tls"],
             ["route", "remove", "00000000-0000-0000-0000-000000000001"],
@@ -170,7 +181,7 @@ final class HumanOutputTests: XCTestCase {
             ["project", "php", "--version"], ["php", "versions", "--bad"], ["php", "install", "8.4", "extra"],
             ["php", "status", "8.4", "--bad"], ["php", "exec", "-v"], ["php", "resolve", "--bad"],
             ["shell", "status", "extra"], ["mysql", "status", "--bad"], ["mysql", "start", "extra"],
-            ["mailpit", "versions", "extra"], ["service", "available"], ["service", "list", "--bad"], ["service", "list", "x"], ["routing", "status", "extra"], ["route", "list", "--bad"],
+            ["mailpit", "versions", "extra"], ["service", "available", "extra"], ["service", "list", "--bad"], ["service", "list", "x"], ["routing", "status", "extra"], ["route", "list", "--bad"],
             ["route", "add", "demo.test", "/tmp/public", "--bad"], ["dns", "install", "--takeover", "--bad"],
             ["tls", "status", "--bad"], ["ports", "status", "--bad"], ["not-a-command"]
         ]

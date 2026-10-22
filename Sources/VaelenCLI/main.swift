@@ -76,6 +76,7 @@ enum CLICommand {
     case mailpitStatus(json: Bool)
     case mailpitOpen
     case serviceList(json: Bool)
+    case serviceAvailable(json: Bool)
     case routingStatus
     case routingStart
     case routingStop
@@ -281,6 +282,10 @@ struct VaelenCLIMain {
             }
             if case .help(let path) = command {
                 printHelp(helpText(for: path))
+                exit(0)
+            }
+            if case .serviceAvailable(let json) = command {
+                print(try ServiceAvailableFormatter.render(.supported, json: json))
                 exit(0)
             }
             switch command {
@@ -571,8 +576,11 @@ struct VaelenCLIMain {
             }
         case "service":
             guard args.count >= 2 else { return .help(path: [first]) }
-            guard args[1] == "list" else { throw CLIError.usage }
-            return .serviceList(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            switch args[1] {
+            case "list": return .serviceList(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            case "available": return .serviceAvailable(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            default: throw CLIError.usage
+            }
         case "dns":
             if args.count == 1 { return .help(path: [first]) }
             guard args.count >= 2 else { throw CLIError.usage }
@@ -1118,6 +1126,8 @@ struct VaelenCLIMain {
             guard inventory.complete else {
                 throw CLIError.message("Service inventory is incomplete because one or more status observations failed.")
             }
+        case .serviceAvailable(let json):
+            print(try ServiceAvailableFormatter.render(.supported, json: json))
          case .mailpitOpen:
              let result = try await client.mailpitStatus(); guard result.state == .running else { throw CLIError.message("Mailpit is not healthy; start it before opening \(result.uiEndpoint).") }; let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/open"); process.arguments = [result.uiEndpoint]; try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { throw CLIError.message("Unable to open \(result.uiEndpoint).") }
         case .routingStatus:

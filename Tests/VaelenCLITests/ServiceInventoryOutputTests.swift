@@ -12,7 +12,9 @@ final class ServiceInventoryOutputTests: XCTestCase {
         }
         XCTAssertThrowsError(try VaelenCLIMain.parse(["service", "list", "--unknown"]))
         XCTAssertThrowsError(try VaelenCLIMain.parse(["service", "list", "extra"]))
-        XCTAssertThrowsError(try VaelenCLIMain.parse(["service", "available"]))
+        guard case .serviceAvailable(json: false) = try VaelenCLIMain.parse(["service", "available"]) else {
+            return XCTFail("service available did not parse")
+        }
         XCTAssertTrue(CLIDocumentation.focusedText(for: ["service", "list"]).contains("val service list --json"))
     }
 
