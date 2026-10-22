@@ -2,7 +2,7 @@
 
 ## Pstack in Codex
 
-Use the installed pstack plugin's Codex mapping at `docs/harness/codex.md` relative to its plugin root. Use Codex's native `spawn_agent` and `wait_agent` tools for pstack delegation. Do not substitute `Scripts/vaelen-agents`, OpenCode, detached agent processes, or another orchestration adapter.
+Use the installed pstack plugin's Codex mapping at `docs/harness/codex.md` relative to its plugin root. Use Codex's native `spawn_agent` and `wait_agent` tools for pstack delegation.
 
 Do not create explorer or verification subagents automatically. Implementation and review subagents are created only as the Codex model routing below describes.
 
