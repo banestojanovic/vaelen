@@ -809,27 +809,11 @@ public struct BundledPHPManifestLocation: PHPManifestLocation {
         request.timeoutInterval = 15
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        let session = URLSession(configuration: .ephemeral)
-        let box = PHPRemoteResultBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        session.dataTask(with: request) { data, response, error in
-            if let data { box.set(.success((data, response as? HTTPURLResponse))) }
-            else { box.set(.failure(error ?? PHPModuleError.catalogUnavailable("The PHP provider feed could not be reached."))) }
-            semaphore.signal()
-        }.resume()
-        semaphore.wait()
-        session.finishTasksAndInvalidate()
-        let (data, response): (Data, HTTPURLResponse?)
-        do { (data, response) = try box.get()!.get() }
+        do { return try PHPMetadataRequest.fetch(request: request, allowedHosts: ["dl.static-php.dev"]) }
         catch {
             let cause = error as NSError
             throw PHPModuleError.catalogUnavailable("The PHP provider feed could not be reached (network error \(cause.code)).")
         }
-        // A provider error page must never be recorded as a successful check.
-        guard let response, (200..<300).contains(response.statusCode) else {
-            throw PHPModuleError.catalogUnavailable(response.map { "The PHP provider feed returned HTTP \($0.statusCode)." } ?? "The PHP provider feed returned no HTTP response.")
-        }
-        return data
     }
 }
 
@@ -1254,6 +1238,56 @@ private final class PHPRemoteResultBox: @unchecked Sendable {
     private var value: Result<(Data, HTTPURLResponse?), Error>?
     func set(_ value: Result<(Data, HTTPURLResponse?), Error>) { lock.lock(); self.value = value; lock.unlock() }
     func get() -> Result<(Data, HTTPURLResponse?), Error>? { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+enum PHPMetadataRequest {
+    static func fetch(url: URL, allowedHosts: Set<String>, configuration: URLSessionConfiguration = .ephemeral) throws -> Data {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        return try fetch(request: request, allowedHosts: allowedHosts, configuration: configuration)
+    }
+
+    static func fetch(request: URLRequest, allowedHosts: Set<String>, configuration: URLSessionConfiguration = .ephemeral) throws -> Data {
+        let delegate = PHPMetadataRedirectDelegate(allowedHosts: allowedHosts)
+        guard delegate.permits(request) else { throw URLError(.unsupportedURL) }
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        let box = PHPRemoteResultBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        session.dataTask(with: request) { data, response, error in
+            if let data, let response = response as? HTTPURLResponse,
+               let url = response.url, delegate.permits(URLRequest(url: url)) {
+                box.set(.success((data, response)))
+            }
+            else { box.set(.failure(error ?? PHPModuleError.catalogUnavailable("unreachable"))) }
+            semaphore.signal()
+        }.resume()
+        semaphore.wait()
+        session.finishTasksAndInvalidate()
+        let (data, response): (Data, HTTPURLResponse?)
+        do { (data, response) = try box.get()!.get() } catch { throw error }
+        guard let response, (200..<300).contains(response.statusCode) else { throw PHPModuleError.catalogUnavailable("metadata unavailable") }
+        return data
+    }
+}
+
+private final class PHPMetadataRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let allowedHosts: Set<String>
+
+    init(allowedHosts: Set<String>) { self.allowedHosts = allowedHosts }
+
+    func permits(_ request: URLRequest) -> Bool {
+        guard let url = request.url,
+              url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(), allowedHosts.contains(host),
+              url.port == nil || url.port == 443,
+              url.user == nil, url.password == nil else { return false }
+        return true
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        guard permits(request) else { completionHandler(nil); task.cancel(); return }
+        completionHandler(request)
+    }
 }
 
 private final class PHPArtifactTransferDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
@@ -1904,7 +1938,7 @@ public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog 
         try? manager.createDirectory(at: destination, withIntermediateDirectories: true)
         let isLegacy = manifest.release?.url == PHPPackageProvider.legacyBaseURL
         let licenseBase = isLegacy ? PHPPackageProvider.legacyLicenseBaseURL : PHPPackageProvider.licenseBaseURL
-        if let notices = manifest.build?.notices, !notices.isEmpty {
+        if let notices = manifest.build?.notices {
             for name in notices where !name.contains("/") && !name.contains("..") {
                 guard let text = try? fetchText("\(licenseBase)/\(name)") else { continue }
                 try? text.write(to: destination.appendingPathComponent(name), atomically: true, encoding: .utf8)
@@ -1929,17 +1963,7 @@ public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog 
         else { throw PHPModuleError.invalidManifest("PHP provider notice URL is not permitted.") }
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
-        let box = PHPRemoteResultBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        URLSession(configuration: .ephemeral).dataTask(with: request) { data, response, error in
-            if let data { box.set(.success((data, response as? HTTPURLResponse))) }
-            else { box.set(.failure(error ?? PHPModuleError.catalogUnavailable("unreachable"))) }
-            semaphore.signal()
-        }.resume()
-        semaphore.wait()
-        let (data, response): (Data, HTTPURLResponse?)
-        do { (data, response) = try box.get()!.get() } catch { throw PHPModuleError.catalogUnavailable("unreachable") }
-        guard let response, (200..<300).contains(response.statusCode) else { throw PHPModuleError.catalogUnavailable("notice unavailable") }
+        let data = try PHPMetadataRequest.fetch(request: request, allowedHosts: PHPPackageProvider.artifactHosts)
         return String(data: data, encoding: .utf8) ?? ""
     }
 

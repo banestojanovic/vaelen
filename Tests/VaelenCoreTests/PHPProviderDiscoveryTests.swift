@@ -40,6 +40,9 @@ final class PHPProviderDiscoveryTests: XCTestCase {
         var intermediate = URLComponents(string: "https://static-php-cli.fra1.digitaloceanspaces.com/redirect")!
         intermediate.queryItems = [URLQueryItem(name: "target", value: "https://outside.invalid/payload")]
         try assertArtifactRedirectRefused(intermediate.url!.absoluteString)
+        let hosts = PHPArtifactRedirectProtocol.requestedURLs.compactMap(\.host)
+        XCTAssertTrue(hosts.contains("static-php-cli.fra1.digitaloceanspaces.com"), "The allowed intermediate host must be reached.")
+        XCTAssertFalse(hosts.contains("outside.invalid"), "The forbidden next hop must be rejected before a request reaches it.")
     }
 
     func testArtifactRedirectRejectsHTTPSDowngrade() throws {
@@ -52,12 +55,70 @@ final class PHPProviderDiscoveryTests: XCTestCase {
         }
     }
 
+    func testProviderMetadataRedirectAcceptsProviderFeedResponse() throws {
+        let body = try fetchMetadata(from: "https://dl.static-php.dev/feed", allowedHosts: ["dl.static-php.dev"])
+        XCTAssertEqual(body, PHPArtifactRedirectProtocol.payload)
+    }
+
+    func testProviderMetadataRedirectRejectsFeedRedirectToUnlistedHost() {
+        assertMetadataRedirectRefused("https://dl.static-php.dev/redirect?target=https%3A%2F%2Foutside.invalid%2Fbody", allowedHosts: ["dl.static-php.dev"], forbiddenHost: "outside.invalid")
+    }
+
+    func testProviderMetadataRedirectRejectsFeedHTTPSDowngrade() {
+        PHPArtifactRedirectProtocol.resetRequests()
+        XCTAssertThrowsError(try fetchMetadata(from: "https://dl.static-php.dev/redirect?target=http%3A%2F%2Fdl.static-php.dev%2Fbody", allowedHosts: ["dl.static-php.dev"]))
+        XCTAssertFalse(PHPArtifactRedirectProtocol.requestedURLs.contains { $0.scheme == "http" }, "The downgraded destination must never receive a request.")
+    }
+
+    func testProviderMetadataRedirectRejectsInvalidInitialOrigin() {
+        XCTAssertThrowsError(try fetchMetadata(from: "https://user@dl.static-php.dev/feed", allowedHosts: ["dl.static-php.dev"]))
+        XCTAssertThrowsError(try fetchMetadata(from: "https://dl.static-php.dev:8443/feed", allowedHosts: ["dl.static-php.dev"]))
+    }
+
+    func testProviderMetadataRedirectAllowsLicenseRedirectToListedObjectStorage() throws {
+        let body = try fetchMetadata(from: "https://dl.static-php.dev/redirect?target=%2Fdown", allowedHosts: PHPPackageProvider.artifactHosts)
+        XCTAssertEqual(body, PHPArtifactRedirectProtocol.payload)
+    }
+
+    func testProviderMetadataRedirectRejectsLicenseRedirectOutsideAllowlist() {
+        assertMetadataRedirectRefused("https://dl.static-php.dev/redirect?target=https%3A%2F%2Foutside.invalid%2Fbody", allowedHosts: PHPPackageProvider.artifactHosts, forbiddenHost: "outside.invalid", expectedIntermediateHost: "dl.static-php.dev")
+    }
+
+    func testProviderMetadataRedirectRejectsOutsideHostAfterAllowedObjectStorageHop() {
+        var secondHop = URLComponents(string: "https://static-php-cli.fra1.digitaloceanspaces.com/redirect")!
+        secondHop.queryItems = [URLQueryItem(name: "target", value: "https://outside.invalid/body")]
+        var firstHop = URLComponents(string: "https://dl.static-php.dev/redirect")!
+        firstHop.queryItems = [URLQueryItem(name: "target", value: secondHop.url!.absoluteString)]
+        assertMetadataRedirectRefused(firstHop.url!.absoluteString, allowedHosts: PHPPackageProvider.artifactHosts, forbiddenHost: "outside.invalid", expectedIntermediateHost: "static-php-cli.fra1.digitaloceanspaces.com")
+    }
+
+    private func assertMetadataRedirectRefused(_ url: String, allowedHosts: Set<String>, forbiddenHost: String, expectedIntermediateHost: String? = nil) {
+        PHPArtifactRedirectProtocol.resetRequests()
+        XCTAssertThrowsError(try fetchMetadata(from: url, allowedHosts: allowedHosts))
+        let hosts = PHPArtifactRedirectProtocol.requestedURLs.compactMap(\.host)
+        if let expectedIntermediateHost { XCTAssertTrue(hosts.contains(expectedIntermediateHost), "The allowed redirect origin must be reached.") }
+        XCTAssertFalse(hosts.contains(forbiddenHost), "The forbidden redirect destination must never receive a request.")
+    }
+
+    private func fetchMetadata(from url: String, allowedHosts: Set<String>) throws -> Data {
+        try PHPMetadataRequest.fetch(url: URL(string: url)!, allowedHosts: allowedHosts, configuration: {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [PHPArtifactRedirectProtocol.self]
+            return configuration
+        }())
+    }
+
     private func assertArtifactRedirectRefused(_ target: String) throws {
+        PHPArtifactRedirectProtocol.resetRequests()
         let destination = root.appendingPathComponent(UUID().uuidString)
         let samples = ProgressSamples()
         XCTAssertThrowsError(try transferThroughRedirect(to: target, destination: destination, samples: samples))
         XCTAssertTrue(samples.snapshot().isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        let targetHost = URL(string: target)?.host
+        if let targetHost, !PHPPackageProvider.artifactHosts.contains(targetHost) {
+            XCTAssertFalse(PHPArtifactRedirectProtocol.requestedURLs.contains { $0.host == targetHost }, "The disallowed host must never receive a request.")
+        }
     }
 
     private func transferThroughRedirect(to target: String, destination: URL, samples: ProgressSamples? = nil) throws {
@@ -622,15 +683,24 @@ private final class ProgressSamples: @unchecked Sendable {
 
 private final class PHPArtifactRedirectProtocol: URLProtocol, @unchecked Sendable {
     static let payload = Data("redirected artifact body".utf8)
+    private static let requestLock = NSLock()
+    nonisolated(unsafe) private static var requests = [URL]()
+
+    static var requestedURLs: [URL] { requestLock.lock(); defer { requestLock.unlock() }; return requests }
+    static func resetRequests() { requestLock.lock(); requests.removeAll(); requestLock.unlock() }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let url = request.url else { return }
-        if url.path == "/redirect",
-           let target = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "target" })?.value,
-           let destination = URL(string: target) {
+        Self.requestLock.lock(); Self.requests.append(url); Self.requestLock.unlock()
+        let target = url.path == "/down"
+            ? "https://static-php-cli.fra1.digitaloceanspaces.com/body"
+            : URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "target" })?.value
+        if (url.path == "/redirect" || url.path == "/down"),
+           let target,
+           let destination = URL(string: target, relativeTo: url)?.absoluteURL {
             let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": target])!
             client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: destination), redirectResponse: response)
         } else {

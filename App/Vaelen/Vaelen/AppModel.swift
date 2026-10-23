@@ -993,11 +993,32 @@ final class AppModel {
             phpError = message
         } else if let catalog = phpCatalog,
                   let old = catalog.installedVersions.first(where: { $0.isDefault && PHPVersion($0.version)?.family == PHPVersion(version)?.family }) {
-            let upgraded = PHPRuntimeVersion(version: version, running: false, isDefault: true, updateAvailable: false, latestVersion: version, usedByProjectCount: old.usedByProjectCount, explicitProjectCount: old.explicitProjectCount, inheritedProjectCount: old.inheritedProjectCount)
-            let versions = catalog.installedVersions.map { runtime in
-                runtime.version == old.version ? PHPRuntimeVersion(version: runtime.version, running: runtime.running, isDefault: false, updateAvailable: false, latestVersion: version, usedByProjectCount: runtime.usedByProjectCount, explicitProjectCount: runtime.explicitProjectCount, inheritedProjectCount: runtime.inheritedProjectCount) : runtime
-            } + [upgraded]
-            phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions.filter { $0 != version }, installedVersions: versions, defaultVersion: version, runningVersions: catalog.runningVersions, availableVersionsKnown: catalog.availableVersionsKnown, catalogCheckedAt: catalog.catalogCheckedAt)
+            let wasRunning = old.running == true || catalog.runningVersions.contains(old.version)
+            let upgraded = PHPRuntimeVersion(version: version, running: wasRunning, isDefault: true, updateAvailable: false, latestVersion: version, usedByProjectCount: old.usedByProjectCount, explicitProjectCount: old.explicitProjectCount, inheritedProjectCount: old.inheritedProjectCount)
+            let versions = catalog.installedVersions.filter { $0.version != old.version } + [upgraded]
+            let runningVersions = catalog.runningVersions.filter { $0 != old.version } + (wasRunning ? [version] : [])
+            phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions.filter { $0 != version }, installedVersions: versions, defaultVersion: version, runningVersions: runningVersions, availableVersionsKnown: catalog.availableVersionsKnown, catalogCheckedAt: catalog.catalogCheckedAt)
+            if let configuration = phpConfiguration {
+                let replacedConfiguration = configuration.versions.first { $0.version == old.version }
+                let settings = replacedConfiguration?.settings ?? configuration.defaultSettings
+                let inheritsDefault = replacedConfiguration?.inheritsDefault ?? true
+                let runtimeConfiguration = PHPVersionConfiguration(
+                    version: version,
+                    settings: settings,
+                    inheritsDefault: inheritsDefault,
+                    cliIniPath: "/fixture/php/\(version)/cli.ini",
+                    fpmIniPath: "/fixture/php/\(version)/fpm.ini",
+                    fpmConfigurationPath: "/fixture/php/\(version)/php-fpm.conf",
+                    fpmRunning: wasRunning
+                )
+                let remainingConfigurations = configuration.versions.filter { $0.version != old.version && $0.version != version }
+                phpConfiguration = PHPConfigurationResult(
+                    defaultSettings: configuration.defaultSettings,
+                    versions: remainingConfigurations + [runtimeConfiguration],
+                    directory: configuration.directory
+                )
+            }
+            phpSelectionRequest = version
             phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .ready)
         }
         phpRequestInFlight = false

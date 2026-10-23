@@ -6,6 +6,12 @@ import VaelenTestSupport
 @testable import VaelenIPC
 @testable import VaelenDaemonSupport
 
+private struct FPMIdentity {
+    let version: String
+    let pid: Int32
+    let startedAt: String
+}
+
 /// Update convergence through the real dispatcher/IPC path.
 ///
 /// These use a genuine same-family update pair (a real older patch and a real
@@ -16,8 +22,11 @@ import VaelenTestSupport
 @MainActor
 final class PHPUpdateConvergenceTests: XCTestCase {
     /// An older patch and its real successor in the same minor line.
-    private let sourceVersion = "8.4.23"
-    private let targetVersion = "8.4.24"
+    private var sourceVersion = "8.4.23"
+    private var targetVersion = "8.4.24"
+    private var acceptanceArtifactDirectory: URL?
+    private var fpmVersionsToCheck = Set<String>()
+    private var fpmIdentitiesToCheck = [FPMIdentity]()
 
     private var root: URL!
     private var layout: VaelenFilesystemLayout!
@@ -28,9 +37,16 @@ final class PHPUpdateConvergenceTests: XCTestCase {
 
     override func setUpWithError() throws {
         try super.setUpWithError()
+        let isRealAcceptance = (name ?? "").contains("testRealPHP8424To8427Acceptance")
         let cache = ProviderArtifactCache.shared
-        guard (try? cache.artifacts(version: sourceVersion)) != nil, (try? cache.artifacts(version: targetVersion)) != nil else {
+        guard isRealAcceptance || ((try? cache.artifacts(version: sourceVersion)) != nil && (try? cache.artifacts(version: targetVersion)) != nil) else {
             throw XCTSkip("The verified provider cache needs PHP \(sourceVersion) and \(targetVersion). Run ./Scripts/refresh-php-catalog-from-provider.sh first.")
+        }
+        if isRealAcceptance {
+            guard let path = ProcessInfo.processInfo.environment["VAELEN_PHP_ACCEPTANCE_ARTIFACT_DIR"], !path.isEmpty else {
+                throw XCTSkip("Set VAELEN_PHP_ACCEPTANCE_ARTIFACT_DIR to a private directory containing the four exact PHP 8.4.24 and 8.4.27 provider archives.")
+            }
+            acceptanceArtifactDirectory = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         }
         root = URL(fileURLWithPath: "/private/var/tmp/vaelen-update-\(UUID().uuidString.prefix(8))", isDirectory: true)
         layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
@@ -42,13 +58,16 @@ final class PHPUpdateConvergenceTests: XCTestCase {
         // Never remove a temporary root that still has a live PHP-FPM under it.
         var liveChildren: [String] = []
         if let module {
-            for version in module.installedVersions()
-            where FileManager.default.fileExists(atPath: layout.phpInstancesDirectoryURL.appendingPathComponent(version.version).appendingPathComponent("process.json").path) {
-                _ = try? module.stop(requestedVersion: version.version)
-                if FileManager.default.fileExists(atPath: layout.phpInstancesDirectoryURL.appendingPathComponent(version.version).appendingPathComponent("process.json").path) {
-                    liveChildren.append(version.version)
-                }
+            let installed = Set(module.installedVersions().map(\.version))
+            for version in fpmVersionsToCheck.union(installed) {
+                let record = layout.phpInstancesDirectoryURL.appendingPathComponent(version).appendingPathComponent("process.json")
+                guard FileManager.default.fileExists(atPath: record.path) else { continue }
+                if installed.contains(version) { _ = try? module.stop(requestedVersion: version) }
+                if FileManager.default.fileExists(atPath: record.path) { liveChildren.append(version) }
             }
+        }
+        for identity in fpmIdentitiesToCheck where Self.processIdentityIsLive(identity) {
+            liveChildren.append("\(identity.version) (PID \(identity.pid))")
         }
         module = nil
         dispatcher = nil
@@ -63,6 +82,67 @@ final class PHPUpdateConvergenceTests: XCTestCase {
     }
 
     // MARK: - Update reports a real outcome
+
+    /// Runs only when a caller supplies the exact provider archives. All
+    /// downloaded bytes and all Vaelen state stay in caller-owned or temporary
+    /// directories, and the test itself has no network source configured.
+    func testRealPHP8424To8427Acceptance() async throws {
+        sourceVersion = "8.4.24"
+        targetVersion = "8.4.27"
+        let artifactDirectory = try XCTUnwrap(acceptanceArtifactDirectory)
+        let manifests = try [sourceVersion, targetVersion].map { version -> PHPManifest in
+            let digests = try Self.acceptanceDigests(version: version, directory: artifactDirectory)
+            return PHPManifest(
+                schemaVersion: 1, module: "php", phpVersion: version, platform: "macos", architecture: "arm64",
+                build: .init(requiredExtensions: PHPPackageProvider.requiredExtensions, optionalExtensions: PHPPackageProvider.optionalExtensions, notices: []),
+                artifacts: Dictionary(uniqueKeysWithValues: ["cli", "fpm"].map { kind in
+                    (kind, PHPArtifact(file: PHPPackageProvider.artifactFile(version: version, kind: kind), url: PHPPackageProvider.artifactURL(version: version, kind: kind), sha256: digests[kind]!))
+                }),
+                verification: .init(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity, digestPinnedByReview: true),
+                release: .init(tag: PHPPackageProvider.channel, url: PHPPackageProvider.baseURL)
+            )
+        }
+        _ = try makeModule(manifests: manifests, artifactBase: artifactDirectory)
+        let module = self.module!
+        _ = try await install(sourceVersion)
+        XCTAssertEqual(try module.exec(requestedVersion: sourceVersion, workingDirectory: root.path, arguments: ["-r", "echo PHP_VERSION;"]).output.trimmingCharacters(in: .whitespacesAndNewlines), sourceVersion)
+        _ = try await selectDefault(sourceVersion)
+        let settings = PHPManagedSettings(uploadLimitMB: 24, memoryLimitMB: 640, maxExecutionTimeSeconds: 120, maxInputVariables: 4_000, postLimitMB: 32)
+        _ = try module.updateConfiguration(version: sourceVersion, settings: settings)
+        let project = try await linkProject(named: "pinned-acceptance", phpOverride: sourceVersion)
+
+        let refusal = await dispatcher.dispatch(IPCRequest(method: .phpUpdate, params: .phpVersion(PHPVersionRequest(version: targetVersion, sourceVersion: sourceVersion))), handshaken: true)
+        let refusalMessage = try XCTUnwrap(refusal.response.error?.message)
+        XCTAssertTrue(refusalMessage.contains("pinned-acceptance"), refusalMessage)
+        XCTAssertTrue(refusalMessage.contains(sourceVersion), refusalMessage)
+        XCTAssertFalse(module.installedVersions().map(\.version).contains(targetVersion))
+        XCTAssertEqual(module.defaultVersion(), sourceVersion)
+        XCTAssertEqual(try module.status(requestedVersion: sourceVersion).state, .running)
+        let pinnedVersion = try await registry.phpOverride(for: project)
+        XCTAssertEqual(pinnedVersion, sourceVersion)
+
+        try await registry.setPHPOverride(nil, for: project)
+        let sourceRecord = try Self.fpmIdentity(version: sourceVersion, layout: layout)
+        fpmIdentitiesToCheck.append(sourceRecord)
+        let result = try await update(version: targetVersion, sourceVersion: sourceVersion)
+        XCTAssertEqual(result.replacedVersion, sourceVersion)
+        XCTAssertNil(result.convergenceError)
+        XCTAssertTrue(result.wasDefault)
+        XCTAssertTrue(result.isDefault)
+        XCTAssertTrue(result.isRunning)
+        XCTAssertTrue(result.convergence.contains("cleanup"))
+        XCTAssertEqual(module.defaultVersion(), targetVersion)
+        XCTAssertFalse(module.installedVersions().map(\.version).contains(sourceVersion))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.phpPackagesDirectoryURL.appendingPathComponent(sourceVersion).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.phpInstancesDirectoryURL.appendingPathComponent(sourceVersion).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layout.phpInstancesDirectoryURL.appendingPathComponent(sourceVersion).appendingPathComponent("process.json").path))
+        XCTAssertFalse(Self.processIdentityIsLive(sourceRecord), "The exact source FPM master captured before update must have exited.")
+        XCTAssertEqual(try module.status(requestedVersion: targetVersion).state, .running)
+        XCTAssertEqual(try module.exec(requestedVersion: targetVersion, workingDirectory: root.path, arguments: ["-r", "echo PHP_VERSION;"]).output.trimmingCharacters(in: .whitespacesAndNewlines), targetVersion)
+        XCTAssertEqual(try module.configuration().versions.first { $0.version == targetVersion }?.settings, settings)
+        XCTAssertTrue(try serviceIntents.enabledServices().contains("php:\(targetVersion)"))
+        XCTAssertFalse(try serviceIntents.enabledServices().contains("php:\(sourceVersion)"))
+    }
 
     /// Updating a running default must leave the replacement healthy, running and
     /// default, with the replacement owning the saved start intent.
@@ -363,13 +443,13 @@ final class PHPUpdateConvergenceTests: XCTestCase {
     // MARK: - Support
 
     @discardableResult
-    private func makeModule(router: any Router = InMemoryRouter(), loadRoutes: Bool = true) throws -> CoreRequestDispatcher {
+    private func makeModule(router: any Router = InMemoryRouter(), loadRoutes: Bool = true, manifests suppliedManifests: [PHPManifest]? = nil, artifactBase suppliedArtifactBase: URL? = nil) throws -> CoreRequestDispatcher {
         let cache = ProviderArtifactCache.shared
-        let manifests = try [cache.manifest(version: sourceVersion), cache.manifest(version: targetVersion)]
+        let manifests = try (suppliedManifests ?? [cache.manifest(version: sourceVersion), cache.manifest(version: targetVersion)])
         let location = PHPProviderManifestLocation(
             box: .init(PHPManifestCatalog(manifests: manifests)),
             stateDirectory: layout.stateDirectoryURL,
-            artifactBase: try cache.flatDirectory()
+            artifactBase: try (suppliedArtifactBase ?? cache.flatDirectory())
         )
         let module = PHPModule(layout: layout, location: location, includesBundledCatalog: false)
         self.module = module
@@ -388,6 +468,51 @@ final class PHPUpdateConvergenceTests: XCTestCase {
         return dispatcher
     }
 
+    private static func acceptanceDigests(version: String, directory: URL) throws -> [String: String] {
+        var result: [String: String] = [:]
+        for kind in ["cli", "fpm"] {
+            let filename = PHPPackageProvider.artifactFile(version: version, kind: kind)
+            let archive = directory.appendingPathComponent(filename)
+            guard FileManager.default.fileExists(atPath: archive.path) else {
+                throw XCTSkip("Missing required provider artifact \(filename) in VAELEN_PHP_ACCEPTANCE_ARTIFACT_DIR.")
+            }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/shasum")
+            process.arguments = ["-a", "256", archive.path]
+            let output = Pipe(); process.standardOutput = output; process.standardError = FileHandle.nullDevice
+            try process.run()
+            let bytes = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0, let digest = String(data: bytes, encoding: .utf8)?.split(separator: " ").first else {
+                throw PHPModuleError.verificationFailed(filename)
+            }
+            result[kind] = String(digest)
+        }
+        return result
+    }
+
+    private static func fpmIdentity(version: String, layout: VaelenFilesystemLayout) throws -> FPMIdentity {
+        let record = layout.phpInstancesDirectoryURL.appendingPathComponent(version).appendingPathComponent("process.json")
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: Any])
+        XCTAssertEqual(object["version"] as? String, version)
+        return FPMIdentity(
+            version: version,
+            pid: try XCTUnwrap((object["pid"] as? NSNumber)?.int32Value),
+            startedAt: try XCTUnwrap(object["startedAt"] as? String, "The running FPM process record must include its start identity.")
+        )
+    }
+
+    private static func processIdentityIsLive(_ identity: FPMIdentity) -> Bool {
+        let process = Process(); let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", "\(identity.pid)", "-o", "lstart="]
+        process.standardOutput = output; process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return false }
+        let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return false }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == identity.startedAt
+    }
+
     private func install(_ version: String) async throws -> PHPPackage {
         let response = await dispatcher.dispatch(IPCRequest(method: .phpInstall, params: .phpVersion(PHPVersionRequest(version: version))), handshaken: true)
         if let error = response.response.error { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: error.message]) }
@@ -398,6 +523,7 @@ final class PHPUpdateConvergenceTests: XCTestCase {
     private func selectDefault(_ version: String) async throws -> PHPRuntimeCatalog {
         let response = await dispatcher.dispatch(IPCRequest(method: .phpDefaultSet, params: .phpVersion(PHPVersionRequest(version: version))), handshaken: true)
         if let error = response.response.error { throw NSError(domain: "Vaelen", code: 1, userInfo: [NSLocalizedDescriptionKey: error.message]) }
+        fpmVersionsToCheck.insert(version)
         return try module.runtimeCatalog()
     }
 
