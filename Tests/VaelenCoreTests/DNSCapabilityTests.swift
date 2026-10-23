@@ -239,6 +239,62 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertFalse(finalResponderStatus.listenerResponding)
     }
 
+    func testStartupTimeoutRetainsOwnedResponderForSafeRetry() async throws {
+        let childHandle = ChildHandleCapture()
+        let fixture = try makeRealFixture(contents: nil, ignoreTermination: true, binds: false, startupTimeout: 0.25, onChildLaunch: { childHandle.store($0) })
+        var identity: DNSResponderIdentity?
+        func cleanup() async {
+            try? FileManager.default.removeItem(at: fixture.ignoreTerminationFile)
+            if let identity {
+                _ = try? await fixture.responder.stop(expected: identity, timeout: 1)
+            }
+            guard let child = childHandle.load() else {
+                guard identity == nil else {
+                    XCTFail("fixture child handle is unavailable; preserving \(fixture.root.path)")
+                    return
+                }
+                try? FileManager.default.removeItem(at: fixture.root)
+                return
+            }
+            _ = child.terminateAndWait(timeout: 1)
+            guard !child.process.isRunning, !isProcessLive(child.processIdentifier) else {
+                XCTFail("fixture child termination could not be verified; preserving \(fixture.root.path)")
+                return
+            }
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+
+        do {
+            do { _ = try await fixture.responder.start(); XCTFail("a responder that never binds must time out") }
+            catch { guard case DNSCapabilityError.processFailed = error else { throw error } }
+
+            let timedOut = await fixture.responder.status()
+            let ownedIdentity = try XCTUnwrap(timedOut.identity, "the timed out child must remain an owned process")
+            identity = ownedIdentity
+            XCTAssertEqual(timedOut.state, .ownedRunning)
+            XCTAssertTrue(isProcessLive(ownedIdentity.pid))
+
+            do { _ = try await fixture.responder.start(); XCTFail("an owned responder that still does not bind must not be reported ready") }
+            catch { guard case DNSCapabilityError.processFailed = error else { throw error } }
+            let retried = await fixture.responder.status()
+            XCTAssertEqual(retried.identity, ownedIdentity)
+            XCTAssertEqual(retried.state, .ownedRunning)
+            XCTAssertFalse(retried.listenerResponding)
+            XCTAssertTrue(isProcessLive(ownedIdentity.pid))
+
+            try FileManager.default.removeItem(at: fixture.ignoreTerminationFile)
+            let stopped = try await fixture.responder.stop(expected: ownedIdentity, timeout: 1)
+            XCTAssertEqual(stopped.state, .exited)
+            XCTAssertEqual(stopped.pid, ownedIdentity.pid)
+            XCTAssertProcessGone(ownedIdentity.pid)
+            XCTAssertFalse(stopped.listenerPresent)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
     func testIndependentResolverEditPreventsResponderShutdown() async throws {
         let fixture = try makeRealFixture(contents: nil, ignoreTermination: false)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -288,14 +344,14 @@ final class DNSCapabilityTests: XCTestCase {
         XCTAssertEqual(observed.state, .unverified)
         do { _ = try await fixture.capability.remove(); XCTFail("unrelated listener prevents responder cleanup") }
         catch {
-            guard case DNSCapabilityError.responderUnverified = error else {
-                if case DNSCapabilityError.responderShutdownFailed = error { return }
-                return XCTFail("unexpected error: \(error)")
-            }
+            if case DNSCapabilityError.responderUnverified = error { }
+            else if case DNSCapabilityError.responderShutdownFailed = error { }
+            else { XCTFail("unexpected error: \(error)") }
         }
         XCTAssertTrue(unrelated.isRunning)
         XCTAssertEqual(try fixture.ledger.resolverOwnershipRecord()?.phase, .resolverRestored)
         unrelated.terminate(); unrelated.waitUntilExit()
+        XCTAssertProcessGone(unrelated.processIdentifier)
         _ = try await fixture.capability.remove()
         XCTAssertNil(try fixture.ledger.resolverOwnershipRecord())
     }
@@ -558,7 +614,7 @@ final class DNSCapabilityTests: XCTestCase {
         return Fixture(root: root, file: file, database: database, ledger: ledger, helper: helper, responder: responder, capability: DNSCapability(helper: helper, responder: responder, port: 53535, ledger: ledger))
     }
 
-    private func makeRealFixture(contents: Data?, ignoreTermination: Bool) throws -> RealFixture {
+    private func makeRealFixture(contents: Data?, ignoreTermination: Bool, binds: Bool = true, startupTimeout: TimeInterval = 2, onChildLaunch: (@Sendable (OwnedChildProcess) -> Void)? = nil) throws -> RealFixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("dns-owned-process-\(UUID().uuidString)", isDirectory: true)
         let file = root.appendingPathComponent("resolver/test")
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -569,10 +625,18 @@ final class DNSCapabilityTests: XCTestCase {
         let port = try availableUDPPort()
         let script = root.appendingPathComponent("harmless-dns-fixture.py")
         let ignoreFile = root.appendingPathComponent("ignore-sigterm")
-        let source = "import os, signal, socket, sys\nport=int(sys.argv[sys.argv.index('--port')+1])\nignore=sys.argv[sys.argv.index('--ignore-file')+1]\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('127.0.0.1',port))\ndef stop(sig,frame):\n    if not os.path.exists(ignore): raise SystemExit(0)\nsignal.signal(signal.SIGTERM,stop)\nwhile True:\n    data,peer=s.recvfrom(2048); s.sendto(data,peer)\n"
+        let bindSource = binds
+            ? "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('127.0.0.1',port))\nwhile True:\n    data,peer=s.recvfrom(2048); s.sendto(data,peer)\n"
+            : "while True: time.sleep(60)\n"
+        let source = "import os, signal, socket, sys, time\nport=int(sys.argv[sys.argv.index('--port')+1])\nignore=sys.argv[sys.argv.index('--ignore-file')+1]\ndef stop(sig,frame):\n    if not os.path.exists(ignore): raise SystemExit(0)\nsignal.signal(signal.SIGTERM,stop)\n" + bindSource
         try Data(source.utf8).write(to: script)
         if ignoreTermination { try Data("ignore".utf8).write(to: ignoreFile) }
-        let responder = DNSResponderSupervisor(layout: VaelenFilesystemLayout(rootURL: root), port: port, executablePath: "/usr/bin/python3", launchArguments: { ["-u", script.path, "--port", "\($0)", "--ignore-file", ignoreFile.path] }, startupTimeout: 2)
+        let responder: DNSResponderSupervisor
+        if let onChildLaunch {
+            responder = DNSResponderSupervisor(layout: VaelenFilesystemLayout(rootURL: root), port: port, executablePath: "/usr/bin/python3", launchArguments: { ["-u", script.path, "--port", "\($0)", "--ignore-file", ignoreFile.path] }, startupTimeout: startupTimeout, onChildLaunch: onChildLaunch)
+        } else {
+            responder = DNSResponderSupervisor(layout: VaelenFilesystemLayout(rootURL: root), port: port, executablePath: "/usr/bin/python3", launchArguments: { ["-u", script.path, "--port", "\($0)", "--ignore-file", ignoreFile.path] }, startupTimeout: startupTimeout)
+        }
         let capability = DNSCapability(helper: helper, responder: responder, port: port, ledger: ledger, responderShutdownTimeout: 0.25)
         return RealFixture(root: root, file: file, ledger: ledger, helper: helper, responder: responder, capability: capability, port: port, ignoreTerminationFile: ignoreFile, script: script)
     }
@@ -600,6 +664,23 @@ final class DNSCapabilityTests: XCTestCase {
     private func makeCapability(_ fixture: Fixture) -> DNSCapability { DNSCapability(helper: fixture.helper, responder: FixtureDNSResponder(), port: 53535, ledger: fixture.ledger) }
     private func fixtureRecord(_ fixture: Fixture) throws -> DNSResolverOwnershipRecord { try XCTUnwrap(fixture.ledger.resolverOwnershipRecord()) }
     private func awaitStatus(_ capability: DNSCapability) async -> DNSStatus { await capability.status() }
+}
+
+private final class ChildHandleCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var child: OwnedChildProcess?
+
+    func store(_ child: OwnedChildProcess) {
+        lock.lock()
+        self.child = child
+        lock.unlock()
+    }
+
+    func load() -> OwnedChildProcess? {
+        lock.lock()
+        defer { lock.unlock() }
+        return child
+    }
 }
 
 private struct UnregisteredDNSHelper: PrivilegedDNSHelper {

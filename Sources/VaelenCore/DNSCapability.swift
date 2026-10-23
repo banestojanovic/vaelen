@@ -175,7 +175,16 @@ public actor DNSResponderSupervisor: DNSResponderControlling {
         self.executablePath = (executablePath.map { URL(fileURLWithPath: $0) } ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("vaelendns")).standardizedFileURL.path
         self.launchArguments = launchArguments ?? { ["--port", "\($0)"] }
         self.startupTimeout = startupTimeout
+        self.onChildLaunch = nil
     }
+    init(layout: VaelenFilesystemLayout, port: Int = 53535, executablePath: String? = nil, launchArguments: (@Sendable (Int) -> [String])? = nil, startupTimeout: TimeInterval = 1, onChildLaunch: @escaping @Sendable (OwnedChildProcess) -> Void) {
+        self.layout = layout; self.port = port
+        self.executablePath = (executablePath.map { URL(fileURLWithPath: $0) } ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("vaelendns")).standardizedFileURL.path
+        self.launchArguments = launchArguments ?? { ["--port", "\($0)"] }
+        self.startupTimeout = startupTimeout
+        self.onChildLaunch = onChildLaunch
+    }
+    private let onChildLaunch: (@Sendable (OwnedChildProcess) -> Void)?
     public func validateExecutable() async throws {
         try validateExecutableFile()
     }
@@ -204,22 +213,36 @@ public actor DNSResponderSupervisor: DNSResponderControlling {
     public func start() throws -> DNSResponderIdentity {
         if ownedChild != nil {
             let current = status()
-            if current.state == .ownedRunning, let identity = current.identity { return identity }
+            if current.state == .ownedRunning, let identity = current.identity {
+                guard current.listenerResponding else {
+                    throw DNSCapabilityError.processFailed("Owned DNS responder PID \(identity.pid) is running but not responding")
+                }
+                return identity
+            }
         }
         if listenerPresent() { throw DNSCapabilityError.responderUnverified("127.0.0.1:\(port) already has a listener Vaelen cannot prove it started") }
         try validateExecutableFile()
         let arguments = launchArguments(port)
         let child = try OwnedChildProcess.launch(executable: URL(fileURLWithPath: executablePath), arguments: arguments, label: "Vaelen DNS responder")
-        let identity = DNSResponderIdentity(pid: child.processIdentifier, executablePath: openedExecutablePath(child.processIdentifier) ?? executablePath, arguments: arguments, startedAt: processStartIdentity(child.processIdentifier))
-        ownedChild = child; ownedIdentity = identity; lastExitedPID = nil; lastExitedIdentity = nil
+        onChildLaunch?(child)
+        lastExitedPID = nil; lastExitedIdentity = nil
         let deadline = Date().addingTimeInterval(startupTimeout)
         while Date() < deadline {
             if !child.isRunningAndReapedIfExited() { break }
-            if responds() { return identity }
+            if responds() {
+                let identity = DNSResponderIdentity(pid: child.processIdentifier, executablePath: openedExecutablePath(child.processIdentifier) ?? executablePath, arguments: arguments, startedAt: processStartIdentity(child.processIdentifier))
+                ownedChild = child; ownedIdentity = identity
+                return identity
+            }
             usleep(20_000)
         }
         if child.isRunningAndReapedIfExited() { _ = child.terminateAndWait(timeout: 1, signal: SIGTERM, waitForDescendants: false) }
-        if !child.isRunningAndReapedIfExited() { child.process.waitUntilExit(); ownedChild = nil; ownedIdentity = nil; lastExitedPID = identity.pid }
+        if child.isRunningAndReapedIfExited() {
+            let identity = DNSResponderIdentity(pid: child.processIdentifier, executablePath: openedExecutablePath(child.processIdentifier) ?? executablePath, arguments: arguments, startedAt: processStartIdentity(child.processIdentifier))
+            ownedChild = child; ownedIdentity = identity
+        } else {
+            child.process.waitUntilExit(); ownedChild = nil; ownedIdentity = nil; lastExitedPID = child.processIdentifier
+        }
         throw DNSCapabilityError.processFailed("DNS responder could not bind 127.0.0.1:\(port)")
     }
     public func stop(expected: DNSResponderIdentity, timeout: TimeInterval) throws -> DNSResponderStatus {
@@ -301,7 +324,7 @@ public actor DNSResponderSupervisor: DNSResponderControlling {
     private func processMatches(_ identity: DNSResponderIdentity) -> Bool {
         guard identity.pid > 1, processStartIdentity(identity.pid) == identity.startedAt else { return false }
         let commandLine = (try? command("/bin/ps", ["-p", "\(identity.pid)", "-o", "command="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard commandLine.contains(identity.executablePath), identity.arguments.allSatisfy({ commandLine.contains($0) }) else { return false }
+        guard identity.arguments.allSatisfy({ commandLine.contains($0) }) else { return false }
         let executable = (try? command("/usr/sbin/lsof", ["-p", "\(identity.pid)", "-a", "-d", "txt", "-Fn"])) ?? ""
         let expectedExecutable = URL(fileURLWithPath: identity.executablePath).resolvingSymlinksInPath().path
         return executable.split(separator: "\n").contains { entry in
