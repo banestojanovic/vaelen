@@ -43,49 +43,74 @@ final class NodeCLIIntegrationTests: XCTestCase {
 
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true))
         try FileManager.default.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
-        let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
         XCTAssertEqual(SQLiteStateStore.schemaVersion, 8)
-        let projects = ProjectRepository(store: store)
         let parentID = ProjectID()
         let nestedID = ProjectID()
         let siblingID = ProjectID()
         let unrelatedID = ProjectID()
-        try projects.upsert(.init(id: parentID, name: "parent", canonicalPath: parent.path))
-        try projects.upsert(.init(id: nestedID, name: "nested", canonicalPath: nested.path))
-        try projects.upsert(.init(id: siblingID, name: "sibling", canonicalPath: sibling.path))
-        try projects.upsert(.init(id: unrelatedID, name: "unrelated", canonicalPath: unrelated.path))
-        try projects.setPHPOverride("8.4.23", for: parentID)
-        try projects.setNodeOverride(try NodeVersion("22.18.0"), for: unrelatedID)
         let node = NodePackageManager(layout: layout, catalog: [release]) { _, destination in
             try FileManager.default.copyItem(at: archive, to: destination)
         }
-        let dispatcher = try CoreRequestDispatcher(runtime: .init(version: "test", pid: 1), registry: ProjectRegistry(store: store), node: node, serviceIntents: .init(url: layout.stateDirectoryURL.appendingPathComponent("service-intents.json")))
         let paths = CoreEndpointPaths(layout: layout)
-        let server = DaemonServer(paths: paths, dispatcher: dispatcher)
-        let serverExited = DispatchSemaphore(value: 0)
-        let serverTask = Task.detached { defer { serverExited.signal() }; try server.run() }
-        var serverStopped = false
+        var generation: PrivateCoreGeneration? = nil
         do {
-            try await waitForSocket(paths.socketPath)
             let projectBefore = try snapshot([parent, nested, sibling, unrelated])
-            let install = try runVal(valPath, ["node", "install", "24.22.1"], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
-            XCTAssertEqual(install.status, 0, install.output + install.error)
-            let packageURL = node.packagesURL.appendingPathComponent("24.22.1")
-            let packageContents = try snapshot([packageURL])
-            let repeatedInstall = try runVal(valPath, ["node", "install", "24.22.1"], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
-            XCTAssertEqual(repeatedInstall.status, 0, repeatedInstall.output + repeatedInstall.error)
-            XCTAssertEqual(try snapshot([packageURL]), packageContents, "Repeated install must preserve the validated package contents.")
+            do {
+                let first = try startCoreGeneration(layout: layout, paths: paths, node: node)
+                generation = first
+                try first.projects.upsert(.init(id: parentID, name: "parent", canonicalPath: parent.path))
+                try first.projects.upsert(.init(id: nestedID, name: "nested", canonicalPath: nested.path))
+                try first.projects.upsert(.init(id: siblingID, name: "sibling", canonicalPath: sibling.path))
+                try first.projects.upsert(.init(id: unrelatedID, name: "unrelated", canonicalPath: unrelated.path))
+                try first.projects.setPHPOverride("8.4.23", for: parentID)
+                try first.projects.setNodeOverride(try NodeVersion("22.18.0"), for: unrelatedID)
+                try await waitForSocket(paths.socketPath)
+                let install = try runVal(valPath, ["node", "install", "24.22.1"], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(install.status, 0, install.output + install.error)
+                let packageURL = node.packagesURL.appendingPathComponent("24.22.1")
+                let packageContents = try snapshot([packageURL])
+                let repeatedInstall = try runVal(valPath, ["node", "install", "24.22.1"], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(repeatedInstall.status, 0, repeatedInstall.output + repeatedInstall.error)
+                XCTAssertEqual(try snapshot([packageURL]), packageContents, "Repeated install must preserve the validated package contents.")
 
-            let isolate = try runVal(valPath, ["node", "isolate", "24.22.1", parent.path], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
-            XCTAssertEqual(isolate.status, 0, isolate.output + isolate.error)
-            let recordsAfterIsolate = try projects.nodeRecords()
-            XCTAssertEqual(recordsAfterIsolate.first { $0.id == parentID }?.pin?.description, "24.22.1")
-            XCTAssertNil(recordsAfterIsolate.first { $0.id == nestedID }?.pin)
-            XCTAssertNil(recordsAfterIsolate.first { $0.id == siblingID }?.pin)
-            XCTAssertEqual(recordsAfterIsolate.first { $0.id == unrelatedID }?.pin?.description, "22.18.0")
-            XCTAssertEqual(try runVal(valPath, ["node", "exec", "--", "node", "--version"], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot).output, "v24.22.1\n")
-            XCTAssertEqual(try runVal(valPath, ["node", "exec", "--", "node", "--version"], cwd: nested, root: root, path: fakeBin.path, preserveRoot: &preserveRoot).output, "v99.0.0\n")
-            XCTAssertEqual(try runVal(valPath, ["node", "exec", "--", "node", "--version"], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot).output, "v99.0.0\n")
+                let isolate = try runVal(valPath, ["node", "isolate", "24.22.1", parent.path], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(isolate.status, 0, isolate.output + isolate.error)
+                let recordsAfterIsolate = try first.projects.nodeRecords()
+                XCTAssertEqual(recordsAfterIsolate.first { $0.id == parentID }?.pin?.description, "24.22.1")
+                XCTAssertNil(recordsAfterIsolate.first { $0.id == nestedID }?.pin)
+                XCTAssertNil(recordsAfterIsolate.first { $0.id == siblingID }?.pin)
+                XCTAssertEqual(recordsAfterIsolate.first { $0.id == unrelatedID }?.pin?.description, "22.18.0")
+                try await first.stop()
+                generation = nil
+            }
+            let second = try startCoreGeneration(layout: layout, paths: paths, node: node)
+            generation = second
+            try await waitForSocket(paths.socketPath)
+
+            let restartedState = try runVal(valPath, ["node", "isolated", "--json"], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+            XCTAssertEqual(restartedState.status, 0, restartedState.output + restartedState.error)
+            let decodedState = try JSONDecoder().decode(NodeCommandResult.self, from: Data(restartedState.output.utf8)).nodeResult
+            XCTAssertEqual(decodedState.selections.filter { $0.projectID == parentID }.map { $0.pinnedVersion?.description }, ["24.22.1"])
+            XCTAssertEqual(decodedState.selections.filter { $0.projectID == unrelatedID }.map { $0.pinnedVersion?.description }, ["22.18.0"])
+
+            let unregisteredChild = parent.appendingPathComponent("unregistered-child", isDirectory: true)
+            try FileManager.default.createDirectory(at: unregisteredChild, withIntermediateDirectories: true)
+            for cwd in [parent, unregisteredChild] {
+                let nodeVersion = try runVal(valPath, ["node", "exec", "--", "node", "--version"], cwd: cwd, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(nodeVersion.status, 0, nodeVersion.error)
+                XCTAssertEqual(nodeVersion.output, "v24.22.1\n")
+                let npmVersion = try runVal(valPath, ["node", "exec", "--", "npm", "--version"], cwd: cwd, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(npmVersion.status, 0, npmVersion.error)
+                XCTAssertEqual(npmVersion.output, "11.19.1\n")
+            }
+            for cwd in [nested, sibling] {
+                let nodeVersion = try runVal(valPath, ["node", "exec", "--", "node", "--version"], cwd: cwd, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(nodeVersion.status, 0, nodeVersion.error)
+                XCTAssertEqual(nodeVersion.output, "v99.0.0\n")
+                let npmVersion = try runVal(valPath, ["node", "exec", "--", "npm", "--version"], cwd: cwd, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(npmVersion.status, 0, npmVersion.error)
+                XCTAssertEqual(npmVersion.output, "v99.0.0\n")
+            }
 
             let shellHome = root.appendingPathComponent("shell-home", isDirectory: true)
             let resolver = shellHome.appendingPathComponent("Library/Application Support/Vaelen/bin/vaelen-php-resolver")
@@ -98,16 +123,33 @@ final class NodeCLIIntegrationTests: XCTestCase {
             let defaultShell = try runShell(home: shellHome, support: layout.rootURL, cwd: sibling, path: fakeBin.path)
             XCTAssertEqual(defaultShell.status, 0, defaultShell.error)
             XCTAssertEqual(defaultShell.output, "v99.0.0\nv99.0.0\n")
-
-            let isolated = try runVal(valPath, ["node", "isolated", "--json"], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
-            XCTAssertEqual(isolated.status, 0, isolated.output + isolated.error)
-            XCTAssertTrue(isolated.output.contains(parentID.description), isolated.output)
-            XCTAssertTrue(isolated.output.contains("24.22.1"), isolated.output)
-            XCTAssertTrue(isolated.output.contains(unrelatedID.description), isolated.output)
             let listing = try runVal(valPath, ["node", "list", "--json"], cwd: parent, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
             XCTAssertEqual(listing.status, 0, listing.output + listing.error)
             XCTAssertTrue(listing.output.contains("24.22.1"), listing.output)
             XCTAssertTrue(listing.output.contains(parentID.description), listing.output)
+
+            let clearExisting = try runVal(valPath, ["node", "use-default", parentID.description], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+            XCTAssertEqual(clearExisting.status, 0, clearExisting.output + clearExisting.error)
+            for cwd in [parent, unregisteredChild] {
+                let nodeVersion = try runVal(valPath, ["node", "exec", "--", "node", "--version"], cwd: cwd, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(nodeVersion.status, 0, nodeVersion.error)
+                XCTAssertEqual(nodeVersion.output, "v99.0.0\n")
+                let npmVersion = try runVal(valPath, ["node", "exec", "--", "npm", "--version"], cwd: cwd, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+                XCTAssertEqual(npmVersion.status, 0, npmVersion.error)
+                XCTAssertEqual(npmVersion.output, "v99.0.0\n")
+            }
+            let afterClear = try runVal(valPath, ["node", "isolated", "--json"], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+            XCTAssertEqual(afterClear.status, 0, afterClear.output + afterClear.error)
+            let clearedState = try JSONDecoder().decode(NodeCommandResult.self, from: Data(afterClear.output.utf8)).nodeResult
+            XCTAssertFalse(clearedState.selections.contains { $0.projectID == parentID })
+            XCTAssertEqual(clearedState.selections.filter { $0.projectID == unrelatedID }.map { $0.pinnedVersion?.description }, ["22.18.0"])
+
+            let repin = try runVal(valPath, ["node", "isolate", "24.22.1", parent.path], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+            XCTAssertEqual(repin.status, 0, repin.output + repin.error)
+            let repinnedState = try runVal(valPath, ["node", "isolated", "--json"], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
+            XCTAssertEqual(repinnedState.status, 0, repinnedState.output + repinnedState.error)
+            let repinnedDecoded = try JSONDecoder().decode(NodeCommandResult.self, from: Data(repinnedState.output.utf8)).nodeResult
+            XCTAssertEqual(repinnedDecoded.selections.filter { $0.projectID == parentID }.map { $0.pinnedVersion?.description }, ["24.22.1"])
 
             XCTAssertEqual(try snapshot([parent, nested, sibling, unrelated]), projectBefore)
             try FileManager.default.removeItem(at: parent)
@@ -115,23 +157,42 @@ final class NodeCLIIntegrationTests: XCTestCase {
             XCTAssertEqual(missingListing.status, 0, missingListing.output + missingListing.error)
             XCTAssertTrue(missingListing.output.contains(parentID.description), missingListing.output)
             XCTAssertTrue(missingListing.output.contains("missing"), missingListing.output)
+            let missingState = try JSONDecoder().decode(NodeCommandResult.self, from: Data(missingListing.output.utf8)).nodeResult
+            XCTAssertEqual(missingState.selections.filter { $0.projectID == parentID }.map { $0.pinnedVersion?.description }, ["24.22.1"])
             let clear = try runVal(valPath, ["node", "use-default", parentID.description], cwd: sibling, root: root, path: fakeBin.path, preserveRoot: &preserveRoot)
             XCTAssertEqual(clear.status, 0, clear.output + clear.error)
-            XCTAssertNil(try projects.nodeRecords().first { $0.id == parentID }?.pin)
-            XCTAssertNil(try projects.nodeRecords().first { $0.id == siblingID }?.pin)
-            XCTAssertEqual(try projects.nodeRecords().first { $0.id == unrelatedID }?.pin?.description, "22.18.0")
-            XCTAssertEqual(try projects.phpOverride(for: parentID), "8.4.23")
+            XCTAssertNil(try second.projects.nodeRecords().first { $0.id == parentID }?.pin)
+            XCTAssertNil(try second.projects.nodeRecords().first { $0.id == siblingID }?.pin)
+            XCTAssertEqual(try second.projects.nodeRecords().first { $0.id == unrelatedID }?.pin?.description, "22.18.0")
+            XCTAssertEqual(try second.projects.phpOverride(for: parentID), "8.4.23")
 
-            try await stopServer(paths: paths, serverTask: serverTask, serverExited: serverExited)
-            serverStopped = true
+            try await second.stop()
+            generation = nil
         } catch {
             let failure = error
-            if !serverStopped {
-                do { try await stopServer(paths: paths, serverTask: serverTask, serverExited: serverExited); serverStopped = true }
-                catch { preserveRoot = true; XCTFail("Private Core shutdown could not be confirmed. Fixture preserved at \(root.path). Shutdown error: \(error). Original error: \(failure)") }
+            if let activeGeneration = generation {
+                do { try await activeGeneration.stop(); generation = nil }
+                catch {
+                    let terminationConfirmed = activeGeneration.serverExitConfirmed
+                    if !terminationConfirmed { preserveRoot = true }
+                    let fixtureDisposition = preserveRoot
+                        ? "Fixture preserved at \(root.path) because \(terminationConfirmed ? "a CLI child" : "the Private Core server") exit was not confirmed."
+                        : "Fixture will be removed because process exit was confirmed."
+                    XCTFail("Private Core shutdown failed. Termination confirmed: \(terminationConfirmed). \(fixtureDisposition) Shutdown error: \(error). Original error: \(failure)")
+                }
             }
             throw failure
         }
+    }
+
+    private func startCoreGeneration(layout: VaelenFilesystemLayout, paths: CoreEndpointPaths, node: NodePackageManager) throws -> PrivateCoreGeneration {
+        let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
+        let projects = ProjectRepository(store: store)
+        let dispatcher = try CoreRequestDispatcher(runtime: .init(version: "test", pid: 1), registry: ProjectRegistry(store: store), node: node, serviceIntents: .init(url: layout.stateDirectoryURL.appendingPathComponent("service-intents.json")))
+        let server = DaemonServer(paths: paths, dispatcher: dispatcher)
+        let exited = DispatchSemaphore(value: 0)
+        let task = Task.detached { defer { exited.signal() }; try server.run() }
+        return PrivateCoreGeneration(projects: projects, paths: paths, task: task, exited: exited)
     }
 
     private func runVal(_ executable: String, _ arguments: [String], cwd: URL, root: URL, path: String, preserveRoot: inout Bool) throws -> (status: Int32, output: String, error: String) {
@@ -200,16 +261,6 @@ final class NodeCLIIntegrationTests: XCTestCase {
         throw NSError(domain: "NodeCLIIntegrationTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "Private Core socket did not appear."])
     }
 
-    private func stopServer(paths: CoreEndpointPaths, serverTask: Task<Void, Error>, serverExited: DispatchSemaphore) async throws {
-        let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: ClientIdentity(name: "node-cli-test-stop", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))
-        let finished = DispatchSemaphore(value: 0)
-        let shutdown = Task.detached { defer { finished.signal() }; do { try await client.connect(); _ = try await client.shutdown(); await client.disconnect() } catch { await client.disconnect() } }
-        guard Self.wait(finished, seconds: 3) else { throw NSError(domain: "NodeCLIIntegrationTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Private Core shutdown request timed out."]) }
-        await shutdown.value
-        guard Self.wait(serverExited, seconds: 3) else { throw NSError(domain: "NodeCLIIntegrationTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "Private Core exit was not confirmed."]) }
-        _ = try await serverTask.value
-    }
-
     private func snapshot(_ roots: [URL]) throws -> [String: Data] {
         var result = [String: Data]()
         for root in roots where FileManager.default.fileExists(atPath: root.path) {
@@ -221,5 +272,43 @@ final class NodeCLIIntegrationTests: XCTestCase {
         return result
     }
 
-    private static func wait(_ semaphore: DispatchSemaphore, seconds: TimeInterval) -> Bool { semaphore.wait(timeout: .now() + seconds) == .success }
+    fileprivate static func wait(_ semaphore: DispatchSemaphore, seconds: TimeInterval) -> Bool { semaphore.wait(timeout: .now() + seconds) == .success }
+}
+
+private final class PrivateCoreGeneration {
+    let projects: ProjectRepository
+    private let paths: CoreEndpointPaths
+    private let task: Task<Void, Error>
+    private let exited: DispatchSemaphore
+    private var shutdownRequest: (task: Task<Void, Error>, finished: DispatchSemaphore)?
+    private(set) var serverExitConfirmed = false
+
+    init(projects: ProjectRepository, paths: CoreEndpointPaths, task: Task<Void, Error>, exited: DispatchSemaphore) {
+        self.projects = projects
+        self.paths = paths
+        self.task = task
+        self.exited = exited
+    }
+
+    func stop() async throws {
+        if shutdownRequest == nil {
+            let client = VaelenCoreClient(transport: UnixSocketTransport(path: paths.socketPath), identity: ClientIdentity(name: "node-cli-test-stop", version: VaelenBuildInfo.version, schemaCompatibilityVersion: VaelenBuildInfo.schemaCompatibilityVersion, buildIdentity: VaelenBuildInfo.buildIdentity))
+            let finished = DispatchSemaphore(value: 0)
+            let task = Task.detached { () throws -> Void in
+                defer { finished.signal() }
+                do { try await client.connect(); _ = try await client.shutdown(); await client.disconnect() }
+                catch { await client.disconnect(); throw error }
+            }
+            shutdownRequest = (task, finished)
+        }
+        guard let shutdownRequest else { throw NSError(domain: "NodeCLIIntegrationTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Private Core shutdown request was not started."]) }
+        guard NodeCLIIntegrationTests.wait(shutdownRequest.finished, seconds: 3) else { throw NSError(domain: "NodeCLIIntegrationTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Private Core shutdown request timed out."]) }
+        self.shutdownRequest = nil
+        try await shutdownRequest.task.value
+        if !serverExitConfirmed {
+            guard NodeCLIIntegrationTests.wait(exited, seconds: 3) else { throw NSError(domain: "NodeCLIIntegrationTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "Private Core exit was not confirmed."]) }
+            serverExitConfirmed = true
+        }
+        _ = try await task.value
+    }
 }
