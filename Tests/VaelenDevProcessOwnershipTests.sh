@@ -7,13 +7,16 @@ source "$repo_root/Scripts/vaelen-dev"
 # A worktree harness must recognize the canonical app's embedded processes.
 CORE="/private/tmp/vaelen-worktree/.build/release/vaelend"
 DNS="/private/tmp/vaelen-worktree/.build/release/vaelendns"
-CANONICAL_APP="/Applications/Vaelen.app"
+CANONICAL_APP="$HOME/Applications/Vaelen.app"
 
 is_owned_process_command "$CANONICAL_APP/Contents/Resources/vaelend" || {
   echo "canonical app-embedded Core was not recognized from a worktree harness" >&2; exit 1;
 }
 is_owned_process_command "$CANONICAL_APP/Contents/Resources/vaelendns --port 53535" || {
   echo "canonical app-embedded DNS was not recognized from a worktree harness" >&2; exit 1;
+}
+is_owned_process_command "/Applications/Vaelen.app/Contents/Resources/vaelend" || {
+  echo "legacy system app Core was not recognized during migration" >&2; exit 1;
 }
 is_owned_process_command "$CORE" || { echo "worktree release Core was not recognized" >&2; exit 1; }
 is_owned_process_command "$DNS --port 53535" || { echo "worktree release DNS was not recognized" >&2; exit 1; }

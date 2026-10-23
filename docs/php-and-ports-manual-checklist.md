@@ -1,6 +1,6 @@
 # Manual review checklist — PHP families and standard ports
 
-Everything here runs against the installed signed app in `/Applications/Vaelen.app`.
+Everything here runs against the installed signed app in `$HOME/Applications/Vaelen.app`.
 Nothing below mutates projects, routes, TLS state, MySQL data, or your database.
 
 ## 1. Bundled offline activation

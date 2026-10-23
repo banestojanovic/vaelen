@@ -6,15 +6,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 SUPPORT="$HOME/Library/Application Support/Vaelen"
 ARTIFACTS="$HOME/Library/Application Support/Vaelen-dev-harness/updates"
-CANONICAL="/Applications/Vaelen.app"
+APPLICATIONS="$HOME/Applications"
+CANONICAL="$APPLICATIONS/Vaelen.app"
+LEGACY="/Applications/Vaelen.app"
 SOCKET="$SUPPORT/runtime/sockets/core.sock"
 STATE_DB="$SUPPORT/state/vaelen.sqlite"
 TEAM="TFKZJV643G"
 BUNDLE_ID="dev.vaelen.app"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN="$ARTIFACTS/product-dev-$STAMP"
-OLD_APP="/Applications/Vaelen.previous-$STAMP.app"
-STAGED_APP="/Applications/.Vaelen.candidate-$STAMP.app"
+OLD_APP="$APPLICATIONS/Vaelen.previous-$STAMP.app"
+STAGED_APP="$APPLICATIONS/.Vaelen.candidate-$STAMP.app"
 DERIVED="$ROOT/.build/product-dev-release"
 APP="$DERIVED/Build/Products/Release/Vaelen.app"
 CORE="$APP/Contents/Resources/vaelend"
@@ -43,10 +45,34 @@ assert_no_process() {
   return 0
 }
 process_pid_for_command() {
-  # Consume all ps output: exiting awk early can SIGPIPE ps under pipefail.
-  ps -axo pid=,command= | awk -v exact="$1" '$2 == exact && !found { pid=$1; found=1 } END { if (found) print pid }'
+  ps -axo pid=,comm= | awk -v exact="$1" '
+    {
+      pid = $1
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+      if ($0 == exact && !found) { found = 1; result = pid }
+    }
+    END { if (found) print result }
+  '
+}
+process_count_for_command() {
+  ps -axo comm= | awk -v exact="$1" '
+    $0 == exact { count++ }
+    END { print count+0 }
+  '
+}
+process_count_for_bundle_executable() {
+  ps -axo comm= | awk -v suffix="$1" '
+    {
+      if (length($0) >= length(suffix) && substr($0, length($0) - length(suffix) + 1) == suffix) count++
+    }
+    END { print count+0 }
+  '
 }
 
+if [[ ! -e "$APPLICATIONS" && ! -L "$APPLICATIONS" ]]; then
+  mkdir "$APPLICATIONS" || die "could not create home Applications directory"
+fi
+[[ -d "$APPLICATIONS" && ! -L "$APPLICATIONS" && "$(stat -f %u "$APPLICATIONS")" == "$(id -u)" ]] || die "home Applications directory must be a real directory owned by the current user"
 [[ -d "$CANONICAL" && -f "$STATE_DB" ]] || die "installed app or live state database is missing"
 [[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 8 ]] || die "live database is not schema v8; refusing this update"
 [[ "$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)" == 8 ]] || die "candidate source does not declare schema v8"
@@ -132,9 +158,18 @@ printf 'installed-app-tree-sha256=%s\ninstalled-embedded-core-sha256=%s\n' \
 # Request normal GUI termination. Only the exact harness-recorded repository
 # Core may be signalled, and only when it is the sole verified socket owner.
 note "Requesting normal GUI shutdown"
-GUI_PID=""
-GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
-if [[ -n "$GUI_PID" ]]; then
+CANONICAL_GUI="$CANONICAL/Contents/MacOS/Vaelen"
+LEGACY_GUI="$LEGACY/Contents/MacOS/Vaelen"
+CANONICAL_CORE="$CANONICAL/Contents/Resources/vaelend"
+LEGACY_CORE="$LEGACY/Contents/Resources/vaelend"
+GUI_COUNT=$(( $(process_count_for_command "$CANONICAL_GUI") + $(process_count_for_command "$LEGACY_GUI") ))
+CORE_COUNT=$(( $(process_count_for_command "$CANONICAL_CORE") + $(process_count_for_command "$LEGACY_CORE") ))
+ALL_GUI_COUNT="$(process_count_for_bundle_executable "/Vaelen.app/Contents/MacOS/Vaelen")"
+ALL_CORE_COUNT="$(process_count_for_bundle_executable "/Vaelen.app/Contents/Resources/vaelend")"
+(( GUI_COUNT <= 1 && CORE_COUNT <= 1 && ALL_GUI_COUNT == GUI_COUNT && ALL_CORE_COUNT == CORE_COUNT )) || die "multiple or unrecognized GUI/Core owners are running; refusing ambiguous shutdown"
+GUI_PID="$(process_pid_for_command "$CANONICAL_GUI")"
+[[ -n "$GUI_PID" ]] || GUI_PID="$(process_pid_for_command "$LEGACY_GUI")"
+if [[ "$GUI_COUNT" == 1 ]]; then
   # Quit is asynchronous in the app. AppleScript may report cancellation while
   # the GUI and Core complete their normal shutdown; process/socket state is the
   # authority, not the AppleScript reply.
@@ -143,14 +178,16 @@ if [[ -n "$GUI_PID" ]]; then
   fi
 fi
 for _ in {1..80}; do
-  GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
+  GUI_PID="$(process_pid_for_command "$CANONICAL_GUI")"
+  [[ -n "$GUI_PID" ]] || GUI_PID="$(process_pid_for_command "$LEGACY_GUI")"
   [[ -z "$GUI_PID" ]] && break
   sleep .25
 done
 [[ -z "$GUI_PID" ]] || die "canonical GUI remains running; no process was killed"
 
 for _ in {1..80}; do
-  EMBEDDED_PID="$(process_pid_for_command "$CANONICAL/Contents/Resources/vaelend")"
+  EMBEDDED_PID="$(process_pid_for_command "$CANONICAL_CORE")"
+  [[ -n "$EMBEDDED_PID" ]] || EMBEDDED_PID="$(process_pid_for_command "$LEGACY_CORE")"
   [[ -z "$EMBEDDED_PID" && ! -e "$SOCKET" ]] && break
   sleep .25
 done
@@ -176,31 +213,23 @@ if [[ -S "$SOCKET" ]]; then
 fi
 assert_no_process "$CURRENT_CORE"
 assert_no_process "$CANONICAL/Contents/Resources/vaelend"
+assert_no_process "$LEGACY/Contents/Resources/vaelend"
 [[ ! -e "$SOCKET" ]] || die "Core socket exists without a verified owner; refusing to install"
 
 # Copy and verify on the target volume. Keep the prior app beside the new one
 # for immediate rollback; a separate copy is already preserved under $RUN.
 [[ ! -e "$OLD_APP" && ! -e "$STAGED_APP" ]] || die "update staging path already exists"
-note "Staging signed candidate in /Applications"
-osascript - "$APP" "$STAGED_APP" <<'APPLESCRIPT' || die "authorized candidate staging failed"
-on run argv
-  set sourceApp to item 1 of argv
-  set stagedApp to item 2 of argv
-  do shell script "/usr/bin/ditto " & quoted form of sourceApp & " " & quoted form of stagedApp with administrator privileges
-end run
-APPLESCRIPT
+note "Staging signed candidate in $APPLICATIONS"
+ditto "$APP" "$STAGED_APP" || die "candidate staging failed"
 codesign --verify --deep --strict "$STAGED_APP" || die "staged candidate signature verification failed"
 [[ "$(tree_hash "$STAGED_APP")" == "$APP_SHA" ]] || die "staged candidate bytes differ from verified build"
 
 note "Promoting candidate while retaining the prior app"
-osascript - "$CANONICAL" "$OLD_APP" "$STAGED_APP" <<'APPLESCRIPT' || die "authorized app promotion failed; old app backup remains available"
-on run argv
-  set currentApp to item 1 of argv
-  set previousApp to item 2 of argv
-  set stagedApp to item 3 of argv
-  do shell script "/bin/mv " & quoted form of currentApp & " " & quoted form of previousApp & " && (/bin/mv " & quoted form of stagedApp & " " & quoted form of currentApp & " || { /bin/mv " & quoted form of previousApp & " " & quoted form of currentApp & "; exit 1; })" with administrator privileges
-end run
-APPLESCRIPT
+mv "$CANONICAL" "$OLD_APP" || die "could not preserve the prior app"
+if ! mv "$STAGED_APP" "$CANONICAL"; then
+  mv "$OLD_APP" "$CANONICAL" || die "promotion and rollback failed; prior app remains at $OLD_APP"
+  die "candidate promotion failed; prior app restored"
+fi
 codesign --verify --deep --strict "$CANONICAL" || die "installed signature invalid; prior app is retained at $OLD_APP"
 [[ "$(tree_hash "$CANONICAL")" == "$APP_SHA" ]] || die "installed bytes differ from candidate; prior app is retained at $OLD_APP"
 [[ "$(team_of "$CANONICAL/Contents/Resources/vaelend")" == "$TEAM" ]] || die "installed Core Team ID mismatch"

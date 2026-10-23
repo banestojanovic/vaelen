@@ -717,7 +717,7 @@ PHP remains a module because Vaelen should not architecturally assume that every
 The Vaelen application bundle contains application code only:
 
 ```text
-/Applications/Vaelen.app
+~/Applications/Vaelen.app
 ```
 
 Mutable application state must not be stored inside the application bundle.

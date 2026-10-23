@@ -12,7 +12,7 @@ VAL="$ROOT/.build/release/val"
 CORE="$ROOT/.build/release/vaelend"
 DNS="$ROOT/.build/release/vaelendns"
 GUI="$ROOT/.build/app/Build/Products/Debug/Vaelen.app"
-CANONICAL_APP="/Applications/Vaelen.app"
+CANONICAL_APP="$HOME/Applications/Vaelen.app"
 MYSQL="$SUPPORT/packages/mysql/8.4.11/bin/mysql"
 EXPECTED_LABEL="dev.vaelen.vaelend"
 EXPECTED_PARENT="dev.vaelen.app"
@@ -266,7 +266,7 @@ smoke_dev() { VAELEN_DEV_INTERNAL=1 smoke; }
 is_owned_process_command() {
   local command="$1"
   case "$command" in
-    "$CORE"|"$DNS --port 53535"|"$CANONICAL_APP/Contents/Resources/vaelend"|"$CANONICAL_APP/Contents/Resources/vaelendns --port 53535"|*/Vaelen.app/Contents/MacOS/Vaelen) return 0;;
+    "$CORE"|"$DNS --port 53535"|"$CANONICAL_APP/Contents/Resources/vaelend"|"$CANONICAL_APP/Contents/Resources/vaelendns --port 53535"|"/Applications/Vaelen.app/Contents/Resources/vaelend"|"/Applications/Vaelen.app/Contents/Resources/vaelendns --port 53535"|*/Vaelen.app/Contents/MacOS/Vaelen) return 0;;
   esac
   return 1
 }
@@ -347,10 +347,10 @@ tree_hash() {
 
 verify_canonical_install() {
   local installed gui_count canonical_count
-  installed="$(find /Applications -maxdepth 1 -type d -name 'Vaelen.app' -print 2>/dev/null | wc -l | tr -d ' ')"
+  installed="$(find "$HOME/Applications" -maxdepth 1 -type d -name 'Vaelen.app' -print 2>/dev/null | wc -l | tr -d ' ')"
   [[ "$installed" == 1 ]] || { echo "installed Vaelen.app count=$installed (expected 1)" >&2; return 1; }
   gui_count="$(ps -axo command= | awk '/\/Vaelen\.app\/Contents\/MacOS\/Vaelen$/ {count++} END {print count+0}')"
-  canonical_count="$(ps -axo command= | awk '$0 == "/Applications/Vaelen.app/Contents/MacOS/Vaelen" {count++} END {print count+0}')"
+  canonical_count="$(ps -axo command= | awk -v exact="$CANONICAL_APP/Contents/MacOS/Vaelen" '$0 == exact {count++} END {print count+0}')"
   [[ "$gui_count" == 1 && "$canonical_count" == 1 ]] || { echo "running GUI count=$gui_count canonical=$canonical_count (expected one canonical)" >&2; return 1; }
 }
 
@@ -533,13 +533,9 @@ clean_install() {
   printf 'source-tree-sha256=%s\n' "$(tree_hash "$app")" >> "$run/app-provenance.txt"
   [[ "$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$signing_team" ]] || die "release GUI Team ID mismatch"
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" == "$EXPECTED_PARENT" ]] || die "release GUI bundle ID mismatch"
-  osascript - "$app" "$CANONICAL_APP" <<'APPLESCRIPT' || die "canonical app install authorization/install failed"
-on run argv
-  set sourceApp to item 1 of argv
-  set destinationApp to item 2 of argv
-  do shell script "/usr/bin/ditto " & quoted form of sourceApp & " " & quoted form of destinationApp with administrator privileges
-end run
-APPLESCRIPT
+  [[ -e "$HOME/Applications" || -L "$HOME/Applications" ]] || mkdir "$HOME/Applications"
+  [[ ! -L "$HOME/Applications" && "$(stat -f %u "$HOME/Applications")" == "$(id -u)" ]] || die "home Applications directory must be a real directory owned by the current user"
+  ditto "$app" "$CANONICAL_APP" || die "canonical app install failed"
   diff -qr "$app" "$CANONICAL_APP" >/dev/null || die "installed canonical app differs byte-for-byte from verified source"
   codesign --verify --deep --strict "$CANONICAL_APP" || die "installed canonical app signature invalid"
   [[ "$(codesign -dv --verbose=4 "$CANONICAL_APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')" == "$signing_team" ]] || die "installed canonical app Team ID mismatch"

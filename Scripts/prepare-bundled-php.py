@@ -22,8 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 RESOURCE_PATH = Path("Sources/VaelenCore/Resources/PHPBundledRuntime")
 KINDS = ("cli", "fpm")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-INSTALLED_APP_RESOURCES = Path(
-    "/Applications/Vaelen.app/Contents/Resources/Vaelen_VaelenCore.bundle/Contents/Resources"
+INSTALLED_APP_RESOURCES = (
+    Path.home()
+    / "Applications/Vaelen.app/Contents/Resources/Vaelen_VaelenCore.bundle/Contents/Resources"
 )
 
 

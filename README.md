@@ -66,8 +66,8 @@ explicitly needed and the exclusive installed-operation slot is available:
 ./Scripts/vaelen-dev-update
 ```
 
-It replaces only `/Applications/Vaelen.app`, requires the configured signing
-identity and normal authorization, and checks the live schema-v8 database,
+It replaces only `$HOME/Applications/Vaelen.app`, requires the configured signing
+identity and write access to your home Applications folder, and checks the live schema-v8 database,
 route inventory, and enabled-service readiness. It does not replace the support
 root or reset the database.
 
