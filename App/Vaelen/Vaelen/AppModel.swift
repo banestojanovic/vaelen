@@ -195,13 +195,13 @@ final class AppModel {
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
             case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
-                let mysqlState: MySQLState = mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
-                let mysqlVersion = (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
+                let mysqlState: MySQLState = mode == "node-settings-selected" ? .running : mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
+                let mysqlVersion = (mode == "node-settings-selected" || mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
                 let mysql = MySQLStatus(
                     state: mysqlState,
-                    health: mysqlState == .unhealthy ? "identity-unverified" : mysqlState == .stopped ? "stopped" : "not-installed",
+                    health: mysqlState == .unhealthy ? "identity-unverified" : mysqlState == .stopped ? "stopped" : mysqlState == .running ? "healthy" : "not-installed",
                     installedVersion: mysqlVersion,
-                    selectedVersion: nil,
+                    selectedVersion: mysqlState == .running ? mysqlVersion : nil,
                     pid: mysqlState == .unhealthy ? 4242 : nil,
                     port: 3306,
                     socket: "/fixture/mysql.sock",

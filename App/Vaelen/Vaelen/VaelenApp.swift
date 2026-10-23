@@ -1251,7 +1251,7 @@ struct ProjectSettingsView: View {
     private var coreConnecting: Bool { if case .connecting = model.state { true } else { false } }
     private var filteredProjects: [ProjectWire] {
         model.linkedProjects.filter { project in
-            ProjectSearch.matches(project: project, report: report(for: project), query: projectSearchText)
+            ProjectSearch.matches(project: project, report: report(for: project), nodeSelection: nodeSelection(for: project), query: projectSearchText)
         }
     }
     private var selectedProject: ProjectWire? { filteredProjects.first { $0.path == selectedPath } }
@@ -1260,6 +1260,11 @@ struct ProjectSettingsView: View {
             let php = report.observed.php
             return [report.identity.path, php.resolvedVersion ?? "", php.overrideVersion ?? "", php.defaultVersion ?? ""].joined(separator: "\u{0}")
         }.joined(separator: "\u{1}")
+    }
+    private var projectNodeSearchSignature: String {
+        model.nodeSnapshot?.selections.map { selection in
+            "\(selection.projectID.rawValue.uuidString)\u{0}\(selection.path)\u{0}\(selection.pinnedVersion?.description ?? "")"
+        }.joined(separator: "\u{1}") ?? ""
     }
 
     var body: some View {
@@ -1321,6 +1326,7 @@ struct ProjectSettingsView: View {
         .onChange(of: model.linkedProjects.map(\.path)) { _, _ in selectVisibleProjectIfNeeded() }
         .onChange(of: projectSearchText) { _, _ in selectVisibleProjectIfNeeded() }
         .onChange(of: projectReportSearchSignature) { _, _ in selectVisibleProjectIfNeeded() }
+        .onChange(of: projectNodeSearchSignature) { _, _ in selectVisibleProjectIfNeeded() }
     }
 
     private var projectList: some View {
@@ -1365,7 +1371,7 @@ struct ProjectSettingsView: View {
                 Text("LINKED PROJECTS").font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary).padding(.horizontal, 13).padding(.top, 14).padding(.bottom, 4)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("Name, path, framework, or PHP", text: $projectSearchText)
+                    TextField("Name, path, framework, PHP, or Node", text: $projectSearchText)
                         .textFieldStyle(.plain)
                         .accessibilityLabel("Search linked projects")
                     if !projectSearchText.isEmpty {
@@ -1399,6 +1405,13 @@ struct ProjectSettingsView: View {
                                 .foregroundStyle(projectPHPListIsUnavailable(for: project) ? Color.orange : Color.secondary)
                                 .lineLimit(1)
                                 .accessibilityLabel(projectPHPListSummary(for: project))
+                            if let nodeSummary = projectNodeListSummary(for: project) {
+                                Text(nodeSummary)
+                                    .font(.caption2)
+                                    .foregroundStyle(projectNodeListIsUnavailable(for: project) ? Color.orange : Color.secondary)
+                                    .lineLimit(1)
+                                    .accessibilityLabel(nodeSummary)
+                            }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading).padding(10)
                         .background(selectedPath == project.path ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
@@ -1438,13 +1451,29 @@ struct ProjectSettingsView: View {
         }
         return php.resolvedVersion == nil
     }
+
+    private func nodeSelection(for project: ProjectWire) -> ProjectNodeSelection? {
+        guard let selections = model.nodeSnapshot?.selections else { return nil }
+        if let id = project.id { return selections.first { $0.projectID.rawValue == id } }
+        return selections.first { $0.path == project.path }
+    }
+
+    private func projectNodeListSummary(for project: ProjectWire) -> String? {
+        guard let selection = nodeSelection(for: project), let pinned = selection.pinnedVersion else { return nil }
+        return selection.runtimeAvailable ? "Node \(pinned) · Project Pin" : "Node \(pinned) unavailable · Project Pin"
+    }
+
+    private func projectNodeListIsUnavailable(for project: ProjectWire) -> Bool {
+        guard let selection = nodeSelection(for: project) else { return false }
+        return selection.pinnedVersion != nil && !selection.runtimeAvailable
+    }
 }
 
 private enum ProjectSearch {
-    static func matches(project: ProjectWire, report: ProjectEnvironmentReport?, query: String) -> Bool {
+    static func matches(project: ProjectWire, report: ProjectEnvironmentReport?, nodeSelection: ProjectNodeSelection?, query: String) -> Bool {
         let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
         guard !terms.isEmpty else { return true }
-        let searchable = [project.name, project.path, project.detectedFramework ?? "", report?.observed.php.resolvedVersion ?? "", report?.observed.php.overrideVersion ?? ""]
+        let searchable = [project.name, project.path, project.detectedFramework ?? "", report?.observed.php.resolvedVersion ?? "", report?.observed.php.overrideVersion ?? "", nodeSelection?.pinnedVersion?.description ?? ""]
             .joined(separator: " ")
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         return terms.allSatisfy { term in
@@ -1477,7 +1506,7 @@ private struct ProjectSelectedDetail: View {
             HStack(spacing: 10) {
                 projectMetric("Runtime", projectPHPText, report == nil ? "Checking with Core" : (model.phpCatalogReadPending ? "Checking runtime catalog" : projectPHPMode))
                 projectMetric("Site", projectRouteValue, projectRouteDetail)
-                projectMetric("Database", report?.observed.mysql?.selectedVersion.map { "MySQL \($0)" } ?? "MySQL", report?.observed.mysql?.state.rawValue ?? "Checking")
+                projectMetric("Database", projectDatabaseValue, projectDatabaseDetail)
             }
             SettingsInsetCard {
                 VStack(alignment: .leading, spacing: 10) {
@@ -1523,7 +1552,9 @@ private struct ProjectSelectedDetail: View {
                         projectFact("Framework", project.detectedFramework ?? "Not detected")
                         projectFact("Availability", project.availability)
                         projectFact("PHP", projectPHPText)
-                        projectFact("MySQL", report.observed.mysql.map { "\($0.state.rawValue) · \($0.selectedVersion ?? "version unavailable")" } ?? "Status unavailable")
+                        projectFact("Configured database", configuredDatabaseSummary(report))
+                        projectFact("MySQL requested", report.desired.mysql.map { $0 ? "Yes" : "No" } ?? "Not specified")
+                        projectFact("Vaelen MySQL service", report.observed.mysql.map { "\($0.state.rawValue) · \($0.selectedVersion ?? "version unavailable")" } ?? "Status unavailable")
                         if let routeError = model.configuredRoutesError { projectFact("Routes", "Unavailable · \(routeError)") }
                         else { projectFact("Routes", routes?.map { $0.route.hostname }.joined(separator: ", ") ?? "No configured route") }
                     }
@@ -1547,6 +1578,34 @@ private struct ProjectSelectedDetail: View {
         return "Unavailable"
     }
     private var projectPHPMode: String { report?.observed.php.overrideVersion == nil ? "Uses shared default" : "Project override" }
+    private var projectDatabaseValue: String {
+        guard let report else { return "Checking" }
+        if let connection = report.configured.dbConnection, !connection.isEmpty { return databaseConnectionTitle(connection) }
+        if report.desired.mysql == true { return "MySQL" }
+        return "Not configured"
+    }
+    private var projectDatabaseDetail: String {
+        guard let report else { return "Checking project configuration" }
+        if let connection = report.configured.dbConnection, !connection.isEmpty { return "DB_CONNECTION=\(connection)" }
+        if report.desired.mysql == true { return "Requested by project" }
+        return report.configured.envFilePresent ? "No DB_CONNECTION" : "No project .env file"
+    }
+    private func configuredDatabaseSummary(_ report: ProjectEnvironmentReport) -> String {
+        if let connection = report.configured.dbConnection, !connection.isEmpty {
+            return "DB_CONNECTION=\(connection)\(report.configured.envFilePresent ? "" : " · .env file unavailable")"
+        }
+        if report.desired.mysql == true { return "MySQL requested by project · DB_CONNECTION unavailable" }
+        return report.configured.envFilePresent ? "No DB_CONNECTION configured" : "No project .env file"
+    }
+    private func databaseConnectionTitle(_ connection: String) -> String {
+        switch connection.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "mysql", "mariadb": return "MySQL"
+        case "sqlite": return "SQLite"
+        case "pgsql", "postgres", "postgresql": return "PostgreSQL"
+        case "sqlsrv", "mssql": return "SQL Server"
+        default: return connection
+        }
+    }
     private var projectRouteValue: String {
         guard let routes else { return model.configuredRoutesError == nil ? "Checking" : "Unavailable" }
         return routes.first?.route.hostname ?? "No route"
