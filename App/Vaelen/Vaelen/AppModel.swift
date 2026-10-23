@@ -992,12 +992,13 @@ final class AppModel {
             phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .failed, message: message)
             phpError = message
         } else if let catalog = phpCatalog,
-                  let old = catalog.installedVersions.first(where: { $0.isDefault && PHPVersion($0.version)?.family == PHPVersion(version)?.family }) {
+                  let update = phpInstallableUpdates.first(where: { $0.to == version }),
+                  let old = catalog.installedVersions.first(where: { $0.version == update.from.version }) {
             let wasRunning = old.running == true || catalog.runningVersions.contains(old.version)
-            let upgraded = PHPRuntimeVersion(version: version, running: wasRunning, isDefault: true, updateAvailable: false, latestVersion: version, usedByProjectCount: old.usedByProjectCount, explicitProjectCount: old.explicitProjectCount, inheritedProjectCount: old.inheritedProjectCount)
+            let upgraded = PHPRuntimeVersion(version: version, running: wasRunning, isDefault: old.isDefault, updateAvailable: false, latestVersion: version, usedByProjectCount: old.usedByProjectCount, explicitProjectCount: old.explicitProjectCount, inheritedProjectCount: old.inheritedProjectCount)
             let versions = catalog.installedVersions.filter { $0.version != old.version } + [upgraded]
             let runningVersions = catalog.runningVersions.filter { $0 != old.version } + (wasRunning ? [version] : [])
-            phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions.filter { $0 != version }, installedVersions: versions, defaultVersion: version, runningVersions: runningVersions, availableVersionsKnown: catalog.availableVersionsKnown, catalogCheckedAt: catalog.catalogCheckedAt)
+            phpCatalog = PHPRuntimeCatalog(availableVersions: catalog.availableVersions.filter { $0 != version }, installedVersions: versions, defaultVersion: old.isDefault ? version : catalog.defaultVersion, runningVersions: runningVersions, availableVersionsKnown: catalog.availableVersionsKnown, catalogCheckedAt: catalog.catalogCheckedAt)
             if let configuration = phpConfiguration {
                 let replacedConfiguration = configuration.versions.first { $0.version == old.version }
                 let settings = replacedConfiguration?.settings ?? configuration.defaultSettings
@@ -1020,6 +1021,10 @@ final class AppModel {
             }
             phpSelectionRequest = version
             phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .ready)
+        } else {
+            let message = "Fixture update could not find the installed PHP runtime being updated."
+            phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .failed, message: message)
+            phpError = message
         }
         phpRequestInFlight = false
         phpRequestTarget = nil
