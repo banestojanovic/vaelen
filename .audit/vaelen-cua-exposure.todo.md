@@ -25,6 +25,15 @@
 - [x] Exercise project Node isolation in a disposable linked project: Node 24.22.1/npm 11.19.1 resolved in the project root and child directory, persisted across app/Core restart, then returned to invocation PATH (Node 24.16.0/npm 11.13.0) after clearing the pin. The temporary project was unlinked and deleted.
 - [x] Fresh independent Sol review: no actionable findings; stale-Core recovery remains limited to status exit 3, embedded schema 7, and absent installed Core process/socket.
 
+## Selected-project accessibility follow-up
+
+- [x] Reproduce the confusing snapshot on the installed app: the visual project details were current, while the accessibility text group mixed in the previous selection's path and route.
+- [x] Key the detail subtree by `ProjectWire.path` and label its accessibility container with the selected project name.
+- [x] Independently reviewed by Sol; no actionable findings.
+- [x] Rebuilt and installed through the signed updater; schema-v8 preservation and service readiness passed.
+- [x] Used CUA to switch between two live projects; the selected details group, path, site, and route changed together and matched screenshots.
+- [x] Updated the Projects verification guide. No isolated app view test target exists, so verification used the installed app.
+
 ## Remaining limits
 
 - `LSUIElement=NO` gives Vaelen a Dock entry so the app is normally registered and addressable by Computer Use.

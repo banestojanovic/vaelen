@@ -1292,6 +1292,7 @@ struct ProjectSettingsView: View {
                         }
                         if let selectedProject {
                             ProjectSelectedDetail(project: selectedProject, model: model)
+                                .id(selectedProject.path)
                         } else if coreHasSnapshot {
                             VStack(alignment: .leading, spacing: 10) {
                                 if !model.linkedProjects.isEmpty && filteredProjects.isEmpty {
@@ -1531,6 +1532,8 @@ private struct ProjectSelectedDetail: View {
                 HStack(spacing: 8) { ProgressView().controlSize(.small); Text(model.projectReportErrors[project.path] ?? "Checking project details with Core…").font(.caption).foregroundStyle(.secondary) }
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Selected project details for \(project.name)")
         .confirmationDialog("Unlink \(project.name)?", isPresented: $confirmUnlink, titleVisibility: .visible) {
             Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint()
             Button("Cancel", role: .cancel) { }
