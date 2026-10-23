@@ -119,4 +119,65 @@ final class ProjectReconciliationTests: XCTestCase {
         XCTAssertEqual(operation?.disposition, ProjectReconciliationDisposition.pending)
         XCTAssertEqual(operation?.currentState, ProjectReconciliationResourceState.unknown)
     }
+
+    func testPHPRouteTargetIsPlannedWithoutSecureWebDeclaration() {
+        let base = report(mysql: nil, mailpit: healthyMailpit(), secureWeb: nil)
+        let route = ProjectPHPRouteTargetObservation(
+            projectID: base.identity.id!.rawValue,
+            routeID: RouteID(),
+            hostname: "fixture.test",
+            persistedDocumentRoot: "/tmp/reconciliation-fixture/public",
+            observedDocumentRoot: "/tmp/reconciliation-fixture/public",
+            persistedTLS: .local,
+            observedTLS: .local,
+            persistedSocket: "/tmp/php-8.4.22.sock",
+            observedSocket: "/tmp/php-8.4.22.sock",
+            currentPHPVersion: "8.4.22",
+            desiredPHPDeclaration: "8.4",
+            resolvedPHPVersion: "8.4.23",
+            desiredSocket: "/tmp/php-8.4.23.sock",
+            associationAuthority: .allowed,
+            currentTargetOwnership: .proven,
+            desiredTargetOwnership: .proven,
+            providerAgreement: .diverged,
+            disposition: .actionable,
+            reason: "The linked project selected a different PHP runtime."
+        )
+        let updated = ProjectEnvironmentReport(identity: base.identity, desired: base.desired, configured: base.configured, observed: base.observed, derived: base.derived, secret: base.secret, diagnostics: base.diagnostics, routeTargets: [route])
+
+        let operation = ProjectReconciliationPlanner().plan(report: updated).operations.first { $0.id.hasPrefix("route.php-target.update.") }
+
+        XCTAssertEqual(operation?.disposition, .actionable)
+    }
+
+    func testPHPRouteTargetDoesNotCreateRedundantGenericRouteBlocker() {
+        let base = report(mysql: nil, mailpit: healthyMailpit(), routeTargetMatchesPHP: false)
+        let route = ProjectPHPRouteTargetObservation(
+            projectID: base.identity.id!.rawValue,
+            routeID: RouteID(),
+            hostname: "fixture.test",
+            persistedDocumentRoot: "/tmp/reconciliation-fixture/public",
+            observedDocumentRoot: "/tmp/reconciliation-fixture/public",
+            persistedTLS: .local,
+            observedTLS: .local,
+            persistedSocket: "/tmp/php-8.4.22.sock",
+            observedSocket: "/tmp/php-8.4.22.sock",
+            currentPHPVersion: "8.4.22",
+            desiredPHPDeclaration: "8.4",
+            resolvedPHPVersion: "8.4.23",
+            desiredSocket: "/tmp/php-8.4.23.sock",
+            associationAuthority: .allowed,
+            currentTargetOwnership: .proven,
+            desiredTargetOwnership: .proven,
+            providerAgreement: .diverged,
+            disposition: .actionable,
+            reason: "The linked project selected a different PHP runtime."
+        )
+        let updated = ProjectEnvironmentReport(identity: base.identity, desired: base.desired, configured: base.configured, observed: base.observed, derived: base.derived, secret: base.secret, diagnostics: base.diagnostics, routeTargets: [route])
+
+        let operations = ProjectReconciliationPlanner().plan(report: updated).operations
+
+        XCTAssertTrue(operations.contains { $0.id.hasPrefix("route.php-target.update.") && $0.disposition == .actionable })
+        XCTAssertFalse(operations.contains { $0.id == "route.reconcile" })
+    }
 }

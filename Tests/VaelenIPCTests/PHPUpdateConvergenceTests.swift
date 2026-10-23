@@ -83,9 +83,6 @@ final class PHPUpdateConvergenceTests: XCTestCase {
 
     // MARK: - Update reports a real outcome
 
-    /// Runs only when a caller supplies the exact provider archives. All
-    /// downloaded bytes and all Vaelen state stay in caller-owned or temporary
-    /// directories, and the test itself has no network source configured.
     func testRealPHP8424To8427Acceptance() async throws {
         sourceVersion = "8.4.24"
         targetVersion = "8.4.27"

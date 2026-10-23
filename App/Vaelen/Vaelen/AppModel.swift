@@ -950,7 +950,7 @@ final class AppModel {
     /// settings are the ones carried over when several patches coexist.
     func updatePHP(_ version: String, replacing source: String? = nil) async {
         if isSettingsFixture, settingsFixtureMode?.hasPrefix("php-update") == true {
-            await performPHPUpdateFixture(version)
+            await performPHPUpdateFixture(version, replacing: source)
             return
         }
         // A previous outcome must not survive into this operation, whether the
@@ -974,7 +974,7 @@ final class AppModel {
         }
     }
 
-    private func performPHPUpdateFixture(_ version: String) async {
+    private func performPHPUpdateFixture(_ version: String, replacing source: String?) async {
         guard !phpRequestInFlight else { return }
         phpError = nil
         phpRequestInFlight = true
@@ -992,8 +992,12 @@ final class AppModel {
             phpOperation = PHPOperationState(kind: .update, targetVersion: version, phase: .failed, message: message)
             phpError = message
         } else if let catalog = phpCatalog,
-                  let update = phpInstallableUpdates.first(where: { $0.to == version }),
-                  let old = catalog.installedVersions.first(where: { $0.version == update.from.version }) {
+                  let target = PHPVersion(version), target.isStable,
+                  catalog.availableVersions.contains(version),
+                  let sourceVersion = source ?? phpInstallableUpdates.first(where: { $0.to == version })?.from.version,
+                  let old = catalog.installedVersions.first(where: { $0.version == sourceVersion }),
+                  let installed = PHPVersion(old.version), installed.isStable,
+                  installed.family == target.family, installed < target {
             let wasRunning = old.running == true || catalog.runningVersions.contains(old.version)
             let upgraded = PHPRuntimeVersion(version: version, running: wasRunning, isDefault: old.isDefault, updateAvailable: false, latestVersion: version, usedByProjectCount: old.usedByProjectCount, explicitProjectCount: old.explicitProjectCount, inheritedProjectCount: old.inheritedProjectCount)
             let versions = catalog.installedVersions.filter { $0.version != old.version } + [upgraded]
