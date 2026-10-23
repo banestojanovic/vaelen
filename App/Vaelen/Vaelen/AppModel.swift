@@ -249,7 +249,7 @@ final class AppModel {
                         )
                         let observed = ProjectObservedEnvironment(
                             php: php,
-                            mysql: nil,
+                            mysql: mysql,
                             mailpit: nil,
                             route: ProjectObservedRoute(intentExists: false, routerState: .stopped, routerHealth: .unknown),
                             dns: DNSStatus(state: .notInstalled, ownership: .none, health: "not-installed"),
@@ -267,8 +267,8 @@ final class AppModel {
                         )
                         model.projectReports = [ProjectEnvironmentReport(
                             identity: ProjectEnvironmentIdentity(project: projectDomain),
-                            desired: ProjectDesiredEnvironment(file: .absent),
-                            configured: ProjectConfiguredEnvironment(envFile: "/fixture/projects/storefront/.env", envFilePresent: false),
+                            desired: ProjectDesiredEnvironment(file: .valid, mysql: false),
+                            configured: ProjectConfiguredEnvironment(envFile: "/fixture/projects/storefront/.env", envFilePresent: true, dbConnection: "sqlite"),
                             observed: observed,
                             derived: derived,
                             secret: ProjectSecretEnvironment(databasePassword: .unknown, mailPassword: .unknown),
@@ -1482,6 +1482,10 @@ final class AppModel {
     private func refreshProjectRelationships() async {
         guard !isSettingsFixture else { return }
         guard !relationshipMutationInFlight else { return }
+        // The main refresh owns the authoritative project relationship snapshot
+        // while it is connecting. Starting a second snapshot here can advance
+        // relationshipSnapshotGeneration and discard that startup result.
+        guard !refreshInFlight else { return }
         if projectRelationshipsRefreshInFlight {
             projectRelationshipsRefreshRequested = true
             return
