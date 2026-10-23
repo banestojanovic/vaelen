@@ -73,6 +73,17 @@ final class PHPDefaultSwitchTests: XCTestCase {
     }
 
     func testColdAndWarmSwitchWithSixInheritedRoutes() async throws {
+        var installedPackages: [String: PHPPackage] = [:]
+        for version in ["8.4.23", "8.3.29"] {
+            let live = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Vaelen/packages/php/\(version)")
+            guard let data = try? Data(contentsOf: live.appendingPathComponent(".vaelen-package.json")),
+                  let package = try? JSONDecoder().decode(PHPPackage.self, from: data),
+                  FileManager.default.isExecutableFile(atPath: package.cliPath),
+                  FileManager.default.isExecutableFile(atPath: package.fpmPath) else {
+                throw XCTSkip("Read-only real PHP binaries required")
+            }
+            installedPackages[version] = package
+        }
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/vb-\(UUID().uuidString.prefix(8))")
         let layout = VaelenFilesystemLayout(rootURL: root, logsDirectoryURL: root.appendingPathComponent("logs"))
         var routerStopped = false
@@ -101,8 +112,7 @@ final class PHPDefaultSwitchTests: XCTestCase {
         }
         for version in ["8.4.23", "8.3.29"] {
             let live = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Vaelen/packages/php/\(version)")
-            guard let data = try? Data(contentsOf: live.appendingPathComponent(".vaelen-package.json")),
-                  let package = try? JSONDecoder().decode(PHPPackage.self, from: data) else { throw XCTSkip("Read-only real PHP binaries required") }
+            let package = try XCTUnwrap(installedPackages[version])
             let directory = layout.phpPackagesDirectoryURL.appendingPathComponent(version)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             for name in ["php", "php-fpm"] { try FileManager.default.copyItem(at: live.appendingPathComponent(name), to: directory.appendingPathComponent(name)) }

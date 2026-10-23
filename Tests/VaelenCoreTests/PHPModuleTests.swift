@@ -256,10 +256,10 @@ final class PHPModuleTests: XCTestCase {
         XCTAssertNil(catalog.catalogCheckError)
         let bundled = try JSONDecoder().decode(PHPManifestCatalog.self, from: Data(contentsOf: try XCTUnwrap(Bundle.module.url(forResource: "php-catalog", withExtension: "json"))))
         let newest = try XCTUnwrap(bundled.manifests.compactMap({ PHPVersion($0.phpVersion) }).max())
-        // Versions are presented newest first.
-        // Every supported family is offered, newest patch first, with the legacy line
-        // clearly labelled rather than dropped.
-        XCTAssertEqual(catalog.availableVersions, ["8.5.9", "8.4.24", "8.3.33", "8.2.33"])
+        let expectedVersions = bundled.manifests.compactMap { PHPVersion($0.phpVersion) }
+            .sorted(by: >)
+            .map(\.description)
+        XCTAssertEqual(catalog.availableVersions, expectedVersions)
         XCTAssertTrue(catalog.availableVersions.contains(newest.description))
         // Nothing is installed yet, and that must be reported honestly.
         XCTAssertEqual(catalog.installedVersions, [])

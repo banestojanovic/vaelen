@@ -4,9 +4,7 @@ import Darwin
 
 final class PHPFPMRuntimeLifecycleTests: XCTestCase {
     func testRelaunchedCoreStopsRecordedFPMMasterWithoutKillingSiblingProcesses() throws {
-        let defaultLayout = VaelenFilesystemLayout()
-        let packageURL = defaultLayout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
-        let installed = try JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageURL))
+        let installed = try installedPHP(version: "8.4.23")
         let fixture = try IsolatedPHPFixture(installedPackage: installed)
         defer { _ = fixture.cleanup() }
 
@@ -23,8 +21,7 @@ final class PHPFPMRuntimeLifecycleTests: XCTestCase {
 
     func testPHPFPMIsolationRegressionLeavesNormalRuntimeStoppedAndUnrelatedProcessUntouched() throws {
         let defaultLayout = VaelenFilesystemLayout()
-        let packageURL = defaultLayout.phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
-        let installed = try JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageURL))
+        let installed = try installedPHP(version: "8.4.23")
         let fpm = URL(fileURLWithPath: installed.fpmPath)
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: fpm.path))
         let hash = try command("/usr/bin/shasum", ["-a", "256", fpm.path])
@@ -269,5 +266,16 @@ final class PHPFPMRuntimeLifecycleTests: XCTestCase {
         try process.run(); let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
         guard process.terminationStatus == 0 else { throw NSError(domain: "PHPFPMRuntimeLifecycleTests", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: String(decoding: data, as: UTF8.self)]) }
         return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func installedPHP(version: String) throws -> PHPPackage {
+        let layout = VaelenFilesystemLayout()
+        let packageURL = layout.phpPackagesDirectoryURL.appendingPathComponent("\(version)/.vaelen-package.json")
+        guard let data = try? Data(contentsOf: packageURL),
+              let package = try? JSONDecoder().decode(PHPPackage.self, from: data),
+              FileManager.default.isExecutableFile(atPath: package.fpmPath) else {
+            throw XCTSkip("Installed PHP \(version) FPM package required")
+        }
+        return package
     }
 }

@@ -94,6 +94,8 @@ final class RoutingTests: XCTestCase {
             // Emulate the durable v6 pre-migration state while leaving every
             // existing project, route, target, association, and TLS value intact.
             try store.execute("DROP TABLE park_route_ownership")
+            try store.execute("ALTER TABLE projects DROP COLUMN php_override_version")
+            try store.execute("ALTER TABLE projects DROP COLUMN node_override_version")
             try store.execute("PRAGMA user_version = 6")
         }
 
@@ -179,6 +181,11 @@ final class RoutingTests: XCTestCase {
             let store = try SQLiteStateStore(databaseURL: database)
             try RouteIntentRepository(store: store).upsert(RouteIntent(route: route))
             try store.execute("DROP TABLE route_target_transitions")
+            try store.execute("DROP TABLE park_route_ownership")
+            try store.execute("ALTER TABLE projects DROP COLUMN php_override_version")
+            try store.execute("ALTER TABLE projects DROP COLUMN node_override_version")
+            try store.execute("DROP TABLE tls_capability")
+            try store.execute("CREATE TABLE tls_capability (id INTEGER PRIMARY KEY CHECK (id = 1), ca_fingerprint TEXT NOT NULL, ca_certificate_path TEXT NOT NULL, active INTEGER NOT NULL)")
             try store.execute("PRAGMA user_version = 4")
         }
         let reopened = try SQLiteStateStore(databaseURL: database)

@@ -56,6 +56,9 @@ final class TLSCapabilityTests: XCTestCase {
             if withRow {
                 try store.execute("INSERT INTO tls_capability VALUES (1, 'legacy-fingerprint', '/legacy/ca.der', \(active))")
             }
+            try store.execute("DROP TABLE park_route_ownership")
+            try store.execute("ALTER TABLE projects DROP COLUMN php_override_version")
+            try store.execute("ALTER TABLE projects DROP COLUMN node_override_version")
             try store.execute("PRAGMA user_version = 5")
         }
         return database
@@ -99,6 +102,9 @@ final class TLSCapabilityTests: XCTestCase {
         do {
             let store = try SQLiteStateStore(databaseURL: database)
             try store.execute("DROP TABLE tls_capability")
+            try store.execute("DROP TABLE park_route_ownership")
+            try store.execute("ALTER TABLE projects DROP COLUMN php_override_version")
+            try store.execute("ALTER TABLE projects DROP COLUMN node_override_version")
             try store.execute("PRAGMA user_version = 5")
         }
         XCTAssertThrowsError(try SQLiteStateStore(databaseURL: database))
