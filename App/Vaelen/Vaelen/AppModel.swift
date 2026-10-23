@@ -350,11 +350,9 @@ final class AppModel {
         }
         #endif
         let model = AppModel()
-        #if VAELEN_SETTINGS_FIXTURES
         if let argument = arguments.first(where: { $0.hasPrefix("--verification-open-settings=") }) {
             model.verificationOpenSettingsPage = SettingsPage(rawValue: String(argument.dropFirst("--verification-open-settings=".count)))
         }
-        #endif
         return model
     }
 

@@ -50,7 +50,7 @@ class CLIPreflightTests(unittest.TestCase):
 
     def test_connection_failure_is_distinct_and_keeps_cli_diagnostic(self):
         result = self.run_preflight(3, "Error: Vaelen Core is not running.")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 3)
         self.assertIn("Vaelen Core is unavailable", result.stderr)
         self.assertIn("Error: Vaelen Core is not running.", result.stderr)
         self.assertIn("has not requested app shutdown", result.stderr)
@@ -60,14 +60,14 @@ class CLIPreflightTests(unittest.TestCase):
     def test_protocol_failure_is_distinct_and_keeps_version_diagnostic(self):
         diagnostic = "Client: 2\nCore: 1"
         result = self.run_preflight(4, diagnostic)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("protocol compatibility failed", result.stderr)
         self.assertIn(diagnostic, result.stderr)
         self.assert_status_was_the_only_cli_action()
 
     def test_unclassified_status_failure_keeps_exit_code_and_diagnostic(self):
         result = self.run_preflight(1, "permission denied opening Core socket")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("status exited 1", result.stderr)
         self.assertIn("permission denied opening Core socket", result.stderr)
         self.assert_status_was_the_only_cli_action()

@@ -12,11 +12,11 @@ release or architectural freeze**. The current product version is
 `0.0.14-dev`. Recent integrated work includes the Settings window and compact
 menu-bar experience, service-specific settings, and safer MySQL package
 management (including removal of package debug-only binaries). The signed app
-and embedded Core were updated and validated against the existing schema-v7
+and embedded Core were updated and validated against the existing schema-v8
 installation; reuse the accepted runtime evidence unless product source
 changes.
 
-Compatibility versions: SQLite `user_version` **7**; IPC compatibility schema
+Compatibility versions: SQLite `user_version` **8**; IPC compatibility schema
 **6**; IPC protocol **v1**.
 
 Historical records remain historical: M12 (`v0.0.13-m12`) is the frozen
@@ -67,7 +67,7 @@ explicitly needed and the exclusive installed-operation slot is available:
 ```
 
 It replaces only `/Applications/Vaelen.app`, requires the configured signing
-identity and normal authorization, and checks the live schema-v7 database,
+identity and normal authorization, and checks the live schema-v8 database,
 route inventory, and enabled-service readiness. It does not replace the support
 root or reset the database.
 

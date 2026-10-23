@@ -22,7 +22,11 @@ struct VaelenApp: App {
                 .onAppear {
                     if !model.isSettingsFixture { model.startMonitoring() }
                     appDelegate.requestQuit = { Task { await model.quitVaelen() } }
-                    if model.isSettingsFixture || model.verificationOpenSettingsPage != nil { openWindow(id: "settings") }
+                    if model.isSettingsFixture {
+                        openWindow(id: "settings")
+                    } else if model.verificationOpenSettingsPage != nil {
+                        SettingsWindowActivation.openSettings { openWindow(id: "settings") }
+                    }
                 }
         }
         .menuBarExtraStyle(.window)

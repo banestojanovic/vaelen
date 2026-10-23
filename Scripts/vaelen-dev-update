@@ -48,8 +48,8 @@ process_pid_for_command() {
 }
 
 [[ -d "$CANONICAL" && -f "$STATE_DB" ]] || die "installed app or live state database is missing"
-[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 7 ]] || die "live database is not schema v7; refusing this update"
-[[ "$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)" == 7 ]] || die "candidate source does not declare schema v7"
+[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 8 ]] || die "live database is not schema v8; refusing this update"
+[[ "$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)" == 8 ]] || die "candidate source does not declare schema v8"
 codesign --verify --deep --strict "$CANONICAL" || die "current installed app signature is invalid"
 
 # The post-update status check is part of the acceptance path. Prove the
@@ -59,7 +59,21 @@ CLI="$SUPPORT/bin/val"
 CLI_OWNER="$SUPPORT/bin/.val.sha256"
 CLI_LINK="$HOME/.local/bin/val"
 source "$ROOT/Scripts/vaelen-dev-update-cli-preflight.sh"
-vaelen_update_cli_preflight "$CLI" "$CLI_OWNER" "$CLI_LINK" || exit 1
+if vaelen_update_cli_preflight "$CLI" "$CLI_OWNER" "$CLI_LINK"; then
+  :
+else
+  CLI_PREFLIGHT_STATUS=$?
+  if [[ "$CLI_PREFLIGHT_STATUS" == 3 ]]; then
+    INSTALLED_CORE="$CANONICAL/Contents/Resources/vaelend"
+    INSTALLED_CORE_SCHEMA="$(schema_constant "$INSTALLED_CORE")" || die "cannot read installed embedded Core schema"
+    [[ "$INSTALLED_CORE_SCHEMA" == 7 ]] || die "CLI reports Core unavailable, but installed embedded Core schema is not the known stale schema 7"
+    [[ -z "$(process_pid_for_command "$INSTALLED_CORE")" ]] || die "installed embedded Core is running despite unavailable CLI status"
+    [[ ! -e "$SOCKET" && ! -L "$SOCKET" ]] || die "Core socket exists despite unavailable CLI status"
+    note "Allowing unavailable CLI preflight for stale installed Core schema $INSTALLED_CORE_SCHEMA; no installed Core process or socket exists"
+  else
+    exit "$CLI_PREFLIGHT_STATUS"
+  fi
+fi
 
 mkdir -p "$ARTIFACTS"
 chmod 700 "$ARTIFACTS"
@@ -87,11 +101,11 @@ fi
 codesign --verify --deep --strict "$APP" || die "candidate app signature verification failed"
 [[ "$(team_of "$APP")" == "$TEAM" ]] || die "candidate app Team ID mismatch"
 [[ "$(team_of "$CORE")" == "$TEAM" ]] || die "candidate embedded Core Team ID mismatch"
-[[ "$(schema_constant "$CORE")" == 7 ]] || die "candidate embedded Core does not support schema v7"
+[[ "$(schema_constant "$CORE")" == 8 ]] || die "candidate embedded Core does not support schema v8"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" == "$BUNDLE_ID" ]] || die "candidate bundle identifier mismatch"
 CORE_SHA="$(shasum -a 256 "$CORE" | awk '{print $1}')"
 APP_SHA="$(tree_hash "$APP")"
-printf 'candidate-app-tree-sha256=%s\ncandidate-core-sha256=%s\ncandidate-core-schema=7\nteam=%s\n' \
+printf 'candidate-app-tree-sha256=%s\ncandidate-core-sha256=%s\ncandidate-core-schema=8\nteam=%s\n' \
   "$APP_SHA" "$CORE_SHA" "$TEAM" > "$RUN/candidate.manifest"
 printf 'source-root=%s\nsource-head=%s\nsource-branch=%s\nsource-diff-sha256=%s\nderived-data=%s\n' \
   "$ROOT" "$(git -C "$ROOT" rev-parse HEAD)" "$(git -C "$ROOT" branch --show-current)" \
@@ -102,12 +116,12 @@ git -C "$ROOT" ls-files --others --exclude-standard -z | while IFS= read -r -d '
 done > "$RUN/source-untracked.sha256"
 
 # Recovery artifacts never restore data: the online SQLite backup is evidence,
-# and rollback restores only the prior app bundle. Live v7 and later MySQL or
+# and rollback restores only the prior app bundle. Live v8 and later MySQL or
 # project writes are never replaced from snapshots.
-note "Capturing app, v7 database, routes, and durable-file hashes"
+note "Capturing app, v8 database, routes, and durable-file hashes"
 ditto "$CANONICAL" "$RUN/app-before.app"
 codesign --verify --deep --strict "$RUN/app-before.app" || die "preserved app copy failed signature verification"
-sqlite3 "$STATE_DB" ".backup '$RUN/state-v7-before.sqlite'" || die "could not make online SQLite backup"
+sqlite3 "$STATE_DB" ".backup '$RUN/state-v8-before.sqlite'" || die "could not make online SQLite backup"
 printf '%s\n' "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" > "$RUN/schema-before.txt"
 route_inventory > "$RUN/routes-before.txt"
 [[ "$(wc -l < "$RUN/routes-before.txt" | tr -d ' ')" -ge 5 ]] || die "fewer than five route records exist; refusing update"
@@ -190,10 +204,10 @@ APPLESCRIPT
 codesign --verify --deep --strict "$CANONICAL" || die "installed signature invalid; prior app is retained at $OLD_APP"
 [[ "$(tree_hash "$CANONICAL")" == "$APP_SHA" ]] || die "installed bytes differ from candidate; prior app is retained at $OLD_APP"
 [[ "$(team_of "$CANONICAL/Contents/Resources/vaelend")" == "$TEAM" ]] || die "installed Core Team ID mismatch"
-[[ "$(schema_constant "$CANONICAL/Contents/Resources/vaelend")" == 7 ]] || die "installed Core schema mismatch"
+[[ "$(schema_constant "$CANONICAL/Contents/Resources/vaelend")" == 8 ]] || die "installed Core schema mismatch"
 
 note "Launching canonical signed app"
-open "$CANONICAL" || die "canonical app launch failed; live database remains schema v7"
+open "$CANONICAL" --args --verification-open-settings=services || die "canonical app launch failed; live database remains schema v8"
 GUI_PID=""; CORE_PID=""
 for _ in {1..120}; do
   GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
@@ -201,21 +215,21 @@ for _ in {1..120}; do
   [[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] && break
   sleep .25
 done
-[[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] || die "signed embedded Core did not acquire socket; preserve v7 DB and use candidate app backup"
+[[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] || die "signed embedded Core did not acquire socket; preserve v8 DB and use candidate app backup"
 [[ "$(ps -p "$CORE_PID" -o ppid= | tr -d ' ')" == "$GUI_PID" ]] || die "Core socket owner is not a child of canonical GUI"
 [[ "$(lsof -t -- "$SOCKET" 2>/dev/null | sort -u)" == "$CORE_PID" ]] || die "Core socket ownership does not match embedded Core PID"
 
 note "Checking CLI, schema, and route preservation"
 "$SUPPORT/bin/val" status
 wait_enabled_services || die "enabled service readiness failed; see per-service timeout/observation above"
-[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 7 ]] || die "live DB schema changed; do not restore the saved DB"
+[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 8 ]] || die "live DB schema changed; do not restore the saved DB"
 route_inventory > "$RUN/routes-after.txt"
 cmp -s "$RUN/routes-before.txt" "$RUN/routes-after.txt" || die "route records changed; saved DB remains evidence only"
-echo "signed-v7 app update: PASS"
+echo "signed-v8 app update: PASS"
 echo "Core PID=$CORE_PID path=$CANONICAL/Contents/Resources/vaelend"
-echo "Core SHA-256=$CORE_SHA schema=7 Team=$TEAM"
+echo "Core SHA-256=$CORE_SHA schema=8 Team=$TEAM"
 echo "GUI PID=$GUI_PID"
 echo "prior app backup=$RUN/app-before.app"
 echo "prior installed app=$OLD_APP"
-echo "online v7 DB evidence=$RUN/state-v7-before.sqlite (never auto-restore)"
+echo "online v8 DB evidence=$RUN/state-v8-before.sqlite (never auto-restore)"
 echo "update evidence=$RUN"

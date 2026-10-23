@@ -49,6 +49,7 @@ vaelen_update_cli_preflight() {
   case "$status_code" in
     3)
       printf 'Vaelen Core is unavailable (val status exited 3). The updater has not requested app shutdown. %s\n' "$status_output" >&2
+      return 3
       ;;
     4)
       printf 'Vaelen Core and CLI protocol compatibility failed (val status exited 4). The updater has not requested app shutdown. %s\n' "$status_output" >&2
