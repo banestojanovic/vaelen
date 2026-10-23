@@ -2494,6 +2494,10 @@ public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog 
     }
 
     static func transferArtifact(source: URL, destination: URL, progress: PHPArtifactProgressSink) throws {
+        try transferArtifact(source: source, destination: destination, progress: progress, configuration: .ephemeral)
+    }
+
+    static func transferArtifact(source: URL, destination: URL, progress: PHPArtifactProgressSink, configuration: URLSessionConfiguration) throws {
         if source.isFileURL {
             let sourceHandle = try FileHandle(forReadingFrom: source)
             defer { try? sourceHandle.close() }
@@ -2512,7 +2516,7 @@ public func selectDefault(requestedVersion: String) throws -> PHPRuntimeCatalog 
             return
         }
         let delegate = PHPArtifactTransferDelegate(destination: destination, progress: progress)
-        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         session.dataTask(with: source).resume()
         try delegate.wait()

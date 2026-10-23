@@ -22,6 +22,52 @@ final class PHPProviderDiscoveryTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testArtifactRedirectAllowsBothProviderHosts() throws {
+        for host in ["dl.static-php.dev", "static-php-cli.fra1.digitaloceanspaces.com", "dl.static-php.dev:443"] {
+            let destination = root.appendingPathComponent(UUID().uuidString)
+            try transferThroughRedirect(to: "https://\(host)/payload", destination: destination)
+            XCTAssertEqual(try Data(contentsOf: destination), PHPArtifactRedirectProtocol.payload)
+        }
+    }
+
+    func testArtifactRedirectRejectsUnlistedHost() throws {
+        for target in ["https://outside.invalid/payload", "https://dl.static-php.dev.outside.invalid/payload"] {
+            try assertArtifactRedirectRefused(target)
+        }
+    }
+
+    func testArtifactRedirectRejectsUnlistedHostAfterAllowedRedirect() throws {
+        var intermediate = URLComponents(string: "https://static-php-cli.fra1.digitaloceanspaces.com/redirect")!
+        intermediate.queryItems = [URLQueryItem(name: "target", value: "https://outside.invalid/payload")]
+        try assertArtifactRedirectRefused(intermediate.url!.absoluteString)
+    }
+
+    func testArtifactRedirectRejectsHTTPSDowngrade() throws {
+        try assertArtifactRedirectRefused("http://dl.static-php.dev/payload")
+    }
+
+    func testArtifactRedirectRejectsNonstandardPortAndCredentials() throws {
+        for target in ["https://dl.static-php.dev:8443/payload", "https://user:password@dl.static-php.dev/payload", "https://user@dl.static-php.dev/payload"] {
+            try assertArtifactRedirectRefused(target)
+        }
+    }
+
+    private func assertArtifactRedirectRefused(_ target: String) throws {
+        let destination = root.appendingPathComponent(UUID().uuidString)
+        let samples = ProgressSamples()
+        XCTAssertThrowsError(try transferThroughRedirect(to: target, destination: destination, samples: samples))
+        XCTAssertTrue(samples.snapshot().isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    private func transferThroughRedirect(to target: String, destination: URL, samples: ProgressSamples? = nil) throws {
+        var source = URLComponents(string: "https://dl.static-php.dev/redirect")!
+        source.queryItems = [URLQueryItem(name: "target", value: target)]
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PHPArtifactRedirectProtocol.self]
+        try PHPModule.transferArtifact(source: source.url!, destination: destination, progress: PHPArtifactProgressSink { bytes, total in samples?.append(bytes, total) }, configuration: configuration)
+    }
+
     // MARK: - Discovery
 
     /// A provider check must find a patch published after the app was built, and
@@ -572,4 +618,28 @@ private final class ProgressSamples: @unchecked Sendable {
     private var values = [(Int64, Int64?)]()
     func append(_ bytes: Int64, _ total: Int64?) { lock.lock(); values.append((bytes, total)); lock.unlock() }
     func snapshot() -> [(Int64, Int64?)] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
+private final class PHPArtifactRedirectProtocol: URLProtocol, @unchecked Sendable {
+    static let payload = Data("redirected artifact body".utf8)
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        if url.path == "/redirect",
+           let target = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "target" })?.value,
+           let destination = URL(string: target) {
+            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": target])!
+            client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: destination), redirectResponse: response)
+        } else {
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": String(Self.payload.count)])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Self.payload)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
 }
