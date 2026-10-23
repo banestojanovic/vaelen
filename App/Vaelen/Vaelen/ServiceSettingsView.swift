@@ -3,6 +3,51 @@ import AppKit
 import VaelenCore
 import VaelenIPC
 
+private struct LocalProxyFormValidation {
+    let hostnameError: String?
+    let upstreamError: String?
+    let isReady: Bool
+
+    init(hostname: String, upstreamURL: String, proxies: [LocalProxyWire]?) {
+        let hasBothValues = !hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !upstreamURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard hasBothValues else {
+            hostnameError = nil
+            upstreamError = nil
+            isReady = false
+            return
+        }
+
+        let hostnameValidation = try? LocalProxyConfiguration(hostname: hostname, upstreamURL: "http://127.0.0.1:1")
+        let duplicate = hostnameValidation.map { validated in
+            (proxies ?? []).contains { $0.hostname.caseInsensitiveCompare(validated.hostname) == .orderedSame }
+        } ?? false
+        hostnameError = hostnameValidation == nil
+            ? Self.hostnameError(hostname: hostname)
+            : duplicate ? "A proxy already uses this hostname." : nil
+
+        let upstreamValidation = try? LocalProxyConfiguration(hostname: "vaelen-validation.test", upstreamURL: upstreamURL)
+        upstreamError = upstreamValidation == nil ? Self.upstreamError(upstreamURL: upstreamURL) : nil
+
+        isReady = proxies != nil && hostnameError == nil && upstreamError == nil
+            && (try? LocalProxyConfiguration(hostname: hostname, upstreamURL: upstreamURL)) != nil
+    }
+
+    private static func hostnameError(hostname: String) -> String {
+        do { _ = try LocalProxyConfiguration(hostname: hostname, upstreamURL: "http://127.0.0.1:1") }
+        catch LocalProxyError.invalidHostname(let message) { return message }
+        catch {}
+        return "Use a valid local hostname ending in .test."
+    }
+
+    private static func upstreamError(upstreamURL: String) -> String {
+        do { _ = try LocalProxyConfiguration(hostname: "vaelen-validation.test", upstreamURL: upstreamURL) }
+        catch LocalProxyError.invalidUpstreamURL(let message) { return message }
+        catch {}
+        return "Use an HTTP loopback URL with an explicit port."
+    }
+}
+
 private enum ManagedSettingsService: String, CaseIterable, Identifiable, Hashable {
     case mysql = "MySQL", mailpit = "Mailpit", caddy = "Caddy", dns = ".test Domains", https = "Local HTTPS", ports = "Standard Ports"
     var id: String { rawValue }
@@ -698,7 +743,8 @@ struct NetworkSecuritySettingsView: View {
     }
 
     private var localProxiesCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let validation = LocalProxyFormValidation(hostname: proxyHostname, upstreamURL: proxyUpstreamURL, proxies: model.localProxies)
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.left.arrow.right").foregroundStyle(Color.accentColor).frame(width: 28, height: 28).background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
                 Text("Local Proxies").font(.headline)
@@ -712,11 +758,19 @@ struct NetworkSecuritySettingsView: View {
                     Text("Hostname").font(.caption.weight(.medium)).foregroundStyle(.secondary)
                     TextField("frontend.test", text: $proxyHostname).textFieldStyle(.roundedBorder)
                         .accessibilityLabel("Proxy hostname")
+                    if let error = validation.hostnameError {
+                        Label(error, systemImage: "exclamationmark.circle.fill").font(.caption).foregroundStyle(.red)
+                            .accessibilityIdentifier("Proxy hostname validation error")
+                    }
                 }
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Upstream URL").font(.caption.weight(.medium)).foregroundStyle(.secondary)
                     TextField("http://127.0.0.1:3000", text: $proxyUpstreamURL).textFieldStyle(.roundedBorder)
                         .accessibilityLabel("HTTP loopback upstream URL")
+                    if let error = validation.upstreamError {
+                        Label(error, systemImage: "exclamationmark.circle.fill").font(.caption).foregroundStyle(.red)
+                            .accessibilityIdentifier("Proxy upstream validation error")
+                    }
                 }
             }
             HStack {
@@ -725,7 +779,7 @@ struct NetworkSecuritySettingsView: View {
                     let hostname = proxyHostname
                     let upstreamURL = proxyUpstreamURL
                     Task { await model.addLocalProxy(hostname: hostname, upstreamURL: upstreamURL) }
-                }.buttonStyle(.borderedProminent).disabled(proxyHostname.isEmpty || proxyUpstreamURL.isEmpty || model.localProxies == nil)
+                }.buttonStyle(.borderedProminent).disabled(!validation.isReady)
             }
             if model.localProxies == nil {
                 Label(model.localProxiesError ?? "Core has not confirmed local proxy state.", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange).textSelection(.enabled)
