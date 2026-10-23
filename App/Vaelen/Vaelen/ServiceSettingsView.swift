@@ -48,6 +48,54 @@ private struct LocalProxyFormValidation {
     }
 }
 
+private struct LocalProxyHealthPresentation {
+    struct Status {
+        let title: String
+        let tone: SettingsStateBadge.Tone
+    }
+
+    let ownershipStatus: Status?
+    let routeStatus: Status?
+    let upstreamStatus: Status?
+    let nextStep: String?
+
+    init(_ proxy: LocalProxyWire) {
+        switch proxy.ownershipPhase {
+        case .prepared:
+            ownershipStatus = Status(title: "Preparing", tone: .pending)
+            routeStatus = nil
+            upstreamStatus = nil
+            nextStep = nil
+        case .deleting:
+            ownershipStatus = Status(title: "Removing", tone: .pending)
+            routeStatus = nil
+            upstreamStatus = nil
+            nextStep = nil
+        case .active:
+            ownershipStatus = nil
+            switch proxy.caddyObservation {
+            case .observed:
+                routeStatus = Status(title: "Route active", tone: .healthy)
+            case .notObserved:
+                routeStatus = Status(title: "Route missing", tone: .attention)
+            case .unavailable:
+                routeStatus = Status(title: "Route unavailable", tone: .neutral)
+            }
+            switch proxy.upstreamReachability {
+            case .reachable:
+                upstreamStatus = Status(title: "Upstream reachable", tone: .healthy)
+                nextStep = nil
+            case .unreachable:
+                upstreamStatus = Status(title: "Upstream unreachable", tone: .attention)
+                nextStep = "Start the local server at the upstream URL above. Vaelen routes traffic but does not start it."
+            case .unknown:
+                upstreamStatus = Status(title: "Upstream unknown", tone: .neutral)
+                nextStep = nil
+            }
+        }
+    }
+}
+
 private enum ManagedSettingsService: String, CaseIterable, Identifiable, Hashable {
     case mysql = "MySQL", mailpit = "Mailpit", caddy = "Caddy", dns = ".test Domains", https = "Local HTTPS", ports = "Standard Ports"
     var id: String { rawValue }
@@ -801,7 +849,22 @@ struct NetworkSecuritySettingsView: View {
                         }
                     }
                     Text(proxy.upstreamURL).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                    Text("Caddy: \(proxy.caddyObservation.rawValue) · Upstream: \(proxy.upstreamReachability.rawValue)").font(.caption).foregroundStyle(.secondary)
+                    let health = LocalProxyHealthPresentation(proxy)
+                    HStack(spacing: 6) {
+                        if let status = health.ownershipStatus {
+                            SettingsStateBadge(title: status.title, tone: status.tone)
+                        } else {
+                            if let status = health.routeStatus {
+                                SettingsStateBadge(title: status.title, tone: status.tone)
+                            }
+                            if let status = health.upstreamStatus {
+                                SettingsStateBadge(title: status.title, tone: status.tone)
+                            }
+                        }
+                    }
+                    if let nextStep = health.nextStep {
+                        Text(nextStep).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                 }.padding(10).background(Color(nsColor: .windowBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
             }
             if let error = model.localProxiesError, model.localProxies != nil {
