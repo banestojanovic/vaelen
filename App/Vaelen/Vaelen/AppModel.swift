@@ -1020,7 +1020,8 @@ final class AppModel {
                 phpConfiguration = PHPConfigurationResult(
                     defaultSettings: configuration.defaultSettings,
                     versions: remainingConfigurations + [runtimeConfiguration],
-                    directory: configuration.directory
+                    directory: configuration.directory,
+                    affectedVersions: configuration.affectedVersions
                 )
             }
             phpSelectionRequest = version
