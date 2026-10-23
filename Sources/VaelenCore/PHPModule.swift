@@ -1267,7 +1267,22 @@ private final class PHPArtifactTransferDelegate: NSObject, URLSessionDataDelegat
 
     init(destination: URL, progress: PHPArtifactProgressSink) { self.destination = destination; self.progress = progress }
 
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        guard let url = request.url,
+              url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(), PHPPackageProvider.artifactHosts.contains(host),
+              url.port == nil || url.port == 443,
+              url.user == nil, url.password == nil else {
+            failure = URLError(.unsupportedURL)
+            completionHandler(nil)
+            task.cancel()
+            return
+        }
+        completionHandler(request)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard failure == nil else { completionHandler(.cancel); return }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             failure = URLError(.badServerResponse); completionHandler(.cancel); return
         }
@@ -1292,6 +1307,7 @@ private final class PHPArtifactTransferDelegate: NSObject, URLSessionDataDelegat
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error, failure == nil { failure = error }
         try? handle?.close(); handle = nil
+        if failure != nil { try? FileManager.default.removeItem(at: destination) }
         finished.signal()
     }
 
