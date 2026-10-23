@@ -80,6 +80,11 @@ final class CaddyRouterTests: XCTestCase {
 
     func testPerSiteWildcardTLSPreservesExactHostPrecedenceAndDoesNotServeUnrelatedHosts() async throws {
         let root = URL(fileURLWithPath: "/tmp/vaelen-wildcard-\(UUID().uuidString)", isDirectory: true)
+        let keychain = LocalCAKeychain(tag: "dev.vaelen.caddy-test.\(UUID().uuidString)")
+        addTeardownBlock {
+            try? keychain.removeCAKey()
+            try? FileManager.default.removeItem(at: root)
+        }
         let parentRoot = root.appendingPathComponent("parent", isDirectory: true)
         let tenantRoot = root.appendingPathComponent("tenant", isDirectory: true)
         try FileManager.default.createDirectory(at: parentRoot, withIntermediateDirectories: true)
@@ -91,13 +96,10 @@ final class CaddyRouterTests: XCTestCase {
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
         await supervisor.installPackage(try resolveCaddyPackage())
-        let tls = TLSCapability(layout: layout)
+        let tls = TLSCapability(layout: layout, keychain: keychain)
         _ = try await tls.install()
         let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
-        addTeardownBlock {
-            try? await router.stop()
-            try? FileManager.default.removeItem(at: root)
-        }
+        addTeardownBlock { try? await router.stop() }
         try await router.start()
         let parent = Route(hostname: "tenant-parent.test", target: .staticFiles(documentRoot: parentRoot.path), tls: .local)
         let exactTenant = Route(hostname: "hotel.tenant-parent.test", target: .staticFiles(documentRoot: tenantRoot.path), tls: .local)
@@ -201,18 +203,20 @@ final class CaddyRouterTests: XCTestCase {
 
     func testOfficialCaddyRoundTripsNormalizedFastCGIRoute() async throws {
         let root = URL(fileURLWithPath: "/tmp/vaelen-fastcgi-observation-\(UUID().uuidString)", isDirectory: true)
+        let keychain = LocalCAKeychain(tag: "dev.vaelen.caddy-test.\(UUID().uuidString)")
+        addTeardownBlock {
+            try? keychain.removeCAKey()
+            try? FileManager.default.removeItem(at: root)
+        }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
         await supervisor.installPackage(try resolveCaddyPackage())
-        let tls = TLSCapability(layout: layout)
+        let tls = TLSCapability(layout: layout, keychain: keychain)
         _ = try await tls.install()
         let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
-        addTeardownBlock {
-            try? await router.stop()
-            try? FileManager.default.removeItem(at: root)
-        }
+        addTeardownBlock { try? await router.stop() }
 
         try await router.start()
         let route = Route(hostname: "roundtrip.test", target: .fastCGI(socketPath: "/tmp/vaelen-roundtrip.sock", documentRoot: root.appendingPathComponent("public").path), tls: .local)
@@ -293,21 +297,23 @@ final class CaddyRouterTests: XCTestCase {
 
     func testTLSRouteRedirectsBackendHTTPToHTTPS() async throws {
         let root = URL(fileURLWithPath: "/tmp/vaelen-redirect-\(UUID().uuidString)", isDirectory: true)
+        let keychain = LocalCAKeychain(tag: "dev.vaelen.caddy-test.\(UUID().uuidString)")
+        addTeardownBlock {
+            try? keychain.removeCAKey()
+            try? FileManager.default.removeItem(at: root)
+        }
         let docRoot = root.appendingPathComponent("public", isDirectory: true)
         try FileManager.default.createDirectory(at: docRoot, withIntermediateDirectories: true)
         try Data("redirect content".utf8).write(to: docRoot.appendingPathComponent("index.html"))
 
         let layout = VaelenFilesystemLayout(rootURL: root)
-        let tls = TLSCapability(layout: layout)
+        let tls = TLSCapability(layout: layout, keychain: keychain)
         _ = try await tls.install()
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
         await supervisor.installPackage(try resolveCaddyPackage())
         let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
-        addTeardownBlock {
-            try? await router.stop()
-            try? FileManager.default.removeItem(at: root)
-        }
+        addTeardownBlock { try? await router.stop() }
         try await router.start()
         try await router.reconcile(routes: [Route(hostname: "redirect.test", target: .staticFiles(documentRoot: docRoot.path), tls: .local)])
 
