@@ -1,5 +1,15 @@
 # Current development notes
 
+## Five-task installed acceptance and diagnostics — 2026-10-24
+
+Installed checks passed for disposable `val site info`, Settings proxy add/remove, and the native Projects popover. The site-info fixture used a Laravel marker tree and a PHP Artisan stand-in, verifying installed child arguments, cwd, output, nonzero status propagation, unsupported-framework refusal, narrow human output, and zero-route reporting. It did not run a Laravel application. Proxy Settings rows matched `val proxy list --json`; the temporary route was removed. Menu-bar project groups matched CLI linked and discovered project data. Project, route, parked-root, and proxy snapshots matched the preflight files byte-for-byte, and Doctor remained healthy. Detailed records: `docs/cli/manual-test-slice-2a.md`, `docs/cli/manual-test-slice-2b.md`, and `artifacts/verification/vaelen-five-task-20261024/`.
+
+The current full-suite failure diagnosis found a repeatable missing prerequisite: `testDiscoveredVersionReusesItsRecordedDigestOnReinstall` cannot run without the verified provider cache entry for PHP 8.4.24 and instructs running `Scripts/refresh-php-catalog-from-provider.sh`. The refresh would download and alter generated package/catalog state, so it was not run against this checkout. Retained prior full-run logs also contain environment-specific cache permission failures and historical service/test failures; they do not establish a current source regression. Safe focused tests for site commands, PHP process isolation, recorded FPM ownership, and the six-route warm/cold switch passed. The complete suite remains **unverified** until the provider artifact prerequisite is supplied and the suite is rerun. The retained direct reproduction is `.audit/test-failures/swift-test.tj4rSh`.
+
+PHP 7.4 remains unavailable. Both configured static-php-cli provider feeds were checked for a compatible prepared macOS arm64 package and returned no PHP 7.4 artifact. Upstream v2 documentation states 7.4 builds are unsupported, and PHP's official lifecycle page records 7.4 end of life on 2022-11-28. The provider research captures are under `artifacts/verification/vaelen-five-task-20261024/`; sources: [static-php-cli v2 guide](https://static-php.github.io/v2-docs/en/guide/) and [PHP supported versions](https://www.php.net/eol.php). No unofficial package was enabled.
+
+The session followed pstack principles in concrete ways: a disposable project fixture verified the installed command without touching a real project; proxy UI mutations were temporary and checked against exact before/after snapshots; read-only research preceded shared-state actions; and a failed first fixture was logged as setup error and corrected before acceptance. No product source code changed.
+
 ## Retired OpenCode2 orchestration adapter — 2026-10-18
 
 Accepted PHP/provider/ports work and the reviewed OpenCode2 orchestration setup

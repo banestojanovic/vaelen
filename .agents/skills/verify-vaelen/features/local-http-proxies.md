@@ -1,6 +1,6 @@
 # Manage local HTTP proxies
 
-The local proxy feature is a task candidate. It is not installed or accepted.
+The local proxy feature is implemented. Its installed Settings create/remove journey was accepted on 2026-10-24; the broader Open and Copy URL actions still need installed UI review.
 
 ## Current checks
 
@@ -20,4 +20,8 @@ The Core end-to-end test invokes the actual `val proxy` child through a private 
 
 ## Required acceptance
 
-Settings create, list, remove, and Open or Copy URL actions require manual GUI verification. Do not use an installed app, installed CLI, or live Vaelen state for this recipe.
+## Installed acceptance (2026-10-24)
+
+The installed Vaelen Settings > Network & Security journey added a temporary `.test` proxy to loopback port 39991, showed it as the second configured route, and removed it with the Settings action. `val proxy list --json` agreed after both mutations. The pre-existing `bakalar.test` proxy remained unchanged; upstream reachability was intentionally false because no service listened on port 3001. Exact project, route, and proxy snapshots matched the preflight state after cleanup. Evidence: `artifacts/verification/vaelen-five-task-20261024/`.
+
+This verifies installed add/remove and CLI parity only. Open and Copy URL actions and successful upstream forwarding were not part of this installed journey; isolated Caddy forwarding remains covered by the focused automated test above.

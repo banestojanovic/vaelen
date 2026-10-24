@@ -1,0 +1,3 @@
+head=6086e730e23d79d0afc42510e252ff1278fcedf6
+branch=dev
+val=/Users/banes/.local/bin/val

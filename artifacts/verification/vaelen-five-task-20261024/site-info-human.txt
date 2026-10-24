@@ -1,0 +1,20 @@
+Site information
+  Project      laravel-decad6eb-9fa4-4bc
+               e-b690-2cbc6fec5794
+  Path         /Users/banes/Code/apps
+               /vaelen/artifacts
+               /verification/vaelen-five
+               -task-20261024/fixtures/l
+               aravel-decad6eb-9fa4-4bce
+               -b690-2cbc6fec5794
+  Application  Laravel
+  Command      php artisan about
+                --no-ansi
+Configured routes
+No configured routes.
+Runtime observations
+Caddy configuration only; this is not an
+ HTTP reachability check.
+No configured routes to observe.
+Application output · exit 0
+Laravel fixture about output

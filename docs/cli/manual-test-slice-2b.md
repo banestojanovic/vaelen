@@ -39,3 +39,9 @@ The acceptance work is complete for review. This sheet is not authorization to c
 - In a disposable Laravel fixture with controlled project PHP, verify `artisan about --no-ansi` receives the project working directory, output, and exit status. Confirm `val site info --json` gives stable JSON with application output/status distinct from configured route entries and exact Caddy configuration observation.
 - Verify zero configured routes and Caddy unavailable remain explicit; a configured route or observed Caddy route is not an HTTP-reachability claim. Other/unknown framework fixtures fail with actionable unsupported-driver guidance and do not execute a command.
 - Human output at 40 columns wraps without losing fields; piped output, `NO_COLOR`, and `TERM=dumb` contain no ANSI. JSON contains no ANSI. Use only temporary fixtures; do not touch Syncproof or alter persistent Core state.
+
+## Installed CLI result — 2026-10-24
+
+The installed CLI passed this contract against a disposable Laravel-marker fixture and PHP Artisan stand-in. Human and JSON invocations used the fixture cwd and `about --no-ansi`; JSON preserved the child's output and exit status 7 and represented zero routes explicitly. The fixture's `artisan` recorded its argv, cwd, and PHP version. The human form was checked at 40 columns with color disabled. A generic unsupported fixture was rejected with exit 1 and did not execute a child command. Help and invalid-argument usage were also captured.
+
+The test fixture was deleted. Post-run `val links`, `val parked`, `val sites`, and `val proxy list` snapshots matched preflight byte-for-byte; Doctor remained healthy. Evidence: `artifacts/verification/vaelen-five-task-20261024/`. The Artisan stand-in verifies installed Vaelen dispatch and presentation, not Laravel's own output.
