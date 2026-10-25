@@ -4,9 +4,10 @@ import Darwin
 
 final class CaddyRouterTests: XCTestCase {
     func testOfficialCaddyForwardsLocalHTTPProxyPathQueryAndErrorStatus() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let root = URL(fileURLWithPath: "/private/var/tmp/vaelen-proxy-caddy-\(UUID().uuidString)", isDirectory: true)
         let layout = VaelenFilesystemLayout(rootURL: root)
-        let package = try resolveCaddyPackage()
         let configuration = try CaddyTestSupport.configuration()
         let upstreamPort = try CaddyTestSupport.availablePort()
         let upstream = try OwnedChildProcess.launch(executable: URL(fileURLWithPath: "/usr/bin/python3"), arguments: ["-c", "from http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):\n  body=self.path.encode(); status=418 if self.path.startswith('/teapot') else 200; self.send_response(status); self.end_headers(); self.wfile.write(body)\n def log_message(self,*args): pass\nHTTPServer(('127.0.0.1',int(__import__('sys').argv[1])),H).serve_forever()", String(upstreamPort)], label: "local proxy upstream fixture")
@@ -46,6 +47,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyServesMultipleStaticRoutesAndRemovesOne() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let root = URL(fileURLWithPath: "/tmp/vaelen-router-\(UUID().uuidString)", isDirectory: true)
         let alphaRoot = root.appendingPathComponent("alpha", isDirectory: true)
         let betaRoot = root.appendingPathComponent("beta", isDirectory: true)
@@ -55,7 +58,6 @@ final class CaddyRouterTests: XCTestCase {
         try Data("beta response".utf8).write(to: betaRoot.appendingPathComponent("index.html"))
         
         let layout = VaelenFilesystemLayout(rootURL: root)
-        let package = try resolveCaddyPackage()
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
         await supervisor.installPackage(package)
@@ -79,6 +81,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testPerSiteWildcardTLSPreservesExactHostPrecedenceAndDoesNotServeUnrelatedHosts() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let root = URL(fileURLWithPath: "/tmp/vaelen-wildcard-\(UUID().uuidString)", isDirectory: true)
         let keychain = LocalCAKeychain(tag: "dev.vaelen.caddy-test.\(UUID().uuidString)")
         addTeardownBlock {
@@ -95,7 +99,7 @@ final class CaddyRouterTests: XCTestCase {
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
-        await supervisor.installPackage(try resolveCaddyPackage())
+        await supervisor.installPackage(package)
         let tls = TLSCapability(layout: layout, keychain: keychain)
         _ = try await tls.install()
         let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
@@ -119,6 +123,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyServesControlledPHPFixtureThroughM2FPM() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let packageMetadata = VaelenFilesystemLayout().phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
         guard let installedPackage = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageMetadata)) else { throw XCTSkip("M2 PHP-FPM package is not installed") }
         let root = URL(fileURLWithPath: "/tmp/vaelen-fastcgi-\(UUID().uuidString)", isDirectory: true)
@@ -138,7 +144,6 @@ final class CaddyRouterTests: XCTestCase {
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
-        let package = try resolveCaddyPackage()
         await supervisor.installPackage(package)
         let router = CaddyRouter(layout: layout, supervisor: supervisor)
         addTeardownBlock {
@@ -202,6 +207,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyRoundTripsNormalizedFastCGIRoute() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let root = URL(fileURLWithPath: "/tmp/vaelen-fastcgi-observation-\(UUID().uuidString)", isDirectory: true)
         let keychain = LocalCAKeychain(tag: "dev.vaelen.caddy-test.\(UUID().uuidString)")
         addTeardownBlock {
@@ -212,7 +219,7 @@ final class CaddyRouterTests: XCTestCase {
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
-        await supervisor.installPackage(try resolveCaddyPackage())
+        await supervisor.installPackage(package)
         let tls = TLSCapability(layout: layout, keychain: keychain)
         _ = try await tls.install()
         let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
@@ -257,6 +264,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testOfficialCaddyReachesSyncproofLaravelFrontController() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let packageMetadata = VaelenFilesystemLayout().phpPackagesDirectoryURL.appendingPathComponent("8.4.23/.vaelen-package.json")
         guard let installedPackage = try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: packageMetadata)) else { throw XCTSkip("M2 PHP-FPM package is not installed") }
         let project = URL(fileURLWithPath: "/Users/banes/Code/syncproof", isDirectory: true)
@@ -274,7 +283,7 @@ final class CaddyRouterTests: XCTestCase {
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
-        await supervisor.installPackage(try resolveCaddyPackage())
+        await supervisor.installPackage(package)
         let router = CaddyRouter(layout: layout, supervisor: supervisor)
         addTeardownBlock {
             let phpClean = phpFixture.cleanup()
@@ -296,6 +305,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testTLSRouteRedirectsBackendHTTPToHTTPS() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let root = URL(fileURLWithPath: "/tmp/vaelen-redirect-\(UUID().uuidString)", isDirectory: true)
         let keychain = LocalCAKeychain(tag: "dev.vaelen.caddy-test.\(UUID().uuidString)")
         addTeardownBlock {
@@ -311,7 +322,7 @@ final class CaddyRouterTests: XCTestCase {
         _ = try await tls.install()
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
-        await supervisor.installPackage(try resolveCaddyPackage())
+        await supervisor.installPackage(package)
         let router = CaddyRouter(layout: layout, supervisor: supervisor, tls: tls)
         addTeardownBlock { try? await router.stop() }
         try await router.start()
@@ -327,6 +338,8 @@ final class CaddyRouterTests: XCTestCase {
     }
 
     func testRoutingDisablesHTTP3AndHoldsNoUDPListener() async throws {
+        try requireCaddyAcceptance()
+        let package = try resolveCaddyPackage()
         let root = URL(fileURLWithPath: "/tmp/vaelen-protocols-\(UUID().uuidString)", isDirectory: true)
         let docRoot = root.appendingPathComponent("public", isDirectory: true)
         try FileManager.default.createDirectory(at: docRoot, withIntermediateDirectories: true)
@@ -335,7 +348,7 @@ final class CaddyRouterTests: XCTestCase {
         let layout = VaelenFilesystemLayout(rootURL: root)
         let configuration = try CaddyTestSupport.configuration()
         let supervisor = CaddyProcessSupervisor(layout: layout, configuration: configuration)
-        await supervisor.installPackage(try resolveCaddyPackage())
+        await supervisor.installPackage(package)
         let router = CaddyRouter(layout: layout, supervisor: supervisor)
         addTeardownBlock {
             try? await router.stop()
@@ -361,16 +374,18 @@ final class CaddyRouterTests: XCTestCase {
         XCTAssertTrue(canBindUDP(port: configuration.httpsPort), "Caddy must not hold a UDP listener on the HTTPS backend port")
     }
 
+    private func requireCaddyAcceptance() throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_CADDY_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_CADDY_ACCEPTANCE=1 to run Caddy routing acceptance tests that use local services or the user Keychain.")
+        }
+    }
+
     private func resolveCaddyPackage() throws -> CaddyPackage {
         let module = CaddyModule(layout: VaelenFilesystemLayout())
         do {
             return try module.resolveInstalled(requestedVersion: "2.11.4")
-        } catch CaddyModuleError.packageMissing {
-            do {
-                return try module.install(requestedVersion: "2.11.4")
-            } catch {
-                throw XCTSkip("Caddy distribution prerequisite unavailable: \(error)")
-            }
+        } catch CaddyModuleError.packageMissing(let reason) {
+            throw XCTSkip("Installed Caddy 2.11.4 prerequisite unavailable: \(reason)")
         }
     }
 

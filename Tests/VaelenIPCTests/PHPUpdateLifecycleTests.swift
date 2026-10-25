@@ -96,9 +96,23 @@ final class PHPUpdateLifecycleTests: XCTestCase {
 
     override func setUpWithError() throws {
         try super.setUpWithError()
-        let cache = ProviderArtifactCache.shared
-        guard (try? cache.artifacts(version: sourceVersion)) != nil, (try? cache.artifacts(version: targetVersion)) != nil else {
-            throw XCTSkip("The verified provider cache needs PHP \(sourceVersion) and \(targetVersion). Run ./Scripts/refresh-php-catalog-from-provider.sh first.")
+        let wireFormatTests: Set<String> = [
+            "testSuccessfulUpdateResultRoundTrip",
+            "testPartialUpdateResultWithAbsentOptionalsRoundTrip",
+            "testVersionsResultStillDecodesAsVersions",
+            "testFullUpdateResponseEnvelopeRoundTrip",
+        ]
+        let isWireFormatTest = wireFormatTests.contains { (name ?? "").contains($0) }
+        if !isWireFormatTest {
+            guard ProcessInfo.processInfo.environment["VAELEN_PHP_PROVIDER_ACCEPTANCE"] == "1" else {
+                throw XCTSkip("Set VAELEN_PHP_PROVIDER_ACCEPTANCE=1 to run provider-cache-backed PHP update lifecycle tests.")
+            }
+        }
+        if !isWireFormatTest {
+            let cache = ProviderArtifactCache.shared
+            guard (try? cache.artifacts(version: sourceVersion)) != nil, (try? cache.artifacts(version: targetVersion)) != nil else {
+                throw XCTSkip("The local provider acceptance cache needs PHP \(sourceVersion) and \(targetVersion). Populate it before enabling provider acceptance.")
+            }
         }
         root = URL(fileURLWithPath: "/private/var/tmp/vaelen-lifecycle-\(UUID().uuidString.prefix(8))", isDirectory: true)
         layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))

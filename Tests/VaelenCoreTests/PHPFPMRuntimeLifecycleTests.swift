@@ -4,6 +4,7 @@ import Darwin
 
 final class PHPFPMRuntimeLifecycleTests: XCTestCase {
     func testRelaunchedCoreStopsRecordedFPMMasterWithoutKillingSiblingProcesses() throws {
+        try requirePHPAcceptanceOptIn()
         let installed = try installedPHP(version: "8.4.23")
         let fixture = try IsolatedPHPFixture(installedPackage: installed)
         defer { _ = fixture.cleanup() }
@@ -20,6 +21,7 @@ final class PHPFPMRuntimeLifecycleTests: XCTestCase {
     }
 
     func testPHPFPMIsolationRegressionLeavesNormalRuntimeStoppedAndUnrelatedProcessUntouched() throws {
+        try requirePHPAcceptanceOptIn()
         let defaultLayout = VaelenFilesystemLayout()
         let installed = try installedPHP(version: "8.4.23")
         let fpm = URL(fileURLWithPath: installed.fpmPath)
@@ -277,5 +279,11 @@ final class PHPFPMRuntimeLifecycleTests: XCTestCase {
             throw XCTSkip("Installed PHP \(version) FPM package required")
         }
         return package
+    }
+
+    private func requirePHPAcceptanceOptIn() throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_PHP_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_PHP_ACCEPTANCE=1 to run PHP-FPM process acceptance tests.")
+        }
     }
 }

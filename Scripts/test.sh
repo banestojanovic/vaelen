@@ -5,7 +5,7 @@ raw_log="$(mktemp "${TMPDIR:-/tmp}/vaelen-swift-test.XXXXXX")" || exit 1
 trap 'rm -f "$raw_log"' EXIT
 
 status=0
-(cd "$ROOT" && swift test "$@") >"$raw_log" 2>&1 || status=$?
+(cd "$ROOT" && swift test --disable-automatic-resolution "$@") >"$raw_log" 2>&1 || status=$?
 if [[ "$status" == 0 ]]; then
   echo 'swift test passed (full log discarded)'
   exit 0

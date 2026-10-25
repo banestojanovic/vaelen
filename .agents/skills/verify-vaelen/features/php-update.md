@@ -14,14 +14,29 @@ Run `val php update` for the intended runtime or use PHP update controls in Sett
 
 ## Driving it with Swift XCTest
 
-Preconditions: inspect `Tests/VaelenIPCTests/PHPUpdateLifecycleTests.swift` and `PHPUpdateConvergenceTests.swift` before execution. Both need the already verified provider-cache pair PHP 8.4.23 and 8.4.24. Do not refresh or download it under this skill. Confirm all processes and roots belong to the new test run.
+These provider-backed recipes are opt-in. The default suite runs the pure wire-format tests in `PHPUpdateLifecycleTests` and skips tests that consume provider PHP bytes. Cache-backed recipes require PHP 8.4.23 and 8.4.24 to already exist in the verified local provider cache. Set `VAELEN_PHP_PROVIDER_ACCEPTANCE=1` to opt in. This flag never refreshes the provider catalog or downloads artifacts. Confirm all processes and roots belong to the new test run.
 
 ```bash
-swift test --skip-build --filter PHPUpdateLifecycleTests
-swift test --skip-build --filter PHPUpdateConvergenceTests
+VAELEN_PHP_PROVIDER_ACCEPTANCE=1 Scripts/test.sh --skip-build --filter PHPUpdateLifecycleTests
+VAELEN_PHP_PROVIDER_ACCEPTANCE=1 Scripts/test.sh --skip-build --filter PHPUpdateConvergenceTests
 ```
 
 These are optional focused recipes, not part of the initial executed proof. Record discovery, passed tests, and skips separately. Require the expected update payloads, preserved default/settings, and specific partial-failure outcomes. Read each test's owned FPM teardown results. A skip from a missing cache leaves the journey unverified.
+
+Run provider install/update acceptance from the existing local cache with this command:
+
+```bash
+VAELEN_PHP_PROVIDER_ACCEPTANCE=1 Scripts/test.sh --filter PHPProviderInstallUpdateTests
+```
+
+The one test that downloads the latest stable package also requires the separate network opt-in:
+
+```bash
+VAELEN_PHP_PROVIDER_ACCEPTANCE=1 VAELEN_PHP_NETWORK_ACCEPTANCE=1 \
+  Scripts/test.sh --filter PHPProviderInstallUpdateTests.testLatestStableInstallsFromProviderActivatesAndBecomesDefault
+```
+
+This test contacts the live provider and is distinct from acceptance using locally cached bytes. Never set the network flag as part of the ordinary suite.
 
 ### Real PHP 8.4.24 → 8.4.27 acceptance
 

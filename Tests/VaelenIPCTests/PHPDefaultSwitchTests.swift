@@ -5,6 +5,7 @@ import XCTest
 
 final class PHPDefaultSwitchTests: XCTestCase {
     func testSingleColdDefaultSelectionProcessRecordLifecycle() async throws {
+        try requirePHPAcceptanceOptIn()
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/vb-record-\(UUID().uuidString.prefix(8))")
         let layout = VaelenFilesystemLayout(rootURL: root, logsDirectoryURL: root.appendingPathComponent("logs"))
         let live = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Vaelen/packages/php/8.3.29")
@@ -73,6 +74,7 @@ final class PHPDefaultSwitchTests: XCTestCase {
     }
 
     func testColdAndWarmSwitchWithSixInheritedRoutes() async throws {
+        try requirePHPAcceptanceOptIn()
         var installedPackages: [String: PHPPackage] = [:]
         for version in ["8.4.23", "8.3.29"] {
             let live = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Vaelen/packages/php/\(version)")
@@ -304,5 +306,11 @@ final class PHPDefaultSwitchTests: XCTestCase {
         let ns = error as NSError
         let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError
         print("PHP_SWITCH_STAGE_FAILURE operation=\(operation) domain=\(ns.domain) code=\(ns.code) underlying=\(underlying.map { "\($0.domain):\($0.code)" } ?? "none") path=\(ns.userInfo["NSFilePath"] ?? underlying?.userInfo["NSFilePath"] ?? "unknown") error=\(error)")
+    }
+
+    private func requirePHPAcceptanceOptIn() throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_PHP_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_PHP_ACCEPTANCE=1 to run PHP default-switch process acceptance tests (requires installed PHP and, for the route test, Caddy packages).")
+        }
     }
 }

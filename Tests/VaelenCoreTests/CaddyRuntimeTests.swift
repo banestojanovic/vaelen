@@ -26,6 +26,7 @@ final class CaddyRuntimeTests: XCTestCase {
     }
 
     func testOfficialCaddyLifecycleIsOwnedAndIdempotent() async throws {
+        try requireCaddyAcceptance()
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }
         let layout = VaelenFilesystemLayout(rootURL: root)
@@ -50,6 +51,7 @@ final class CaddyRuntimeTests: XCTestCase {
     }
 
     func testNewCoreCanStopPreciselyRecordedCaddyProcess() async throws {
+        try requireCaddyAcceptance()
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-core-restart-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }
         let layout = VaelenFilesystemLayout(rootURL: root)
@@ -68,6 +70,7 @@ final class CaddyRuntimeTests: XCTestCase {
     }
 
     func testExternalCrashIsObservedAndPortCollisionDoesNotKillListener() async throws {
+        try requireCaddyAcceptance()
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-failure-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }
         let package = try resolveCaddyPackage()
@@ -111,6 +114,7 @@ final class CaddyRuntimeTests: XCTestCase {
     }
 
     func testRecordedCaddyWithUnreadyAdminNeverGetsSecondLaunchOrSelfConflict() async throws {
+        try requireCaddyAcceptance()
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-unready-admin-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }
         let package = try resolveCaddyPackage()
@@ -139,6 +143,7 @@ final class CaddyRuntimeTests: XCTestCase {
     }
 
     func testAcceptingButSilentAdminSocketFailsWithinDeadlineAndRetainsCaddyRecord() async throws {
+        try requireCaddyAcceptance()
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-silent-admin-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }
         let package = try resolveCaddyPackage()
@@ -271,16 +276,18 @@ final class CaddyRuntimeTests: XCTestCase {
         }
     }
 
+    private func requireCaddyAcceptance() throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_CADDY_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_CADDY_ACCEPTANCE=1 to run real Caddy lifecycle acceptance tests.")
+        }
+    }
+
     private func resolveCaddyPackage() throws -> CaddyPackage {
         let module = CaddyModule(layout: VaelenFilesystemLayout())
         do {
             return try module.resolveInstalled(requestedVersion: "2.11.4")
-        } catch CaddyModuleError.packageMissing {
-            do {
-                return try module.install(requestedVersion: "2.11.4")
-            } catch {
-                throw XCTSkip("Caddy distribution prerequisite unavailable: \(error)")
-            }
+        } catch CaddyModuleError.packageMissing(let reason) {
+            throw XCTSkip("Installed Caddy 2.11.4 prerequisite unavailable: \(reason)")
         }
     }
 }

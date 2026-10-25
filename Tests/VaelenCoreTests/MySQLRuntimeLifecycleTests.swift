@@ -4,9 +4,9 @@ import Darwin
 
 final class MySQLRuntimeLifecycleTests: XCTestCase {
     func testConfiguredInstanceMigratesTo3306WithoutReinitializingData() throws {
+        try requireMySQLAcceptance()
+        let installed = try installedMySQLPackage()
         guard !isPortListening(3306) else { throw XCTSkip("canonical MySQL port is occupied") }
-        let installedLayout = VaelenFilesystemLayout()
-        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vm-port-migration-\(UUID().uuidString.prefix(8))", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
@@ -50,8 +50,8 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
     }
 
     func testRelaunchedCoreStopsRecordedMySQLInstanceWithoutProcessHandle() throws {
-        let installedLayout = VaelenFilesystemLayout()
-        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        try requireMySQLAcceptance()
+        let installed = try installedMySQLPackage()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("mysql-core-restart-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let fixture = try makeModule(named: "restart", root: root, installed: installed)
@@ -69,8 +69,8 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
     }
 
     func testStartReconcilesOnlyProvenExitedRuntimeSocketAndPIDArtifacts() throws {
-        let installedLayout = VaelenFilesystemLayout()
-        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        try requireMySQLAcceptance()
+        let installed = try installedMySQLPackage()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("mysql-stale-runtime-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let fixture = try makeModule(named: "stale", root: root, installed: installed)
@@ -103,8 +103,8 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
     }
 
     func testStartReadinessIsBoundedWhenMysqlAdminHangs() throws {
-        let installedLayout = VaelenFilesystemLayout()
-        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        try requireMySQLAcceptance()
+        let installed = try installedMySQLPackage()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vm-ping-timeout-\(UUID().uuidString.prefix(8))", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
@@ -132,8 +132,8 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
     }
 
     func testStopRetainsOwnershipAcrossClientAndServerShutdownTimeouts() throws {
-        let installedLayout = VaelenFilesystemLayout()
-        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        try requireMySQLAcceptance()
+        let installed = try installedMySQLPackage()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vm-timeout-\(UUID().uuidString.prefix(8))", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let unrelatedFixture = try makeModule(named: "unrelated", root: root.appendingPathComponent("unrelated"), installed: installed)
@@ -203,8 +203,8 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
     }
 
     func testManagedMySQLIsolatedLifecyclePreservesUnrelatedSameBinaryServer() throws {
-        let installedLayout = VaelenFilesystemLayout()
-        let installed = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: installedLayout.mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")))
+        try requireMySQLAcceptance()
+        let installed = try installedMySQLPackage()
         let serverURL = URL(fileURLWithPath: installed.serverPath)
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: serverURL.path))
         let hash = try command("/usr/bin/shasum", ["-a", "256", serverURL.path])
@@ -329,6 +329,21 @@ final class MySQLRuntimeLifecycleTests: XCTestCase {
 
         XCTAssertEqual(try unrelated.stop().state, .stopped)
         XCTAssertProcessGone(unrelatedPID)
+    }
+
+    private func requireMySQLAcceptance() throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_MYSQL_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_MYSQL_ACCEPTANCE=1 to run MySQL lifecycle acceptance tests that launch local servers or use canonical ports.")
+        }
+    }
+
+    private func installedMySQLPackage() throws -> MySQLPackage {
+        let metadataURL = VaelenFilesystemLayout().mysqlPackagesDirectoryURL.appendingPathComponent("8.4.11/.vaelen-package.json")
+        do {
+            return try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: metadataURL))
+        } catch {
+            throw XCTSkip("Installed MySQL 8.4.11 package prerequisite unavailable: \(error)")
+        }
     }
 
     private func makeModule(named name: String, root: URL, installed: MySQLPackage, clientCommandTimeout: TimeInterval = 10, shutdownTimeout: TimeInterval = 8) throws -> (module: MySQLModule, layout: VaelenFilesystemLayout) {

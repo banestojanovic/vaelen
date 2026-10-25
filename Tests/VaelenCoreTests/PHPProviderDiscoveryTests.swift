@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 import VaelenTestSupport
@@ -486,6 +487,9 @@ final class PHPProviderDiscoveryTests: XCTestCase {
     /// An explicitly named runtime must be validated, never silently replaced by a
     /// different one. Each rejection names the actual problem.
     func testExplicitUpdateSourceIsValidatedRatherThanSubstituted() throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_PHP_PROVIDER_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_PHP_PROVIDER_ACCEPTANCE=1 to run this provider-cache-backed source validation test.")
+        }
         let cache = ProviderArtifactCache.shared
         let older = try cache.manifest(version: "8.4.23")
         let newer = try cache.manifest(version: "8.4.24")
@@ -572,37 +576,92 @@ final class PHPProviderDiscoveryTests: XCTestCase {
     /// recorded digest is a local integrity record, not provider authentication,
     /// and is labelled as such.
     func testDiscoveredVersionReusesItsRecordedDigestOnReinstall() throws {
-        let cache = ProviderArtifactCache.shared
-        let version = "8.4.24"
-        // Discovered, not review-pinned, and carrying no digest yet.
-        let manifest = try cache.manifest(version: version)
-        let discovered = manifest.replacingVersion(version, artifacts: [
-            "cli": PHPArtifact(file: manifest.artifacts["cli"]!.file, url: manifest.artifacts["cli"]!.url, sha256: ""),
-            "fpm": PHPArtifact(file: manifest.artifacts["fpm"]!.file, url: manifest.artifacts["fpm"]!.url, sha256: ""),
-        ], verification: PHPVerification(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity, digestPinnedByReview: false))
+        // Data shape: provider-named CLI and FPM archives built from local
+        // arm64 executables, mapped by artifact filename to the transfer callback.
+        let version = "8.5.9"
+        let baselineVersion = "8.5.8"
+        let fixtureRoot = root.appendingPathComponent("provider-artifacts-\(UUID().uuidString)", isDirectory: true)
+        let artifactDirectory = fixtureRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+        let source = fixtureRoot.appendingPathComponent("fixture.c")
+        let extensions = PHPPackageProvider.requiredExtensions.map { "\"\($0)\"" }.joined(separator: ", ")
+        let sourceText = """
+        #include <stdio.h>
+        #include <string.h>
+        int main(int argc, char **argv) {
+            if (argc > 1 && strcmp(argv[1], "-v") == 0) { puts("PHP \(version) fixture"); return 0; }
+            if (argc > 1 && strcmp(argv[1], "-m") == 0) {
+                puts("[PHP Modules]");
+                const char *modules[] = {\(extensions)};
+                for (unsigned long i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) puts(modules[i]);
+                return 0;
+            }
+            return 0;
+        }
+        """
+        try sourceText.write(to: source, atomically: true, encoding: .utf8)
+        var fixtureArtifacts: [String: URL] = [:]
+        for (kind, executable) in [("cli", "php"), ("fpm", "php-fpm")] {
+            let binary = fixtureRoot.appendingPathComponent(executable)
+            let compiler = Process()
+            compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            compiler.arguments = ["clang", "-arch", "arm64", "-mmacosx-version-min=12.0", source.path, "-o", binary.path]
+            try compiler.run()
+            compiler.waitUntilExit()
+            XCTAssertEqual(compiler.terminationStatus, 0, "The local arm64 \(kind) executable fixture must compile.")
+            let archive = artifactDirectory.appendingPathComponent(PHPPackageProvider.artifactFile(version: version, kind: kind))
+            let tar = Process()
+            tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+            tar.arguments = ["-czf", archive.path, "-C", fixtureRoot.path, executable]
+            try tar.run()
+            tar.waitUntilExit()
+            XCTAssertEqual(tar.terminationStatus, 0, "The local \(kind) archive fixture must be created.")
+            fixtureArtifacts[archive.lastPathComponent] = archive
+        }
+        let artifacts = fixtureArtifacts
+        let baseline = manifestFixture(version: baselineVersion, cliSHA: String(repeating: "a", count: 64), fpmSHA: String(repeating: "b", count: 64))
+        let feed = Self.feed(published: ["8.5.8-cli", "8.5.8-fpm", "8.5.9-cli", "8.5.9-fpm"])
+        let location = BundledPHPManifestLocation(
+            catalog: PHPManifestCatalog(manifests: [baseline]),
+            stateDirectory: fixtureRoot.appendingPathComponent("catalog-state", isDirectory: true),
+            now: { Self.now },
+            fetchFeed: { feed },
+            fetchLegacyFeed: { Self.feed(published: []) }
+        )
+        try location.checkCatalogNow()
+        let discovered = try XCTUnwrap(location.discoveredManifests().first { $0.phpVersion == version })
         XCTAssertFalse(discovered.verification.isPinnedByReview)
+        XCTAssertEqual(discovered.artifacts["cli"]?.sha256, "")
+        XCTAssertEqual(discovered.artifacts["fpm"]?.sha256, "")
 
-        let directory = URL(fileURLWithPath: "/private/var/tmp/vaelen-discovered-\(UUID().uuidString.prefix(8))", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let moduleLayout = VaelenFilesystemLayout(rootURL: directory.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: directory.appendingPathComponent("logs", isDirectory: true))
-        let module = PHPModule(layout: moduleLayout, location: PHPProviderManifestLocation(
-            box: .init(PHPManifestCatalog(manifests: [discovered])),
-            stateDirectory: moduleLayout.stateDirectoryURL,
-            artifactBase: try cache.flatDirectory()
-        ), includesBundledCatalog: false)
+        let moduleLayout = VaelenFilesystemLayout(rootURL: fixtureRoot.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: fixtureRoot.appendingPathComponent("logs", isDirectory: true))
+        let transferCount = Counter()
+        let module = PHPModule(layout: moduleLayout, location: location, includesBundledCatalog: false, artifactTransfer: { source, destination, _ in
+            guard let fixture = artifacts[source.lastPathComponent] else { throw PHPModuleError.invalidManifest("Missing local artifact fixture.") }
+            transferCount.increment()
+            try FileManager.default.copyItem(at: fixture, to: destination)
+        })
 
+        let cliArchive = try XCTUnwrap(artifacts[PHPPackageProvider.artifactFile(version: version, kind: "cli")])
+        let fpmArchive = try XCTUnwrap(artifacts[PHPPackageProvider.artifactFile(version: version, kind: "fpm")])
+        let expectedCLISHA = Self.sha256(try Data(contentsOf: cliArchive))
+        let expectedFPMSHA = Self.sha256(try Data(contentsOf: fpmArchive))
         let installed = try module.install(requestedVersion: version)
-        // The digest of the bytes actually received is recorded, never invented.
-        XCTAssertEqual(installed.cliSHA256.count, 64)
-        XCTAssertEqual(installed.fpmSHA256.count, 64)
-        XCTAssertNotEqual(installed.cliSHA256, String(repeating: "0", count: 64))
+        XCTAssertEqual(installed.cliSHA256, expectedCLISHA, "The package records the digest of received CLI archive bytes.")
+        XCTAssertEqual(installed.fpmSHA256, expectedFPMSHA, "The package records the digest of received FPM archive bytes.")
+        XCTAssertEqual(transferCount.value, 2, "The first install transfers each local archive once.")
+        let persisted = try XCTUnwrap(location.discoveredManifests().first { $0.phpVersion == version })
+        XCTAssertEqual(persisted.artifacts["cli"]?.sha256, expectedCLISHA)
+        XCTAssertEqual(persisted.artifacts["fpm"]?.sha256, expectedFPMSHA)
 
-        // Removal then reinstall must verify the recorded digest rather than
-        // skipping verification, and must reuse the verified cache.
+        // Removal then reinstall must validate and reuse the local bytes against
+        // their persisted digests without another transfer.
         try module.remove(requestedVersion: version)
         let reinstalled = try module.install(requestedVersion: version)
         XCTAssertEqual(reinstalled.cliSHA256, installed.cliSHA256, "Reinstall must match the recorded integrity record.")
         XCTAssertEqual(reinstalled.fpmSHA256, installed.fpmSHA256)
+        XCTAssertEqual(module.operationState()?.usingVerifiedCachedDownloads, true, "Reinstall must reuse both verified local archive bytes.")
+        XCTAssertEqual(transferCount.value, 2, "Reinstall must not transfer either archive again.")
     }
 
     // MARK: - Support
@@ -625,6 +684,10 @@ final class PHPProviderDiscoveryTests: XCTestCase {
             verification: .init(algorithm: "sha256", authenticity: PHPPackageProvider.authenticity, digestPinnedByReview: true),
             release: .init(tag: PHPPackageProvider.channel, url: PHPPackageProvider.baseURL)
         )
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 

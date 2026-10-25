@@ -19,6 +19,14 @@ final class PHPProviderInstallUpdateTests: XCTestCase {
 
     override func setUpWithError() throws {
         try super.setUpWithError()
+        guard ProcessInfo.processInfo.environment["VAELEN_PHP_PROVIDER_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_PHP_PROVIDER_ACCEPTANCE=1 to run tests that consume locally cached real provider PHP artifacts.")
+        }
+        if (name ?? "").contains("testLatestStableInstallsFromProviderActivatesAndBecomesDefault") {
+            guard ProcessInfo.processInfo.environment["VAELEN_PHP_NETWORK_ACCEPTANCE"] == "1" else {
+                throw XCTSkip("Set VAELEN_PHP_NETWORK_ACCEPTANCE=1 as well to allow the live provider download acceptance test.")
+            }
+        }
         root = URL(fileURLWithPath: "/private/var/tmp/vaelen-provider-\(UUID().uuidString.prefix(8))", isDirectory: true)
         layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true), logsDirectoryURL: root.appendingPathComponent("logs", isDirectory: true))
         try FileManager.default.createDirectory(at: layout.configurationDirectoryURL, withIntermediateDirectories: true)

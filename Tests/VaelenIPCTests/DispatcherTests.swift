@@ -1552,11 +1552,19 @@ final class DispatcherTests: XCTestCase {
     }
 
     func testCoreShutdownStopsCaddyThenContinuesThroughDNSRestore() async throws {
+        guard ProcessInfo.processInfo.environment["VAELEN_CADDY_ACCEPTANCE"] == "1" else {
+            throw XCTSkip("Set VAELEN_CADDY_ACCEPTANCE=1 to run Core shutdown acceptance with a real Caddy package and process.")
+        }
         let root = URL(fileURLWithPath: "/tmp/vln-qcd-\(UUID().uuidString.prefix(8))", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let support = root.appendingPathComponent("support", isDirectory: true)
         let layout = VaelenFilesystemLayout(rootURL: support)
-        let package = try CaddyModule(layout: VaelenFilesystemLayout()).resolveInstalled(requestedVersion: "2.11.4")
+        let package: CaddyPackage
+        do {
+            package = try CaddyModule(layout: VaelenFilesystemLayout()).resolveInstalled(requestedVersion: "2.11.4")
+        } catch CaddyModuleError.packageMissing(let reason) {
+            throw XCTSkip("Installed Caddy 2.11.4 prerequisite unavailable: \(reason)")
+        }
         let httpPort = try ephemeralTCPPort()
         var httpsPort = try ephemeralTCPPort()
         while httpsPort == httpPort { httpsPort = try ephemeralTCPPort() }

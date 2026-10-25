@@ -38,16 +38,19 @@ final class PHPSettingsWorkflowTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("php-official-boundary-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let layout = VaelenFilesystemLayout(rootURL: root)
-        let liveRoot = VaelenFilesystemLayout().phpPackagesDirectoryURL
-        let metadata = (try? FileManager.default.contentsOfDirectory(at: liveRoot, includingPropertiesForKeys: nil)) ?? []
-        guard let live = metadata.filter({ $0.lastPathComponent.hasPrefix("8.4.") }).sorted(by: { $0.path < $1.path }).compactMap({
-            try? JSONDecoder().decode(PHPPackage.self, from: Data(contentsOf: $0.appendingPathComponent(".vaelen-package.json")))
-        }).first else {
-            throw XCTSkip("Read-only installed PHP 8.4 required for isolated eligibility check")
-        }
-        let directory = layout.phpPackagesDirectoryURL.appendingPathComponent(live.version)
+        let version = "8.4.26"
+        let directory = layout.phpPackagesDirectoryURL.appendingPathComponent(version)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let package = PHPPackage(version: live.version, architecture: live.architecture, packagePath: directory.path, cliPath: live.cliPath, fpmPath: live.fpmPath, source: live.source, cliSHA256: live.cliSHA256, fpmSHA256: live.fpmSHA256, installedAt: live.installedAt)
+        let executableURL = directory.appendingPathComponent("php-fixture")
+        let sourceURL = root.appendingPathComponent("php-fixture.c")
+        try Data("#include <stdio.h>\nint main(void) { puts(\"PHP 8.4.26 (cli)\"); return 0; }\n".utf8).write(to: sourceURL)
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/clang")
+        compiler.arguments = ["-arch", "arm64", sourceURL.path, "-o", executableURL.path]
+        try compiler.run()
+        compiler.waitUntilExit()
+        XCTAssertEqual(compiler.terminationStatus, 0, "The isolated PHP executable fixture must compile")
+        let package = PHPPackage(version: version, architecture: "arm64", packagePath: directory.path, cliPath: executableURL.path, fpmPath: executableURL.path, source: "fixture", cliSHA256: "fixture", fpmSHA256: "fixture", installedAt: Date())
         try JSONEncoder().encode(package).write(to: directory.appendingPathComponent(".vaelen-package.json"))
         let fetches = OfficialReleaseFetchCounter()
         let official = PHPReleaseAdvisoryStore(directory: layout.stateDirectoryURL, fetch: { _ in
