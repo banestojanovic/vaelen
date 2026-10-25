@@ -15,7 +15,7 @@ Do not create explorer or verification subagents automatically. Implementation a
 - The delegate's brief gives file paths, the named data shape, tests to write first, commands to run, and clear completion criteria. The delegate does not commit.
 - The lead reads the full diff, reruns focused tests itself, and checks the real surface. For bounded CLI and Core changes, follow `.agents/skills/verify-vaelen/SKILL.md` and its affected feature recipe. For an app UI change, run the app and inspect the changed flow. A fix round goes to a fresh delegate with the previous report and review findings.
 - The lead edits implementation inline only when the change is a few lines in one file. The lead may edit tests, docs, and configuration inline.
-- Review uses fresh, read-only subagents on the models configured for `interrogate reviewers` in the global Codex `pstack-models.md`. The lead judges their findings.
+- Review uses one fresh, read-only Sol subagent that did not write the change. Use additional reviewers only for a genuinely complex integration or a major bottleneck where independent opinions materially reduce risk. State that reason before creating a panel and use the smallest panel that can address it. The lead judges the findings.
 
 ### Tests
 
