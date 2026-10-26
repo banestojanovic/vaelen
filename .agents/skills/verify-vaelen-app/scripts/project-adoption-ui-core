@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(cd "$(dirname "$0")/../../../.." && pwd -P)
+exec swift run --package-path "$repository_root" project-adoption-ui-core "$@"

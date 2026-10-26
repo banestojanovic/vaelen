@@ -1,0 +1,14 @@
+token=93FC3504-BED8-44F8-BA5F-CA0C97A1C8F2
+evidence=/private/tmp/vaelen-adoption-live-core/artifacts/verification/native-project-adoption-live-core-20261026-r3
+scratch=/private/tmp/vaui-93fc3504
+support=/private/tmp/vaui-93fc3504/s
+project=/private/tmp/vaui-93fc3504/p
+project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E
+app=/private/tmp/vaui-93fc3504/DerivedData/Build/Products/Debug/Vaelen.app
+app_pid=70433
+app_start=1793041081:148973
+core=/private/tmp/vaui-93fc3504/DerivedData/Build/Products/Debug/Vaelen.app/Contents/Resources/vaelend
+core_pid=70429
+core_start=1793041080:217194
+project_seed=linked declaration-free; composer.php=^8.3; package.engines.node=>=20; dotenv=sha256:40159274711e850f0e3b974731e710bcca23ec84054c49340077602e1472b263
+services=catalog-only postgresql-18.6 adoption-db; valkey-9.1.2 adoption-cache

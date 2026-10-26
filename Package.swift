@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "VaelenDaemonSupport", targets: ["VaelenDaemonSupport"]),
         .executable(name: "vaelend", targets: ["VaelenDaemon"]),
         .executable(name: "projects-php-core", targets: ["ProjectsPHPUIAcceptance"]),
+        .executable(name: "project-adoption-ui-core", targets: ["ProjectAdoptionUIAcceptance"]),
         .executable(name: "vaelendns", targets: ["VaelenDNS"]),
         .executable(name: "val", targets: ["VaelenCLI"]),
         .executable(name: "vaelen-privileged-helper", targets: ["VaelenPrivilegedHelper"])
@@ -23,6 +24,7 @@ let package = Package(
         .target(name: "VaelenDaemonSupport", dependencies: ["VaelenCore", "VaelenIPC"]),
         .executableTarget(name: "VaelenDaemon", dependencies: ["VaelenDaemonSupport"]),
         .executableTarget(name: "ProjectsPHPUIAcceptance", dependencies: ["VaelenCore", "VaelenIPC"], path: ".agents/skills/verify-vaelen-app/scripts/ProjectsPHPUIAcceptance"),
+        .executableTarget(name: "ProjectAdoptionUIAcceptance", dependencies: ["VaelenCore", "VaelenIPC", .product(name: "Yams", package: "Yams")], path: ".agents/skills/verify-vaelen-app/scripts/ProjectAdoptionUIAcceptance"),
         .target(name: "VaelenDNSCore"),
         .executableTarget(name: "VaelenDNS", dependencies: ["VaelenDNSCore"]),
         .executableTarget(name: "VaelenCLI", dependencies: ["VaelenIPC"]),

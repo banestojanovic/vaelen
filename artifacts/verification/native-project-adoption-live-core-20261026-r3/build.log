@@ -1,0 +1,117 @@
+--- xcodebuild: WARNING: Using the first of multiple matching destinations:
+{ platform:macOS, arch:arm64, id:00008132-000C38E122D0401C, name:My Mac }
+{ platform:macOS, arch:x86_64, id:00008132-000C38E122D0401C, name:My Mac }
+{ platform:macOS, name:Any Mac }
+error: the following command failed with exit code 0 but produced no further output
+SwiftCompile normal arm64 /private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/ValkeyServiceModule.swift (in target 'VaelenCore' from project 'Vaelen' at path '/tmp/vaelen-adoption-live-core/Package.swift')
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/ValkeyServiceModule.swift:300:28: warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+298 |         var buffer = [CChar](repeating: 0, count: 4096)
+299 |         let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+300 |         return count > 0 ? String(cString: buffer) : nil
+    |                            `- warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+301 |     }
+302 |     private func processMatches(_ evidence: ProcessEvidence, record: ServiceInstanceRecord) -> Bool {
+
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/PostgreSQLServiceModule.swift:132:13: warning: initialization of immutable value 'options' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+130 |         try manager.createDirectory(at: paths.socket, withIntermediateDirectories: true)
+131 |         try manager.createDirectory(at: paths.runtime, withIntermediateDirectories: true)
+132 |         let options = "-h 127.0.0.1 -p \(port) -k \(paths.socket.path)"
+    |             `- warning: initialization of immutable value 'options' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+133 |         try manager.createDirectory(at: paths.log.deletingLastPathComponent(), withIntermediateDirectories: true)
+134 |         if !manager.fileExists(atPath: paths.log.path) { manager.createFile(atPath: paths.log.path, contents: nil) }
+
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/PostgreSQLServiceModule.swift:171:13: warning: initialization of immutable value 'package' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+169 |         guard let evidence = readEvidence(id) else { return }
+170 |         guard processMatches(evidence, record: record) else { throw PostgreSQLServiceError.processIdentityMismatch }
+171 |         let package = try validatedPackage()
+    |             `- warning: initialization of immutable value 'package' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+172 |         guard kill(evidence.pid, SIGTERM) == 0 || errno == ESRCH else { throw PostgreSQLServiceError.processFailure("PostgreSQL graceful shutdown signal failed; process evidence and data were retained.") }
+173 |         let deadline = Date().addingTimeInterval(shutdownTimeout)
+
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/PostgreSQLServiceModule.swift:282:28: warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+280 |         var buffer = [CChar](repeating: 0, count: 4096)
+281 |         let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+282 |         return count > 0 ? String(cString: buffer) : nil
+    |                            `- warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+283 |     }
+284 |     private func processMatches(_ evidence: ProcessEvidence, record: ServiceInstanceRecord) -> Bool {
+
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+error: the following command failed with exit code 0 but produced no further output
+SwiftCompile normal arm64 /private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/ProjectEnvironment.swift (in target 'VaelenCore' from project 'Vaelen' at path '/tmp/vaelen-adoption-live-core/Package.swift')
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/ProjectEnvironment.swift:928:17: warning: result of 'ProjectWebRequirement' initializer is unused [#NoUsage]
+ 926 |             secure = try c.decodeIfPresent(Bool.self, forKey: .secure)
+ 927 |             createRoute = try c.decodeIfPresent(Bool.self, forKey: .createRoute) ?? false
+ 928 |             try ProjectWebRequirement(host: host, documentRoot: documentRoot, secure: secure, createRoute: createRoute)
+     |                 `- warning: result of 'ProjectWebRequirement' initializer is unused [#NoUsage]
+ 929 |         }
+ 930 |     }
+
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+/tmp/vaelen-adoption-live-core/App/Vaelen/Vaelen/AppModel.swift:1431:37: warning: result of call to 'unpark(path:workingDirectory:)' is unused [#NoUsage]
+1429 |         do {
+1430 |             try await commandClient.connect()
+1431 |             try await commandClient.unpark(path: folder.path, workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+     |                                     `- warning: result of call to 'unpark(path:workingDirectory:)' is unused [#NoUsage]
+1432 |             try await reconcileProjectRelationships(using: commandClient)
+1433 |             await commandClient.disconnect()
+
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+Bundled PHP 8.5.9 already verified
+Building for production...
+[5 / 20] Vaelen_VaelenCore
+[5 / 20]
+[6 / 19] Yams
+[8 / 20] Yams
+[11 / 22] VaelenCore
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/PostgreSQLServiceModule.swift:132:13: warning: initialization of immutable value 'options' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+130 |         try manager.createDirectory(at: paths.socket, withIntermediateDirectories: true)
+131 |         try manager.createDirectory(at: paths.runtime, withIntermediateDirectories: true)
+132 |         let options = "-h 127.0.0.1 -p \(port) -k \(paths.socket.path)"
+    |             `- warning: initialization of immutable value 'options' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+133 |         try manager.createDirectory(at: paths.log.deletingLastPathComponent(), withIntermediateDirectories: true)
+134 |         if !manager.fileExists(atPath: paths.log.path) { manager.createFile(atPath: paths.log.path, contents: nil) }
+
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/PostgreSQLServiceModule.swift:171:13: warning: initialization of immutable value 'package' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+169 |         guard let evidence = readEvidence(id) else { return }
+170 |         guard processMatches(evidence, record: record) else { throw PostgreSQLServiceError.processIdentityMismatch }
+171 |         let package = try validatedPackage()
+    |             `- warning: initialization of immutable value 'package' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+172 |         guard kill(evidence.pid, SIGTERM) == 0 || errno == ESRCH else { throw PostgreSQLServiceError.processFailure("PostgreSQL graceful shutdown signal failed; process evidence and data were retained.") }
+173 |         let deadline = Date().addingTimeInterval(shutdownTimeout)
+
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/PostgreSQLServiceModule.swift:282:28: warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+280 |         var buffer = [CChar](repeating: 0, count: 4096)
+281 |         let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+282 |         return count > 0 ? String(cString: buffer) : nil
+    |                            `- warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+283 |     }
+284 |     private func processMatches(_ evidence: ProcessEvidence, record: ServiceInstanceRecord) -> Bool {
+
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/ProjectEnvironment.swift:928:17: warning: result of 'ProjectWebRequirement' initializer is unused [#NoUsage]
+ 926 |             secure = try c.decodeIfPresent(Bool.self, forKey: .secure)
+ 927 |             createRoute = try c.decodeIfPresent(Bool.self, forKey: .createRoute) ?? false
+ 928 |             try ProjectWebRequirement(host: host, documentRoot: documentRoot, secure: secure, createRoute: createRoute)
+     |                 `- warning: result of 'ProjectWebRequirement' initializer is unused [#NoUsage]
+ 929 |         }
+ 930 |     }
+
+/private/tmp/vaelen-adoption-live-core/Sources/VaelenCore/ValkeyServiceModule.swift:300:28: warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+298 |         var buffer = [CChar](repeating: 0, count: 4096)
+299 |         let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+300 |         return count > 0 ? String(cString: buffer) : nil
+    |                            `- warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+301 |     }
+302 |     private func processMatches(_ evidence: ProcessEvidence, record: ServiceInstanceRecord) -> Bool {
+
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+[13 / 23] VaelenCore
+[18 / 26] VaelenIPC
+Build complete! (29,56 sec)
+/tmp/vaui-93fc3504/DerivedData/Build/Products/Debug/Vaelen.app/Contents/Resources/vaelend: replacing existing signature
+note: Run script build phase 'Embed Vaelen Core' will be run during every build because the option to run the script phase "Based on dependency analysis" is unchecked. (in target 'Vaelen' from project 'Vaelen' at path '/tmp/vaelen-adoption-live-core/App/Vaelen/Vaelen.xcodeproj')
+note: Run script build phase 'Embed Privileged Daemon' will be run during every build because the option to run the script phase "Based on dependency analysis" is unchecked. (in target 'Vaelen' from project 'Vaelen' at path '/tmp/vaelen-adoption-live-core/App/Vaelen/Vaelen.xcodeproj')
+note: Run script build phase 'Embed DNS Responder' will be run during every build because the option to run the script phase "Based on dependency analysis" is unchecked. (in target 'Vaelen' from project 'Vaelen' at path '/tmp/vaelen-adoption-live-core/App/Vaelen/Vaelen.xcodeproj')
