@@ -7,6 +7,17 @@ public struct ProjectServiceReleaseSummary: Equatable, Sendable {
     public init(operations: [ProjectReconciliationOperationResult], releasedBindingCount: Int, failed: Bool) { self.operations = operations; self.releasedBindingCount = releasedBindingCount; self.failed = failed }
 }
 
+public struct ProjectServiceRecoveryFailure: Equatable, Sendable {
+    public let serviceKey: String
+    public let detail: String
+    public init(serviceKey: String, detail: String) { self.serviceKey = serviceKey; self.detail = detail }
+}
+
+struct ProjectServiceRecoveryRuntime {
+    let observe: (ServiceInstanceID) throws -> (ServiceInstanceRecord?, String)
+    let start: (ServiceInstanceID) throws -> Void
+}
+
 public final class ProjectServiceBindings: @unchecked Sendable {
     private struct SingletonRuntime {
         let inspectBody: (ServiceInstanceID) throws -> (ServiceInstanceRecord?, String)
@@ -63,6 +74,56 @@ public final class ProjectServiceBindings: @unchecked Sendable {
             entries.append(.init(record: record, claims: []))
         }
         return .init(entries: entries.sorted { ($0.record.id.kind.rawValue, $0.record.id.name.value) < ($1.record.id.kind.rawValue, $1.record.id.name.value) })
+    }
+
+    public func recoverClaimedInstances() throws -> [ProjectServiceRecoveryFailure] {
+        let inventory = try inventorySnapshot()
+        return Self.recoverClaimedInstances(inventory: inventory, runtime: { [self] binding in
+            guard let runtime = runtime(for: binding) else { return nil }
+            return ProjectServiceRecoveryRuntime(observe: { try runtime.status(id: $0) }, start: { try runtime.start(id: $0) })
+        })
+    }
+
+    static func recoverClaimedInstances(
+        inventory: ServiceInstanceInventorySnapshot,
+        observe: @escaping (ServiceInstanceID) throws -> (ServiceInstanceRecord?, String),
+        start: @escaping (ServiceInstanceID) throws -> Void
+    ) -> [ProjectServiceRecoveryFailure] {
+        recoverClaimedInstances(inventory: inventory, runtime: { _ in ProjectServiceRecoveryRuntime(observe: observe, start: start) })
+    }
+
+    private static func recoverClaimedInstances(
+        inventory: ServiceInstanceInventorySnapshot,
+        runtime: (ProjectServiceBinding) -> ProjectServiceRecoveryRuntime?
+    ) -> [ProjectServiceRecoveryFailure] {
+        var failures = [ProjectServiceRecoveryFailure]()
+        let groups = Dictionary(grouping: inventory.entries, by: { $0.record.id })
+        for (id, entries) in groups {
+            guard let entry = entries.first else { continue }
+            let bindings = entries.flatMap(\.claims).compactMap { claim -> ProjectServiceBinding? in
+                if case .project(_, let binding) = claim { return binding }
+                return nil
+            }
+            guard !bindings.isEmpty else { continue }
+            let serviceKey = "project-service.\(id.kind.rawValue).\(id.name.value)"
+            do {
+                guard let first = bindings.first,
+                      let managedKind = ProjectManagedServiceKind(binding: first),
+                      bindings.allSatisfy({ ProjectManagedServiceKind(binding: $0) == managedKind && managedKind.matches($0, record: entry.record) && ($0.version == nil || $0.version == entry.record.packageIdentifier) }),
+                      entries.allSatisfy({ $0.record == entry.record }),
+                      let runtime = runtime(first) else { throw SQLiteStateError.invalidRecord }
+                let before = try runtime.observe(id)
+                guard before.0 == entry.record else { throw SQLiteStateError.invalidRecord }
+                if before.1 == "healthy" { continue }
+                guard before.1 == "stopped" || (id.kind == .mailpit && before.1 == "installed") else { throw SQLiteStateError.invalidRecord }
+                try runtime.start(id)
+                let after = try runtime.observe(id)
+                guard after.0 == entry.record, after.1 == "healthy" else { throw SQLiteStateError.invalidRecord }
+            } catch {
+                failures.append(.init(serviceKey: serviceKey, detail: "The claimed \(id.kind.rawValue) instance could not be verified healthy during startup recovery."))
+            }
+        }
+        return failures
     }
 
     public func record(for id: ServiceInstanceID) throws -> ServiceInstanceRecord? {

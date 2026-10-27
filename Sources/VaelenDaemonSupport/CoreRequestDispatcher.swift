@@ -206,6 +206,12 @@ public actor CoreRequestDispatcher {
         guard handshaken else {
             return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Handshake is required before other requests.")), false)
         }
+        if requiresStartupRecoveryBarrier(method, params: request.params), let restorationTask {
+            await restorationTask.value
+        }
+        if shutdownBegun && method != .status && method != .handshake && method != .phpOperation {
+            return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Core shutdown is in progress. Retry after cleanup completes.")), handshaken)
+        }
         do {
             switch method {
             case .nodeCommand:
@@ -746,6 +752,22 @@ public actor CoreRequestDispatcher {
         } catch {
             logger.error("Registry operation failed: \(String(describing: error), privacy: .public)")
             return (.init(id: request.id, error: .init(code: .internalError, message: "Core operation failed: \(error)")), true)
+        }
+    }
+
+    private func requiresStartupRecoveryBarrier(_ method: CoreMethod, params: RequestParams?) -> Bool {
+        switch method {
+        case .projectLink, .projectUnlink, .projectAdoptionApply, .projectActivate, .projectDown,
+             .mysqlStart, .mysqlStop, .mailpitStart, .mailpitStop:
+            return true
+        case .projectPHP:
+            guard let params, let request = try? params.decode(ProjectPHPRequest.self) else { return false }
+            return request.version != nil || request.useDefault
+        case .serviceInstanceLifecycle:
+            guard let params, let lifecycle = try? params.decode(ServiceInstanceLifecycleRequest.self) else { return false }
+            return lifecycle.action != .status
+        default:
+            return false
         }
     }
 
@@ -1414,6 +1436,7 @@ public actor CoreRequestDispatcher {
         let intents = serviceIntents
         let php = self.php, mysql = self.mysql, mailpit = self.mailpit
         let router = self.router, dns = self.dns, ports = self.ports
+        let projectServices = self.projectServiceBindings
         let routes = routeIntents.values.map(\.route)
         restorationTask = Task.detached { [weak self] in
             // An overdue PHP provider check runs once on startup so a machine
@@ -1426,7 +1449,10 @@ public actor CoreRequestDispatcher {
             }
             let enabled: Set<String>
             do { enabled = try intents.enabledServices() }
-            catch { return }
+            catch {
+                enabled = []
+                Logger(subsystem: "dev.vaelen.daemon", category: "service-restoration").error("Saved service intents could not be read; project-owned service recovery will still run.")
+            }
             func note(_ service: String, _ operation: () async throws -> Void) async {
                 do {
                     try await operation()
@@ -1468,6 +1494,31 @@ public actor CoreRequestDispatcher {
             if enabled.contains("mysql"), let mysql { await note("mysql") { _ = try mysql.start() } }
             guard !Task.isCancelled else { return }
             if enabled.contains("mailpit"), let mailpit { await note("mailpit") { _ = try mailpit.start() } }
+            guard !Task.isCancelled else { return }
+            do {
+                let failures = try projectServices.recoverClaimedInstances()
+                let failedKeys = Set(failures.map(\.serviceKey))
+                for failure in failures {
+                    try? intents.setFailure(failure.serviceKey, detail: failure.detail)
+                    Logger(subsystem: "dev.vaelen.daemon", category: "service-restoration").error("Claimed project service recovery failed for \(failure.serviceKey, privacy: .public).")
+                }
+                let inventory = try projectServices.inventorySnapshot()
+                let claimedKeys = Set(inventory.entries.flatMap { entry in
+                    entry.claims.compactMap { claim -> String? in
+                        guard case .project(_, let binding) = claim else { return nil }
+                        return "project-service.\(binding.kind.rawValue).\(binding.instance.value)"
+                    }
+                })
+                for key in claimedKeys.subtracting(failedKeys) { try? intents.clearFailure(key) }
+                for key in intents.failures().keys where key.hasPrefix("project-service.") && !claimedKeys.contains(key) {
+                    try? intents.clearFailure(key)
+                }
+                try? intents.clearFailure("project-service-inventory")
+            } catch {
+                let key = "project-service-inventory"
+                try? intents.setFailure(key, detail: "Project service claims could not be read during startup recovery.")
+                Logger(subsystem: "dev.vaelen.daemon", category: "service-restoration").error("Project service claims could not be read during startup recovery.")
+            }
             guard !Task.isCancelled else { return }
             if enabled.contains("caddy") {
                 await note("caddy") { try await router.start(); try await router.reconcile(routes: routes) }

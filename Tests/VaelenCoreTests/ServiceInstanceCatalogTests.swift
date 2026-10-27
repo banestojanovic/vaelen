@@ -109,6 +109,89 @@ final class ServiceInstanceCatalogTests: XCTestCase {
         XCTAssertEqual(try repository.claims(for: record.id), [.manual(instance: record.id), .project(projectID: other.id, binding: otherBinding)])
     }
 
+    func testClaimedInstanceRecoveryDeduplicatesAliasesAndStartsExactSupportedKinds() throws {
+        let project = ProjectID()
+        let records = try [
+            instance("default", kind: .mysql, endpoint: .mysql(port: 3306), package: "mysql-\(MySQLModule.defaultVersion)", directory: "/data/mysql"),
+            instance("default", kind: .mailpit, endpoint: .mailpit(smtpPort: 1025, httpPort: 8025), package: "mailpit-\(MailpitModule.defaultVersion)", directory: "/data/mailpit"),
+            instance("primary", kind: .postgresql, endpoint: .postgresql(port: 5432), package: PostgreSQLServiceModule.packageIdentifier, directory: "/data/postgresql"),
+            instance("cache", kind: .valkey, endpoint: .valkey(port: 6379), package: ValkeyServiceModule.packageIdentifier, directory: "/data/valkey")
+        ]
+        let entries = try records.map { record -> ServiceInstanceInventoryEntry in
+            let first = try recoveryBinding("primary", kind: record.id.kind, instance: record.id.name.value)
+            let second = try recoveryBinding("alternate", kind: record.id.kind, instance: record.id.name.value)
+            return .init(record: record, claims: [.project(projectID: project, binding: first), .project(projectID: project, binding: second)])
+        }
+        var starts: [ServiceInstanceID] = []
+        var states = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0.id.kind == .mailpit ? "installed" : "stopped") })
+        let failures = ProjectServiceBindings.recoverClaimedInstances(
+            inventory: .init(entries: entries),
+            observe: { id in (records.first { $0.id == id }, states[id] ?? "missing") },
+            start: { id in starts.append(id); states[id] = "healthy" }
+        )
+
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertEqual(Set(starts), Set(records.map(\.id)))
+        XCTAssertEqual(starts.count, records.count)
+    }
+
+    func testClaimedInstanceRecoverySkipsHealthyAndUnclaimedInstances() throws {
+        let claimed = try instance("primary", kind: .postgresql, endpoint: .postgresql(port: 5432), package: PostgreSQLServiceModule.packageIdentifier, directory: "/data/postgresql")
+        let unclaimed = try instance("manual", kind: .valkey, endpoint: .valkey(port: 6380), package: ValkeyServiceModule.packageIdentifier, directory: "/data/valkey-manual")
+        let binding = try recoveryBinding("db", kind: .postgresql, instance: "primary")
+        let entries = [ServiceInstanceInventoryEntry(record: claimed, claims: [.project(projectID: ProjectID(), binding: binding)]), .init(record: unclaimed, claims: [.manual(instance: unclaimed.id)])]
+        var starts = [ServiceInstanceID]()
+        let failures = ProjectServiceBindings.recoverClaimedInstances(
+            inventory: .init(entries: entries),
+            observe: { id in (id == claimed.id ? claimed : unclaimed, "healthy") },
+            start: { starts.append($0) }
+        )
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertTrue(starts.isEmpty)
+    }
+
+    func testClaimedInstanceRecoveryRejectsPackageAndRuntimeIdentityMismatchAndContinues() throws {
+        let project = ProjectID()
+        let packageMismatch = try instance("wrong-package", kind: .valkey, endpoint: .valkey(port: 6379), package: "other-package", directory: "/data/wrong")
+        let observedMismatch = try instance("wrong-runtime", kind: .postgresql, endpoint: .postgresql(port: 5433), package: PostgreSQLServiceModule.packageIdentifier, directory: "/data/wrong-runtime")
+        let valid = try instance("valid", kind: .valkey, endpoint: .valkey(port: 6381), package: ValkeyServiceModule.packageIdentifier, directory: "/data/valid")
+        let records = [packageMismatch, observedMismatch, valid]
+        let entries = try records.map { record in
+            ServiceInstanceInventoryEntry(record: record, claims: [.project(projectID: project, binding: try recoveryBinding("owner", kind: record.id.kind, instance: record.id.name.value))])
+        }
+        var starts = [ServiceInstanceID]()
+        var states = Dictionary(uniqueKeysWithValues: records.map { ($0.id, "stopped") })
+        let failures = ProjectServiceBindings.recoverClaimedInstances(
+            inventory: .init(entries: entries),
+            observe: { id in
+                if id == observedMismatch.id { return (try? self.instance("wrong-runtime", kind: .postgresql, endpoint: .postgresql(port: 5434), package: PostgreSQLServiceModule.packageIdentifier, directory: "/data/different"), "stopped") }
+                return (records.first { $0.id == id }, states[id] ?? "missing")
+            },
+            start: { starts.append($0); states[$0] = "healthy" }
+        )
+        XCTAssertEqual(starts, [valid.id])
+        XCTAssertEqual(failures.count, 2)
+    }
+
+    func testClaimedInstanceRecoveryIsolatesStartFailures() throws {
+        let project = ProjectID()
+        let first = try instance("first", kind: .valkey, endpoint: .valkey(port: 6379), package: ValkeyServiceModule.packageIdentifier, directory: "/data/first")
+        let second = try instance("second", kind: .valkey, endpoint: .valkey(port: 6380), package: ValkeyServiceModule.packageIdentifier, directory: "/data/second")
+        let entries = try [first, second].map { record in
+            ServiceInstanceInventoryEntry(record: record, claims: [.project(projectID: project, binding: try recoveryBinding("cache", kind: .valkey, instance: record.id.name.value))])
+        }
+        var starts = [ServiceInstanceID]()
+        var states = [first.id: "stopped", second.id: "stopped"]
+        let failures = ProjectServiceBindings.recoverClaimedInstances(
+            inventory: .init(entries: entries),
+            observe: { id in ([first, second].first { $0.id == id }, states[id] ?? "missing") },
+            start: { id in starts.append(id); if id == first.id { throw SQLiteStateError.invalidRecord }; states[id] = "healthy" }
+        )
+        XCTAssertEqual(Set(starts), [first.id, second.id])
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(states[second.id], "healthy")
+    }
+
     func testProjectClaimPreventsBoundedRemovalActionBeforeItRuns() throws {
         let (root, _, store) = try makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -258,5 +341,16 @@ final class ServiceInstanceCatalogTests: XCTestCase {
 
     private func binding(_ alias: String, kind: ProjectServiceKind, instance: String) throws -> ProjectServiceBinding {
         try .init(alias: ProjectBindingAlias(alias), kind: kind, instance: ProjectInstanceName(instance))
+    }
+
+    private func recoveryBinding(_ alias: String, kind: ProjectServiceKind, instance: String) throws -> ProjectServiceBinding {
+        let version: String? = switch kind {
+        case .mysql: "mysql-\(MySQLModule.defaultVersion)"
+        case .mailpit: "mailpit-\(MailpitModule.defaultVersion)"
+        case .postgresql: PostgreSQLServiceModule.packageIdentifier
+        case .valkey: ValkeyServiceModule.packageIdentifier
+        case .redis: nil
+        }
+        return try .init(alias: ProjectBindingAlias(alias), kind: kind, instance: ProjectInstanceName(instance), version: version)
     }
 }

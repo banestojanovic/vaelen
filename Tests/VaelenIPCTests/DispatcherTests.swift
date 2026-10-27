@@ -100,6 +100,28 @@ private actor BlockedRestoreRouter: Router {
     func attemptCount() -> Int { attempts }
 }
 
+private actor GatedRestoreRouter: Router {
+    private var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func start() async throws {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+        throw RouterError.notRunning
+    }
+    func stop() async throws {}
+    func status() async -> RouterStatus { .init(provider: "gated-restore", state: .stopped, health: .unknown, routeCount: 0) }
+    func health() async -> RouterHealth { .unhealthy }
+    func reconcile(routes: [Route]) async throws {}
+    func addRoute(_ route: Route) async throws {}
+    func updateRoute(_ route: Route) async throws {}
+    func removeRoute(id: RouteID) async throws {}
+    func observedRoutes() async throws -> [Route] { [] }
+    func waitUntilStarted() async {
+        while !started { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
 private actor ParkMonitorTestRouter: Router {
     private var running = true
     private var observationsStarted = 0
@@ -950,6 +972,243 @@ final class DispatcherTests: XCTestCase {
         let failedReply = await failedDispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
         guard case .status(let failedStatus) = failedReply.response.result else { return XCTFail("expected failed-start status") }
         XCTAssertEqual(failedStatus.serviceIssues?["dns"], "macOS authorization for resolver changes is unavailable.")
+    }
+
+    func testStartupRestoresProjectClaimedServicesAndSurfacesPerInstanceFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-claim-startup-recovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let repository = ServiceInstanceRepository(store: store)
+        let project = LinkedProjectRecord(id: ProjectID(), name: "project", canonicalPath: root.path)
+        try ProjectRepository(store: store).upsert(project)
+        let name = try ProjectInstanceName("primary")
+        let record = try ServiceInstanceRecord(id: .init(kind: .postgresql, name: name), packageIdentifier: PostgreSQLServiceModule.packageIdentifier, endpoint: .postgresql(port: 55432), dataDirectory: root.appendingPathComponent("postgresql").path)
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .postgresql, instance: name, version: PostgreSQLServiceModule.packageIdentifier)
+        try repository.replaceProjectClaims([binding], materializing: [record], for: project.id)
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), serviceIntents: intents, serviceInstances: repository)
+
+        await dispatcher.restoreServicesOnStartup()
+        let response = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status(let status) = response.response.result else { return XCTFail("expected Core status") }
+        XCTAssertNotNil(status.serviceIssues?["project-service.postgresql.primary"])
+        XCTAssertEqual(try repository.projectClaims(for: project.id), [binding])
+        XCTAssertEqual(try repository.instance(record.id), record)
+    }
+
+    func testStartupClearsProjectServiceFailureAfterItsClaimIsReleased() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-claim-stale-failure-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let repository = ServiceInstanceRepository(store: store)
+        let project = LinkedProjectRecord(id: ProjectID(), name: "project", canonicalPath: root.path)
+        try ProjectRepository(store: store).upsert(project)
+        let name = try ProjectInstanceName("primary")
+        let record = try ServiceInstanceRecord(id: .init(kind: .postgresql, name: name), packageIdentifier: PostgreSQLServiceModule.packageIdentifier, endpoint: .postgresql(port: 55433), dataDirectory: root.appendingPathComponent("postgresql").path)
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .postgresql, instance: name, version: PostgreSQLServiceModule.packageIdentifier)
+        try repository.replaceProjectClaims([binding], materializing: [record], for: project.id)
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        let first = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), serviceIntents: intents, serviceInstances: repository)
+
+        await first.restoreServicesOnStartup()
+        let failed = await first.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status(let failedStatus) = failed.response.result else { return XCTFail("expected Core status") }
+        XCTAssertNotNil(failedStatus.serviceIssues?["project-service.postgresql.primary"])
+
+        try repository.removeProjectClaims(for: project.id)
+        let restarted = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: ProjectRegistry(store: store), serviceIntents: intents, serviceInstances: repository)
+        await restarted.restoreServicesOnStartup()
+        let recovered = await restarted.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status(let recoveredStatus) = recovered.response.result else { return XCTFail("expected Core status") }
+        XCTAssertNil(recoveredStatus.serviceIssues?["project-service.postgresql.primary"])
+    }
+
+    func testProjectUnlinkWaitsForStartupServiceRecoveryToFinish() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-claim-recovery-barrier-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let repository = ServiceInstanceRepository(store: store)
+        let registry = ProjectRegistry(store: store)
+        let projectPath = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let linked = try await registry.link(path: projectPath, name: "recovery")
+        let project = try XCTUnwrap(linked.id)
+        let name = try ProjectInstanceName("primary")
+        let record = try ServiceInstanceRecord(id: .init(kind: .postgresql, name: name), packageIdentifier: PostgreSQLServiceModule.packageIdentifier, endpoint: .postgresql(port: 55434), dataDirectory: root.appendingPathComponent("postgresql").path)
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .postgresql, instance: name, version: PostgreSQLServiceModule.packageIdentifier)
+        try repository.replaceProjectClaims([binding], materializing: [record], for: project)
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        try intents.set("caddy", enabled: true)
+        let router = BlockedRestoreRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, router: router, serviceIntents: intents, serviceInstances: repository)
+
+        await dispatcher.restoreServicesOnStartup()
+        for _ in 0..<100 {
+            if await router.attemptCount() > 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let attempts = await router.attemptCount()
+        XCTAssertEqual(attempts, 1)
+
+        let unlinkStarted = CompletionFlag()
+        let unlinkCompleted = CompletionFlag()
+        let unlink = Task {
+            unlinkStarted.markCompleted()
+            let response = await dispatcher.dispatch(IPCRequest(method: .projectUnlink, params: .unlink(.init(path: projectPath.path, workingDirectory: root.path))), handshaken: true)
+            unlinkCompleted.markCompleted()
+            return response
+        }
+        for _ in 0..<100 where !unlinkStarted.isCompleted() { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(unlinkStarted.isCompleted())
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(unlinkCompleted.isCompleted(), "project ownership must not change during startup recovery")
+        XCTAssertEqual(try repository.projectClaims(for: project), [binding])
+
+        let response = await unlink.value
+        guard case .projectMutation = response.response.result else { return XCTFail("project unlink failed") }
+        XCTAssertTrue(unlinkCompleted.isCompleted())
+        XCTAssertTrue(try repository.projectClaims(for: project).isEmpty)
+    }
+
+    func testProjectPHPMutationWaitsForStartupServiceRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-php-recovery-barrier-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let projectPath = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let linked = try await registry.link(path: projectPath, name: "php-recovery")
+        let projectID = try XCTUnwrap(linked.id)
+        try await registry.setPHPOverride("8.3.0", for: projectID)
+        let repository = ServiceInstanceRepository(store: store)
+        let instanceName = try ProjectInstanceName("primary")
+        let record = try ServiceInstanceRecord(id: .init(kind: .postgresql, name: instanceName), packageIdentifier: PostgreSQLServiceModule.packageIdentifier, endpoint: .postgresql(port: 55436), dataDirectory: root.appendingPathComponent("postgresql").path)
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .postgresql, instance: instanceName, version: PostgreSQLServiceModule.packageIdentifier)
+        try repository.replaceProjectClaims([binding], materializing: [record], for: projectID)
+        let router = GatedRestoreRouter()
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        try intents.set("caddy", enabled: true)
+        let dispatcher = try CoreRequestDispatcher(runtime: .init(version: "test", pid: 1), registry: registry, router: router, serviceIntents: intents, serviceInstances: repository)
+        await dispatcher.restoreServicesOnStartup()
+        await router.waitUntilStarted()
+
+        let mutationFinished = CompletionFlag()
+        let mutation = Task {
+            let response = await dispatcher.dispatch(IPCRequest(method: .projectPHP, params: .projectPHP(.init(selector: nil, workingDirectory: projectPath.path, useDefault: true))), handshaken: true)
+            mutationFinished.markCompleted()
+            return response
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(mutationFinished.isCompleted())
+        let overrideDuringRecovery = try await registry.phpOverride(for: projectID)
+        XCTAssertEqual(overrideDuringRecovery, "8.3.0", "the selection must not change before startup recovery finishes")
+        XCTAssertEqual(try repository.projectClaims(for: projectID), [binding], "the PHP activation must not alter service claims during startup recovery")
+
+        await router.release()
+        _ = await mutation.value
+        XCTAssertTrue(mutationFinished.isCompleted())
+    }
+
+    func testMutationWaitingOnRecoveryIsRejectedAfterShutdownBegins() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-unlink-recovery-shutdown-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let repository = ServiceInstanceRepository(store: store)
+        let registry = ProjectRegistry(store: store)
+        let projectPath = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let linked = try await registry.link(path: projectPath, name: "shutdown-recovery")
+        let projectID = try XCTUnwrap(linked.id)
+        let name = try ProjectInstanceName("primary")
+        let record = try ServiceInstanceRecord(id: .init(kind: .postgresql, name: name), packageIdentifier: PostgreSQLServiceModule.packageIdentifier, endpoint: .postgresql(port: 55435), dataDirectory: root.appendingPathComponent("postgresql").path)
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .postgresql, instance: name, version: PostgreSQLServiceModule.packageIdentifier)
+        try repository.replaceProjectClaims([binding], materializing: [record], for: projectID)
+        let router = GatedRestoreRouter()
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+        try intents.set("caddy", enabled: true)
+        let dispatcher = try CoreRequestDispatcher(runtime: .init(version: "test", pid: 1), registry: registry, router: router, serviceIntents: intents, serviceInstances: repository)
+        await dispatcher.restoreServicesOnStartup()
+        await router.waitUntilStarted()
+
+        let unlinkFinished = CompletionFlag()
+        let unlink = Task {
+            let response = await dispatcher.dispatch(IPCRequest(method: .projectUnlink, params: .unlink(.init(path: projectPath.path, workingDirectory: root.path))), handshaken: true)
+            unlinkFinished.markCompleted()
+            return response
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(unlinkFinished.isCompleted())
+        let shutdown = Task { await dispatcher.dispatch(IPCRequest(method: .shutdown), handshaken: true) }
+        for _ in 0..<100 where !(await dispatcher.isShutdownInProgress()) { try await Task.sleep(for: .milliseconds(5)) }
+        let shutdownBegan = await dispatcher.isShutdownInProgress()
+        XCTAssertTrue(shutdownBegan)
+        await router.release()
+
+        let response = await unlink.value
+        XCTAssertEqual(response.response.error?.message, "Core shutdown is in progress. Retry after cleanup completes.")
+        XCTAssertEqual(try repository.projectClaims(for: projectID), [binding], "the waiting unlink must not release claims after shutdown starts")
+        _ = await shutdown.value
+    }
+
+    func testCoreRestartRestoresProjectClaimedMailpitWithoutGlobalIntent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-mailpit-core-restart-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var activeModule: MailpitModule?
+        defer {
+            do {
+                if let activeModule, activeModule.status().state == .running { _ = try activeModule.stop() }
+                if activeModule?.status().state == .running { XCTFail("Mailpit fixture did not stop; root preserved at \(root.path)") }
+                else { try FileManager.default.removeItem(at: root) }
+            } catch {
+                XCTFail("Mailpit fixture cleanup failed; root preserved at \(root.path): \(error)")
+            }
+        }
+        let fixture = try makeMailpitFixture(root: root, resistant: false)
+        activeModule = fixture.module
+        let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("mailpit-core", isDirectory: true))
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let repository = ServiceInstanceRepository(store: store)
+        let registry = ProjectRegistry(store: store)
+        let projectPath = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let linked = try await registry.link(path: projectPath, name: "mailpit-recovery")
+        let project = try XCTUnwrap(linked.id)
+        let primary = try ProjectServiceBinding(alias: ProjectBindingAlias("smtp"), kind: .mailpit, instance: ProjectInstanceName("default"), version: "mailpit-\(MailpitModule.defaultVersion)")
+        let secondary = try ProjectServiceBinding(alias: ProjectBindingAlias("inbox"), kind: .mailpit, instance: ProjectInstanceName("default"), version: "mailpit-\(MailpitModule.defaultVersion)")
+        let record = try XCTUnwrap(fixture.module.projectBindingSnapshot().record)
+        try repository.replaceProjectClaims([primary, secondary], materializing: [record], for: project)
+        let intents = ServiceIntentStore(url: root.appendingPathComponent("service-intents.json"))
+
+        let firstCore = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 1), registry: registry, mailpit: fixture.module, serviceIntents: intents, serviceInstances: repository)
+        await firstCore.restoreServicesOnStartup()
+        let firstStatusResponse = await firstCore.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status = firstStatusResponse.response.result else { return XCTFail("expected first Core status") }
+        let firstStatus = fixture.module.status()
+        XCTAssertEqual(firstStatus.health, "healthy")
+        let firstPID = try XCTUnwrap(firstStatus.pid)
+        XCTAssertFalse(try intents.enabledServices().contains("mailpit"), "project ownership must restore independently from the global toggle")
+        XCTAssertEqual(Set(try repository.projectClaims(for: project)), Set([primary, secondary]))
+        XCTAssertEqual(try repository.instance(record.id), record)
+
+        let firstShutdown = await firstCore.shutdownForParentExit()
+        XCTAssertTrue(firstShutdown.completed)
+        XCTAssertEqual(fixture.module.status().state, .stopped)
+
+        let restartedModule = MailpitModule(layout: layout, configuration: fixture.configuration)
+        activeModule = restartedModule
+        let restartedCore = try CoreRequestDispatcher(runtime: CoreRuntime(version: "test", pid: 2), registry: registry, mailpit: restartedModule, serviceIntents: intents, serviceInstances: repository)
+        await restartedCore.restoreServicesOnStartup()
+        let restartedStatusResponse = await restartedCore.dispatch(IPCRequest(method: .status), handshaken: true)
+        guard case .status = restartedStatusResponse.response.result else { return XCTFail("expected restarted Core status") }
+        let restartedStatus = restartedModule.status()
+        XCTAssertEqual(restartedStatus.health, "healthy")
+        XCTAssertNotEqual(restartedStatus.pid, firstPID)
+        XCTAssertEqual(Set(try repository.projectClaims(for: project)), Set([primary, secondary]))
+        XCTAssertEqual(try repository.instance(record.id), record)
+
+        let finalShutdown = await restartedCore.shutdownForParentExit()
+        XCTAssertTrue(finalShutdown.completed)
+        XCTAssertEqual(restartedModule.status().state, .stopped)
     }
 
     func testSavedDNSAutostartAndConcurrentRetryAcquireOnceAndRecoverOnQuit() async throws {

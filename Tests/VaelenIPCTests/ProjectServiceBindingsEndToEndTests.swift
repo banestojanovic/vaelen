@@ -89,7 +89,7 @@ final class ProjectServiceBindingsEndToEndTests: XCTestCase {
             var status = isolated.status()
             XCTAssertEqual(status.state, .running)
             XCTAssertEqual(status.health, "healthy")
-            let pid = try XCTUnwrap(status.pid)
+            var pid = try XCTUnwrap(status.pid)
             let id = ServiceInstanceID(kind: .mailpit, name: try ProjectInstanceName("default"))
             let claims = try repository.claims(for: id)
             XCTAssertEqual(claims.compactMap { claim -> String? in if case .project(_, let binding) = claim { return binding.alias.value }; return nil }.sorted(), ["notifications", "smtp"])
@@ -109,6 +109,23 @@ final class ProjectServiceBindingsEndToEndTests: XCTestCase {
             guard case .project(_, let firstAlias, _) = try XCTUnwrap(entry.owners.first(where: { if case .project(_, let alias, _) = $0 { return alias.value == "smtp" }; return false })) else { return XCTFail("smtp claim missing") }
             XCTAssertEqual(firstAlias.value, "smtp")
             XCTAssertEqual(entry.owners.compactMap { claim -> String? in if case .project(_, let alias, _) = claim { return alias.value }; return nil }.sorted(), ["notifications", "smtp"])
+
+            _ = try isolated.stop()
+            XCTAssertEqual(isolated.status().state, .stopped)
+            await dispatcher.restoreServicesOnStartup()
+            let recoveryBarrier = await dispatcher.dispatch(IPCRequest(method: .status), handshaken: true)
+            guard case .status = recoveryBarrier.response.result else { return XCTFail("expected Core recovery status") }
+            let recoveredProjectStatus = try run(["project", "status", projectID.rawValue.uuidString, "--json"])
+            XCTAssertEqual(recoveredProjectStatus.status, 0, recoveredProjectStatus.error + "\n" + recoveredProjectStatus.output)
+            let recoveredReport = try JSONDecoder().decode(ProjectEnvironmentReport.self, from: Data(recoveredProjectStatus.output.utf8))
+            XCTAssertTrue(recoveredReport.serviceBindings?.allSatisfy { $0.claimed && $0.health == "healthy" } == true)
+            status = isolated.status()
+            XCTAssertEqual(status.state, .running)
+            let recoveredPID = try XCTUnwrap(status.pid)
+            XCTAssertNotEqual(recoveredPID, pid)
+            pid = recoveredPID
+            XCTAssertEqual(try repository.claims(for: id), claims)
+            XCTAssertFalse(try intents.enabledServices().contains("mailpit"))
 
             XCTAssertEqual(try runProject("down").state, .succeeded)
             XCTAssertTrue(try repository.claims(for: id).isEmpty)
