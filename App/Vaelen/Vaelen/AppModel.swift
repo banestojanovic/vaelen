@@ -449,6 +449,11 @@ final class AppModel {
 
     func refresh(whileRelationshipMutationInFlight: Bool = false) async {
         guard !isSettingsFixture else { return }
+        if ProcessInfo.processInfo.environment["VAELEN_TEST_ALLOW_CORE_START"] == "1",
+           VaelenTestRuntimePaths.isolatedSupportRoot() == nil {
+            state = .unavailable
+            return
+        }
         guard !relationshipMutationInFlight || whileRelationshipMutationInFlight else {
             refreshRequested = true
             return
@@ -492,11 +497,19 @@ final class AppModel {
                 try await client.connect()
             } catch let error as CoreClientError {
                 guard case .coreUnavailable = error else { throw error }
-                if VaelenTestRuntimePaths.isolatedSupportRoot() != nil { throw error }
-                let coreStarted = try await CoreStartupHelperGate.run(
-                    reconcileHelper: { try await self.registerCurrentPrivilegedHelper() },
-                    startCore: { try CoreProcessManager.shared.start() }
-                )
+                let coreStarted: Bool
+                if ProcessInfo.processInfo.environment["VAELEN_TEST_ALLOW_CORE_START"] == "1" {
+                    guard VaelenTestRuntimePaths.isolatedSupportRoot() != nil else { throw error }
+                    try CoreProcessManager.shared.start()
+                    coreStarted = true
+                } else if VaelenTestRuntimePaths.isolatedSupportRoot() != nil {
+                    throw error
+                } else {
+                    coreStarted = try await CoreStartupHelperGate.run(
+                        reconcileHelper: { try await self.registerCurrentPrivilegedHelper() },
+                        startCore: { try CoreProcessManager.shared.start() }
+                    )
+                }
                 guard coreStarted else { throw HelperRegistrationError.failed(Self.helperApprovalGuidance) }
                 var connected = false
                 for _ in 0..<20 {
@@ -864,6 +877,8 @@ final class AppModel {
     /// a functional update. A pending digest prevents a failed first XPC call
     /// from repeating the unregister/register cycle on the user's next retry.
     private func registerCurrentPrivilegedHelper() async throws -> Bool {
+        guard ProcessInfo.processInfo.environment["VAELEN_TEST_ALLOW_CORE_START"] != "1",
+              VaelenTestRuntimePaths.isolatedSupportRoot() == nil else { return false }
         guard #available(macOS 13, *) else { return true }
         let service = SMAppService.daemon(plistName: "dev.vaelen.privileged-helper.plist")
         let digest = try helperRegistrationDigest()
@@ -1871,6 +1886,11 @@ final class AppModel {
 
     func quitVaelen() async {
         guard !isQuitting else { return }
+        if VaelenTestRuntimePaths.hasInvalidCoreRuntime() {
+            isQuitting = true
+            VaelenAppDelegate.shared?.terminateAfterCleanQuit()
+            return
+        }
         if isSettingsFixture {
             isQuitting = true
             VaelenAppDelegate.shared?.terminateAfterCleanQuit()

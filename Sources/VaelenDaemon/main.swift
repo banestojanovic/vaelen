@@ -7,17 +7,26 @@ import VaelenIPC
 struct VaelenDaemonMain {
     static func main() async {
         do {
+            if ProcessInfo.processInfo.environment["VAELEN_TEST_ALLOW_CORE_START"] == "1",
+               VaelenTestRuntimePaths.isolatedSupportRoot() == nil {
+                throw NSError(domain: "VaelenDaemon", code: 1, userInfo: [NSLocalizedDescriptionKey: "test Core start requires an isolated support root"])
+            }
             let paths = CoreEndpointPaths()
             let layout = VaelenFilesystemLayout()
             let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
             let registry = ProjectRegistry(store: store)
-            let helper: any PrivilegedDNSHelper = ProcessInfo.processInfo.environment["VAELEN_ENABLE_DEVELOPMENT_PRIVILEGED_DNS"] == "1" ? DevelopmentPrivilegedDNSHelper() : HelperPrivilegedDNS()
+            let helper: any PrivilegedDNSHelper
+            let privilegedPorts: any StandardPortsPrivileged
+            if VaelenTestRuntimePaths.isolatedSupportRoot() != nil {
+                helper = UnavailablePrivilegedDNSHelper()
+                privilegedPorts = UnavailableStandardPortsPrivileged()
+            } else {
+                helper = ProcessInfo.processInfo.environment["VAELEN_ENABLE_DEVELOPMENT_PRIVILEGED_DNS"] == "1" ? DevelopmentPrivilegedDNSHelper() : HelperPrivilegedDNS()
+                privilegedPorts = HelperStandardPortsPrivileged()
+            }
             let tls = TLSCapability(layout: layout, store: store)
             let router = CaddyRouter(layout: layout, tls: tls)
-            // Production Core talks to the signed helper over XPC; without an
-            // installed helper every mutation reports helperUnavailable and
-            // observation stays user-space, so development behavior is safe.
-            let ports = StandardPortsCapability(privileged: HelperStandardPortsPrivileged(), ledger: SystemModificationLedger(store: store), backendHealthy: { let status = await router.status(); return status.state == .running && status.health == .healthy })
+            let ports = StandardPortsCapability(privileged: privilegedPorts, ledger: SystemModificationLedger(store: store), backendHealthy: { let status = await router.status(); return status.state == .running && status.health == .healthy })
             // The shipped catalog is the production PHP source. A development
             // manifest, when present, still takes precedence so local work can
             // pin its own packages.

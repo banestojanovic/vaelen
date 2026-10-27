@@ -27,17 +27,24 @@ public enum CoreClientError: Error, Equatable, Sendable, LocalizedError {
 public actor VaelenCoreClient {
     private let transport: any CoreTransport
     private let identity: ClientIdentity
+    private let allowsConnection: @Sendable () -> Bool
     private var decoder = FrameDecoder()
     private var connected = false
     private var sendInFlight = false
     private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(transport: any CoreTransport, identity: ClientIdentity) {
+        self.init(transport: transport, identity: identity, allowsConnection: { !VaelenTestRuntimePaths.hasInvalidCoreRuntime() })
+    }
+
+    init(transport: any CoreTransport, identity: ClientIdentity, allowsConnection: @escaping @Sendable () -> Bool) {
         self.transport = transport
         self.identity = identity
+        self.allowsConnection = allowsConnection
     }
 
     public func connect() async throws {
+        guard allowsConnection() else { throw CoreClientError.coreUnavailable }
         do {
             try await transport.connect()
             connected = true

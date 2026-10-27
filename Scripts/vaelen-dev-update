@@ -4,25 +4,106 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-SUPPORT="$HOME/Library/Application Support/Vaelen"
-ARTIFACTS="$HOME/Library/Application Support/Vaelen-dev-harness/updates"
-APPLICATIONS="$HOME/Applications"
-CANONICAL="$APPLICATIONS/Vaelen.app"
 LEGACY="/Applications/Vaelen.app"
-SOCKET="$SUPPORT/runtime/sockets/core.sock"
-STATE_DB="$SUPPORT/state/vaelen.sqlite"
 TEAM="TFKZJV643G"
 BUNDLE_ID="dev.vaelen.app"
+TEST_MODE=0
+
+die() { echo "vaelen-dev-update: $*" >&2; exit 1; }
+note() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+configure_paths() {
+  local test_mode="${VAELEN_DEV_UPDATE_TEST_MODE-}" test_root="${VAELEN_DEV_UPDATE_TEST_ROOT-}"
+  if [[ -n "$test_mode" || -n "$test_root" ]]; then
+    [[ "$test_mode" == 1 && -n "$test_root" ]] || die "test mode requires VAELEN_DEV_UPDATE_TEST_MODE=1 and VAELEN_DEV_UPDATE_TEST_ROOT"
+    [[ "$test_root" == /private/tmp/* && "${test_root#/private/tmp/}" != */* && "${test_root#/private/tmp/}" != . && "${test_root#/private/tmp/}" != .. ]] || die "test root must be a direct child of /private/tmp"
+    [[ -d "$test_root" && ! -L "$test_root" && "$(stat -f %u "$test_root")" == "$(id -u)" ]] || die "test root must be a real directory owned by the current user"
+    local marker="$test_root/.vaelen-dev-update-test-fixture"
+    [[ -f "$marker" && ! -L "$marker" && "$(stat -f %u "$marker")" == "$(id -u)" ]] || die "test root ownership marker must be a regular file owned by the current user"
+    printf 'vaelen-dev-update-test-fixture-v1\n' | cmp -s - "$marker" || die "test root ownership marker has unexpected contents"
+    TEST_MODE=1
+    HOME_ROOT="$test_root/home"
+  else
+    HOME_ROOT="$HOME"
+  fi
+  SUPPORT="$HOME_ROOT/Library/Application Support/Vaelen"
+  ARTIFACTS="$HOME_ROOT/Library/Application Support/Vaelen-dev-harness/updates"
+  APPLICATIONS="$HOME_ROOT/Applications"
+  CANONICAL="$APPLICATIONS/Vaelen.app"
+  SOCKET="$SUPPORT/runtime/sockets/core.sock"
+  STATE_DB="$SUPPORT/state/vaelen.sqlite"
+  CLI_LINK="$HOME_ROOT/.local/bin/val"
+  if [[ "$TEST_MODE" == 1 ]]; then
+    local path
+    for path in \
+      "$HOME_ROOT" \
+      "$HOME_ROOT/Library" \
+      "$HOME_ROOT/Library/Application Support" \
+      "$SUPPORT" \
+      "$SUPPORT/bin" \
+      "$SUPPORT/config" \
+      "$SUPPORT/instances" \
+      "$SUPPORT/packages" \
+      "$SUPPORT/state" \
+      "$STATE_DB" \
+      "$STATE_DB-wal" \
+      "$STATE_DB-shm" \
+      "$SUPPORT/state/local-proxy-ownership.sqlite" \
+      "$SUPPORT/state/local-proxy-ownership.sqlite-wal" \
+      "$SUPPORT/state/local-proxy-ownership.sqlite-shm" \
+      "$SUPPORT/state/service-intents.json" \
+      "$SUPPORT/tls" \
+      "$SUPPORT/logs" \
+      "$SUPPORT/cache" \
+      "$SUPPORT/runtime" \
+      "$SUPPORT/runtime/sockets" \
+      "$SOCKET" \
+      "$SUPPORT/runtime/locks" \
+      "$SUPPORT/runtime/pids" \
+      "$SUPPORT/bin/val" \
+      "$SUPPORT/bin/.val.sha256" \
+      "$HOME_ROOT/Library/Application Support/Vaelen-dev-harness" \
+      "$ARTIFACTS" \
+      "$APPLICATIONS" \
+      "$CANONICAL" \
+      "$CANONICAL/Contents" \
+      "$CANONICAL/Contents/MacOS" \
+      "$CANONICAL/Contents/MacOS/Vaelen" \
+      "$CANONICAL/Contents/Resources" \
+      "$CANONICAL/Contents/Resources/vaelend" \
+      "$HOME_ROOT/.local" \
+      "$HOME_ROOT/.local/bin" \
+      "$test_root/DerivedData" \
+      "$test_root/DerivedData/product-dev-release"; do
+      [[ ! -L "$path" ]] || die "test fixture path component must not be a symlink: $path"
+    done
+    if [[ -d "$SUPPORT" ]]; then
+      local support_symlink
+      support_symlink="$(find "$SUPPORT" -type l -print -quit)" || die "cannot inspect fixture support paths"
+      [[ -z "$support_symlink" ]] || die "test fixture support paths must not contain symlinks: $support_symlink"
+    fi
+  fi
+}
+
+configure_paths
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN="$ARTIFACTS/product-dev-$STAMP"
 OLD_APP="$APPLICATIONS/Vaelen.previous-$STAMP.app"
 STAGED_APP="$APPLICATIONS/.Vaelen.candidate-$STAMP.app"
 DERIVED="$ROOT/.build/product-dev-release"
+if [[ "$TEST_MODE" == 1 ]]; then
+  DERIVED="$VAELEN_DEV_UPDATE_TEST_ROOT/DerivedData/product-dev-release"
+fi
 APP="$DERIVED/Build/Products/Release/Vaelen.app"
 CORE="$APP/Contents/Resources/vaelend"
 
-die() { echo "vaelen-dev-update: $*" >&2; exit 1; }
-note() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+if [[ "$TEST_MODE" == 1 ]]; then
+  export VAELEN_TEST_ALLOW_CORE_START=1
+  export VAELEN_TEST_SUPPORT_ROOT_ENABLED=1
+  export VAELEN_TEST_SUPPORT_ROOT="$SUPPORT"
+  export VAELEN_READINESS_VAL="$SUPPORT/bin/val"
+  export VAELEN_READINESS_INTENTS="$SUPPORT/state/service-intents.json"
+fi
 source "$ROOT/Scripts/vaelen-service-readiness"
 team_of() { codesign -dv --verbose=4 "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1; }
 tree_hash() { (cd "$1" && find . -type f -print | LC_ALL=C sort | while IFS= read -r file; do shasum -a 256 "$file"; done) | shasum -a 256 | awk '{print $1}'; }
@@ -33,6 +114,28 @@ schema_constant() {
   value="$(otool -s __TEXT __const "$binary" | awk -v address="$address" '$1 == address {print $2; exit}')"
   [[ "$value" =~ ^[0-9a-fA-F]{8}$ ]] || return 1
   printf '%d\n' "$((16#$value))"
+}
+validate_schema_compatibility() {
+  local live_schema="$1" installed_schema="$2" candidate_schema="$3"
+  [[ "$live_schema" =~ ^[0-9]+$ && "$installed_schema" =~ ^[0-9]+$ && "$candidate_schema" =~ ^[0-9]+$ ]] || { echo "could not determine live, installed Core, and candidate schema versions" >&2; return 1; }
+  [[ "$installed_schema" == "$live_schema" ]] || { echo "installed Core schema $installed_schema does not match live DB schema $live_schema; refusing before app shutdown" >&2; return 1; }
+  (( candidate_schema >= live_schema )) || { echo "candidate schema $candidate_schema is below live DB schema $live_schema; refusing before app shutdown" >&2; return 1; }
+}
+migration_outcome() {
+  local post_schema="$1" candidate_schema="$2" live_schema="$3"
+  if [[ "$post_schema" == "$candidate_schema" ]]; then
+    printf 'target-reached\n'
+  elif [[ "$post_schema" == "$live_schema" ]]; then
+    printf 'pre-migration\n'
+  else
+    printf 'advanced\n'
+  fi
+}
+cli_unavailable_is_safe_without_core() {
+  local status="$1" installed_core="$2" socket="$3"
+  [[ "$status" == 3 ]] || return 1
+  [[ -z "$(process_pid_for_command "$installed_core")" ]] || return 1
+  [[ ! -e "$socket" && ! -L "$socket" ]]
 }
 route_inventory() {
   sqlite3 -readonly "$STATE_DB" 'SELECT id || "|" || hex(route_json) || "|" || coalesce(project_id, "") || "|" || coalesce(project_path, "") FROM route_intents ORDER BY id;'
@@ -45,19 +148,39 @@ assert_no_process() {
   return 0
 }
 process_pid_for_command() {
-  ps -axo pid=,comm= | awk -v exact="$1" '
+  ps -axo pid=,comm= | awk -v exact="$1" -v fixture="${VAELEN_DEV_UPDATE_TEST_ROOT-}" -v test_mode="${TEST_MODE:-0}" '
+    function identity(path) {
+      if (test_mode == 1 && fixture != "" && index(path, "/tmp/" substr(fixture, 14) "/") == 1) return "/private" path
+      return path
+    }
     {
       pid = $1
       sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-      if ($0 == exact && !found) { found = 1; result = pid }
+      if (identity($0) == exact && !found) { found = 1; result = pid }
     }
     END { if (found) print result }
   '
 }
 process_count_for_command() {
-  ps -axo comm= | awk -v exact="$1" '
-    $0 == exact { count++ }
+  ps -axo comm= | awk -v exact="$1" -v fixture="${VAELEN_DEV_UPDATE_TEST_ROOT-}" -v test_mode="${TEST_MODE:-0}" '
+    function identity(path) {
+      if (test_mode == 1 && fixture != "" && index(path, "/tmp/" substr(fixture, 14) "/") == 1) return "/private" path
+      return path
+    }
+    identity($0) == exact { count++ }
     END { print count+0 }
+  '
+}
+process_owns_socket() {
+  local pid="$1" socket="$2" alias="$2"
+  if [[ "$TEST_MODE" == 1 && "$socket" == /private/tmp/* ]]; then alias="${socket#/private}"; fi
+  lsof -nP -Fpn -p "$pid" 2>/dev/null | awk -v expected_pid="$pid" -v expected_path="$socket" -v alias_path="$alias" '
+    /^p/ { pid = substr($0, 2) }
+    /^n/ {
+      path = substr($0, 2)
+      if (pid == expected_pid && (path == expected_path || path == alias_path)) owns = 1
+    }
+    END { exit owns ? 0 : 1 }
   '
 }
 process_count_for_bundle_executable() {
@@ -68,14 +191,89 @@ process_count_for_bundle_executable() {
     END { print count+0 }
   '
 }
+assert_no_gui_core_processes() {
+  local gui_count core_count
+  gui_count="$(process_count_for_bundle_executable "/Contents/MacOS/Vaelen")"
+  core_count="$(process_count_for_bundle_executable "/Contents/Resources/vaelend")"
+  (( gui_count == 0 && core_count == 0 )) || die "test mode refuses existing Vaelen GUI/Core processes (GUI=$gui_count Core=$core_count)"
+}
+
+validate_updater_fixture() {
+  [[ "$TEST_MODE" == 1 ]] || die "fixture validation requires test mode"
+  python3 - "$STATE_DB" "$SUPPORT" <<'FIXTURE_SAFETY'
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+
+def inspection_failed(error):
+    raise error
+
+database, support = map(Path, sys.argv[1:])
+try:
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        schema = connection.execute("PRAGMA user_version").fetchone()[0]
+        if schema != 8:
+            raise ValueError("updater fixture must start at schema 8")
+        for table in ("projects", "parked_paths", "system_modifications", "tls_capability", "route_target_transitions", "park_route_ownership"):
+            if connection.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0]:
+                raise ValueError(f"updater fixture must not contain {table} records")
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_resolver_ownership'").fetchone():
+            if connection.execute("SELECT EXISTS(SELECT 1 FROM dns_resolver_ownership)").fetchone()[0]:
+                raise ValueError("updater fixture must not contain dns_resolver_ownership records")
+        if connection.execute("SELECT EXISTS(SELECT 1 FROM route_intents WHERE project_id IS NOT NULL OR project_path IS NOT NULL)").fetchone()[0]:
+            raise ValueError("updater fixture routes must not retain project associations")
+    with (support / "state/service-intents.json").open(encoding="utf-8") as stream:
+        intents = json.load(stream)
+    if not isinstance(intents, dict) or any(type(value) is not bool or value for value in intents.values()) or intents.get("caddy") is not False:
+        raise ValueError("updater fixture service intents must disable all services and explicitly disable caddy")
+    instances = support / "instances"
+    if instances.exists() and any(path.name == "process.json" for path in instances.rglob("process.json")):
+        raise ValueError("updater fixture must not contain service process records")
+    tls = support / "tls"
+    if tls.exists() and (not tls.is_dir() or any(files for _, _, files in os.walk(tls, onerror=inspection_failed))):
+        raise ValueError("updater fixture TLS directory must contain no CA or leaf material")
+except (OSError, ValueError, sqlite3.Error) as error:
+    sys.exit(f"unsafe updater fixture: {error}")
+FIXTURE_SAFETY
+}
+
+launch_fixture_app() {
+  [[ "$TEST_MODE" == 1 ]] || die "fixture launch requires test mode"
+  configure_paths
+  [[ "$TEST_MODE" == 1 && "$HOME_ROOT" == "$VAELEN_DEV_UPDATE_TEST_ROOT/home" ]] || die "fixture launch lost isolated paths"
+  validate_updater_fixture || die "fixture safety check failed before launch"
+  assert_no_gui_core_processes
+  # HOME alone does not redirect Foundation's home directory on macOS.
+  /usr/bin/env -i HOME="$HOME_ROOT" CFFIXED_USER_HOME="$HOME_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    VAELEN_TEST_SUPPORT_ROOT_ENABLED=1 VAELEN_TEST_SUPPORT_ROOT="$SUPPORT" \
+    VAELEN_TEST_ALLOW_CORE_START=1 \
+    "$CANONICAL/Contents/MacOS/Vaelen" --verification-open-settings=services \
+    >"$RUN/fixture-app.log" 2>&1 &
+  FIXTURE_GUI_PID=$!
+}
+assert_fixture_launch() {
+  [[ "$GUI_PID" == "$FIXTURE_GUI_PID" ]] || die "fixture GUI PID does not match directly launched child"
+  [[ "$(process_count_for_bundle_executable "/Contents/MacOS/Vaelen")" == 1 && "$(process_count_for_bundle_executable "/Contents/Resources/vaelend")" == 1 ]] || die "fixture launch found additional GUI/Core processes"
+  [[ -S "$SOCKET" ]] || die "fixture Core socket is missing"
+}
+
+if [[ "$TEST_MODE" == 1 ]]; then
+  assert_no_gui_core_processes
+  validate_updater_fixture || die "fixture safety check failed before update"
+fi
 
 if [[ ! -e "$APPLICATIONS" && ! -L "$APPLICATIONS" ]]; then
   mkdir "$APPLICATIONS" || die "could not create home Applications directory"
 fi
 [[ -d "$APPLICATIONS" && ! -L "$APPLICATIONS" && "$(stat -f %u "$APPLICATIONS")" == "$(id -u)" ]] || die "home Applications directory must be a real directory owned by the current user"
 [[ -d "$CANONICAL" && -f "$STATE_DB" ]] || die "installed app or live state database is missing"
-[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 8 ]] || die "live database is not schema v8; refusing this update"
-[[ "$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)" == 8 ]] || die "candidate source does not declare schema v8"
+LIVE_SCHEMA="$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')"
+INSTALLED_CORE="$CANONICAL/Contents/Resources/vaelend"
+INSTALLED_CORE_SCHEMA="$(schema_constant "$INSTALLED_CORE")" || die "cannot read installed embedded Core schema"
+CANDIDATE_SCHEMA="$(grep -E 'schemaVersion = [0-9]+' "$ROOT/Sources/VaelenCore/SQLiteStateStore.swift" | sed -E 's/.*= ([0-9]+).*/\1/' | head -1)"
+validate_schema_compatibility "$LIVE_SCHEMA" "$INSTALLED_CORE_SCHEMA" "$CANDIDATE_SCHEMA" || die "schema compatibility check failed"
 codesign --verify --deep --strict "$CANONICAL" || die "current installed app signature is invalid"
 
 # The post-update status check is part of the acceptance path. Prove the
@@ -83,19 +281,13 @@ codesign --verify --deep --strict "$CANONICAL" || die "current installed app sig
 # GUI/Core to quit; otherwise an updater failure would strand the running app.
 CLI="$SUPPORT/bin/val"
 CLI_OWNER="$SUPPORT/bin/.val.sha256"
-CLI_LINK="$HOME/.local/bin/val"
 source "$ROOT/Scripts/vaelen-dev-update-cli-preflight.sh"
 if vaelen_update_cli_preflight "$CLI" "$CLI_OWNER" "$CLI_LINK"; then
   :
 else
   CLI_PREFLIGHT_STATUS=$?
-  if [[ "$CLI_PREFLIGHT_STATUS" == 3 ]]; then
-    INSTALLED_CORE="$CANONICAL/Contents/Resources/vaelend"
-    INSTALLED_CORE_SCHEMA="$(schema_constant "$INSTALLED_CORE")" || die "cannot read installed embedded Core schema"
-    [[ "$INSTALLED_CORE_SCHEMA" == 7 ]] || die "CLI reports Core unavailable, but installed embedded Core schema is not the known stale schema 7"
-    [[ -z "$(process_pid_for_command "$INSTALLED_CORE")" ]] || die "installed embedded Core is running despite unavailable CLI status"
-    [[ ! -e "$SOCKET" && ! -L "$SOCKET" ]] || die "Core socket exists despite unavailable CLI status"
-    note "Allowing unavailable CLI preflight for stale installed Core schema $INSTALLED_CORE_SCHEMA; no installed Core process or socket exists"
+  if cli_unavailable_is_safe_without_core "$CLI_PREFLIGHT_STATUS" "$INSTALLED_CORE" "$SOCKET"; then
+    note "Allowing unavailable CLI because no Core process or socket exists and installed Core matches live schema $LIVE_SCHEMA"
   else
     exit "$CLI_PREFLIGHT_STATUS"
   fi
@@ -127,12 +319,12 @@ fi
 codesign --verify --deep --strict "$APP" || die "candidate app signature verification failed"
 [[ "$(team_of "$APP")" == "$TEAM" ]] || die "candidate app Team ID mismatch"
 [[ "$(team_of "$CORE")" == "$TEAM" ]] || die "candidate embedded Core Team ID mismatch"
-[[ "$(schema_constant "$CORE")" == 8 ]] || die "candidate embedded Core does not support schema v8"
+[[ "$(schema_constant "$CORE")" == "$CANDIDATE_SCHEMA" ]] || die "candidate embedded Core schema does not match candidate source schema $CANDIDATE_SCHEMA"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" == "$BUNDLE_ID" ]] || die "candidate bundle identifier mismatch"
 CORE_SHA="$(shasum -a 256 "$CORE" | awk '{print $1}')"
 APP_SHA="$(tree_hash "$APP")"
-printf 'candidate-app-tree-sha256=%s\ncandidate-core-sha256=%s\ncandidate-core-schema=8\nteam=%s\n' \
-  "$APP_SHA" "$CORE_SHA" "$TEAM" > "$RUN/candidate.manifest"
+printf 'candidate-app-tree-sha256=%s\ncandidate-core-sha256=%s\ncandidate-core-schema=%s\nteam=%s\n' \
+  "$APP_SHA" "$CORE_SHA" "$CANDIDATE_SCHEMA" "$TEAM" > "$RUN/candidate.manifest"
 printf 'source-root=%s\nsource-head=%s\nsource-branch=%s\nsource-diff-sha256=%s\nderived-data=%s\n' \
   "$ROOT" "$(git -C "$ROOT" rev-parse HEAD)" "$(git -C "$ROOT" branch --show-current)" \
   "$(git -C "$ROOT" diff HEAD --binary | shasum -a 256 | awk '{print $1}')" "$DERIVED" >> "$RUN/candidate.manifest"
@@ -141,13 +333,10 @@ git -C "$ROOT" ls-files --others --exclude-standard -z | while IFS= read -r -d '
   [[ -f "$ROOT/$file" ]] && shasum -a 256 "$ROOT/$file"
 done > "$RUN/source-untracked.sha256"
 
-# Recovery artifacts never restore data: the online SQLite backup is evidence,
-# and rollback restores only the prior app bundle. Live v8 and later MySQL or
-# project writes are never replaced from snapshots.
-note "Capturing app, v8 database, routes, and durable-file hashes"
+note "Capturing app, schema $LIVE_SCHEMA database, routes, and durable-file hashes"
 ditto "$CANONICAL" "$RUN/app-before.app"
 codesign --verify --deep --strict "$RUN/app-before.app" || die "preserved app copy failed signature verification"
-sqlite3 "$STATE_DB" ".backup '$RUN/state-v8-before.sqlite'" || die "could not make online SQLite backup"
+sqlite3 "$STATE_DB" ".backup '$RUN/state-before.sqlite'" || die "could not make online SQLite backup"
 printf '%s\n' "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" > "$RUN/schema-before.txt"
 route_inventory > "$RUN/routes-before.txt"
 [[ "$(wc -l < "$RUN/routes-before.txt" | tr -d ' ')" -ge 5 ]] || die "fewer than five route records exist; refusing update"
@@ -164,12 +353,14 @@ CANONICAL_CORE="$CANONICAL/Contents/Resources/vaelend"
 LEGACY_CORE="$LEGACY/Contents/Resources/vaelend"
 GUI_COUNT=$(( $(process_count_for_command "$CANONICAL_GUI") + $(process_count_for_command "$LEGACY_GUI") ))
 CORE_COUNT=$(( $(process_count_for_command "$CANONICAL_CORE") + $(process_count_for_command "$LEGACY_CORE") ))
-ALL_GUI_COUNT="$(process_count_for_bundle_executable "/Vaelen.app/Contents/MacOS/Vaelen")"
-ALL_CORE_COUNT="$(process_count_for_bundle_executable "/Vaelen.app/Contents/Resources/vaelend")"
+ALL_GUI_COUNT="$(process_count_for_bundle_executable "/Contents/MacOS/Vaelen")"
+ALL_CORE_COUNT="$(process_count_for_bundle_executable "/Contents/Resources/vaelend")"
 (( GUI_COUNT <= 1 && CORE_COUNT <= 1 && ALL_GUI_COUNT == GUI_COUNT && ALL_CORE_COUNT == CORE_COUNT )) || die "multiple or unrecognized GUI/Core owners are running; refusing ambiguous shutdown"
 GUI_PID="$(process_pid_for_command "$CANONICAL_GUI")"
 [[ -n "$GUI_PID" ]] || GUI_PID="$(process_pid_for_command "$LEGACY_GUI")"
-if [[ "$GUI_COUNT" == 1 ]]; then
+if [[ "$TEST_MODE" == 1 ]]; then
+  assert_no_gui_core_processes
+elif [[ "$GUI_COUNT" == 1 ]]; then
   # Quit is asynchronous in the app. AppleScript may report cancellation while
   # the GUI and Core complete their normal shutdown; process/socket state is the
   # authority, not the AppleScript reply.
@@ -200,8 +391,7 @@ if [[ -S "$SOCKET" ]]; then
   CORE_PID="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
   [[ "$CORE_PID" =~ ^[0-9]+$ ]] || die "Core socket exists but no harness PID record identifies its owner"
   [[ "$(ps -p "$CORE_PID" -o command= 2>/dev/null || true)" == "$CURRENT_CORE" ]] || die "Core PID record does not match the running candidate executable"
-  SOCKET_OWNERS="$(lsof -t -- "$SOCKET" 2>/dev/null | sort -u || true)"
-  [[ "$SOCKET_OWNERS" == "$CORE_PID" ]] || die "Core socket owners are not exactly the recorded candidate PID: $SOCKET_OWNERS"
+  process_owns_socket "$CORE_PID" "$SOCKET" || die "Core socket is not owned by the recorded candidate PID $CORE_PID"
   note "Gracefully stopping verified repository Core PID $CORE_PID"
   kill -TERM "$CORE_PID"
   for _ in {1..80}; do
@@ -216,14 +406,20 @@ assert_no_process "$CANONICAL/Contents/Resources/vaelend"
 assert_no_process "$LEGACY/Contents/Resources/vaelend"
 [[ ! -e "$SOCKET" ]] || die "Core socket exists without a verified owner; refusing to install"
 
+if [[ "$TEST_MODE" == 1 ]]; then assert_no_gui_core_processes; fi
+
 # Copy and verify on the target volume. Keep the prior app beside the new one
 # for immediate rollback; a separate copy is already preserved under $RUN.
-[[ ! -e "$OLD_APP" && ! -e "$STAGED_APP" ]] || die "update staging path already exists"
+[[ ! -e "$OLD_APP" && ! -L "$OLD_APP" && ! -e "$STAGED_APP" && ! -L "$STAGED_APP" ]] || die "update staging path already exists"
 note "Staging signed candidate in $APPLICATIONS"
 ditto "$APP" "$STAGED_APP" || die "candidate staging failed"
 codesign --verify --deep --strict "$STAGED_APP" || die "staged candidate signature verification failed"
 [[ "$(tree_hash "$STAGED_APP")" == "$APP_SHA" ]] || die "staged candidate bytes differ from verified build"
 
+if [[ "$TEST_MODE" == 1 ]]; then
+  configure_paths
+  validate_updater_fixture || die "fixture safety check failed before promotion"
+fi
 note "Promoting candidate while retaining the prior app"
 mv "$CANONICAL" "$OLD_APP" || die "could not preserve the prior app"
 if ! mv "$STAGED_APP" "$CANONICAL"; then
@@ -233,10 +429,14 @@ fi
 codesign --verify --deep --strict "$CANONICAL" || die "installed signature invalid; prior app is retained at $OLD_APP"
 [[ "$(tree_hash "$CANONICAL")" == "$APP_SHA" ]] || die "installed bytes differ from candidate; prior app is retained at $OLD_APP"
 [[ "$(team_of "$CANONICAL/Contents/Resources/vaelend")" == "$TEAM" ]] || die "installed Core Team ID mismatch"
-[[ "$(schema_constant "$CANONICAL/Contents/Resources/vaelend")" == 8 ]] || die "installed Core schema mismatch"
+[[ "$(schema_constant "$CANONICAL/Contents/Resources/vaelend")" == "$CANDIDATE_SCHEMA" ]] || die "installed Core schema does not match candidate schema $CANDIDATE_SCHEMA"
 
 note "Launching canonical signed app"
-open "$CANONICAL" --args --verification-open-settings=services || die "canonical app launch failed; live database remains schema v8"
+if [[ "$TEST_MODE" == 1 ]]; then
+  launch_fixture_app
+else
+  open "$CANONICAL" --args --verification-open-settings=services || die "canonical app launch failed; live DB schema is $(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;'), before schema migration verification"
+fi
 GUI_PID=""; CORE_PID=""
 for _ in {1..120}; do
   GUI_PID="$(process_pid_for_command "$CANONICAL/Contents/MacOS/Vaelen")"
@@ -244,21 +444,40 @@ for _ in {1..120}; do
   [[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] && break
   sleep .25
 done
-[[ -n "$GUI_PID" && -n "$CORE_PID" && -S "$SOCKET" ]] || die "signed embedded Core did not acquire socket; preserve v8 DB and use candidate app backup"
+if [[ -z "$GUI_PID" || -z "$CORE_PID" || ! -S "$SOCKET" ]]; then
+  POST_LAUNCH_SCHEMA="$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;' 2>/dev/null || printf unknown)"
+  MIGRATION_OUTCOME="$(migration_outcome "$POST_LAUNCH_SCHEMA" "$CANDIDATE_SCHEMA" "$LIVE_SCHEMA")"
+  printf '%s\n' "$POST_LAUNCH_SCHEMA" > "$RUN/schema-after.txt"
+  printf '%s\n' "$MIGRATION_OUTCOME" > "$RUN/migration-outcome.txt"
+  if [[ "$MIGRATION_OUTCOME" == pre-migration ]]; then
+    die "signed embedded Core did not acquire socket; DB remains pre-migration at schema $POST_LAUNCH_SCHEMA"
+  fi
+  die "signed embedded Core did not acquire socket; DB advanced from schema $LIVE_SCHEMA to $POST_LAUNCH_SCHEMA, and the prior app may not read it"
+fi
+if [[ "$TEST_MODE" == 1 ]]; then assert_fixture_launch; fi
+POST_LAUNCH_SCHEMA="$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;' 2>/dev/null || printf unknown)"
+MIGRATION_OUTCOME="$(migration_outcome "$POST_LAUNCH_SCHEMA" "$CANDIDATE_SCHEMA" "$LIVE_SCHEMA")"
+printf '%s\n' "$POST_LAUNCH_SCHEMA" > "$RUN/schema-after.txt"
+printf '%s\n' "$MIGRATION_OUTCOME" > "$RUN/migration-outcome.txt"
+if [[ "$MIGRATION_OUTCOME" != target-reached ]]; then
+  if [[ "$MIGRATION_OUTCOME" == pre-migration ]]; then
+    die "DB remains pre-migration at schema $POST_LAUNCH_SCHEMA; candidate target is $CANDIDATE_SCHEMA"
+  fi
+  die "DB advanced from schema $LIVE_SCHEMA to $POST_LAUNCH_SCHEMA, but candidate target is $CANDIDATE_SCHEMA; the prior app may not read it"
+fi
 [[ "$(ps -p "$CORE_PID" -o ppid= | tr -d ' ')" == "$GUI_PID" ]] || die "Core socket owner is not a child of canonical GUI"
-[[ "$(lsof -t -- "$SOCKET" 2>/dev/null | sort -u)" == "$CORE_PID" ]] || die "Core socket ownership does not match embedded Core PID"
+process_owns_socket "$CORE_PID" "$SOCKET" || die "Core socket ownership does not match embedded Core PID"
 
 note "Checking CLI, schema, and route preservation"
 "$SUPPORT/bin/val" status
 wait_enabled_services || die "enabled service readiness failed; see per-service timeout/observation above"
-[[ "$(sqlite3 -readonly "$STATE_DB" 'PRAGMA user_version;')" == 8 ]] || die "live DB schema changed; do not restore the saved DB"
 route_inventory > "$RUN/routes-after.txt"
 cmp -s "$RUN/routes-before.txt" "$RUN/routes-after.txt" || die "route records changed; saved DB remains evidence only"
-echo "signed-v8 app update: PASS"
+echo "signed schema-$CANDIDATE_SCHEMA app update: PASS"
 echo "Core PID=$CORE_PID path=$CANONICAL/Contents/Resources/vaelend"
-echo "Core SHA-256=$CORE_SHA schema=8 Team=$TEAM"
+echo "Core SHA-256=$CORE_SHA schema=$CANDIDATE_SCHEMA Team=$TEAM"
 echo "GUI PID=$GUI_PID"
 echo "prior app backup=$RUN/app-before.app"
 echo "prior installed app=$OLD_APP"
-echo "online v8 DB evidence=$RUN/state-v8-before.sqlite (never auto-restore)"
+echo "online schema-$LIVE_SCHEMA DB evidence=$RUN/state-before.sqlite (never auto-restore)"
 echo "update evidence=$RUN"

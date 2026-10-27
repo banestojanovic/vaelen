@@ -5,6 +5,10 @@ import Darwin
 /// an incidental inherited path variable from redirecting normal product
 /// state. Production runtime launches leave both variables unset.
 public enum VaelenTestRuntimePaths {
+    public static func hasInvalidCoreRuntime(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        environment["VAELEN_TEST_ALLOW_CORE_START"] == "1" && isolatedSupportRoot(environment: environment) == nil
+    }
+
     public static func isolatedSupportRoot(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
         guard environment["VAELEN_TEST_SUPPORT_ROOT_ENABLED"] == "1",
               let path = environment["VAELEN_TEST_SUPPORT_ROOT"],

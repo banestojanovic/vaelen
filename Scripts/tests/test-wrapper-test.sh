@@ -8,7 +8,19 @@ run_fixture() {
   local mode="$1" expected_status="$2"
   local fixture="$TEMP/$mode"
   mkdir -p "$fixture/scripts" "$fixture/bin" "$fixture/tmp"
-  cp "$ROOT/scripts/test.sh" "$fixture/scripts/test.sh"
+  cp "$ROOT/Scripts/test.sh" "$fixture/scripts/test.sh"
+  if [[ "$mode" == failure ]]; then
+    mkdir -p "$fixture/Scripts/tests"
+    cat > "$fixture/Scripts/tests/vaelen-dev-update-schema-contract-test.sh" <<'CONTRACT'
+#!/usr/bin/env bash
+printf 'earlier shell contract failure\n'
+exit 17
+CONTRACT
+    chmod +x "$fixture/Scripts/tests/vaelen-dev-update-schema-contract-test.sh"
+    cat > "$fixture/Scripts/tests/service-package-build-test.py" <<'PYTHON'
+print('later Python contract output')
+PYTHON
+  fi
   cat > "$fixture/bin/swift" <<'SWIFT'
 #!/usr/bin/env bash
 printf 'swift args: %s\n' "$*"
@@ -28,7 +40,7 @@ SWIFT
   [[ "$actual_status" == "$expected_status" ]] || { cat "$stdout_file" >&2; echo "expected status $expected_status, got $actual_status" >&2; exit 1; }
   if [[ "$mode" == success ]]; then
     [[ "$(wc -l < "$stdout_file" | tr -d ' ')" == 1 ]] || { cat "$stdout_file" >&2; echo 'success output was not one quiet summary line' >&2; exit 1; }
-    grep -q 'swift test passed' "$stdout_file"
+    grep -q 'tests passed (full log discarded)' "$stdout_file"
     [[ -z "$(find "$fixture/tmp" -type f -print -quit)" ]]
     [[ ! -d "$fixture/.audit/test-failures" || -z "$(find "$fixture/.audit/test-failures" -type f -print -quit)" ]]
   else
@@ -41,6 +53,8 @@ SWIFT
     ! grep -q 'noise that should not be printed' "$stdout_file"
     grep -q 'swift args: test --filter FixtureTest' "$retained"
     grep -q 'noise that should not be printed' "$retained"
+    grep -q 'earlier shell contract failure' "$retained"
+    grep -q 'later Python contract output' "$retained"
     grep -q 'status 23' "$stdout_file"
   fi
 }

@@ -3,6 +3,45 @@ import XCTest
 @testable import VaelenIPC
 
 final class ClientTests: XCTestCase {
+    func testInvalidTestRuntimeRejectsBeforeTransportConnect() async throws {
+        let invalidEnvironment = ["VAELEN_TEST_ALLOW_CORE_START": "1"]
+        let isolatedEnvironment = [
+            "VAELEN_TEST_ALLOW_CORE_START": "1",
+            "VAELEN_TEST_SUPPORT_ROOT_ENABLED": "1",
+            "VAELEN_TEST_SUPPORT_ROOT": "/tmp/vaelen-fixture"
+        ]
+
+        let invalidTransport = ConnectRecordingTransport()
+        let invalidClient = VaelenCoreClient(
+            transport: invalidTransport,
+            identity: ClientIdentity(name: "test", version: VaelenBuildInfo.version),
+            allowsConnection: { !VaelenTestRuntimePaths.hasInvalidCoreRuntime(environment: invalidEnvironment) }
+        )
+        do {
+            try await invalidClient.connect()
+            XCTFail("Invalid test runtime must reject Core connections")
+        } catch CoreClientError.coreUnavailable {
+        }
+        let invalidConnectCount = await invalidTransport.connectCount()
+        XCTAssertEqual(invalidConnectCount, 0)
+
+        for environment in [isolatedEnvironment, [:]] {
+            let transport = ConnectRecordingTransport()
+            let client = VaelenCoreClient(
+                transport: transport,
+                identity: ClientIdentity(name: "test", version: VaelenBuildInfo.version),
+                allowsConnection: { !VaelenTestRuntimePaths.hasInvalidCoreRuntime(environment: environment) }
+            )
+            do {
+                try await client.connect()
+                XCTFail("Recording transport should fail after recording connect")
+            } catch CoreClientError.coreUnavailable {
+            }
+            let connectCount = await transport.connectCount()
+            XCTAssertEqual(connectCount, 1)
+        }
+    }
+
     func testConcurrentCallsOnOneClientNeverCompeteForResponseReader() async throws {
         let transport = ConcurrentReadProbeTransport()
         let client = VaelenCoreClient(transport: transport, identity: ClientIdentity(name: "test", version: VaelenBuildInfo.version))
@@ -305,6 +344,18 @@ final class ClientTests: XCTestCase {
             }
         }
     }
+}
+
+private actor ConnectRecordingTransport: CoreTransport {
+    private var connections = 0
+    func connect() async throws {
+        connections += 1
+        throw CoreTransportError.unavailable
+    }
+    func write(_ data: Data) async throws { throw CoreTransportError.notConnected }
+    func read() async throws -> Data { throw CoreTransportError.notConnected }
+    func disconnect() async {}
+    func connectCount() -> Int { connections }
 }
 
 private actor ConcurrentReadProbeTransport: CoreTransport {
