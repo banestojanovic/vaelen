@@ -76,6 +76,10 @@ public enum CoreMethod: String, Sendable {
     case projectDown = "project.down"
     case projectPHP = "project.php"
     case projectPHPSelections = "project.php.selections"
+    case projectDatabaseCreate = "project.database.create"
+    case projectDatabaseStatus = "project.database.status"
+    case projectDatabaseRetry = "project.database.retry"
+    case projectDatabasePassword = "project.database.password"
     case pathPark = "path.park"
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
@@ -149,6 +153,10 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case projectAdoptionPreview(ProjectEnvironmentRequest)
     case projectAdoptionApply(ProjectAdoptionApplyRequest)
     case projectPHP(ProjectPHPRequest)
+    case projectDatabaseCreate(ProjectDatabaseCreateRequest)
+    case projectDatabaseStatus(ProjectDatabaseOperationRequest)
+    case projectDatabaseRetry(ProjectDatabaseOperationRequest)
+    case projectDatabasePassword(ProjectDatabasePasswordRequest)
     case park(ParkPathRequest)
     case unpark(UnparkPathRequest)
     case phpVersion(PHPVersionRequest)
@@ -178,6 +186,10 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .projectAdoptionPreview(let value): try value.encode(to: encoder)
         case .projectAdoptionApply(let value): try value.encode(to: encoder)
         case .projectPHP(let value): try value.encode(to: encoder)
+        case .projectDatabaseCreate(let value): try value.encode(to: encoder)
+        case .projectDatabaseStatus(let value): try value.encode(to: encoder)
+        case .projectDatabaseRetry(let value): try value.encode(to: encoder)
+        case .projectDatabasePassword(let value): try value.encode(to: encoder)
         case .park(let value): try value.encode(to: encoder)
         case .unpark(let value): try value.encode(to: encoder)
         case .phpVersion(let value): try value.encode(to: encoder)
@@ -212,6 +224,9 @@ public enum RequestParams: Codable, Equatable, Sendable {
                 self = .phpConfigurationUpdate(params); return
             }
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
+            if fields["creation"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseCreateRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseCreate(params); return }
+            if fields["revealPassword"] != nil, let params = try? IPCCodec.decode(ProjectDatabasePasswordRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabasePassword(params); return }
+            if fields["operationID"] != nil, fields["workingDirectory"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseOperationRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseStatus(params); return }
             if fields["confirmation"] != nil, let params = try? IPCCodec.decode(ProjectAdoptionApplyRequest.self, from: IPCCodec.encode(value)) { self = .projectAdoptionApply(params); return }
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectEnvironmentRequest.self, from: IPCCodec.encode(value)) { self = .projectAdoptionPreview(params); return }
             if fields["workingDirectory"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPResolveRequest.self, from: IPCCodec.encode(value)) { self = .phpResolve(params); return }
@@ -497,6 +512,53 @@ public struct PHPConfigurationUpdateRequest: Codable, Equatable, Sendable {
 public struct PHPExecRequest: Codable, Equatable, Sendable { public let version: String?; public let workingDirectory: String; public let arguments: [String]; public init(version: String? = nil, workingDirectory: String, arguments: [String]) { self.version = version; self.workingDirectory = workingDirectory; self.arguments = arguments } }
 public struct PHPResolveRequest: Codable, Equatable, Sendable { public let workingDirectory: String; public init(workingDirectory: String) { self.workingDirectory = workingDirectory } }
 public struct PHPResolveResult: Codable, Equatable, Sendable { public let version: String; public let cliPath: String; public let projectName: String?; public init(version: String, cliPath: String, projectName: String?) { self.version = version; self.cliPath = cliPath; self.projectName = projectName } }
+public struct ProjectDatabaseCreateRequest: Codable, Equatable, Sendable {
+    public let selector: String?
+    public let workingDirectory: String
+    public let creation: ProjectDatabaseCreation
+    public init(selector: String?, workingDirectory: String, creation: ProjectDatabaseCreation) { self.selector = selector; self.workingDirectory = workingDirectory; self.creation = creation }
+}
+public struct ProjectDatabaseOperationRequest: Codable, Equatable, Sendable {
+    public let selector: String?
+    public let workingDirectory: String
+    public let operationID: DatabaseOperationID
+    public init(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) { self.selector = selector; self.workingDirectory = workingDirectory; self.operationID = operationID }
+}
+public struct ProjectDatabasePasswordRequest: Codable, Equatable, Sendable {
+    public let selector: String?
+    public let workingDirectory: String
+    public let operationID: DatabaseOperationID
+    public let revealPassword: Bool
+    public init(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) {
+        self.selector = selector; self.workingDirectory = workingDirectory; self.operationID = operationID; self.revealPassword = true
+    }
+}
+public struct ProjectDatabaseAttemptResult: Codable, Equatable, Sendable {
+    public let operationID: DatabaseOperationID
+    public let receiptID: UUID
+    public let projectID: ProjectID
+    public let binding: ProjectServiceBinding
+    public let database: String
+    public let user: String
+    public let state: DatabaseProvisionState
+    public let pendingEffect: DatabaseProvisionEffect?
+    public let confirmedEffects: [DatabaseProvisionEffect]
+    public let uncertainEffects: [DatabaseProvisionEffect]
+    public let diagnostic: DatabaseProvisionDiagnostic?
+    public init(_ attempt: DatabaseProvisionAttempt) {
+        operationID = attempt.request.operationID; receiptID = attempt.receiptID; projectID = attempt.request.projectID
+        binding = attempt.request.binding; database = attempt.request.database.value; user = attempt.request.user.value
+        state = attempt.state; pendingEffect = attempt.pendingEffect
+        confirmedEffects = attempt.confirmedEffects.sorted { $0.rawValue < $1.rawValue }
+        uncertainEffects = attempt.uncertainEffects.sorted { $0.rawValue < $1.rawValue }
+        diagnostic = attempt.diagnostic
+    }
+    public init(operationID: DatabaseOperationID, receiptID: UUID, projectID: ProjectID, binding: ProjectServiceBinding, database: String, user: String, state: DatabaseProvisionState, pendingEffect: DatabaseProvisionEffect? = nil, confirmedEffects: [DatabaseProvisionEffect] = [], uncertainEffects: [DatabaseProvisionEffect] = [], diagnostic: DatabaseProvisionDiagnostic? = nil) {
+        self.operationID = operationID; self.receiptID = receiptID; self.projectID = projectID; self.binding = binding
+        self.database = database; self.user = user; self.state = state; self.pendingEffect = pendingEffect
+        self.confirmedEffects = confirmedEffects; self.uncertainEffects = uncertainEffects; self.diagnostic = diagnostic
+    }
+}
 public struct PHPPackageWire: Codable, Equatable, Sendable { public let version: String; public let architecture: String; public init(_ package: PHPPackage) { version = package.version; architecture = package.architecture } }
 public struct PHPVersionsResult: Codable, Equatable, Sendable { public let available: [String]; public let installed: [PHPPackageWire]; public let `default`: String?; public init(available: [String], installed: [PHPPackageWire], default: String?) { self.available = available; self.installed = installed; self.default = `default` } }
 public struct PHPRuntimeCatalogResult: Codable, Equatable, Sendable { public let catalog: PHPRuntimeCatalog; public init(catalog: PHPRuntimeCatalog) { self.catalog = catalog } }
@@ -698,6 +760,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectActivation(ProjectReconciliationExecutionResponse)
     case projectPHP(ProjectPHPSelection)
     case projectPHPSelections(ProjectPHPSelectionsResult)
+    case projectDatabaseAttempt(ProjectDatabaseAttemptResult)
+    case projectDatabasePassword(ProjectDatabasePasswordResult)
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
@@ -747,6 +811,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectActivation(let value): try value.encode(to: encoder)
         case .projectPHP(let value): try value.encode(to: encoder)
         case .projectPHPSelections(let value): try value.encode(to: encoder)
+        case .projectDatabaseAttempt(let value): try value.encode(to: encoder)
+        case .projectDatabasePassword(let value): try value.encode(to: encoder)
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
@@ -799,6 +865,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["execution"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationExecutionResponse.self, from: data) { self = .projectActivation(result) }
         else if fields["selections"] != nil, let result = try? IPCCodec.decode(ProjectPHPSelectionsResult.self, from: data) { self = .projectPHPSelections(result) }
         else if fields["overrideVersion"] != nil || fields["effectiveVersion"] != nil, let result = try? IPCCodec.decode(ProjectPHPSelection.self, from: data) { self = .projectPHP(result) }
+        else if fields["password"] != nil, fields.count == 1, let result = try? IPCCodec.decode(ProjectDatabasePasswordResult.self, from: data) { self = .projectDatabasePassword(result) }
+        else if fields["operationID"] != nil, let result = try? IPCCodec.decode(ProjectDatabaseAttemptResult.self, from: data) { self = .projectDatabaseAttempt(result) }
         else if fields["project"] != nil, let result = try? IPCCodec.decode(ProjectMutationResult.self, from: data) { self = .projectMutation(result) }
         else if fields["paths"] != nil, let result = try? IPCCodec.decode(ParkedPathListResult.self, from: data) { self = .parkedPathList(result) }
         else if fields["path"] != nil, let result = try? IPCCodec.decode(ParkedPathMutationResult.self, from: data) { self = .parkedPathMutation(result) }
@@ -836,6 +904,11 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["health"] != nil, let result = try? IPCCodec.decode(ServiceInstanceLifecycleResult.self, from: data) { self = .serviceInstanceLifecycle(result) }
         else { self = .raw(value) }
     }
+}
+
+public struct ProjectDatabasePasswordResult: Codable, Equatable, Sendable {
+    public let password: String
+    public init(password: String) { self.password = password }
 }
 
 public struct IPCResponse: Codable, Equatable, Sendable {

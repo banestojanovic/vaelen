@@ -47,6 +47,7 @@ final class AppModel {
     private(set) var projectReportErrors: [String: String] = [:]
     private(set) var projectLifecycleStates: [String: ProjectLifecycleState] = [:]
     private(set) var projectAdoptionReviews: [String: ProjectAdoptionReview] = [:]
+    private(set) var projectDatabaseAttempts: [String: ProjectDatabaseAttemptResult] = [:]
     private(set) var projectStartupMilestones: [String: TimeInterval] = [:]
     private(set) var phpCatalog: PHPRuntimeCatalog?
     private(set) var phpCatalogReadPending = false
@@ -216,10 +217,10 @@ final class AppModel {
             case "unavailable":
                 model.state = .unavailable
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
-            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable", "project-adoption":
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable", "project-adoption", "project-database", "project-database-postgresql", "project-database-retry":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
-                let mysqlState: MySQLState = mode == "node-settings-selected" ? .running : mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
-                let mysqlVersion = (mode == "node-settings-selected" || mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
+                let mysqlState: MySQLState = mode == "node-settings-selected" || mode == "project-database" ? .running : mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
+                let mysqlVersion = (mode == "node-settings-selected" || mode == "project-database" || mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
                 let mysql = MySQLStatus(
                     state: mysqlState,
                     health: mysqlState == .unhealthy ? "identity-unverified" : mysqlState == .stopped ? "stopped" : mysqlState == .running ? "healthy" : "not-installed",
@@ -245,7 +246,7 @@ final class AppModel {
                 )
                 let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
-                if mode.hasPrefix("node-settings-") || mode == "project-adoption" {
+                if mode.hasPrefix("node-settings-") || mode == "project-adoption" || mode == "project-database" || mode == "project-database-postgresql" || mode == "project-database-retry" {
                     let projectID = UUID(uuidString: "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!
                     let project = ProjectWire(id: projectID, name: "Storefront", path: "/fixture/projects/storefront", registration: "linked", availability: "available", detectedFramework: "Next.js")
                     let version = try! NodeVersion("24.22.1")
@@ -253,7 +254,7 @@ final class AppModel {
                     let packageJSON = Data(#"{"version":"24.22.1","platform":"darwin","architecture":"arm64","artifactSHA256":"fixture","receiptVersion":1}"#.utf8)
                     let package = try? JSONDecoder().decode(NodePackageIdentity.self, from: packageJSON)
                     model.linkedProjects = [project]
-                    if mode == "node-settings-selected" || mode == "project-adoption" {
+                    if mode == "node-settings-selected" || mode == "project-adoption" || mode == "project-database" || mode == "project-database-postgresql" || mode == "project-database-retry" {
                         let projectDomain = Project(
                             id: ProjectID(rawValue: projectID),
                             name: project.name,
@@ -288,14 +289,33 @@ final class AppModel {
                             routeDocumentRootMatches: nil,
                             configCache: ProjectConfigCacheObservation(state: "unknown", cachePath: "/fixture/projects/storefront/bootstrap/cache/config.php")
                         )
+                        let mysqlBinding = try! ProjectServiceBinding(alias: ProjectBindingAlias("mysql"), kind: .mysql, instance: ProjectInstanceName("default"), version: "8.4.11")
+                        let mysqlObservation = ProjectServiceBindingObservation(binding: mysqlBinding, packageIdentifier: "mysql-8.4.11", endpoint: ["host": "127.0.0.1", "port": "3306"], dataDirectory: "/fixture/mysql-data", health: "healthy", claimed: true)
+                        let postgresqlBinding = try! ProjectServiceBinding(alias: ProjectBindingAlias("postgresql"), kind: .postgresql, instance: ProjectInstanceName("fixture-pg"), version: "18.6")
+                        let postgresqlObservation = ProjectServiceBindingObservation(binding: postgresqlBinding, packageIdentifier: "postgresql-18.6", endpoint: ["host": "127.0.0.1", "port": "15432"], dataDirectory: "/fixture/postgresql-data", health: "healthy", claimed: true)
+                        let isPostgreSQLDatabaseFixture = mode == "project-database-postgresql"
+                        if mode == "project-database" || isPostgreSQLDatabaseFixture || mode == "project-database-retry" {
+                            let operationID = DatabaseOperationID(UUID(uuidString: mode == "project-database-retry" ? "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC408" : isPostgreSQLDatabaseFixture ? "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC409" : "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!)
+                            let binding = isPostgreSQLDatabaseFixture ? postgresqlBinding : mysqlBinding
+                            let result = ProjectDatabaseAttemptResult(
+                                operationID: operationID,
+                                receiptID: UUID(uuidString: "D0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!,
+                                projectID: ProjectID(rawValue: projectID), binding: binding,
+                                database: "storefront_app", user: "storefront_user",
+                                state: mode == "project-database-retry" ? .failedBeforeDDL : .ready,
+                                diagnostic: mode == "project-database-retry" ? .engineRejected : nil
+                            )
+                            model.projectDatabaseAttempts[project.path] = result
+                        }
                         model.projectReports = [ProjectEnvironmentReport(
                             identity: ProjectEnvironmentIdentity(project: projectDomain),
-                            desired: ProjectDesiredEnvironment(file: mode == "project-adoption" ? .absent : .valid, mysql: false),
-                            configured: ProjectConfiguredEnvironment(envFile: "/fixture/projects/storefront/.env", envFilePresent: true, dbConnection: "sqlite"),
+                            desired: ProjectDesiredEnvironment(file: mode == "project-adoption" ? .absent : .valid, mysql: mode == "project-database" || mode == "project-database-retry"),
+                            configured: ProjectConfiguredEnvironment(envFile: "/fixture/projects/storefront/.env", envFilePresent: true, dbConnection: isPostgreSQLDatabaseFixture ? "pgsql" : "sqlite"),
                             observed: observed,
                             derived: derived,
                             secret: ProjectSecretEnvironment(databasePassword: .unknown, mailPassword: .unknown),
-                            diagnostics: []
+                            diagnostics: [],
+                            serviceBindings: mode == "project-database" || mode == "project-database-retry" ? [mysqlObservation] : isPostgreSQLDatabaseFixture ? [postgresqlObservation] : nil
                         )]
                         if mode == "project-adoption", let report = model.projectReports.first {
                             let preview = ProjectAdoptionPreview(
@@ -1587,6 +1607,69 @@ final class AppModel {
 
     func projectAdoptionReview(for project: ProjectWire) -> ProjectAdoptionReview {
         projectAdoptionReviews[project.path] ?? ProjectAdoptionReview()
+    }
+
+    func createProjectDatabase(_ project: ProjectWire, binding: ProjectServiceBinding, database: String, user: String) async throws -> ProjectDatabaseAttemptResult {
+        guard let projectUUID = project.id, project.availability == "available", !isSettingsFixture else { throw CoreClientError.coreUnavailable }
+        let creation = ProjectDatabaseCreation(
+            projectID: ProjectID(rawValue: projectUUID),
+            binding: binding,
+            database: try DatabaseName(database),
+            user: try DatabaseUserName(user)
+        )
+        guard beginRelationshipMutation("Creating project database…") else { throw CoreClientError.coreUnavailable }
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            let result = try await commandClient.createProjectDatabase(selector: projectUUID.uuidString, workingDirectory: project.path, creation: creation)
+            await commandClient.disconnect()
+            projectDatabaseAttempts[project.path] = result
+            finishRelationshipMutation()
+            return result
+        } catch {
+            await commandClient.disconnect()
+            finishRelationshipMutation(error: error)
+            throw error
+        }
+    }
+
+    func projectDatabaseStatus(_ project: ProjectWire, operationID: DatabaseOperationID) async throws -> ProjectDatabaseAttemptResult {
+        guard !isSettingsFixture else { throw CoreClientError.coreUnavailable }
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            let result = try await commandClient.projectDatabaseStatus(selector: project.id?.uuidString, workingDirectory: project.path, operationID: operationID)
+            await commandClient.disconnect()
+            projectDatabaseAttempts[project.path] = result
+            return result
+        } catch {
+            await commandClient.disconnect()
+            throw error
+        }
+    }
+
+    func retryProjectDatabase(_ project: ProjectWire, operationID: DatabaseOperationID) async throws -> ProjectDatabaseAttemptResult {
+        guard !isSettingsFixture else { throw CoreClientError.coreUnavailable }
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            let result = try await commandClient.retryProjectDatabase(selector: project.id?.uuidString, workingDirectory: project.path, operationID: operationID)
+            await commandClient.disconnect(); projectDatabaseAttempts[project.path] = result; return result
+        } catch { await commandClient.disconnect(); throw error }
+    }
+
+    func revealProjectDatabasePassword(_ project: ProjectWire, operationID: DatabaseOperationID) async throws -> String {
+        guard !isSettingsFixture else { throw CoreClientError.coreUnavailable }
+        let commandClient = makeCoreClient()
+        do {
+            try await commandClient.connect()
+            let password = try await commandClient.revealProjectDatabasePassword(selector: project.id?.uuidString, workingDirectory: project.path, operationID: operationID)
+            await commandClient.disconnect()
+            return password
+        } catch {
+            await commandClient.disconnect()
+            throw error
+        }
     }
 
     func reviewProjectAdoption(_ project: ProjectWire) async {

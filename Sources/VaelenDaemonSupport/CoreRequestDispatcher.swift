@@ -105,6 +105,8 @@ public actor CoreRequestDispatcher {
     private let logs: CoreLogCatalog
     private let serviceIntents: ServiceIntentStore
     private let serviceInstances: ServiceInstanceRepository?
+    private let databaseReceipts: ProjectDatabaseReceiptRepository?
+    private let databasePasswords: any ProjectDatabasePasswordStore
     private let projectServiceBindings: ProjectServiceBindings
     private let postgresql: PostgreSQLServiceModule?
     private let valkey: ValkeyServiceModule?
@@ -124,9 +126,9 @@ public actor CoreRequestDispatcher {
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, node: NodePackageManager = .init(), mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, postgresql: PostgreSQLServiceModule? = nil, valkey: ValkeyServiceModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, serviceInstances: ServiceInstanceRepository? = nil, logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, node: NodePackageManager = .init(), mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, postgresql: PostgreSQLServiceModule? = nil, valkey: ValkeyServiceModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, serviceInstances: ServiceInstanceRepository? = nil, databaseReceipts: ProjectDatabaseReceiptRepository? = nil, databasePasswords: any ProjectDatabasePasswordStore = KeychainProjectDatabasePasswordStore(), logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
         self.node = node
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.postgresql = postgresql; self.valkey = valkey; self.router = router; self.routeRepository = routeRepository; self.localProxyRepository = localProxyRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.logs = logs; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json")); self.serviceInstances = serviceInstances
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.postgresql = postgresql; self.valkey = valkey; self.router = router; self.routeRepository = routeRepository; self.localProxyRepository = localProxyRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.logs = logs; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json")); self.serviceInstances = serviceInstances; self.databaseReceipts = databaseReceipts; self.databasePasswords = databasePasswords
         self.projectServiceBindings = ProjectServiceBindings(repository: serviceInstances, mysql: mysql, postgresql: postgresql, valkey: valkey, mailpit: mailpit)
         var persistedRoutes = try routeRepository?.all() ?? []
         if let localProxyRepository {
@@ -169,6 +171,98 @@ public actor CoreRequestDispatcher {
             return (.init(id: request.id, error: .init(code: .invalidRequest, message: "Core shutdown is in progress. Retry after cleanup completes.")), handshaken)
         }
         return await dispatchRequest(request, handshaken: handshaken)
+    }
+
+    public func createProjectDatabase(_ request: ProjectDatabaseCreation) async throws -> DatabaseProvisionAttempt {
+        guard let serviceInstances, let receipts = databaseReceipts,
+              let project = try await registry.linkedProject(id: request.projectID), project.availability == .available else { throw DatabaseProvisioningError.targetMismatch }
+        let record = try await validateProjectDatabaseTarget(project: project, binding: request.binding, expectedRecord: nil)
+        switch request.binding.kind {
+        case .mysql:
+            guard let mysql else { throw DatabaseProvisioningError.targetMismatch }
+            return try mysql.provisionDatabase(request, record: record, receipts: receipts, passwords: databasePasswords)
+        case .postgresql:
+            guard let postgresql else { throw DatabaseProvisioningError.targetMismatch }
+            return try postgresql.provisionDatabase(request, record: record, receipts: receipts, passwords: databasePasswords)
+        default: throw DatabaseProvisioningError.targetMismatch
+        }
+    }
+
+    public func retryProjectDatabase(project: Project, operationID: DatabaseOperationID) async throws -> DatabaseProvisionAttempt {
+        guard let receipts = databaseReceipts, let projectID = project.id,
+              project.registrationKind == .linked, project.availability == .available,
+              let attempt = try receipts.attempt(operationID), attempt.request.projectID == projectID,
+              attempt.state == .failedBeforeDDL, attempt.pendingEffect == nil,
+              attempt.confirmedEffects.isEmpty, attempt.uncertainEffects.isEmpty else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        let record = try await validateProjectDatabaseTarget(project: project, binding: attempt.request.binding, expectedRecord: attempt.target.record)
+        switch attempt.request.binding.kind {
+        case .mysql:
+            guard let mysql, mysql.databaseTargetMatches(attempt) else { throw DatabaseProvisioningError.targetMismatch }
+            return try mysql.provisionDatabase(attempt.request, record: record, receipts: receipts, passwords: databasePasswords, retryFailedBeforeDDL: true)
+        case .postgresql:
+            guard let postgresql, postgresql.databaseTargetMatches(attempt) else { throw DatabaseProvisioningError.targetMismatch }
+            return try postgresql.provisionDatabase(attempt.request, record: record, receipts: receipts, passwords: databasePasswords, retryFailedBeforeDDL: true)
+        default: throw DatabaseProvisioningError.targetMismatch
+        }
+    }
+
+    private func revealProjectDatabasePassword(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) async throws -> String {
+        guard let receipts = databaseReceipts else { throw DatabaseProvisioningError.targetMismatch }
+        let project = try await resolveProject(selector: selector, workingDirectory: workingDirectory)
+        guard project.registrationKind == .linked, project.availability == .available,
+              let projectID = project.id, let attempt = try receipts.attempt(operationID),
+              attempt.request.projectID == projectID, attempt.state == .ready else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        let record = try await validateProjectDatabaseTarget(project: project, binding: attempt.request.binding, expectedRecord: nil)
+        switch attempt.request.binding.kind {
+        case .mysql:
+            guard let mysql else { throw DatabaseProvisioningError.targetMismatch }
+            return try mysql.revealDatabasePassword(for: attempt, passwords: databasePasswords)
+        case .postgresql:
+            guard let postgresql else { throw DatabaseProvisioningError.targetMismatch }
+            return try postgresql.revealDatabasePassword(for: attempt, record: record, passwords: databasePasswords)
+        default: throw DatabaseProvisioningError.targetMismatch
+        }
+    }
+
+    private func validateProjectDatabaseTarget(project: Project, binding: ProjectServiceBinding, expectedRecord: ServiceInstanceRecord?) async throws -> ServiceInstanceRecord {
+        guard (binding.kind == .mysql || binding.kind == .postgresql),
+              let serviceInstances, let projectID = project.id, project.registrationKind == .linked,
+              project.availability == .available else { throw DatabaseProvisioningError.targetMismatch }
+        if binding.kind == .mysql {
+            guard binding.instance.value == "default", mysql != nil else { throw DatabaseProvisioningError.targetMismatch }
+        } else if postgresql == nil {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        let report = try await projectEnvironmentReport(for: project)
+        guard report.projectSpec?.services.contains(binding) == true,
+              let observation = report.serviceBindings?.first(where: { $0.binding.alias == binding.alias }),
+              observation.binding == binding, observation.claimed, observation.health == "healthy",
+              let package = observation.packageIdentifier, let dataDirectory = observation.dataDirectory,
+              observation.catalogPersisted == true else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        let instanceID = ServiceInstanceID(kind: binding.kind, name: binding.instance)
+        guard try serviceInstances.projectClaims(for: projectID).contains(binding),
+              let record = try serviceInstances.instance(instanceID),
+              record.packageIdentifier == package, record.dataDirectory == dataDirectory,
+              observation.endpoint == record.endpoint.loopbackEndpoints,
+              record.endpoint.kind == binding.kind, expectedRecord == nil || expectedRecord == record else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        let snapshot: ModuleOwnedServiceSnapshot
+        switch binding.kind {
+        case .mysql: snapshot = mysql!.projectBindingSnapshot()
+        case .postgresql: snapshot = postgresql!.projectBindingSnapshot(for: instanceID)
+        default: throw DatabaseProvisioningError.targetMismatch
+        }
+        guard snapshot.record == record, snapshot.health == "healthy" else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        return record
     }
 
     /// Used by the Core's parent-liveness monitor when the GUI disappears
@@ -226,6 +320,39 @@ public actor CoreRequestDispatcher {
                 let savedIntents = try? serviceIntents.enabledServices()
                 let issues = serviceIntents.failures()
                 return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1, serviceIssues: issues, serviceIntents: savedIntents))), true)
+            case .projectDatabaseCreate:
+                let params = try request.params?.decode(ProjectDatabaseCreateRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project database creation parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard project.registrationKind == .linked, project.id == params.creation.projectID else { throw IPCErrorPayload(code: .invalidRequest, message: "Database creation requires the selected linked project identity.") }
+                let attempt = try await createProjectDatabase(params.creation)
+                return (.init(id: request.id, result: .projectDatabaseAttempt(.init(attempt))), true)
+            case .projectDatabaseStatus:
+                let params = try request.params?.decode(ProjectDatabaseOperationRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project database operation parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard project.registrationKind == .linked, let projectID = project.id,
+                      let receipts = databaseReceipts,
+                      let attempt = try receipts.attempt(params.operationID), attempt.request.projectID == projectID else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "No database operation exists for the selected linked project.")
+                }
+                let record = try await validateProjectDatabaseTarget(project: project, binding: attempt.request.binding, expectedRecord: attempt.target.record)
+                let matches: Bool
+                switch attempt.request.binding.kind {
+                case .mysql: matches = mysql?.databaseTargetMatches(attempt) == true
+                case .postgresql: matches = postgresql?.databaseTargetMatches(attempt) == true
+                default: matches = false
+                }
+                guard record == attempt.target.record, matches else { throw DatabaseProvisioningError.targetMismatch }
+                return (.init(id: request.id, result: .projectDatabaseAttempt(.init(attempt))), true)
+            case .projectDatabaseRetry:
+                let params = try request.params?.decode(ProjectDatabaseOperationRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project database retry parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                let attempt = try await retryProjectDatabase(project: project, operationID: params.operationID)
+                return (.init(id: request.id, result: .projectDatabaseAttempt(.init(attempt))), true)
+            case .projectDatabasePassword:
+                let params = try request.params?.decode(ProjectDatabasePasswordRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "An explicit database password request is required.") }()
+                guard params.revealPassword else { throw IPCErrorPayload(code: .invalidRequest, message: "An explicit database password request is required.") }
+                let password = try await revealProjectDatabasePassword(selector: params.selector, workingDirectory: params.workingDirectory, operationID: params.operationID)
+                return (.init(id: request.id, result: .projectDatabasePassword(.init(password: password))), true)
             case .shutdown:
                 fatalError("shutdown is handled before provider dispatch")
             case .serviceInstances:
@@ -757,7 +884,7 @@ public actor CoreRequestDispatcher {
 
     private func requiresStartupRecoveryBarrier(_ method: CoreMethod, params: RequestParams?) -> Bool {
         switch method {
-        case .projectLink, .projectUnlink, .projectAdoptionApply, .projectActivate, .projectDown,
+        case .projectLink, .projectUnlink, .projectAdoptionApply, .projectActivate, .projectDown, .projectDatabaseCreate,
              .mysqlStart, .mysqlStop, .mailpitStart, .mailpitStop:
             return true
         case .projectPHP:

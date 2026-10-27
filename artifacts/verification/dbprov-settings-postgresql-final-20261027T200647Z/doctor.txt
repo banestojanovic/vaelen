@@ -1,0 +1,2 @@
+Process identity OK: pid=4433 bundle=dev.vaelen.app fixture=project-database-postgresql page=projects
+Check CUA accessibility state for Settings and UI fixture · project-database-postgresql before driving.

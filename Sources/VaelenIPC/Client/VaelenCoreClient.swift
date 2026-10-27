@@ -183,6 +183,30 @@ public actor VaelenCoreClient {
         return result
     }
 
+    public func createProjectDatabase(selector: String?, workingDirectory: String, creation: ProjectDatabaseCreation) async throws -> ProjectDatabaseAttemptResult {
+        let params = ProjectDatabaseCreateRequest(selector: selector, workingDirectory: workingDirectory, creation: creation)
+        guard case .projectDatabaseAttempt(let result) = try result(from: await send(IPCRequest(method: .projectDatabaseCreate, params: .projectDatabaseCreate(params)))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
+    public func projectDatabaseStatus(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) async throws -> ProjectDatabaseAttemptResult {
+        let params = ProjectDatabaseOperationRequest(selector: selector, workingDirectory: workingDirectory, operationID: operationID)
+        guard case .projectDatabaseAttempt(let result) = try result(from: await send(IPCRequest(method: .projectDatabaseStatus, params: .projectDatabaseStatus(params)))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
+    public func retryProjectDatabase(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) async throws -> ProjectDatabaseAttemptResult {
+        let params = ProjectDatabaseOperationRequest(selector: selector, workingDirectory: workingDirectory, operationID: operationID)
+        guard case .projectDatabaseAttempt(let result) = try result(from: await send(IPCRequest(method: .projectDatabaseRetry, params: .projectDatabaseStatus(params)))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
+    public func revealProjectDatabasePassword(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) async throws -> String {
+        let params = ProjectDatabasePasswordRequest(selector: selector, workingDirectory: workingDirectory, operationID: operationID)
+        guard case .projectDatabasePassword(let result) = try result(from: await send(IPCRequest(method: .projectDatabasePassword, params: .projectDatabasePassword(params)))) else { throw CoreClientError.invalidResponse }
+        return result.password
+    }
+
     private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
         do {
             guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID))))) else { throw CoreClientError.invalidResponse }

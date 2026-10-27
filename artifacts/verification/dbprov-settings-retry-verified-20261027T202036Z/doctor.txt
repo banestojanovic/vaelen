@@ -1,0 +1,2 @@
+Process identity OK: pid=15498 bundle=dev.vaelen.app fixture=project-database-retry page=projects
+Check CUA accessibility state for Settings and UI fixture · project-database-retry before driving.

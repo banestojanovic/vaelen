@@ -11,7 +11,7 @@ FIXTURE="${VAELEN_SETTINGS_FIXTURE:-php-settings}"
 PAGE="${VAELEN_SETTINGS_PAGE:-services}"
 
 case "$FIXTURE" in
-  pending|unavailable|partial|empty|installed|all-installed|install-failed|remove-failed|php-settings|php-settings-no-default|php-settings-error|php-settings-invalid|php-settings-saving|php-update-review|php-update-progress|php-update-unknown-total|php-update-success|php-update-failed|php-update-checking|php-update-check-failed|php-release-security|php-release-coexist|php-release-stale|node-settings-selected|node-settings-unpinned|node-settings-unavailable|project-adoption) ;;
+  pending|unavailable|partial|empty|installed|all-installed|install-failed|remove-failed|php-settings|php-settings-no-default|php-settings-error|php-settings-invalid|php-settings-saving|php-update-review|php-update-progress|php-update-unknown-total|php-update-success|php-update-failed|php-update-checking|php-update-check-failed|php-release-security|php-release-coexist|php-release-stale|node-settings-selected|node-settings-unpinned|node-settings-unavailable|project-adoption|project-database|project-database-postgresql|project-database-retry) ;;
   *) echo "Unsupported Settings fixture: $FIXTURE" >&2; exit 2 ;;
 esac
 case "$PAGE" in

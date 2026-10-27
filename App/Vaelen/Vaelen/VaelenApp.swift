@@ -1623,6 +1623,7 @@ private struct ProjectSelectedDetail: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            ProjectDatabaseProvisioningControls(project: project, report: report, model: model)
             VStack(alignment: .leading, spacing: 9) {
                 HStack { Text("Project PHP").font(.headline); Spacer(); ProjectPHPMenu(project: project, report: report, model: model) }
                 Text("This runtime choice applies to this project only. Other projects keep their own override or inherit the shared default.").font(.caption).foregroundStyle(.secondary)
@@ -1722,6 +1723,178 @@ private struct ProjectSelectedDetail: View {
     }
     private func projectFact(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline) { Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 92, alignment: .leading); Text(value).font(.caption).textSelection(.enabled); Spacer(minLength: 0) }
+    }
+}
+
+private struct ProjectDatabaseProvisioningControls: View {
+    let project: ProjectWire
+    let report: ProjectEnvironmentReport?
+    let model: AppModel
+    @State private var databaseName = ""
+    @State private var userName = ""
+    @State private var revealedPassword: String?
+    @State private var error: String?
+    @State private var isWorking = false
+    @State private var visibilityGeneration = 0
+
+    private var databaseBindings: [ProjectServiceBindingObservation] {
+        report?.serviceBindings?.filter { $0.binding.kind == .mysql || $0.binding.kind == .postgresql } ?? []
+    }
+
+    private var eligibleBinding: ProjectServiceBinding? {
+        guard project.id != nil, project.availability == "available",
+              model.linkedProjects.contains(where: { $0.path == project.path && $0.id == project.id }),
+              databaseBindings.count == 1,
+              let observation = databaseBindings.first,
+              observation.health == "healthy", observation.claimed else { return nil }
+        return observation.binding
+    }
+
+    private var receiptIsReady: Bool { attempt?.state == .ready }
+    private var attempt: ProjectDatabaseAttemptResult? { model.projectDatabaseAttempts[project.path] }
+
+    var body: some View {
+        SettingsInsetCard {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Project database access").font(.headline)
+                    Spacer()
+                    if let attempt {
+                        SettingsStateBadge(title: databaseStateLabel(attempt.state), tone: attempt.state == .ready ? .healthy : .pending)
+                    }
+                }
+                HStack(spacing: 8) {
+                    TextField("Database name", text: $databaseName)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("New database name")
+                    TextField("User name", text: $userName)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("New database user name")
+                    Button("Create", systemImage: "plus") { createDatabase() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(eligibleBinding == nil || databaseName.isEmpty || userName.isEmpty || isWorking || model.relationshipMutationInFlight || model.isSettingsFixture)
+                }
+                if eligibleBinding == nil {
+                    Text("Requires a linked project with one healthy, claimed MySQL or PostgreSQL service binding.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let attempt {
+                    HStack(spacing: 8) {
+                        Text("\(attempt.database) · \(attempt.user)").font(.caption.weight(.medium))
+                        Text("Operation \(attempt.operationID.rawValue.uuidString)").font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                        if let pending = attempt.pendingEffect {
+                            Text("Pending \(pending.rawValue)").font(.caption).foregroundStyle(.orange)
+                        }
+                        Spacer(minLength: 0)
+                        if !receiptIsReady {
+                            Button("Refresh Status", systemImage: "arrow.clockwise") { refreshStatus() }
+                                .buttonStyle(.bordered).controlSize(.small).disabled(isWorking || model.isSettingsFixture)
+                        }
+                        if attempt.state == .failedBeforeDDL {
+                            Button("Retry", systemImage: "arrow.clockwise") { retryDatabase() }
+                                .buttonStyle(.bordered).controlSize(.small).disabled(isWorking || model.isSettingsFixture)
+                        }
+                    }
+                    if receiptIsReady {
+                        HStack(spacing: 8) {
+                            Button("Reveal Password", systemImage: "eye") { revealPassword() }
+                                .buttonStyle(.bordered).controlSize(.small).disabled(isWorking || model.isSettingsFixture)
+                            Button("Copy Password", systemImage: "doc.on.doc") { copyPassword() }
+                                .buttonStyle(.bordered).controlSize(.small).disabled(isWorking || model.isSettingsFixture)
+                        }
+                        if let revealedPassword {
+                            Text(revealedPassword).font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                    }
+                }
+                if let error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                }
+            }
+        }
+        .onAppear { visibilityGeneration += 1 }
+        .onDisappear { visibilityGeneration += 1; revealedPassword = nil }
+    }
+
+    private func createDatabase() {
+        guard let binding = eligibleBinding else { return }
+        isWorking = true
+        error = nil
+        revealedPassword = nil
+        Task {
+            do { _ = try await model.createProjectDatabase(project, binding: binding, database: databaseName, user: userName) }
+            catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func refreshStatus() {
+        guard !model.isSettingsFixture else { return }
+        guard let operationID = attempt?.operationID else { return }
+        isWorking = true
+        error = nil
+        revealedPassword = nil
+        Task {
+            do { _ = try await model.projectDatabaseStatus(project, operationID: operationID) }
+            catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func retryDatabase() {
+        guard !model.isSettingsFixture, let operationID = attempt?.operationID else { return }
+        isWorking = true; error = nil; revealedPassword = nil
+        Task {
+            do { _ = try await model.retryProjectDatabase(project, operationID: operationID) }
+            catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func revealPassword() {
+        guard !model.isSettingsFixture, receiptIsReady, let operationID = attempt?.operationID else { return }
+        let generation = visibilityGeneration
+        isWorking = true
+        error = nil
+        Task {
+            do {
+                let password = try await model.revealProjectDatabasePassword(project, operationID: operationID)
+                guard generation == visibilityGeneration else { return }
+                revealedPassword = password
+            }
+            catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func copyPassword() {
+        guard !model.isSettingsFixture, receiptIsReady, let operationID = attempt?.operationID else { return }
+        let generation = visibilityGeneration
+        isWorking = true
+        error = nil
+        Task {
+            do {
+                let password = try await model.revealProjectDatabasePassword(project, operationID: operationID)
+                guard generation == visibilityGeneration else { return }
+                NSPasteboard.general.clearContents()
+                guard NSPasteboard.general.setString(password, forType: .string) else { throw CoreClientError.invalidResponse }
+                revealedPassword = nil
+            } catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func databaseStateLabel(_ state: DatabaseProvisionState) -> String {
+        switch state {
+        case .reserved: "Reserved"
+        case .prepared: "Prepared"
+        case .pendingEffect: "Pending effect"
+        case .ready: "Ready"
+        case .refused: "Refused"
+        case .failedBeforeDDL: "Failed before DDL"
+        case .needsAttention: "Needs attention"
+        }
     }
 }
 

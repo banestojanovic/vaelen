@@ -28,6 +28,84 @@ public enum PostgreSQLServiceError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 
+private final class PostgreSQLProvisioningAdapter: ProjectDatabaseProvisioningEngine, @unchecked Sendable {
+    private let module: PostgreSQLServiceModule
+    private let target: VerifiedDatabaseTarget
+    private let packageRoot: URL
+    private let socketPath: String
+
+    init(module: PostgreSQLServiceModule, target: VerifiedDatabaseTarget, packageRoot: URL, socketPath: String) {
+        self.module = module
+        self.target = target
+        self.packageRoot = packageRoot
+        self.socketPath = socketPath
+    }
+
+    func bound(to target: VerifiedDatabaseTarget) -> PostgreSQLProvisioningAdapter {
+        PostgreSQLProvisioningAdapter(module: module, target: target, packageRoot: packageRoot, socketPath: socketPath)
+    }
+
+    func clusterIdentity(for target: VerifiedDatabaseTarget) throws -> String {
+        guard target.record == self.target.record, target.binding == self.target.binding else { throw DatabaseProvisioningError.targetMismatch }
+        let value = try query(database: "postgres", sql: "SELECT system_identifier::text FROM pg_control_system();")
+        guard !value.isEmpty, value.allSatisfy({ $0.isASCII && $0.isNumber }) else { throw DatabaseProvisioningError.engineFailure }
+        return value
+    }
+
+    func checkAbsent(database: DatabaseName, user: DatabaseUserName) throws -> DatabaseProvisionDiagnostic? {
+        let sql = "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_database WHERE datname = \(literal(database.value))) THEN 'database' WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = \(literal(user.value))) THEN 'user' ELSE '' END;"
+        let result: String = try query(database: "postgres", sql: sql)
+        switch result {
+        case "database": return DatabaseProvisionDiagnostic.existingDatabase
+        case "user": return DatabaseProvisionDiagnostic.existingUser
+        case "": return nil
+        default: throw DatabaseProvisioningError.engineFailure
+        }
+    }
+
+    func createLockedUser(_ user: DatabaseUserName, password: SecretPassword) throws {
+        _ = password
+        try execute(database: "postgres", sql: "CREATE ROLE \(identifier(user.value)) WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;")
+    }
+
+    func createDatabase(_ database: DatabaseName) throws {
+        throw DatabaseProvisioningError.engineFailure
+    }
+
+    func createDatabase(_ database: DatabaseName, owner: DatabaseUserName) throws {
+        _ = try query(database: "postgres", sql: "CREATE DATABASE \(identifier(database.value)) OWNER \(identifier(owner.value)); REVOKE ALL PRIVILEGES ON DATABASE \(identifier(database.value)) FROM PUBLIC;")
+    }
+
+    func grantApplicationAccess(database: DatabaseName, user: DatabaseUserName) throws {
+        _ = try query(database: "postgres", sql: "GRANT CONNECT, TEMPORARY ON DATABASE \(identifier(database.value)) TO \(identifier(user.value));")
+        _ = try query(database: database.value, sql: "GRANT USAGE, CREATE ON SCHEMA public TO \(identifier(user.value));")
+    }
+
+    func enableLogin(user: DatabaseUserName) throws {
+        throw DatabaseProvisioningError.engineFailure
+    }
+
+    func enableLogin(user: DatabaseUserName, database: DatabaseName, password: SecretPassword) throws {
+        try module.installApplicationHBA(for: target, database: database, user: user)
+        _ = try module.provisioningQuery(target, package: packageRoot, socketPath: socketPath, database: "postgres", sql: "ALTER ROLE \(identifier(user.value)) WITH LOGIN PASSWORD '__VAELEN_PASSWORD__';", password: password)
+    }
+
+    func authenticate(database: DatabaseName, user: DatabaseUserName, password: SecretPassword) throws {
+        try module.authenticateApplication(target, package: packageRoot, socketPath: socketPath, database: database, user: user, password: password)
+    }
+
+    private func query(database: String, sql: String) throws -> String {
+        try module.provisioningQuery(target, package: packageRoot, socketPath: socketPath, database: database, sql: sql)
+    }
+
+    private func execute(database: String, sql: String) throws {
+        _ = try query(database: database, sql: sql)
+    }
+
+    private func identifier(_ value: String) -> String { "\"\(value)\"" }
+    private func literal(_ value: String) -> String { "'\(value.replacingOccurrences(of: "'", with: "''"))'" }
+}
+
 public struct PostgreSQLServiceStatus: Equatable, Sendable {
     public let record: ServiceInstanceRecord?
     public let health: String
@@ -116,6 +194,140 @@ public final class PostgreSQLServiceModule: @unchecked Sendable {
             return PostgreSQLServiceStatus(record: record, health: "unhealthy", pid: evidence.pid, queryOutput: output)
         }
         return PostgreSQLServiceStatus(record: record, health: "healthy", pid: evidence.pid, queryOutput: output)
+    }
+
+    public func projectBindingSnapshot(for id: ServiceInstanceID) -> ModuleOwnedServiceSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        guard id.kind == .postgresql, let record = try? repository.instance(id),
+              let status = try? self.status(id: id), status.record == record else {
+            return .init(record: nil, health: "identity-unverified")
+        }
+        return .init(record: record, health: status.health)
+    }
+
+    public func provisionDatabase(_ request: ProjectDatabaseCreation, record: ServiceInstanceRecord, receipts: ProjectDatabaseReceiptRepository, passwords: any ProjectDatabasePasswordStore, retryFailedBeforeDDL: Bool = false) throws -> DatabaseProvisionAttempt {
+        let target = VerifiedDatabaseTarget(projectID: request.projectID, binding: request.binding, record: record, clusterIdentity: "")
+        return try withDatabaseProvisioning(target) { engine in
+            let identity = try engine.clusterIdentity(for: target)
+            let verified = VerifiedDatabaseTarget(projectID: request.projectID, binding: request.binding, record: record, clusterIdentity: identity)
+            let bound = engine.bound(to: verified)
+            let provisioner = ProjectDatabaseProvisioner(receipts: receipts, passwords: passwords, engine: bound)
+            return try retryFailedBeforeDDL ? provisioner.retry(request, target: verified) : provisioner.create(request, target: verified)
+        }
+    }
+
+    public func revealDatabasePassword(for attempt: DatabaseProvisionAttempt, record: ServiceInstanceRecord, passwords: any ProjectDatabasePasswordStore) throws -> String {
+        guard attempt.state == .ready, attempt.request.projectID == attempt.target.projectID,
+              attempt.request.binding == attempt.target.binding, attempt.target.record == record else { throw DatabaseProvisioningError.targetMismatch }
+        return try withDatabaseProvisioning(attempt.target) { engine in
+            guard try engine.clusterIdentity(for: attempt.target) == attempt.target.clusterIdentity else { throw DatabaseProvisioningError.targetMismatch }
+            let password = try passwords.load(for: attempt.request.operationID)
+            return try password.withBytes { bytes in
+                guard let value = String(bytes: bytes, encoding: .utf8), !value.isEmpty else { throw DatabaseProvisioningError.secretUnavailable }
+                return value
+            }
+        }
+    }
+
+    public func databaseTargetMatches(_ attempt: DatabaseProvisionAttempt) -> Bool {
+        guard attempt.request.binding == attempt.target.binding, attempt.request.projectID == attempt.target.projectID else { return false }
+        return (try? withDatabaseProvisioning(attempt.target) { engine in
+            try engine.clusterIdentity(for: attempt.target) == attempt.target.clusterIdentity
+        }) == true
+    }
+
+    private func withDatabaseProvisioning<T>(_ target: VerifiedDatabaseTarget, _ operation: (PostgreSQLProvisioningAdapter) throws -> T) throws -> T {
+        lock.lock(); defer { lock.unlock() }
+        let id = target.record.id
+        guard target.binding.kind == .postgresql, target.binding.instance == id.name,
+              target.binding.version == nil || target.binding.version == Self.packageIdentifier,
+              id.kind == .postgresql, target.record.packageIdentifier == Self.packageIdentifier,
+              target.record.endpoint.kind == .postgresql, try repository.instance(id) == target.record,
+              let state = try? status(id: id), state.record == target.record, state.health == "healthy",
+              let package = try? validatedPackage(), let evidence = readEvidence(id),
+              evidence.psqlPath == package.appendingPathComponent("bin/psql").path else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        let adapter = PostgreSQLProvisioningAdapter(module: self, target: target, packageRoot: package, socketPath: instancePaths(id).socket.path)
+        if !target.clusterIdentity.isEmpty, try adapter.clusterIdentity(for: target) != target.clusterIdentity {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        return try operation(adapter)
+    }
+
+    func provisioningQuery(_ target: VerifiedDatabaseTarget, package: URL, socketPath: String, database: String, sql: String, password: SecretPassword? = nil, secretFileInput: Data? = nil, host: String? = nil, user: String? = nil) throws -> String {
+        let arguments = ["-X", "-w", "-h", host ?? socketPath, "-p", "\(target.record.endpoint.portNumbers.first)", "-U", user ?? NSUserName(), "-d", database, "-v", "ON_ERROR_STOP=1", "-qAt"]
+        let input: Data
+        if let password {
+            let secretStatement = try password.withBytes { bytes -> String in
+                guard let value = String(bytes: bytes, encoding: .utf8), !value.isEmpty else { throw DatabaseProvisioningError.secretUnavailable }
+                return sql.replacingOccurrences(of: "__VAELEN_PASSWORD__", with: value.replacingOccurrences(of: "'", with: "''"))
+            }
+            let settings = """
+            SET log_statement = 'none';
+            SET log_duration = off;
+            SET log_min_duration_statement = -1;
+            SET log_min_duration_sample = -1;
+            SET log_statement_sample_rate = 0;
+            SET log_transaction_sample_rate = 0;
+            SET log_min_error_statement = 'PANIC';
+            SET log_parameter_max_length = 0;
+            SET log_parameter_max_length_on_error = 0;
+            DO $vaelen_log_guard$ BEGIN
+              IF NOT (current_setting('log_statement', true) = 'none'
+              AND current_setting('log_duration', true) = 'off'
+              AND current_setting('log_min_duration_statement', true) = '-1'
+              AND current_setting('log_min_duration_sample', true) = '-1'
+              AND current_setting('log_statement_sample_rate', true) = '0'
+              AND current_setting('log_transaction_sample_rate', true) = '0'
+              AND current_setting('log_min_error_statement', true) = 'panic'
+              AND current_setting('log_parameter_max_length', true) = '0'
+              AND current_setting('log_parameter_max_length_on_error', true) = '0'
+              AND COALESCE(current_setting('shared_preload_libraries', true), '') = ''
+              AND COALESCE(current_setting('session_preload_libraries', true), '') = ''
+              AND COALESCE(current_setting('local_preload_libraries', true), '') = ''
+              AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgaudit')) THEN
+                RAISE EXCEPTION 'PostgreSQL password statement logging could not be suppressed';
+              END IF;
+            END $vaelen_log_guard$;
+            \(secretStatement)
+            """
+            input = Data(settings.utf8)
+        } else {
+            input = Data((sql + "\n").utf8)
+        }
+        let result = try run(package.appendingPathComponent("bin/psql"), arguments, timeout: 8, input: input, secretFileInput: secretFileInput)
+        guard result.status == 0 else { throw DatabaseProvisioningError.engineFailure }
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    fileprivate func installApplicationHBA(for target: VerifiedDatabaseTarget, database: DatabaseName, user: DatabaseUserName) throws {
+        let path = URL(fileURLWithPath: target.record.dataDirectory, isDirectory: true).appendingPathComponent("pg_hba.conf")
+        let values = try path.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+        guard values.isRegularFile == true, values.isSymbolicLink != true else { throw DatabaseProvisioningError.targetMismatch }
+        let current = try String(contentsOf: path, encoding: .utf8)
+        let rule = "host \(database.value) \(user.value) 127.0.0.1/32 scram-sha-256"
+        guard !current.split(separator: "\n", omittingEmptySubsequences: false).contains(Substring(rule)) else { return }
+        let separator = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
+        try Data((rule + "\n" + current + separator).utf8).write(to: path, options: .atomic)
+        if let permissions = attributes[.posixPermissions] {
+            try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: path.path)
+        }
+        let package = try validatedPackage()
+        let output = try provisioningQuery(target, package: package, socketPath: instancePaths(target.record.id).socket.path, database: "postgres", sql: "SELECT pg_reload_conf();")
+        guard output == "t" else { throw DatabaseProvisioningError.engineFailure }
+    }
+
+    fileprivate func authenticateApplication(_ target: VerifiedDatabaseTarget, package: URL, socketPath: String, database: DatabaseName, user: DatabaseUserName, password: SecretPassword) throws {
+        let passfile = try password.withBytes { bytes in
+            guard let value = String(bytes: bytes, encoding: .utf8), !value.isEmpty,
+                  !value.contains(":") && !value.contains("\\") else { throw DatabaseProvisioningError.secretUnavailable }
+            return Data("127.0.0.1:\(target.record.endpoint.portNumbers.first):\(database.value):\(user.value):\(value)\n".utf8)
+        }
+        let query = "SELECT current_database() || '|' || current_user;"
+        let output = try provisioningQuery(target, package: package, socketPath: socketPath, database: database.value, sql: query, secretFileInput: passfile, host: "127.0.0.1", user: user.value)
+        guard output == "\(database.value)|\(user.value)" else { throw DatabaseProvisioningError.engineFailure }
     }
 
     public func start(id: ServiceInstanceID) throws {
@@ -217,7 +429,7 @@ public final class PostgreSQLServiceModule: @unchecked Sendable {
     }
 
     private func isExecutable(_ url: URL) -> Bool { manager.isExecutableFile(atPath: url.path) }
-    private func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval) throws -> (status: Int32, output: String) {
+    private func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval, input: Data = Data(), secretFileInput: Data? = nil) throws -> (status: Int32, output: String) {
         try manager.createDirectory(at: layout.cacheDirectoryURL.appendingPathComponent("postgresql-command-logs", isDirectory: true), withIntermediateDirectories: true)
         let logURL = layout.cacheDirectoryURL.appendingPathComponent("postgresql-command-logs", isDirectory: true).appendingPathComponent(UUID().uuidString)
         let fd = open(logURL.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
@@ -229,12 +441,67 @@ public final class PostgreSQLServiceModule: @unchecked Sendable {
         defer { posix_spawn_file_actions_destroy(&actions) }
         _ = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logURL.path, O_WRONLY | O_APPEND, 0o600)
         _ = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO)
+        var inputPipe = [Int32](repeating: -1, count: 2)
+        guard pipe(&inputPipe) == 0 else { throw PostgreSQLServiceError.processFailure("Could not create a private command input channel.") }
+        var secretFileDescriptor: Int32?
+        defer {
+            if inputPipe[0] >= 0 { close(inputPipe[0]) }
+            if inputPipe[1] >= 0 { close(inputPipe[1]) }
+            if let secretFileDescriptor { close(secretFileDescriptor) }
+        }
+        guard posix_spawn_file_actions_adddup2(&actions, inputPipe[0], STDIN_FILENO) == 0,
+              posix_spawn_file_actions_addclose(&actions, inputPipe[1]) == 0 else {
+            throw PostgreSQLServiceError.processFailure("Could not configure the private command input channel.")
+        }
+        if let secretFileInput {
+            let descriptor = try anonymousCredentialDescriptor(secretFileInput)
+            secretFileDescriptor = descriptor
+            guard posix_spawn_file_actions_adddup2(&actions, descriptor, 9) == 0,
+                  (descriptor == 9 || posix_spawn_file_actions_addclose(&actions, descriptor) == 0) else {
+                throw PostgreSQLServiceError.processFailure("Could not configure the private credential channel.")
+            }
+        }
         var argv: [UnsafeMutablePointer<CChar>?] = ([executable.path] + arguments).map { strdup($0) }
         argv.append(nil)
         defer { argv.forEach { free($0) } }
         var pid: pid_t = 0
-        let spawnResult = posix_spawn(&pid, executable.path, &actions, nil, &argv, environ)
+        var environmentStrings: [String] = []
+        var environmentPointers: [UnsafeMutablePointer<CChar>?] = []
+        if secretFileInput != nil {
+            var index = 0
+            while let entry = environ[index] {
+                let value = String(cString: entry)
+                if !value.hasPrefix("PGPASSFILE=") { environmentStrings.append(value) }
+                index += 1
+            }
+            environmentStrings.append("PGPASSFILE=/dev/fd/9")
+            environmentPointers = environmentStrings.map { strdup($0) }
+            environmentPointers.append(nil)
+        }
+        defer { environmentPointers.forEach { if let value = $0 { free(value) } } }
+        let spawnResult: Int32
+        if secretFileInput == nil {
+            spawnResult = posix_spawn(&pid, executable.path, &actions, nil, &argv, environ)
+        } else {
+            spawnResult = posix_spawn(&pid, executable.path, &actions, nil, &argv, &environmentPointers)
+        }
         guard spawnResult == 0 else { throw PostgreSQLServiceError.processFailure("Could not launch command \(executable.path): \(spawnResult)") }
+        close(inputPipe[0]); inputPipe[0] = -1
+        if let descriptor = secretFileDescriptor { close(descriptor); secretFileDescriptor = nil }
+        func writeAll(_ data: Data, to descriptor: Int32) -> Bool {
+            data.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress else { return true }
+                var offset = 0
+                while offset < data.count {
+                    let count = Darwin.write(descriptor, base.advanced(by: offset), data.count - offset)
+                    if count < 0 { if errno == EINTR { continue }; return false }
+                    offset += count
+                }
+                return true
+            }
+        }
+        guard writeAll(input, to: inputPipe[1]) else { _ = kill(pid, SIGTERM); throw PostgreSQLServiceError.processFailure("Could not deliver private command input.") }
+        close(inputPipe[1]); inputPipe[1] = -1
         let deadline = Date().addingTimeInterval(timeout)
         var waitStatus: Int32 = 0
         while true {
@@ -262,6 +529,40 @@ public final class PostgreSQLServiceModule: @unchecked Sendable {
         let code = (waitStatus & 0x7f) == 0 ? (waitStatus >> 8) & 0xff : 128 + (waitStatus & 0x7f)
         return (code, output)
     }
+
+    private func anonymousCredentialDescriptor(_ data: Data) throws -> Int32 {
+        // libpq rejects passfiles with group/world permissions, which an anonymous pipe has.
+        var template = Array((NSTemporaryDirectory() + "vaelen-pgpass.XXXXXX").utf8CString)
+        let descriptor = template.withUnsafeMutableBufferPointer { buffer in mkstemp(buffer.baseAddress!) }
+        guard descriptor >= 0 else { throw PostgreSQLServiceError.processFailure("Could not create a private PostgreSQL credential descriptor.") }
+        let path = String(cString: template)
+        var keepDescriptor = false
+        defer {
+            if !keepDescriptor {
+                _ = unlink(path)
+                close(descriptor)
+            }
+        }
+        guard fchmod(descriptor, 0o600) == 0, unlink(path) == 0 else {
+            throw PostgreSQLServiceError.processFailure("Could not secure the private PostgreSQL credential descriptor.")
+        }
+        let written = data.withUnsafeBytes { bytes -> Bool in
+            guard let base = bytes.baseAddress else { return true }
+            var offset = 0
+            while offset < data.count {
+                let count = Darwin.write(descriptor, base.advanced(by: offset), data.count - offset)
+                if count < 0 { if errno == EINTR { continue }; return false }
+                offset += count
+            }
+            return true
+        }
+        guard written, lseek(descriptor, 0, SEEK_SET) >= 0 else {
+            throw PostgreSQLServiceError.processFailure("Could not prepare the private PostgreSQL credential descriptor.")
+        }
+        keepDescriptor = true
+        return descriptor
+    }
+
     private func portIsFree(_ port: Int) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0); guard fd >= 0 else { return false }; defer { close(fd) }
         var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_addr = in_addr(s_addr: in_addr_t(0x7f000001).bigEndian); address.sin_port = in_port_t(port).bigEndian

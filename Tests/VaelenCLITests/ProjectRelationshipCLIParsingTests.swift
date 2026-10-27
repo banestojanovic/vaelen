@@ -3,6 +3,23 @@ import VaelenCore
 @testable import VaelenCLI
 
 final class ProjectRelationshipCLIParsingTests: XCTestCase {
+    func testProjectDatabaseCommandsParseOperationMetadataWithoutSecretArguments() throws {
+        guard case .projectDatabaseCreate(let database, let user, let selector, let json) = try VaelenCLIMain.parse(["project", "db", "create", "app_db", "app_user", "demo", "--json"]) else { return XCTFail("project db create did not parse") }
+        XCTAssertEqual(database, "app_db"); XCTAssertEqual(user, "app_user"); XCTAssertEqual(selector, "demo"); XCTAssertTrue(json)
+        let operationID = UUID()
+        guard case .projectDatabaseStatus(let parsedID, let statusSelector, false) = try VaelenCLIMain.parse(["project", "db", "status", operationID.uuidString, "demo"]) else { return XCTFail("project db status did not parse") }
+        XCTAssertEqual(parsedID, operationID); XCTAssertEqual(statusSelector, "demo")
+        guard case .projectDatabaseRetry(let retryID, let retrySelector, true) = try VaelenCLIMain.parse(["project", "db", "retry", operationID.uuidString, "demo", "--json"]) else { return XCTFail("project db retry did not parse") }
+        XCTAssertEqual(retryID, operationID); XCTAssertEqual(retrySelector, "demo")
+        guard case .projectDatabasePassword(let revealID, let revealSelector, false) = try VaelenCLIMain.parse(["project", "db", "password", "reveal", operationID.uuidString, "demo"]) else { return XCTFail("explicit reveal did not parse") }
+        XCTAssertEqual(revealID, operationID); XCTAssertEqual(revealSelector, "demo")
+        guard case .projectDatabasePassword(_, nil, true) = try VaelenCLIMain.parse(["project", "db", "password", "copy", operationID.uuidString]) else { return XCTFail("explicit copy did not parse") }
+        for args in [["project", "db", "password", operationID.uuidString], ["project", "db", "password", "reveal", operationID.uuidString, "--json"], ["project", "db", "password", "copy", operationID.uuidString, "demo", "extra"]] {
+            XCTAssertThrowsError(try VaelenCLIMain.parse(args))
+        }
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["project", "db", "create", "db", "user", "--password", "secret"]))
+    }
+
     func testParkCommandsAcceptCurrentDirectoryOrExplicitPath() throws {
         guard case .park(let currentParkPath) = try VaelenCLIMain.parse(["park"]) else {
             return XCTFail("park without a path should use the current directory")

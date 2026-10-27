@@ -1,0 +1,7 @@
+Window: Settings, App: Vaelen.
+Sidebar selection: Projects.
+Project: Storefront at /fixture/projects/storefront.
+Database card: Project database access, state Failed before DDL.
+Receipt: storefront_app, storefront_user, operation C0B8DF3A-310A-4F20-9FC5-F7F4B01CC408.
+Refresh Status and Retry are visible and disabled in the fixture.
+Fixture marker: UI fixture · project-database-retry.

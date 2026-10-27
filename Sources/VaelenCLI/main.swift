@@ -47,6 +47,10 @@ enum CLICommand {
     case projectActivate(selector: String?, json: Bool)
     case projectDown(selector: String?, json: Bool)
     case projectPHP(selector: String?, version: String?, useDefault: Bool, json: Bool)
+    case projectDatabaseCreate(database: String, user: String, selector: String?, json: Bool)
+    case projectDatabaseStatus(operationID: UUID, selector: String?, json: Bool)
+    case projectDatabaseRetry(operationID: UUID, selector: String?, json: Bool)
+    case projectDatabasePassword(operationID: UUID, selector: String?, copy: Bool)
     case phpVersions(json: Bool)
     case phpInstall(String)
     case phpUpdate(String)
@@ -456,6 +460,35 @@ struct VaelenCLIMain {
             return args[1] == "driver" ? .siteDriver(selector: selector, json: json) : .siteInfo(selector: selector, json: json)
         case "project":
             if args.count == 1 { return .help(path: [first]) }
+            if args.count >= 3, args[1] == "db" {
+                let action = args[2]
+                if action == "password" {
+                    guard args.count == 5 || args.count == 6, ["reveal", "copy"].contains(args[3]),
+                          let id = UUID(uuidString: args[4]), args.count == 5 || !args[5].hasPrefix("-") else { throw CLIError.commandUsage("project db") }
+                    return .projectDatabasePassword(operationID: id, selector: args.count == 6 ? args[5] : nil, copy: args[3] == "copy")
+                }
+                var selector: String?; var json = false; var positional = [String]()
+                for value in args.dropFirst(3) {
+                    if value == "--json", !json { json = true }
+                    else if !value.hasPrefix("-"), positional.count < 3 { positional.append(value) }
+                    else { throw CLIError.commandUsage("project db") }
+                }
+                switch action {
+                case "create":
+                    guard positional.count == 2 || positional.count == 3 else { throw CLIError.commandUsage("project db") }
+                    selector = positional.count == 3 ? positional[2] : nil
+                    return .projectDatabaseCreate(database: positional[0], user: positional[1], selector: selector, json: json)
+                case "status":
+                    guard (positional.count == 1 || positional.count == 2), let id = UUID(uuidString: positional[0]) else { throw CLIError.commandUsage("project db") }
+                    selector = positional.count == 2 ? positional[1] : nil
+                    return .projectDatabaseStatus(operationID: id, selector: selector, json: json)
+                case "retry":
+                    guard (positional.count == 1 || positional.count == 2), let id = UUID(uuidString: positional[0]) else { throw CLIError.commandUsage("project db") }
+                    selector = positional.count == 2 ? positional[1] : nil
+                    return .projectDatabaseRetry(operationID: id, selector: selector, json: json)
+                default: throw CLIError.commandUsage("project db")
+                }
+            }
             if args[1] == "php" {
                 var selector: String?; var version: String?; var useDefault = false; var json = false
                 var i = 2
@@ -1135,6 +1168,40 @@ struct VaelenCLIMain {
         case .projectDown(let selector, let json):
             let execution = try await client.projectDown(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(execution), as: UTF8.self)) } else { print(projectActivation(execution)) }
+        case .projectDatabaseCreate(let databaseText, let userText, let selector, let json):
+            let report = try await client.projectStatus(selector: selector, workingDirectory: workingDirectory)
+            guard report.identity.registration == .linked, let projectID = report.identity.id,
+                  let bindings = report.projectSpec?.services.filter({ $0.kind == .mysql || $0.kind == .postgresql }), bindings.count == 1, let binding = bindings.first else {
+                throw CLIError.message("Project database creation requires one linked MySQL or PostgreSQL service binding.")
+            }
+            let creation = ProjectDatabaseCreation(operationID: DatabaseOperationID(), projectID: projectID, binding: binding,
+                database: try DatabaseName(databaseText), user: try DatabaseUserName(userText))
+            let result = try await client.createProjectDatabase(selector: selector, workingDirectory: workingDirectory, creation: creation)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(databaseAttemptOutput(result)) }
+        case .projectDatabaseStatus(let operationID, let selector, let json):
+            let result = try await client.projectDatabaseStatus(selector: selector, workingDirectory: workingDirectory, operationID: DatabaseOperationID(operationID))
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(databaseAttemptOutput(result)) }
+        case .projectDatabaseRetry(let operationID, let selector, let json):
+            let result = try await client.retryProjectDatabase(selector: selector, workingDirectory: workingDirectory, operationID: DatabaseOperationID(operationID))
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(databaseAttemptOutput(result)) }
+        case .projectDatabasePassword(let operationID, let selector, let copy):
+            let password = try await client.revealProjectDatabasePassword(selector: selector, workingDirectory: workingDirectory, operationID: DatabaseOperationID(operationID))
+            if copy {
+                let process = Process(); let input = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/pbcopy")
+                process.standardInput = input
+                do { try process.run() } catch { throw CLIError.message("Could not start the system clipboard service.") }
+                input.fileHandleForWriting.write(Data(password.utf8))
+                try input.fileHandleForWriting.close()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else { throw CLIError.message("Could not copy the database password to the clipboard.") }
+                print("Database password copied to the clipboard.")
+            } else {
+                FileHandle.standardOutput.write(Data((password + "\n").utf8))
+            }
         case .projectPHP(let selector, let version, let useDefault, let json):
             let result = try await client.setProjectPHP(selector: selector, workingDirectory: workingDirectory, version: version, useDefault: useDefault)
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
@@ -1583,6 +1650,21 @@ struct VaelenCLIMain {
     private static func projectActivation(_ execution: ProjectReconciliationExecutionResult) -> String {
         let operationRows = execution.operations.map { ($0.operationID, "\(HumanOutput.state($0.state.rawValue)) · \($0.message)") }
         return HumanOutput.report("Project activation · \(execution.finalPlan.identity.name)", rows: [("Result", HumanOutput.state(execution.state.rawValue)), ("Final plan", HumanOutput.state(execution.finalPlan.state.rawValue))] + (operationRows.isEmpty ? [("Operations", "None required")] : operationRows))
+    }
+
+    private static func databaseAttemptOutput(_ attempt: ProjectDatabaseAttemptResult) -> String {
+        let confirmed = attempt.confirmedEffects.map(\.rawValue).joined(separator: ", ")
+        let uncertain = attempt.uncertainEffects.map(\.rawValue).joined(separator: ", ")
+        return HumanOutput.report("Project database · \(attempt.database)", rows: [
+            ("State", HumanOutput.state(attempt.state.rawValue)),
+            ("User", attempt.user),
+            ("Binding", "\(attempt.binding.alias.value) · \(attempt.binding.instance.value)"),
+            ("Operation", attempt.operationID.rawValue.uuidString),
+            ("Pending effect", attempt.pendingEffect?.rawValue ?? "none"),
+            ("Confirmed", confirmed.isEmpty ? "none" : confirmed),
+            ("Uncertain", uncertain.isEmpty ? "none" : uncertain),
+            ("Diagnostic", attempt.diagnostic?.rawValue ?? "none")
+        ])
     }
 
     private static func message(for error: Error) -> String {

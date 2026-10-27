@@ -9,7 +9,7 @@ public enum SQLiteStateError: Error, Equatable, Sendable {
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public final class SQLiteStateStore: @unchecked Sendable {
-    public static let schemaVersion = 9
+    public static let schemaVersion = 10
     private var database: OpaquePointer?
     internal var databasePointer: OpaquePointer? { database }
 
@@ -137,6 +137,12 @@ public final class SQLiteStateStore: @unchecked Sendable {
                 try execute("CREATE TABLE project_service_claims (project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, alias TEXT NOT NULL, kind TEXT NOT NULL, instance_name TEXT NOT NULL, version TEXT NULL, PRIMARY KEY(project_id, alias), FOREIGN KEY(kind, instance_name) REFERENCES service_instances(kind, name))")
                 try execute("CREATE TABLE manual_service_claims (kind TEXT NOT NULL, instance_name TEXT NOT NULL, PRIMARY KEY(kind, instance_name), FOREIGN KEY(kind, instance_name) REFERENCES service_instances(kind, name))")
                 try execute("PRAGMA user_version = 9")
+            }
+            if version <= 9 {
+                try execute("CREATE TABLE project_database_attempts (operation_id TEXT PRIMARY KEY NOT NULL, receipt_id TEXT NOT NULL UNIQUE, project_id TEXT NOT NULL, binding_alias TEXT NOT NULL, binding_version TEXT NULL, instance_kind TEXT NOT NULL, instance_name TEXT NOT NULL, package_identifier TEXT NOT NULL, endpoint_port INTEGER NOT NULL, data_directory TEXT NOT NULL, cluster_identity TEXT NOT NULL, database_name TEXT NOT NULL, username TEXT NOT NULL, credential_reference TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('reserved','prepared','pendingEffect','ready','refused','failedBeforeDDL','needsAttention')), pending_effect TEXT NULL CHECK (pending_effect IS NULL OR pending_effect IN ('applicationUser','database','privileges','loginEnablement')), confirmed_effects INTEGER NOT NULL DEFAULT 0, uncertain_effects INTEGER NOT NULL DEFAULT 0, diagnostic TEXT NULL, CHECK (endpoint_port BETWEEN 1 AND 65535))")
+                try execute("CREATE TABLE project_database_name_reservations (instance_kind TEXT NOT NULL, instance_name TEXT NOT NULL, database_name TEXT NOT NULL, operation_id TEXT NOT NULL UNIQUE REFERENCES project_database_attempts(operation_id) ON DELETE RESTRICT, PRIMARY KEY(instance_kind, instance_name, database_name))")
+                try execute("CREATE TABLE project_database_user_reservations (instance_kind TEXT NOT NULL, instance_name TEXT NOT NULL, username TEXT NOT NULL, operation_id TEXT NOT NULL UNIQUE REFERENCES project_database_attempts(operation_id) ON DELETE RESTRICT, PRIMARY KEY(instance_kind, instance_name, username))")
+                try execute("PRAGMA user_version = 10")
             }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

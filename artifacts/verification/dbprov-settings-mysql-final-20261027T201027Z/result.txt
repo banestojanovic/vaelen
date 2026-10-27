@@ -1,0 +1,4 @@
+Result: PASS for the visible MySQL ready-state Settings fixture.
+The CUA accessibility state and screenshot showed the Projects page, MySQL 8.4.11 service state, ready project database receipt, and fixture marker. Create, Reveal Password, and Copy Password were disabled as required for a fixture.
+The fixture's configured database summary remains SQLite while MySQL is the managed binding, which is a valid isolated rendering state.
+Coverage boundary: rendering only. The live Core and MySQL behavior is covered by the separate acceptance script.

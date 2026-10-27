@@ -108,7 +108,7 @@ public final class MySQLModule: @unchecked Sendable {
     var clientCommandTimeout: TimeInterval
     var shutdownTimeout: TimeInterval
     private let manager = FileManager.default
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
     private var ownedServer: OwnedChildProcess?
 
     public convenience init(layout: VaelenFilesystemLayout, manifest: MySQLManifest = .official8_4_11, downloader: any MySQLArtifactDownloader = SystemMySQLArtifactDownloader(), port: Int = MySQLModule.defaultPort) {
@@ -168,6 +168,7 @@ public final class MySQLModule: @unchecked Sendable {
     }
 
     public func use(_ version: String) throws -> MySQLPackage {
+        lock.lock(); defer { lock.unlock() }
         guard let package = installedVersions().first(where: { $0.version == version }) else { throw MySQLModuleError.packageMissing(version) }
         if let metadata = instanceMetadata(), metadata.initialized, metadata.initializedVersion != package.version { throw MySQLModuleError.instanceVersionMismatch(expected: metadata.initializedVersion, actual: package.version) }
         try makeDirectories([layout.configurationDirectoryURL]); try atomicWrite(package.version, to: layout.configurationDirectoryURL.appendingPathComponent("mysql-default.json")); return package
@@ -218,6 +219,7 @@ public final class MySQLModule: @unchecked Sendable {
     }
 
     public func initialize() throws {
+        lock.lock(); defer { lock.unlock() }
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }
         if let metadata = instanceMetadata(), metadata.initialized { throw MySQLModuleError.alreadyInitialized }
         let paths = instancePaths(package: package); try makeDirectories([paths.instance, paths.data, layout.mysqlLogsDirectoryURL, layout.rootURL.appendingPathComponent("runtime/sockets/mysql", isDirectory: true), layout.rootURL.appendingPathComponent("runtime/pids/mysql", isDirectory: true)])
@@ -246,6 +248,7 @@ public final class MySQLModule: @unchecked Sendable {
     }
 
     public func status() -> MySQLStatus {
+        lock.lock(); defer { lock.unlock() }
         let package = selectedPackage(); let paths = instancePaths(package: package); let record = processRecord(paths)
         let base = (package?.version, selectedVersion(), paths.socket.path, paths.data.path, package?.serverPath ?? "")
          guard let record else { return MySQLStatus(state: package == nil ? .notInstalled : (instanceMetadata()?.initialized == true ? .stopped : .installed), health: package == nil ? "not-installed" : (instanceMetadata()?.initialized == true ? "stopped" : "not-initialized"), installedVersion: base.0, selectedVersion: base.1, pid: nil, port: instanceMetadata()?.port ?? port, socket: base.2, datadir: base.3, executablePath: base.4) }
@@ -269,6 +272,7 @@ public final class MySQLModule: @unchecked Sendable {
     }
 
     public func projectBindingSnapshot() -> ModuleOwnedServiceSnapshot {
+        lock.lock(); defer { lock.unlock() }
         let observed = status()
         guard let version = observed.installedVersion,
               observed.selectedVersion == nil || observed.selectedVersion == version,
@@ -292,7 +296,93 @@ public final class MySQLModule: @unchecked Sendable {
         return .init(record: record, health: observed.health)
     }
 
+    func withDatabaseProvisioning<T>(_ target: VerifiedDatabaseTarget, _ operation: (any MySQLDatabaseProvisioningEngine) throws -> T) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        let snapshot = projectBindingSnapshot()
+        guard target.binding.kind == .mysql, target.binding.instance.value == "default",
+              snapshot.health == "healthy", snapshot.record == target.record,
+              target.record.packageIdentifier == "mysql-\(manifest.version)",
+              let package = selectedPackage(), let metadata = instanceMetadata(), metadata.initialized,
+              metadata.datadir == target.record.dataDirectory,
+              metadata.socket == instancePaths(package: package).socket.path else {
+            throw DatabaseProvisioningError.targetMismatch
+        }
+        return try operation(MySQLProvisioningAdapter(module: self, package: package, target: target))
+    }
+
+    public func provisionDatabase(_ request: ProjectDatabaseCreation, record: ServiceInstanceRecord, receipts: ProjectDatabaseReceiptRepository, passwords: any ProjectDatabasePasswordStore, retryFailedBeforeDDL: Bool = false) throws -> DatabaseProvisionAttempt {
+        let provisional = VerifiedDatabaseTarget(projectID: request.projectID, binding: request.binding, record: record, clusterIdentity: "")
+        return try withDatabaseProvisioning(provisional) { engine in
+            let identity = try engine.clusterIdentity(for: provisional)
+            let target = VerifiedDatabaseTarget(projectID: request.projectID, binding: request.binding, record: record, clusterIdentity: identity)
+            guard let adapter = engine as? MySQLProvisioningAdapter else { throw DatabaseProvisioningError.targetMismatch }
+            let provisioner = ProjectDatabaseProvisioner(receipts: receipts, passwords: passwords, engine: adapter.bound(to: target))
+            return try retryFailedBeforeDDL ? provisioner.retry(request, target: target) : provisioner.create(request, target: target)
+        }
+    }
+
+    public func revealDatabasePassword(for attempt: DatabaseProvisionAttempt, passwords: any ProjectDatabasePasswordStore) throws -> String {
+        guard attempt.state == .ready, attempt.request.projectID == attempt.target.projectID,
+              attempt.request.binding == attempt.target.binding else { throw DatabaseProvisioningError.targetMismatch }
+        return try withDatabaseProvisioning(attempt.target) { engine in
+            guard try engine.clusterIdentity(for: attempt.target) == attempt.target.clusterIdentity else { throw DatabaseProvisioningError.targetMismatch }
+            let password = try passwords.load(for: attempt.request.operationID)
+            return try password.withBytes { bytes in
+                guard let value = String(bytes: bytes, encoding: .utf8), !value.isEmpty else { throw DatabaseProvisioningError.secretUnavailable }
+                return value
+            }
+        }
+    }
+
+    public func databaseTargetMatches(_ attempt: DatabaseProvisionAttempt) -> Bool {
+        guard attempt.request.binding == attempt.target.binding, attempt.request.projectID == attempt.target.projectID else { return false }
+        return (try? withDatabaseProvisioning(attempt.target) { engine in
+            try engine.clusterIdentity(for: attempt.target) == attempt.target.clusterIdentity
+        }) == true
+    }
+
+    fileprivate func provisioningClient(_ package: MySQLPackage, sql: Data, timeout: TimeInterval = 8) throws -> String {
+        let paths = instancePaths(package: package)
+        let input = Pipe()
+        let output = Pipe()
+        let error = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: package.clientPath)
+        process.arguments = ["--defaults-extra-file=\(paths.credentials.path)", "--protocol=socket", "--socket=\(paths.socket.path)", "--batch", "--skip-column-names"]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        input.fileHandleForWriting.write(sql)
+        try input.fileHandleForWriting.close()
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline { usleep(20_000) }
+        if process.isRunning {
+            process.terminate()
+            let terminationDeadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < terminationDeadline { usleep(20_000) }
+            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+            process.waitUntilExit()
+            throw DatabaseProvisioningError.engineFailure
+        }
+        process.waitUntilExit()
+        let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        _ = error.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else { throw DatabaseProvisioningError.engineFailure }
+        return text
+    }
+
+    fileprivate func provisioningSQL(_ package: MySQLPackage, target: VerifiedDatabaseTarget, statement: String) throws -> String {
+        let prelude = "SET SESSION sql_log_off=1; SET SESSION sql_log_bin=0; SET SESSION long_query_time=31536000; SELECT CONCAT(@@session.sql_log_off,':',@@session.sql_log_bin,':',CAST(@@session.long_query_time AS UNSIGNED)); SELECT @@server_uuid; SELECT COUNT(*) FROM information_schema.plugins WHERE PLUGIN_STATUS='ACTIVE' AND PLUGIN_NAME LIKE '%audit%';\n"
+        let result = try provisioningClient(package, sql: Data((prelude + statement + "\n").utf8))
+        let lines = result.split(whereSeparator: \.isNewline).map(String.init)
+        guard lines.count >= 3, lines[0] == "1:0:31536000", lines[1].lowercased() == target.clusterIdentity, lines[2] == "0" else { throw DatabaseProvisioningError.engineFailure }
+        return lines.dropFirst(3).joined(separator: "\n")
+    }
+
     public func start() throws -> MySQLStatus {
+        lock.lock(); defer { lock.unlock() }
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }; guard instanceMetadata()?.initialized == true else { throw MySQLModuleError.notInitialized }
         let paths = instancePaths(package: package); let current = status(); if current.state == .running { return current }; if current.state == .unhealthy || current.state == .conflict { if let record = processRecord(paths), processExists(record.pid) { throw MySQLModuleError.processIdentityMismatch }; try? manager.removeItem(at: paths.process) }
         if tcpEnabled, !isPortAvailable(port) { throw MySQLModuleError.portConflict(port) }
@@ -308,6 +398,7 @@ public final class MySQLModule: @unchecked Sendable {
     }
 
     public func stop() throws -> MySQLStatus {
+        lock.lock(); defer { lock.unlock() }
         let paths = instancePaths(package: selectedPackage())
         let observed = status()
         guard let record = processRecord(paths) else { return observed }
@@ -417,6 +508,10 @@ public final class MySQLModule: @unchecked Sendable {
          process.arguments = (defaultsFile.map { [$0] } ?? []) + ["--protocol=socket", "--socket=\(paths.socket.path)"] + clientArguments
           let output = Pipe(); let error = Pipe(); process.standardOutput = output; process.standardError = error
          try process.run()
+         // The child owns the inherited pipe writers. Close the parent's
+         // copies so readDataToEndOfFile can observe EOF after it exits.
+         try? output.fileHandleForWriting.close()
+         try? error.fileHandleForWriting.close()
          let deadline = Date().addingTimeInterval(timeout)
          while process.isRunning && Date() < deadline { usleep(20_000) }
          if process.isRunning {
@@ -659,4 +754,144 @@ public final class MySQLModule: @unchecked Sendable {
     private func atomicWrite(_ data: Data, to url: URL) throws { let temp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp"); try data.write(to: temp, options: .atomic); if manager.fileExists(atPath: url.path) { _ = try manager.replaceItemAt(url, withItemAt: temp) } else { try manager.moveItem(at: temp, to: url) } }
      private func setImmutable(_ url: URL) throws { let enumerator = manager.enumerator(at: url, includingPropertiesForKeys: [.isDirectoryKey]); while let item = enumerator?.nextObject() as? URL { let isDirectory = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true; let executable = item.path.hasSuffix("/bin/mysqld") || item.path.hasSuffix("/bin/mysql") || item.path.hasSuffix("/bin/mysqladmin"); try manager.setAttributes([.posixPermissions: isDirectory || executable ? 0o555 : 0o444], ofItemAtPath: item.path) }; try manager.setAttributes([.posixPermissions: 0o555], ofItemAtPath: url.path) }
     private func isValid(_ package: MySQLPackage) -> Bool { package.version == manifest.version && package.architecture == "arm64" && package.artifactSHA256 == manifest.artifactSHA256 && manager.isExecutableFile(atPath: package.serverPath) && manager.isExecutableFile(atPath: package.clientPath) && manager.isExecutableFile(atPath: package.adminPath) && package.packagePath == layout.mysqlPackagesDirectoryURL.appendingPathComponent(package.version).path }
+}
+
+private final class MySQLProvisioningAdapter: MySQLDatabaseProvisioningEngine, @unchecked Sendable {
+    private let module: MySQLModule
+    private let package: MySQLPackage
+    private let target: VerifiedDatabaseTarget
+
+    init(module: MySQLModule, package: MySQLPackage, target: VerifiedDatabaseTarget) {
+        self.module = module
+        self.package = package
+        self.target = target
+    }
+
+    func bound(to target: VerifiedDatabaseTarget) -> MySQLProvisioningAdapter {
+        MySQLProvisioningAdapter(module: module, package: package, target: target)
+    }
+
+    func clusterIdentity(for target: VerifiedDatabaseTarget) throws -> String {
+        guard target.projectID == self.target.projectID, target.binding == self.target.binding, target.record == self.target.record else { throw DatabaseProvisioningError.targetMismatch }
+        let output = try module.provisioningClient(package, sql: Data("SET SESSION sql_log_off=1; SET SESSION sql_log_bin=0; SET SESSION long_query_time=31536000; SELECT CONCAT(@@session.sql_log_off,':',@@session.sql_log_bin,':',CAST(@@session.long_query_time AS UNSIGNED)); SELECT @@server_uuid; SELECT COUNT(*) FROM information_schema.plugins WHERE PLUGIN_STATUS='ACTIVE' AND PLUGIN_NAME LIKE '%audit%';\n".utf8))
+        let lines = output.split(whereSeparator: \.isNewline)
+        guard lines.count == 3, lines[0] == "1:0:31536000", lines[2] == "0",
+              let uuid = UUID(uuidString: String(lines[1])) else { throw DatabaseProvisioningError.engineFailure }
+        let value = uuid.uuidString.lowercased()
+        guard target.clusterIdentity.isEmpty || value == target.clusterIdentity else { throw DatabaseProvisioningError.targetMismatch }
+        return value
+    }
+
+    func checkAbsent(database: DatabaseName, user: DatabaseUserName) throws -> DatabaseProvisionDiagnostic? {
+        let username = Self.literal(user.value)
+        let output = try module.provisioningSQL(package, target: target, statement: "SELECT CONCAT('D:',COUNT(*)) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=\(Self.literal(database.value)); SELECT CONCAT('U:',COUNT(*)) FROM mysql.user WHERE User=\(username);")
+        let lines = output.split(whereSeparator: \.isNewline)
+        guard lines.count == 2, lines[0].hasPrefix("D:"), lines[1].hasPrefix("U:") else { throw DatabaseProvisioningError.engineFailure }
+        if lines[0] != "D:0" { return .existingDatabase }
+        if lines[1] != "U:0" { return .existingUser }
+        return nil
+    }
+
+    func createLockedUser(_ user: DatabaseUserName, password: SecretPassword) throws {
+        try withPassword(password) { value in
+            _ = try module.provisioningSQL(package, target: target, statement: "CREATE USER \(Self.account(user.value)) IDENTIFIED BY '\(value)' ACCOUNT LOCK;")
+        }
+    }
+
+    func createDatabase(_ database: DatabaseName) throws {
+        _ = try module.provisioningSQL(package, target: target, statement: "CREATE DATABASE \(Self.identifier(database.value));")
+    }
+
+    func grantApplicationAccess(database: DatabaseName, user: DatabaseUserName) throws {
+        let pattern = database.value.replacingOccurrences(of: "_", with: "\\_")
+        _ = try module.provisioningSQL(package, target: target, statement: "GRANT ALL PRIVILEGES ON `\(pattern)`.* TO \(Self.account(user.value));")
+    }
+
+    func enableLogin(user: DatabaseUserName) throws {
+        _ = try module.provisioningSQL(package, target: target, statement: "ALTER USER \(Self.account(user.value)) ACCOUNT UNLOCK;")
+    }
+
+    func authenticate(database: DatabaseName, user: DatabaseUserName, password: SecretPassword) throws {
+        try withPassword(password) { value in
+            let contents = "[client]\nuser=\(user.value)\npassword=\(value)\n"
+            let response = try Self.runClient(package.clientPath, database: database.value, port: target.record.endpoint.portNumbers.first, credentials: Data(contents.utf8), sql: Data("SELECT 1;\n".utf8))
+            guard response == 0 else { throw DatabaseProvisioningError.engineFailure }
+        }
+    }
+
+    private static func runClient(_ executable: String, database: String, port: Int, credentials: Data, sql: Data) throws -> Int32 {
+        var credentialPipe = [Int32](repeating: -1, count: 2)
+        guard Darwin.pipe(&credentialPipe) == 0 else { throw DatabaseProvisioningError.engineFailure }
+        defer { if credentialPipe[0] >= 0 { close(credentialPipe[0]) }; if credentialPipe[1] >= 0 { close(credentialPipe[1]) } }
+        var offset = 0
+        while offset < credentials.count {
+            let written = credentials.withUnsafeBytes { bytes in write(credentialPipe[1], bytes.baseAddress!.advanced(by: offset), credentials.count - offset) }
+            guard written > 0 else { throw DatabaseProvisioningError.engineFailure }
+            offset += written
+        }
+        close(credentialPipe[1]); credentialPipe[1] = -1
+
+        var inputPipe = [Int32](repeating: -1, count: 2)
+        guard Darwin.pipe(&inputPipe) == 0 else { throw DatabaseProvisioningError.engineFailure }
+        defer { if inputPipe[0] >= 0 { close(inputPipe[0]) }; if inputPipe[1] >= 0 { close(inputPipe[1]) } }
+        let sources = [credentialPipe[0], inputPipe[0]]
+        var duplicated = sources.map { fcntl($0, F_DUPFD, 10) }
+        guard duplicated.allSatisfy({ $0 >= 0 }) else { throw DatabaseProvisioningError.engineFailure }
+        defer { duplicated.filter { $0 >= 0 }.forEach { close($0) } }
+        var actions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&actions) == 0 else { throw DatabaseProvisioningError.engineFailure }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        guard posix_spawn_file_actions_adddup2(&actions, duplicated[0], 3) == 0,
+              posix_spawn_file_actions_adddup2(&actions, duplicated[1], STDIN_FILENO) == 0,
+              posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) == 0,
+              posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO) == 0 else { throw DatabaseProvisioningError.engineFailure }
+        for descriptor in sources + [inputPipe[1]] where descriptor > STDERR_FILENO && descriptor != 3 { posix_spawn_file_actions_addclose(&actions, descriptor) }
+        for descriptor in duplicated { posix_spawn_file_actions_addclose(&actions, descriptor) }
+        let arguments = [executable, "--defaults-file=/dev/fd/3", "--protocol=tcp", "--host=127.0.0.1", "--port=\(port)", "--batch", "--skip-column-names", database]
+        let argv = arguments.map { strdup($0) } + [nil]
+        defer { argv.compactMap { $0 }.forEach { free($0) } }
+        let environment = ProcessInfo.processInfo.environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { environment.compactMap { $0 }.forEach { free($0) } }
+        var pid: pid_t = 0
+        let spawned = argv.withUnsafeBufferPointer { args in environment.withUnsafeBufferPointer { env in
+            posix_spawn(&pid, executable, &actions, nil, args.baseAddress!, env.baseAddress!)
+        } }
+        guard spawned == 0 else { throw DatabaseProvisioningError.engineFailure }
+        close(inputPipe[0]); inputPipe[0] = -1
+        duplicated.indices.forEach { index in
+            close(duplicated[index])
+            duplicated[index] = -1
+        }
+        var inputOffset = 0
+        while inputOffset < sql.count {
+            let written = sql.withUnsafeBytes { bytes in write(inputPipe[1], bytes.baseAddress!.advanced(by: inputOffset), sql.count - inputOffset) }
+            guard written > 0 else { _ = kill(pid, SIGTERM); throw DatabaseProvisioningError.engineFailure }
+            inputOffset += written
+        }
+        close(inputPipe[1]); inputPipe[1] = -1
+        let deadline = Date().addingTimeInterval(5)
+        var waitStatus: Int32 = 0
+        while Date() < deadline {
+            if waitpid(pid, &waitStatus, WNOHANG) == pid {
+                return waitStatus & 0x7f == 0 ? (waitStatus >> 8) : -1
+            }
+            usleep(20_000)
+        }
+        _ = kill(pid, SIGTERM)
+        usleep(100_000)
+        _ = kill(pid, SIGKILL)
+        _ = waitpid(pid, &waitStatus, 0)
+        throw DatabaseProvisioningError.engineFailure
+    }
+
+    private func withPassword(_ password: SecretPassword, _ body: (String) throws -> Void) throws {
+        try password.withBytes { bytes in
+            guard let value = String(bytes: bytes, encoding: .utf8), value.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else { throw DatabaseProvisioningError.secretUnavailable }
+            try body(value)
+        }
+    }
+
+    private static func identifier(_ value: String) -> String { "`\(value.replacingOccurrences(of: "`", with: "``"))`" }
+    private static func literal(_ value: String) -> String { "'\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'"))'" }
+    private static func account(_ user: String) -> String { "\(literal(user))@'127.0.0.1'" }
 }

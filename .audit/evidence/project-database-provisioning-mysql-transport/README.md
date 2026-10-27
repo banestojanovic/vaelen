@@ -1,0 +1,11 @@
+# MySQL 8.4.11 secret transport and logging gate
+
+Result: PASS on a disposable server and a task-owned private package root. The installed package metadata matched version 8.4.11, arm64, and artifact SHA-256 `b96e00493bc3499b9ffd7f08d65c5d64933af0383a8287d9873b64f94c2d6009`. Client and server executable SHA-256 values were `0ee0668b56046002c0c8d60312840b5e23c4560621761394603f548dc312cf3d` and `e5482c964c6f67aebfe7754c97f28a4876b6a036d63e818e5bf173b1221b671b`.
+
+The Python harness exited 0. It launched the package's `mysqld` in a private data directory and exercised the package's `mysql` and `mysqladmin` executables. Its generated password stayed in process memory, a bounded inherited descriptor-backed defaults stream (`--defaults-file=/dev/fd/N`), and the SQL stdin payload. SQL and credential configuration used separate pipes. The harness did not print or persist the generated password.
+
+With global general logging, slow query logging, and binary logging enabled, the admin connection set and read back `sql_log_off=1`, `sql_log_bin=0`, and `long_query_time=31536000`. That same connection created the account locked, created the schema, granted scoped privileges, and unlocked the account last. The application account authenticated over loopback TCP using the descriptor-backed credential configuration. A duplicate password-bearing `CREATE USER` failure was captured in memory and mapped to a nonzero result. The harness checked argv, client stdout/stderr, and the retained MySQL error, general, and slow logs for the generated password; it was absent.
+
+A separate disposable catalog check confirmed plain `pattern_db.*` grants access to `patternXdb`; a single-backslash escaped identifier in the `GRANT` allowed `pattern_db` and denied `patternXdb`.
+
+The saved files are the private server error, general, and slow logs from the gate and the underscore check's server log. No server process remains. This was the initial transport spike; production `MySQLModule` now uses the verified session suppression and descriptor-backed credential patterns. The final production adapter is covered separately by the live acceptance evidence in `.audit/project-database-provisioning-handoff.md`.

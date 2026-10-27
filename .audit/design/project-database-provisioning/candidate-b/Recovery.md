@@ -1,0 +1,61 @@
+# Creation and recovery contract
+
+## Identity and ownership
+
+Core resolves `ProjectID` to the registered project and reads its current declaration. The request binding must equal the current `ProjectServiceBinding`, including alias, kind, instance and version. The catalog must have the corresponding `ServiceInstanceID`, exact record and `.project(projectID:binding:)` claim. The existing binding observation must be healthy and consistent with the module-owned record. This feature does not activate stopped services, silently adopt undeclared services, or edit claims. An unavailable binding tells the user to activate the project first.
+
+MySQL is limited to `.mysql/default`; no host-wide MySQL search or fallback is permitted. PostgreSQL uses only the selected named instance. Resolve the admin connection inside its owning service module. Match package root, managed process identity, data directory and owned socket or endpoint. Verify server-reported data directory as well as module process evidence. A matching port alone is never sufficient. Recheck target before entry into the engine critical section and before final receipt completion.
+
+Creation runs as one bounded synchronous operation inside the dispatcher actor, so project down, unlink, adoption and binding replacement cannot interleave at actor suspension points. Engine operations additionally require lifecycle exclusion in each module. Existing module locks are not assumed sufficient. Implementation must audit every start/stop/remove/use path and use one non-reentrant internal critical section for identity plus creation. Do not take `MySQLModule`'s existing `NSLock` and call an already-locking public method. Do not hold a SQLite transaction while waiting for Keychain or an engine process.
+
+Reservations are unique on `(service kind, service instance, database name)` and independently on `(service kind, service instance, username)`, regardless of project alias. Same service bound under two aliases cannot bypass the reservation. SQLite inserts reserve both names atomically before engine writes. Full bound target and record identity are stored in the receipt. No foreign key cascade deletes retained receipts when a project is unlinked. Unlink releases ordinary project claims as it does today; receipts and credentials remain retained and do not grant access to another project. No cleanup of Keychain or engine resources is implicit in unlink.
+
+## Preflight and secret ordering
+
+1. Resolve and verify project, exact binding, claim and live managed instance.
+2. Inspect both namespaces. Refuse if the database exists or any MySQL account with the requested username at any host exists, or if a PostgreSQL role exists. System databases and privileged/reserved usernames are rejected before querying. Reserved names include MySQL system schemas and PostgreSQL `postgres`, `template0`, `template1` and the `pg_` role prefix.
+3. Begin a metadata attempt and reserve both names in one SQLite transaction. Same operation ID with the same full request returns its existing outcome; a different request with that ID is rejected.
+4. Create a cryptographically random password in Keychain under a stable application namespace plus operation ID. `SecItemAdd` must not overwrite an existing account. A duplicate belongs to this same operation and is loaded only after the receipt identity matches. Keychain is durable before any engine DDL. Keychain denial, locked access or storage failure produces no engine change.
+5. Recheck the two namespaces inside the verified admin session immediately before its first DDL. If either now exists, terminate without modifying either existing resource. The unused Keychain secret is retained for the receipt; no secret deletion is needed for correctness.
+
+DDL uses plain CREATE statements without `IF NOT EXISTS`, `OR REPLACE`, `ALTER` of a refused existing account, or upsert behavior. A race that creates a conflicting object after preflight yields refusal or retained partial output. That conflicting object is never granted privileges or altered. The first implementation creates the application account disabled, then the database, then application privileges, then enables account login. It never grants global privileges or grant options.
+
+## Engine paths
+
+MySQL uses the verified managed socket and existing empty-root defaults configuration. Create exactly one account restricted to the local connection host policy; the first release uses `'username'@'127.0.0.1'` and returns `127.0.0.1` as application host. Actual engine proof must confirm account selection on the packaged server, including the effect of name resolution. Do not create `%` accounts. Use `ACCOUNT LOCK` at account creation, create the database without takeover syntax, grant only database-scoped application capabilities, then unlock this freshly acknowledged account. Database identifiers in GRANT require special attention because underscore and percent can be wildcard syntax in that context. The adapter must use the packaged server's supported exact-schema grant semantics and prove a nearby wildcard-matching schema receives no privilege. An implementation that cannot prove that exact scope must narrow the name grammar or change its grant representation before shipping.
+
+PostgreSQL uses its verified instance-specific Unix socket and the initdb administrator from the managed cluster, connecting initially to `postgres`. Create a `NOLOGIN` role with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` and its password verifier. Create the new database owned by that role, then set the new database's public access policy, then enable LOGIN for that new role. Default PUBLIC database connect and temporary privileges are revoked only on the new database. Database ownership gives the application its own schema and migration capability. It does not promise that unrelated databases, which may still grant PUBLIC access, become globally inaccessible. Do not modify any other database to enforce isolation.
+
+PostgreSQL role creation can group its own related transactional statements, but CREATE DATABASE cannot be part of that transaction. The operation is therefore not represented as transactionally atomic. See [PostgreSQL CREATE DATABASE](https://www.postgresql.org/docs/18/sql-createdatabase.html).
+
+The current PostgreSQL module initializes local trust authentication. Production provisioning leaves that instance policy intact and accurately reports `authentication = localTrust` in connection metadata. It stores the password verifier and Keychain secret without claiming a wrong password is rejected by a trust-authenticated connection. A fixture with explicit SCRAM authentication is required to prove the generated password authenticates. Adding production per-role `pg_hba.conf` rules is a separate security-policy change, rather than hidden provisioning behavior.
+
+## Durable receipt state machine
+
+Private ledger data contains the full request, full target record, credential reference, current write intent, acknowledged resources, sanitized diagnostic code and outcome. A short SQLite commit records each impending engine write before issuing it. Another commit records successful acknowledgement. Passwords, hashes/verifiers, raw SQL and raw client output are never persisted there.
+
+| Interruption | Recovered result | Allowed follow-up |
+| --- | --- | --- |
+| Before durable receipt | No engine write can have happened | New request is safe. |
+| Receipt exists, before any DDL intent | No engine change | Retry same operation after target and namespace revalidation, using its existing Keychain item. |
+| After DDL intent, before known success or failure | Effect uncertain | Return retained partial, inspect only. |
+| After confirmed user, before next DDL | User confirmed, database absent or unattempted | Return retained partial, no resume. |
+| After database acknowledgement, before grants or enablement | New resources confirmed, application unusable or incomplete | Return retained partial, no resume. |
+| After grants or enablement, before final ready commit | Resources may be usable but success is not durable | Return retained partial, no resume or automatic revoke. |
+| After durable ready commit, before IPC response | Ready | Same operation returns metadata without executing SQL. |
+
+After the first DDL intent, unexpected errors, timeout, cancellation or Core restart all terminalize to retained partial unless a durable ready result already exists. Known duplicate-object errors can identify that resource as refused, but do not erase earlier confirmed effects. Diagnostic inspection may improve the display from unknown to observed existence. It never promotes observed existence to ownership or success. A stale pending intent is not a resume authorization.
+
+This candidate never resumes interrupted DDL, even when a prefix was acknowledged. This is deliberately stronger than a best-effort saga. The user can choose fresh names through another create request. Manual administration may remove abandoned resources outside this feature, but Vaelen supplies no database deletion, overwrite, rollback, accept-ownership or compensating DROP command. Final receipts and secrets survive restarts. Missing or denied Keychain access to a ready receipt reports unavailable credentials; it never rotates the account password.
+
+No local schema can protect against a different unrestricted database administrator maliciously replacing objects concurrently. That administrator is outside this feature's ownership authority. For normal local races, absence checks, strict CREATE, account locking and no resume after interruption prevent Vaelen from taking over a refused resource. Runtime tests must include ordinary namespace races.
+
+## Secret transport
+
+The password store uses generic-password Keychain items with synchronizable disabled and device-local accessibility suitable for the user's running session. The account is a stable namespace plus operation ID; item attributes contain no password. The namespace is injectable for tests. Security framework errors are mapped to typed availability reasons. `SecretPassword` is a scoped memory value, not a general String or part of snapshots.
+
+Password-bearing engine input uses a new bounded stdin pipe, never `mysql -e`, `psql -c`, process environment, a shell, SQL files or project files. Nonsecret executable, endpoint and flags may appear in argv. The runner disables client history and startup files and never echoes its input. Client stdout contains only fixed nonsecret proof fields. Client stderr is consumed in bounded memory and discarded after classification into a fixed diagnostic code. It must never reach the generic PostgreSQL temporary-log runner or MySQL raw-error forwarding path. Bound pipes are drained concurrently to prevent deadlock.
+
+Session logging policy must be established and read back before password-bearing SQL. PostgreSQL requires disabling statement, duration, transaction-sampling, error-statement and bind-parameter logging for the admin session. MySQL requires a verified no-secret path for general, slow, binary and installed audit logging, using admin session controls where supported and refusing unsupported logging paths before DDL. A plaintext-free SCRAM verifier may reduce PostgreSQL exposure but is still sensitive credential material and must not enter logs. PostgreSQL explicitly warns that statement logs may include passwords in [its logging documentation](https://www.postgresql.org/docs/18/runtime-config-logging.html). An unexpected logging configuration must fail closed before creating the account. This is a first-slice engine acceptance requirement, not a claim that stdin alone solves logging.
+
+Only explicit `password --reveal`, Reveal password, or Copy password causes a dedicated IPC password result. IPC transport tracing and diagnostic dumps must redact that response envelope. Ordinary creation, status, inspect, list and error response types cannot hold a password. The same-user authenticated local socket is still the IPC trust boundary; the reveal intent is a product control, not a cryptographic defense against a malicious local process running as that user.

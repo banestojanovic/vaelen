@@ -1,0 +1,7 @@
+Window: Settings, App: Vaelen.
+Sidebar selection: Projects.
+Project: Storefront at /fixture/projects/storefront.
+Database card: Project database access, PostgreSQL, DB_CONNECTION=pgsql.
+Receipt: Ready, database storefront_app, user storefront_user, operation C0B8DF3A-310A-4F20-9FC5-F7F4B01CC409.
+Create, Reveal Password, and Copy Password are disabled in the fixture.
+Fixture marker: UI fixture · project-database-postgresql.

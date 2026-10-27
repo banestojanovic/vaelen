@@ -1,0 +1,8 @@
+Window: Settings, App: Vaelen.
+Sidebar selection: Projects.
+Project: Storefront at /fixture/projects/storefront.
+Database summary: MySQL 8.4.11 is installed and running; project service binding is claimed.
+Configured project database: SQLite, DB_CONNECTION=sqlite.
+Database card: Project database access, Ready receipt for storefront_app and storefront_user, operation C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407.
+Create, Reveal Password, and Copy Password are disabled in the fixture.
+Fixture marker: UI fixture · project-database.

@@ -1,0 +1,2 @@
+Process identity OK: pid=5340 bundle=dev.vaelen.app fixture=project-database page=projects
+Check CUA accessibility state for Settings and UI fixture · project-database before driving.

@@ -3,6 +3,47 @@ import XCTest
 @testable import VaelenIPC
 
 final class ProtocolTests: XCTestCase {
+    func testExplicitDatabasePasswordRequestAndTypedSecretResponseRoundTrip() throws {
+        let operationID = DatabaseOperationID()
+        let request = IPCRequest(method: .projectDatabasePassword, params: .projectDatabasePassword(.init(selector: "demo", workingDirectory: "/tmp/demo", operationID: operationID)))
+        let restored = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(request))
+        XCTAssertEqual(restored, request)
+        guard case .projectDatabasePassword(let params)? = restored.params else { return XCTFail("password request lost its explicit discriminator") }
+        XCTAssertTrue(params.revealPassword)
+        let response = IPCResponse(id: request.id, result: .projectDatabasePassword(.init(password: "fixture-secret")))
+        XCTAssertEqual(try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)), response)
+        let wire = String(decoding: try IPCCodec.encode(response), as: UTF8.self)
+        XCTAssertTrue(wire.contains("\"password\":\"fixture-secret\""))
+        XCTAssertFalse(String(decoding: try IPCCodec.encode(request), as: UTF8.self).contains("fixture-secret"))
+    }
+    func testProjectDatabaseRequestAndMetadataResponseWireShapes() throws {
+        let projectID = ProjectID(rawValue: UUID())
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .mysql, instance: ProjectInstanceName("default"), version: "mysql-8.4.4")
+        let creation = ProjectDatabaseCreation(projectID: projectID, binding: binding, database: try DatabaseName("app_db"), user: try DatabaseUserName("app_user"))
+        let create = IPCRequest(method: .projectDatabaseCreate, params: .projectDatabaseCreate(.init(selector: "demo", workingDirectory: "/tmp/demo", creation: creation)))
+        let decodedCreate = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(create))
+        guard let createParams = decodedCreate.params else { return XCTFail("create params missing") }
+        XCTAssertEqual(try createParams.decode(ProjectDatabaseCreateRequest.self).creation, creation)
+        XCTAssertEqual(decodedCreate.knownMethod, .projectDatabaseCreate)
+
+        let operationID = DatabaseOperationID()
+        let status = IPCRequest(method: .projectDatabaseStatus, params: .projectDatabaseStatus(.init(selector: "demo", workingDirectory: "/tmp/demo", operationID: operationID)))
+        let decodedStatus = try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(status))
+        XCTAssertEqual(try XCTUnwrap(decodedStatus.params).decode(ProjectDatabaseOperationRequest.self).operationID, operationID)
+        let retry = IPCRequest(method: .projectDatabaseRetry, params: .projectDatabaseStatus(.init(selector: "demo", workingDirectory: "/tmp/demo", operationID: operationID)))
+        XCTAssertEqual(try IPCCodec.decode(IPCRequest.self, from: IPCCodec.encode(retry)).knownMethod, .projectDatabaseRetry)
+
+        let metadataJSON = """
+        {"operationID":{"rawValue":"\(operationID.rawValue.uuidString)"},"receiptID":"\(UUID().uuidString)","projectID":{"rawValue":"\(projectID.rawValue.uuidString)"},"binding":{"alias":"database","kind":"mysql","instance":"default","version":"mysql-8.4.4"},"database":"app_db","user":"app_user","state":"ready","confirmedEffects":["applicationUser","database","privileges","loginEnablement"],"uncertainEffects":[]}
+        """
+        let metadata = try IPCCodec.decode(ProjectDatabaseAttemptResult.self, from: Data(metadataJSON.utf8))
+        let encoded = String(decoding: try IPCCodec.encode(metadata), as: UTF8.self)
+        XCTAssertFalse(encoded.lowercased().contains("password"))
+        let response = IPCResponse(id: UUID(), result: .projectDatabaseAttempt(metadata))
+        guard case .projectDatabaseAttempt(let restored)? = try IPCCodec.decode(IPCResponse.self, from: IPCCodec.encode(response)).result else { return XCTFail("metadata result did not decode") }
+        XCTAssertEqual(restored, metadata)
+    }
+
     func testManagedLogErrorsRetainDistinctWireCodes() throws {
         for code in [IPCErrorCode.logMissing, .logUnreadable, .logUnsafePath] {
             let response = IPCResponse(id: UUID(), error: IPCErrorPayload(code: code, message: "managed log error"))
