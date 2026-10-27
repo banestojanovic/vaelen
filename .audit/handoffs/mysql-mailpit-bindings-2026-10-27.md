@@ -2,7 +2,7 @@
 
 ## Status
 
-The MySQL and Mailpit project-binding slice passed focused acceptance and one independent Sol review. It is ready for a scoped commit. The larger Herd-replacement goal remains active.
+The MySQL and Mailpit project-binding slice passed focused acceptance and one independent Sol review. It was committed in `257341c` as part of the adopted project environment lifecycle. The global pstack model routing and project sync command were committed separately in `5f45e12`. The larger Herd-replacement goal remains active.
 
 V2 projects can claim only the exact installed default MySQL or Mailpit instance observed by Core. Project activation validates package identity and health. Multiple aliases share one instance. Project down releases project ownership and leaves these legacy singleton processes running. Package removal is blocked while a project claim exists. The native Settings flow and CLI report the same exact binding without exposing secrets.
 
@@ -23,6 +23,8 @@ One fresh read-only Sol review found two defects. `identityCommand` now waits fo
 ## Limits and next work
 
 This slice does not create named MySQL or Mailpit instances, initialize MySQL, create databases or users, or migrate database contents. It does not close the Herd-replacement goal.
+
+The PostgreSQL lifecycle XCTest fixture no longer assumes a machine-specific package path. It skips package-dependent tests when the package root is unset, errors on an explicitly invalid path, and verifies owned services are stopped before deleting fixture roots. Parent runs passed both without the package (with expected skips) and with the extracted PostgreSQL 18.6 package; one read-only Sol review found no findings. This isolated fixture correction is tracked separately from the feature commit.
 
 Next, verify service ownership and runtime recovery after Core restart for MySQL, Mailpit, PostgreSQL, and Valkey. Then define and test data-safe backup, restore, update, and removal behavior. Complete the signed installed-app adoption-to-working-site journey and the package provenance, legal, signing, repeatability, and macOS 14 release gates.
 
