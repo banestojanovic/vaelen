@@ -48,6 +48,13 @@ public final class RouteIntentRepository: @unchecked Sendable {
         }) { _ in }
     }
 
+    public func createIfHostnameAvailable(_ intent: RouteIntent) throws {
+        try store.transaction {
+            guard try all().allSatisfy({ $0.route.hostname != intent.route.hostname }) else { throw RouterError.duplicateHostname(intent.route.hostname) }
+            try upsert(intent)
+        }
+    }
+
     public func remove(id: RouteID) throws {
         try store.transaction {
             try store.query("DELETE FROM park_route_ownership WHERE route_id = ?", bind: { store.bind(id.description, to: $0, index: 1) }) { _ in }

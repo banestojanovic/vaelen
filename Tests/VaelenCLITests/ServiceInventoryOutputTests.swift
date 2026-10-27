@@ -1,8 +1,45 @@
 import XCTest
 import VaelenCore
+import VaelenIPC
 @testable import VaelenCLI
 
 final class ServiceInventoryOutputTests: XCTestCase {
+    func testNamedPostgreSQLLifecycleCommandsParseWithExactPorts() throws {
+        guard case .postgresqlInstance(.create, name: "shop-db", port: 55432, json: true) = try VaelenCLIMain.parse(["service", "postgresql", "create", "shop-db", "--port", "55432", "--json"]) else { return XCTFail("PostgreSQL create did not parse") }
+        guard case .postgresqlInstance(.status, name: "shop-db", port: nil, json: false) = try VaelenCLIMain.parse(["service", "postgresql", "status", "shop-db"]) else { return XCTFail("PostgreSQL status did not parse") }
+        for args in [["service", "postgresql", "create", "bad name"], ["service", "postgresql", "create", "shop-db", "--port", "0"], ["service", "postgresql", "start", "shop-db", "--port", "5000"], ["service", "postgresql", "remove"], ["service", "postgresql", "status", "shop-db", "--json", "--json"]] {
+            XCTAssertThrowsError(try VaelenCLIMain.parse(args), "Expected rejection for \(args)")
+        }
+        XCTAssertTrue(CLIDocumentation.focusedText(for: ["service", "postgresql"]).contains("service postgresql create"))
+    }
+
+    func testServiceInstancesParsingAndOutput() throws {
+        guard case .serviceInstances(json: false) = try VaelenCLIMain.parse(["service", "instances"]) else { return XCTFail("service instances did not parse") }
+        guard case .serviceInstances(json: true) = try VaelenCLIMain.parse(["service", "instances", "--json"]) else { return XCTFail("service instances --json did not parse") }
+        for args in [["service", "instances", "extra"], ["service", "instances", "--json", "--json"], ["service", "instances", "--unknown"]] { XCTAssertThrowsError(try VaelenCLIMain.parse(args)) }
+        XCTAssertTrue(CLIDocumentation.focusedText(for: ["service", "instances"]).contains("val service instances --json"))
+
+        let empty = ServiceInstanceInventoryResult(.init(entries: []))
+        XCTAssertEqual(try ServiceInstanceInventoryFormatter.render(empty, json: false), "No service instances are registered.")
+        let name = try ProjectInstanceName("primary")
+        let projectID = ProjectID()
+        let bindingAlias = try ProjectBindingAlias("database")
+        let entry = ServiceInstanceInventoryEntryWire(instance: .init(kind: .mysql, name: name, packageIdentifier: "vendor/mysql@8.4.1", endpoint: .mysql(port: 3307), dataDirectory: "/data/mysql"), owners: [.manual, .project(projectID: projectID, alias: bindingAlias, version: "8.4.1")])
+        let laterEntry = ServiceInstanceInventoryEntryWire(instance: .init(kind: .postgresql, name: try ProjectInstanceName("primary"), packageIdentifier: "vendor/postgresql@17", endpoint: .postgresql(port: 5432), dataDirectory: "/data/postgresql"), owners: [])
+        let inventory = ServiceInstanceInventoryResult(entries: [laterEntry, entry])
+        let human = try ServiceInstanceInventoryFormatter.render(inventory, json: false)
+        XCTAssertTrue(human.contains("mysql/primary"))
+        XCTAssertLessThan(try XCTUnwrap(human.range(of: "mysql/primary")).lowerBound, try XCTUnwrap(human.range(of: "postgresql/primary")).lowerBound)
+        XCTAssertTrue(human.contains("mysql 127.0.0.1:3307"))
+        XCTAssertTrue(human.contains("vendor/mysql@8.4.1"))
+        XCTAssertTrue(human.contains("/data/mysql"))
+        XCTAssertTrue(human.contains("manual, project \(projectID) / database (8.4.1)"))
+        let json = try ServiceInstanceInventoryFormatter.render(inventory, json: true)
+        XCTAssertFalse(json.contains("health"))
+        XCTAssertLessThan(try XCTUnwrap(json.range(of: "mysql")).lowerBound, try XCTUnwrap(json.range(of: "postgresql")).lowerBound)
+        XCTAssertEqual(try JSONDecoder().decode(ServiceInstanceInventoryResult.self, from: Data(json.utf8)).entries.map { $0.instance.kind }, [.mysql, .postgresql])
+    }
+
     func testServiceListParsesAndRejectsUnsupportedArguments() throws {
         guard case .serviceList(json: false) = try VaelenCLIMain.parse(["service", "list"]) else {
             return XCTFail("service list did not parse")

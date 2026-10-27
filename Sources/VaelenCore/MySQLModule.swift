@@ -268,6 +268,30 @@ public final class MySQLModule: @unchecked Sendable {
         return MySQLStatus(state: healthy ? .running : .unhealthy, health: healthy ? "healthy" : "not-ready", installedVersion: base.0, selectedVersion: base.1, pid: record.pid, port: record.port, socket: record.socket, datadir: record.datadir, executablePath: record.executable, uptime: processUptime(record.pid), memoryBytes: processMemory(record.pid), cpuPercent: processCPU(record.pid), databases: databases)
     }
 
+    public func projectBindingSnapshot() -> ModuleOwnedServiceSnapshot {
+        let observed = status()
+        guard let version = observed.installedVersion,
+              observed.selectedVersion == nil || observed.selectedVersion == version,
+              observed.port == port,
+              instanceName == "default",
+              let package = selectedPackage() else {
+            return .init(record: nil, health: "identity-unverified")
+        }
+        let paths = instancePaths(package: package)
+        if let metadata = instanceMetadata(), metadata.initialized {
+            guard metadata.version == version, metadata.initializedVersion == version, metadata.port == port,
+                  metadata.datadir == paths.data.path, metadata.socket == paths.socket.path else {
+                return .init(record: nil, health: "identity-unverified")
+            }
+        }
+        guard let endpoint = try? ServiceInstanceEndpoint.mysql(port: observed.port),
+              let idName = try? ProjectInstanceName("default"),
+              let record = try? ServiceInstanceRecord(id: ServiceInstanceID(kind: .mysql, name: idName), packageIdentifier: "mysql-\(version)", endpoint: endpoint, dataDirectory: observed.datadir) else {
+            return .init(record: nil, health: observed.health)
+        }
+        return .init(record: record, health: observed.health)
+    }
+
     public func start() throws -> MySQLStatus {
         guard let package = selectedPackage() else { throw MySQLModuleError.packageMissing(manifest.version) }; guard instanceMetadata()?.initialized == true else { throw MySQLModuleError.notInitialized }
         let paths = instancePaths(package: package); let current = status(); if current.state == .running { return current }; if current.state == .unhealthy || current.state == .conflict { if let record = processRecord(paths), processExists(record.pid) { throw MySQLModuleError.processIdentityMismatch }; try? manager.removeItem(at: paths.process) }

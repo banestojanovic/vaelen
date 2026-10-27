@@ -3,6 +3,39 @@ import OSLog
 import VaelenCore
 import VaelenIPC
 
+private func adoptionDocumentRoot(_ path: String, projectRoot: String) -> String? {
+    guard !path.split(separator: "/", omittingEmptySubsequences: false).contains("..") else { return nil }
+    let root = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+    let candidate: URL
+    if path.hasPrefix("/") {
+        candidate = URL(fileURLWithPath: path, isDirectory: true)
+    } else {
+        candidate = root.appendingPathComponent(path.isEmpty ? "." : path, isDirectory: true)
+    }
+    let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+    let rootPath = root.path
+    let resolvedPath = resolved.path
+    guard resolvedPath == rootPath || resolvedPath.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/") else { return nil }
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: resolvedPath, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+    return resolvedPath
+}
+
+private func routeDocumentRoot(_ route: Route) -> String? {
+    switch route.target {
+    case .fastCGI(_, let root), .staticFiles(let root): root
+    case .http: nil
+    }
+}
+
+private func routeTargetDescription(_ target: RouteTarget) -> String {
+    switch target {
+    case .fastCGI(let socket, _): "fastcgi \(socket)"
+    case .staticFiles: "static"
+    case .http(let host, let port): "http \(host):\(port)"
+    }
+}
+
 private final class LocalProxyProbeRedirectPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
@@ -34,6 +67,13 @@ private struct ProjectReportObservations {
     let ports: StandardPortsStatus
 }
 
+struct ProjectReadinessTestOverride: Sendable {
+    let phpPackage: PHPPackage
+    let phpStatus: PHPStatus
+    let dns: DNSStatus
+    let ports: StandardPortsStatus
+}
+
 enum ProjectObservationSnapshotFreshness {
     static let lifetime: TimeInterval = 30
     static func isFresh(createdAt: Date, now: Date) -> Bool {
@@ -42,6 +82,13 @@ enum ProjectObservationSnapshotFreshness {
 }
 
 public actor CoreRequestDispatcher {
+    private struct ProjectAdoptionSession {
+        let createdAt: Date
+        let project: ProjectEnvironmentIdentity
+        let preview: ProjectAdoptionPreview
+        let routes: [RouteIntent]
+        let instances: ServiceInstanceInventorySnapshot
+    }
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
     private let php: PHPModule?
@@ -57,6 +104,10 @@ public actor CoreRequestDispatcher {
     private let ports: StandardPortsCapability
     private let logs: CoreLogCatalog
     private let serviceIntents: ServiceIntentStore
+    private let serviceInstances: ServiceInstanceRepository?
+    private let projectServiceBindings: ProjectServiceBindings
+    private let postgresql: PostgreSQLServiceModule?
+    private let valkey: ValkeyServiceModule?
     private let shutdownTimingLogger = Logger(subsystem: "dev.vaelen.daemon", category: "shutdown-timing")
     private var restorationStarted = false
     private var restorationTask: Task<Void, Never>?
@@ -67,12 +118,16 @@ public actor CoreRequestDispatcher {
     private var shutdownRunInFlight = false
     private var phpPackageOperationsInFlight = 0
     private var projectObservationSnapshots: [UUID: (createdAt: Date, observations: ProjectReportObservations)] = [:]
+    private var projectAdoptionSessions: [UUID: ProjectAdoptionSession] = [:]
+    private var projectReadinessTestOverride: ProjectReadinessTestOverride?
+    func setProjectReadinessTestOverride(_ value: ProjectReadinessTestOverride?) { projectReadinessTestOverride = value }
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
     private let standardPortsLogger = Logger(subsystem: "dev.vaelen.daemon", category: "standard-ports")
 
-    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, node: NodePackageManager = .init(), mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
+    public init(runtime: CoreRuntime, registry: ProjectRegistry, php: PHPModule? = nil, node: NodePackageManager = .init(), mysql: MySQLModule? = nil, mailpit: MailpitModule? = nil, postgresql: PostgreSQLServiceModule? = nil, valkey: ValkeyServiceModule? = nil, router: any Router = InMemoryRouter(), routeRepository: RouteIntentRepository? = nil, localProxyRepository: LocalProxyRepository? = nil, dns: DNSCapability = DNSCapability(), tls: TLSCapability = TLSCapability(), ports: StandardPortsCapability = StandardPortsCapability(), serviceIntents: ServiceIntentStore? = nil, serviceInstances: ServiceInstanceRepository? = nil, logs: CoreLogCatalog = CoreLogCatalog(layout: VaelenFilesystemLayout())) throws {
         self.node = node
-        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.router = router; self.routeRepository = routeRepository; self.localProxyRepository = localProxyRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.logs = logs; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json"))
+        self.runtime = runtime; self.registry = registry; self.php = php; self.mysql = mysql; self.mailpit = mailpit; self.postgresql = postgresql; self.valkey = valkey; self.router = router; self.routeRepository = routeRepository; self.localProxyRepository = localProxyRepository; self.dns = dns; self.tls = tls; self.ports = ports; self.logs = logs; self.serviceIntents = serviceIntents ?? ServiceIntentStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-service-intents-\(UUID().uuidString).json")); self.serviceInstances = serviceInstances
+        self.projectServiceBindings = ProjectServiceBindings(repository: serviceInstances, mysql: mysql, postgresql: postgresql, valkey: valkey, mailpit: mailpit)
         var persistedRoutes = try routeRepository?.all() ?? []
         if let localProxyRepository {
             guard let routeRepository else { throw LocalProxyError.persistence("Proxy ownership requires the durable Core route repository.") }
@@ -167,6 +222,46 @@ public actor CoreRequestDispatcher {
                 return (.init(id: request.id, result: .status(.init(core: runtime.status, protocolVersion: 1, serviceIssues: issues, serviceIntents: savedIntents))), true)
             case .shutdown:
                 fatalError("shutdown is handled before provider dispatch")
+            case .serviceInstances:
+                guard projectServiceBindings.isAvailable else { throw IPCErrorPayload(code: .internalError, message: "Service instance inventory is unavailable.") }
+                let entries = try assessedServiceInstanceInventory().entries.map { entry in
+                    let health = assessedHealth(for: entry.record)
+                    let eligible = bindingEligible(record: entry.record, health: health)
+                    return ServiceInstanceInventoryEntryWire(entry, assessedHealth: health, eligibleForProjectBinding: eligible)
+                }
+                return (.init(id: request.id, result: .serviceInstances(.init(entries: entries))), true)
+            case .serviceInstanceLifecycle:
+                let params = try request.params?.decode(ServiceInstanceLifecycleRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Service instance lifecycle parameters are required.") }()
+                let name = try ProjectInstanceName(params.name)
+                if params.kind == .valkey {
+                    guard let valkey else { throw IPCErrorPayload(code: .internalError, message: "Valkey lifecycle is unavailable because no verified package root was injected.") }
+                    let id = ServiceInstanceID(kind: .valkey, name: name)
+                    switch params.action {
+                    case .create: try valkey.create(id: id, port: params.port ?? (try serviceInstances?.instance(id))?.endpoint.portNumbers.first ?? ValkeyServiceModule.availableLoopbackPort())
+                    case .status: break
+                    case .start: try valkey.start(id: id)
+                    case .stop: try valkey.stop(id: id)
+                    case .remove:
+                        try valkey.remove(id: id)
+                        return (.init(id: request.id, result: .serviceInstanceLifecycle(.init(instance: nil, health: "removed", pid: nil))), true)
+                    }
+                    let observed = try valkey.status(id: id)
+                    return (.init(id: request.id, result: .serviceInstanceLifecycle(.init(instance: observed.record.map(ServiceInstanceRecordWire.init), health: observed.health, pid: observed.pid))), true)
+                }
+                guard params.kind == .postgresql, let postgresql else { throw IPCErrorPayload(code: .internalError, message: "PostgreSQL lifecycle is unavailable because no verified package root was injected.") }
+                let id = ServiceInstanceID(kind: .postgresql, name: name)
+                switch params.action {
+                case .create:
+                    try postgresql.create(id: id, port: params.port ?? PostgreSQLServiceModule.availableLoopbackPort())
+                case .status: break
+                case .start: try postgresql.start(id: id)
+                case .stop: try postgresql.stop(id: id)
+                case .remove:
+                    try postgresql.remove(id: id)
+                    return (.init(id: request.id, result: .serviceInstanceLifecycle(.init(instance: nil, health: "removed", pid: nil))), true)
+                }
+                let observed = try postgresql.status(id: id)
+                return (.init(id: request.id, result: .serviceInstanceLifecycle(.init(instance: observed.record.map(ServiceInstanceRecordWire.init), health: observed.health, pid: observed.pid))), true)
             case .projectLink:
                 let params = try request.params?.decode(LinkProjectRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Link parameters are required.") }()
                 let mutation = try await registry.linkWithCreation(path: params.path, workingDirectory: params.workingDirectory, name: params.name)
@@ -236,13 +331,88 @@ public actor CoreRequestDispatcher {
                 }
                 let report = try await projectEnvironmentReport(for: project, observations: observations)
                 return (.init(id: request.id, result: .projectEnvironment(.init(report: report))), true)
-            case .projectPlan, .projectActivate:
+            case .projectAdoptionPreview:
+                let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project adoption preview parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                let report = try await projectEnvironmentReport(for: project)
+                let discovery = ProjectAdoptionPreviewBuilder.discover(at: project.rootPath.string)
+                let observed = try? await router.observedRoutes()
+                let routes = try routeRepository?.all() ?? Array(routeIntents.values)
+                let preview = ProjectAdoptionPreviewBuilder.build(report: report, routes: routes, observedRoutes: observed, unavailableReason: observed == nil ? "Live route observation is unavailable." : nil, discovery: discovery)
+                let inventory = try assessedServiceInstanceInventory()
+                let id = UUID()
+                projectAdoptionSessions = projectAdoptionSessions.filter { ProjectObservationSnapshotFreshness.isFresh(createdAt: $0.value.createdAt, now: Date()) }
+                if projectAdoptionSessions.count >= 8, let oldest = projectAdoptionSessions.min(by: { $0.value.createdAt < $1.value.createdAt })?.key { projectAdoptionSessions.removeValue(forKey: oldest) }
+                projectAdoptionSessions[id] = ProjectAdoptionSession(createdAt: Date(), project: report.identity, preview: preview, routes: routes, instances: inventory)
+                return (.init(id: request.id, result: .projectAdoptionPreview(.init(confirmation: id, preview: preview))), true)
+            case .projectAdoptionApply:
+                let params = try request.params?.decode(ProjectAdoptionApplyRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project adoption choices are required.") }()
+                guard let session = projectAdoptionSessions.removeValue(forKey: params.confirmation), ProjectObservationSnapshotFreshness.isFresh(createdAt: session.createdAt, now: Date()) else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "The adoption review expired or was already used. Run the preview again.")
+                }
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard ProjectEnvironmentIdentity(project: project) == session.project else { throw IPCErrorPayload(code: .invalidRequest, message: "The project identity changed after review. Run the preview again.") }
+                guard params.spec.version == 2, session.preview.manifestState == .absent else { throw IPCErrorPayload(code: .invalidRequest, message: "Adoption can create a new V2 vaelen.yml only. Existing declarations remain unchanged.") }
+                guard !session.preview.herdYMLPresent, !session.preview.hasRouteOwnershipConflicts else { throw IPCErrorPayload(code: .invalidRequest, message: "The preview contains unsupported or conflicting evidence. Resolve it and run the preview again.") }
+                guard session.preview.php.sources.isEmpty || params.spec.php != nil,
+                      session.preview.node.sources.isEmpty || params.spec.node != nil else { throw IPCErrorPayload(code: .invalidRequest, message: "Choose an explicit PHP and Node declaration for each detected runtime requirement.") }
+                guard params.webChoiceConfirmed,
+                      params.spec.web == nil ? (params.selectedRouteIDs.isEmpty && !params.createRoute) : (params.createRoute ? params.selectedRouteIDs.isEmpty : params.selectedRouteIDs.count == 1) else { throw IPCErrorPayload(code: .invalidRequest, message: "Confirm no web route, one reviewed route, or explicit route creation.") }
+                guard let projectID = project.id else { throw IPCErrorPayload(code: .invalidRequest, message: "Link this project before claiming service instances.") }
+                let report = try await projectEnvironmentReport(for: project)
+                let observed = try? await router.observedRoutes()
+                let currentRoutes = try routeRepository?.all() ?? Array(routeIntents.values)
+                let discovery = ProjectAdoptionPreviewBuilder.discover(at: project.rootPath.string)
+                let currentPreview = ProjectAdoptionPreviewBuilder.build(report: report, routes: currentRoutes, observedRoutes: observed, unavailableReason: observed == nil ? "Live route observation is unavailable." : nil, discovery: discovery)
+                guard discovery.issues.isEmpty else { throw IPCErrorPayload(code: .invalidRequest, message: "Runtime discovery contains unsupported evidence. Resolve it and run the preview again.") }
+                let inventory = try assessedServiceInstanceInventory()
+                guard currentPreview == session.preview, currentRoutes == session.routes, inventory == session.instances else { throw IPCErrorPayload(code: .invalidRequest, message: "Project, route, or service evidence changed after review. Run the preview again.") }
+                guard params.selectedRouteIDs.count == Set(params.selectedRouteIDs).count,
+                      params.selectedRouteIDs.allSatisfy({ id in session.preview.routes.contains(where: { $0.id == id }) }) else { throw IPCErrorPayload(code: .invalidRequest, message: "Choose only routes listed in the reviewed project preview.") }
+                guard projectServiceBindings.isAvailable else { throw IPCErrorPayload(code: .invalidRequest, message: "The service instance catalog is unavailable.") }
+                if let web = params.spec.web {
+                    guard let host = web.host, let documentRoot = web.documentRoot, let secure = web.secure, web.createRoute == params.createRoute else { throw IPCErrorPayload(code: .invalidRequest, message: "Choose the host, document root, and secure mode, and confirm whether Vaelen may create the route.") }
+                    if params.createRoute {
+                        let normalizedHost = host.lowercased()
+                        let proxies = try localProxyRepository?.list() ?? []
+                        guard let observed,
+                              observed.allSatisfy({ $0.hostname.lowercased() != normalizedHost }),
+                              currentRoutes.allSatisfy({ $0.route.hostname.lowercased() != normalizedHost }),
+                              proxies.allSatisfy({ $0.route.hostname.lowercased() != normalizedHost }) else { throw IPCErrorPayload(code: .invalidRequest, message: "The requested host already has a route, proxy owner, or unavailable live-route evidence; no manifest or claim was changed.") }
+                    } else {
+                        guard let route = session.preview.routes.first(where: { $0.hostname == host }), params.selectedRouteIDs == [route.id] else { throw IPCErrorPayload(code: .invalidRequest, message: "A web host must match the single route that you explicitly selected in the review.") }
+                        guard secure == (route.tls != .disabled) else { throw IPCErrorPayload(code: .invalidRequest, message: "The secure setting must match the reviewed route TLS mode.") }
+                    }
+                    if !params.createRoute, let route = session.preview.routes.first(where: { $0.hostname == host }), let reviewedRoot = route.documentRoot {
+                        guard let normalizedRouteRoot = adoptionDocumentRoot(reviewedRoot, projectRoot: project.rootPath.string),
+                              let normalizedChoice = adoptionDocumentRoot(documentRoot, projectRoot: project.rootPath.string) else {
+                            throw IPCErrorPayload(code: .invalidRequest, message: "The selected route document root must stay within the project.")
+                        }
+                        guard normalizedRouteRoot == normalizedChoice else { throw IPCErrorPayload(code: .invalidRequest, message: "The document root must match the reviewed route.") }
+                    }
+                }
+                let manifest = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent("vaelen.yml")
+                var createdManifestBytes: Data?
+                do {
+                    createdManifestBytes = try ProjectAdoptionManifestWriter.create(spec: params.spec, at: project.rootPath.string, expectedManifest: nil)
+                    if !params.spec.services.isEmpty {
+                        try projectServiceBindings.adopt(params.spec.services, projectID: projectID)
+                    }
+                } catch {
+                    if let createdManifestBytes, (try? Data(contentsOf: manifest)) == createdManifestBytes { try? FileManager.default.removeItem(at: manifest) }
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Adoption could not complete and its new manifest was rolled back: \(error.localizedDescription)")
+                }
+                return (.init(id: request.id, result: .projectAdoptionApply(.init(identity: session.project, manifestCreated: true, claimedServices: params.spec.services, selectedRoutes: params.selectedRouteIDs))), true)
+            case .projectPlan, .projectActivate, .projectDown:
                 let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project reconciliation parameters are required.") }()
                 let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
                 guard project.registrationKind == .linked, project.id != nil else { throw IPCErrorPayload(code: .invalidRequest, message: "Project reconciliation requires a registered linked project.") }
                 if method == .projectPlan {
                     let report = try await projectEnvironmentReport(for: project)
                     return (.init(id: request.id, result: .projectPlan(.init(plan: ProjectReconciliationPlanner().plan(report: report)))), true)
+                }
+                if method == .projectDown {
+                    return (.init(id: request.id, result: .projectActivation(.init(execution: try await deactivate(project: project)))), true)
                 }
                 return (.init(id: request.id, result: .projectActivation(.init(execution: try await activate(project: project)))), true)
             case .projectPHP:
@@ -378,12 +548,15 @@ public actor CoreRequestDispatcher {
             case .mysqlRemove:
                 let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }()
                 guard module.installedVersions().contains(where: { $0.version == params.version }) else { throw IPCErrorPayload(code: .invalidRequest, message: "Core could not verify ownership of MySQL \(params.version); no service or files were changed.") }
-                try serviceIntents.set("mysql", enabled: false)
-                _ = try module.stop()
-                let installed = try module.remove(requestedVersion: params.version)
+                let singletonID = ServiceInstanceID(kind: .mysql, name: try ProjectInstanceName("default"))
+                let installed = try projectServiceBindings.removeSingletonAfterSuccessfulAction(for: singletonID, packageIdentifier: "mysql-\(params.version)") {
+                    try serviceIntents.set("mysql", enabled: false)
+                    _ = try module.stop()
+                    return try module.remove(requestedVersion: params.version)
+                }
                 return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: installed.map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
             case .mysqlUse:
-                let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }(); _ = try module.use(params.version); return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
+                let module = try mysqlModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "MySQL version is required.") }(); let singletonID = ServiceInstanceID(kind: .mysql, name: try ProjectInstanceName("default")); _ = try projectServiceBindings.withNoProjectClaims(for: singletonID) { try module.use(params.version) }; return (.init(id: request.id, result: .mysqlVersions(.init(mysql: .init(available: module.availableVersions(), installed: module.installedVersions().map(MySQLPackageWire.init), default: module.selectedVersion())))), true)
             case .mysqlInitialize:
                 let module = try mysqlModule(); try module.initialize(); return (.init(id: request.id, result: .mysqlStatus(.init(mysql: module.status()))), true)
             case .mysqlStart:
@@ -399,9 +572,12 @@ public actor CoreRequestDispatcher {
             case .mailpitRemove:
                 let module = try mailpitModule(); let params = try request.params?.decode(PHPVersionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Mailpit version is required.") }()
                 guard module.installedVersions().contains(where: { $0.version == params.version }) else { throw IPCErrorPayload(code: .invalidRequest, message: "Core could not verify ownership of Mailpit \(params.version); no service or files were changed.") }
-                try serviceIntents.set("mailpit", enabled: false)
-                _ = try module.stop()
-                let installed = try module.remove(requestedVersion: params.version)
+                let singletonID = ServiceInstanceID(kind: .mailpit, name: try ProjectInstanceName("default"))
+                let installed = try projectServiceBindings.removeSingletonAfterSuccessfulAction(for: singletonID, packageIdentifier: "mailpit-\(params.version)") {
+                    try serviceIntents.set("mailpit", enabled: false)
+                    _ = try module.stop()
+                    return try module.remove(requestedVersion: params.version)
+                }
                 return (.init(id: request.id, result: .mailpitVersions(.init(mailpit: .init(available: module.availableVersions(), installed: installed.map(MailpitPackageWire.init))))), true)
             case .mailpitStart:
                 let module = try mailpitModule(); try serviceIntents.set("mailpit", enabled: true); return (.init(id: request.id, result: .mailpitStatus(.init(mailpit: try module.start()))), true)
@@ -1512,13 +1688,16 @@ public actor CoreRequestDispatcher {
         let routerValue = await routerStatus
         let runtimeRoutesValue = await observedRoutes
         let linkedProjectsValue = try await linkedProjects
+        let dnsValue = await dnsStatus
+        let portsValue = await portsStatus
         async let phpOverrides = registry.phpOverrides()
         let phpOverridesValue = try await phpOverrides
         let pendingTransitions = try routeRepository?.pendingTransitions() ?? []
+        let readiness = projectReadinessTestOverride
         return ProjectReportObservations(
-            phpObservations: phpObservations,
-            phpStatuses: phpStatuses,
-            phpDefault: php?.defaultVersion(),
+            phpObservations: readiness.map { [.init(package: $0.phpPackage, version: $0.phpPackage.version, eligibility: .eligible)] } ?? phpObservations,
+            phpStatuses: readiness.map { [$0.phpStatus] } ?? phpStatuses,
+            phpDefault: readiness?.phpPackage.version ?? php?.defaultVersion(),
             routes: routeIntents.values.sorted { $0.route.hostname < $1.route.hostname },
             router: routerValue,
             runtimeRoutes: runtimeRoutesValue,
@@ -1527,9 +1706,9 @@ public actor CoreRequestDispatcher {
             pendingTransitions: pendingTransitions,
             mysql: mysql?.status(),
             mailpit: mailpit?.status(),
-            dns: await dnsStatus,
+            dns: readiness?.dns ?? dnsValue,
             tls: await tlsStatus,
-            ports: await portsStatus
+            ports: readiness?.ports ?? portsValue
         )
     }
 
@@ -1571,7 +1750,36 @@ public actor CoreRequestDispatcher {
                 try routeRepository.completeFastCGITargetTransition(id: transition.routeID, projectID: projectID, desiredRoute: transition.desiredRoute)
             }
         }
-        return report
+        guard let spec = report.projectSpec, spec.version == 2 else { return report }
+        let bindings = spec.services.map { binding -> ProjectServiceBindingObservation in
+            return (try? projectServiceBindings.observation(binding, projectID: project.id)) ?? ProjectServiceBindingObservation(binding: binding, packageIdentifier: nil, endpoint: nil, dataDirectory: nil, health: "unavailable", claimed: false)
+        }
+        var nodeState: String?
+        var selectedNodeVersion: String?
+        if let requirement = spec.node, let projectID = project.id {
+            let candidates = NodeRelease.reviewed.map(\.version).filter { $0.description == requirement.value || $0.description.hasPrefix(requirement.value + ".") }.sorted { $0.description > $1.description }
+            let records = try await registry.nodeRecords()
+            let snapshot = node.validationSnapshot(records: records, including: candidates)
+            selectedNodeVersion = candidates.first(where: { (try? snapshot.package($0)) != nil })?.description
+            if let selectedNodeVersion, let version = try? NodeVersion(selectedNodeVersion) {
+                nodeState = records.first(where: { $0.id == projectID })?.pin == version ? "selected" : "available"
+            } else { nodeState = "missing" }
+        } else if spec.node != nil {
+            nodeState = "unsupported"
+        }
+        return ProjectEnvironmentReport(identity: report.identity, desired: report.desired, configured: report.configured, observed: report.observed, derived: report.derived, secret: report.secret, diagnostics: report.diagnostics, routeTargets: report.routeTargets, projectSpec: report.projectSpec, serviceBindings: bindings, nodeRequirementState: nodeState, nodeRequirementVersion: selectedNodeVersion)
+    }
+
+    private func assessedServiceInstanceInventory() throws -> ServiceInstanceInventorySnapshot {
+        try projectServiceBindings.inventorySnapshot()
+    }
+
+    private func assessedHealth(for record: ServiceInstanceRecord) -> String {
+        projectServiceBindings.assessedHealth(for: record)
+    }
+
+    private func bindingEligible(record: ServiceInstanceRecord, health: String) -> Bool {
+        projectServiceBindings.isEligible(record: record, health: health)
     }
 
     private func projectPHPSelection(_ project: Project) async throws -> ProjectPHPSelection {
@@ -1656,6 +1864,22 @@ public actor CoreRequestDispatcher {
         )
     }
 
+    private func deactivate(project: Project) async throws -> ProjectReconciliationExecutionResult {
+        let planner = ProjectReconciliationPlanner()
+        let initial = planner.plan(report: try await projectEnvironmentReport(for: project))
+        let fresh = try await projectEnvironmentReport(for: project)
+        let finalInitial = planner.plan(report: fresh)
+        guard let projectID = project.id else {
+            return .init(initialPlan: initial, operations: [.init(operationID: "project.down", state: .failed, message: "Project service claims are unavailable.", verified: false)], finalPlan: finalInitial, state: .failed)
+        }
+        let summary: ProjectServiceReleaseSummary
+        do { summary = try projectServiceBindings.releaseProjectClaims(projectID: projectID) }
+        catch { return .init(initialPlan: initial, operations: [.init(operationID: "project.down", state: .failed, message: "Project service claims could not be released: \(error.localizedDescription)", verified: false)], finalPlan: finalInitial, state: .failed) }
+        let finalPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        let state: ProjectReconciliationExecutionState = summary.failed ? (summary.releasedBindingCount > 0 ? .partial : .failed) : .succeeded
+        return .init(initialPlan: initial, operations: summary.operations, finalPlan: finalPlan, state: state)
+    }
+
     private func activate(project: Project) async throws -> ProjectReconciliationExecutionResult {
         let planner = ProjectReconciliationPlanner()
         let initialReport = try await projectEnvironmentReport(for: project)
@@ -1665,8 +1889,20 @@ public actor CoreRequestDispatcher {
         var results = [ProjectReconciliationOperationResult]()
         var startedMailpit = false
         var startedPHP = false
+        var selectedPHPVersion: String?
+        var serviceClaimsReconciled = freshReport.projectSpec?.version != 2
 
-        for operation in initialPlan.operations {
+        if let projectID = project.id, let spec = freshReport.projectSpec, spec.version == 2,
+           projectServiceBindings.isAvailable {
+            do {
+                try projectServiceBindings.prepareActivation(projectID: projectID, desired: spec.services, observations: freshReport.serviceBindings ?? [])
+                serviceClaimsReconciled = true
+            } catch {
+                results.append(.init(operationID: "service.claims.reconcile", state: .failed, message: "Desired service claims were not reconciled; retired ownership was retained where stop could not be verified: \(error.localizedDescription)", verified: false))
+            }
+        }
+
+        for operation in freshPlan.operations {
             guard operation.disposition != .satisfied else {
                 results.append(.init(operationID: operation.id, state: .satisfied, message: "Already satisfied; no mutation performed.", verified: true))
                 continue
@@ -1692,7 +1928,7 @@ public actor CoreRequestDispatcher {
                     results.append(.init(operationID: operation.id, state: .failed, message: "Mailpit start failed; actual state was re-observed.", verified: false))
                 }
             case "php.fpm.start":
-                guard let php, let version = freshReport.observed.php.resolvedVersion else {
+                guard let php, let version = selectedPHPVersion ?? freshReport.observed.php.resolvedVersion else {
                     results.append(.init(operationID: operation.id, state: .failed, message: "The desired PHP runtime is unavailable at execution time.", verified: false)); continue
                 }
                 do {
@@ -1702,8 +1938,171 @@ public actor CoreRequestDispatcher {
                 } catch {
                     results.append(.init(operationID: operation.id, state: .failed, message: "PHP-FPM start failed; actual state was re-observed.", verified: false))
                 }
+            case "route.create":
+                let routeReport = try await projectEnvironmentReport(for: project)
+                guard let projectID = project.id, let repository = routeRepository,
+                      routeReport.projectSpec == freshReport.projectSpec,
+                      let spec = routeReport.projectSpec, spec.version == 2,
+                      let web = spec.web, web.createRoute,
+                      let host = web.host, let declaredRoot = web.documentRoot, let secure = web.secure,
+                      let socket = routeReport.observed.php.fpmSocket,
+                      routeReport.observed.php.fpmHealth == "healthy",
+                      let absoluteRoot = adoptionDocumentRoot(declaredRoot, projectRoot: project.rootPath.string) else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "Route creation requires complete explicit web intent, a healthy selected PHP-FPM socket, and a document root within the project.", verified: false)); continue
+                }
+                guard (try? ProjectWebRequirement(host: host, documentRoot: declaredRoot, secure: secure)) != nil,
+                      (try? Route(hostname: host, target: .fastCGI(socketPath: socket, documentRoot: absoluteRoot), tls: secure ? .local : .disabled).validated()) != nil else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "The declared host or FastCGI route intent is invalid.", verified: false)); continue
+                }
+                let normalizedHost = host.lowercased()
+                let persisted = try repository.all()
+                let retryIntent = persisted.first { intent in
+                    intent.projectID == projectID.rawValue && intent.projectPath == project.rootPath.string &&
+                    intent.route.hostname.lowercased() == normalizedHost && intent.route.target == .fastCGI(socketPath: socket, documentRoot: absoluteRoot) &&
+                    intent.route.tls == (secure ? .local : .disabled)
+                }
+                let retryIsReviewed = retryIntent.map { intent in
+                    routeReport.routeTargets.count == 1 && routeReport.routeTargets[0].routeID == intent.route.id &&
+                    routeReport.routeTargets[0].providerAgreement == .missing && routeReport.routeTargets[0].associationAuthority == .allowed
+                } ?? false
+                guard (!routeReport.observed.route.intentExists && routeReport.routeTargets.isEmpty) || retryIsReviewed else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "An existing route does not match the same reviewed, durably owned project intent; no route was changed.", verified: false)); continue
+                }
+                let proxies = try localProxyRepository?.list() ?? []
+                let observed = try? await router.observedRoutes()
+                let retryObservationMatches: (Route) -> Bool = { liveRoute in
+                    guard let retryIntent, liveRoute.hostname.lowercased() == normalizedHost,
+                          liveRoute.tls == retryIntent.route.tls else { return false }
+                    guard case .fastCGI(let expectedSocket, let expectedRoot) = retryIntent.route.target,
+                          case .fastCGI(let liveSocket, let liveRoot) = liveRoute.target else { return false }
+                    return liveSocket == expectedSocket && liveRoot == expectedRoot
+                }
+                guard routeIntents.values.allSatisfy({ $0.route.id == retryIntent?.route.id || $0.route.hostname.lowercased() != normalizedHost }),
+                      proxies.allSatisfy({ $0.route.hostname.lowercased() != normalizedHost }),
+                      observed?.allSatisfy({ $0.hostname.lowercased() != normalizedHost || retryObservationMatches($0) }) == true,
+                      let latestProject = try await registry.linkedProject(id: projectID),
+                      latestProject.rootPath == project.rootPath,
+                      try repository.all().allSatisfy({ $0.route.hostname.lowercased() != normalizedHost || $0.route.id == retryIntent?.route.id }) else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "The requested host now has a route, proxy claim, or unavailable live-route evidence; no route was changed.", verified: false)); continue
+                }
+                do {
+                    let dnsStatus: DNSStatus
+                    if let readiness = projectReadinessTestOverride { dnsStatus = readiness.dns } else { dnsStatus = await dns.status() }
+                    let routerStatus = await router.status()
+                    let tlsStatus = secure ? await tls.status() : nil
+                    let portsStatus: StandardPortsStatus
+                    if let readiness = projectReadinessTestOverride { portsStatus = readiness.ports } else { portsStatus = await ports.status() }
+                    guard normalizedHost.hasSuffix(".test"), dnsStatus.health == "healthy",
+                          portsStatus.state == .healthy,
+                          routerStatus.state == .running, routerStatus.health == .healthy else {
+                        results.append(.init(operationID: operation.id, state: .blocked, message: "Local project routes require the .test host namespace, healthy DNS, healthy standard ports, and a healthy router. No route was changed.", verified: false)); continue
+                    }
+                    if secure && (tlsStatus?.state != .trusted || tlsStatus?.trustObserved != true) {
+                        results.append(.init(operationID: operation.id, state: .blocked, message: "Local HTTPS requires an existing trusted Local CA. No route was changed.", verified: false)); continue
+                    }
+                }
+                let latestProxies = try localProxyRepository?.list() ?? []
+                let latestLiveRoutes = try await router.observedRoutes()
+                let latestPersistedRoutes = try repository.all()
+                guard routeIntents.values.allSatisfy({ $0.route.id == retryIntent?.route.id || $0.route.hostname.lowercased() != normalizedHost }),
+                      latestProxies.allSatisfy({ $0.route.hostname.lowercased() != normalizedHost }),
+                      latestLiveRoutes.allSatisfy({ $0.hostname.lowercased() != normalizedHost || retryObservationMatches($0) }),
+                      latestPersistedRoutes.allSatisfy({ $0.route.hostname.lowercased() != normalizedHost || $0.route.id == retryIntent?.route.id }),
+                      let latestProject = try await registry.linkedProject(id: projectID), latestProject.rootPath == project.rootPath else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "Route ownership, host availability, or linked-project evidence changed before mutation; no route was changed.", verified: false)); continue
+                }
+                let route = retryIntent?.route ?? Route(hostname: normalizedHost, target: .fastCGI(socketPath: socket, documentRoot: absoluteRoot), tls: secure ? .local : .disabled)
+                let intent = RouteIntent(route: route, projectID: projectID.rawValue, projectPath: project.rootPath.string)
+                do {
+                    if retryIntent == nil { try repository.createIfHostnameAvailable(intent) }
+                    routeIntents[route.id] = intent
+                    guard (await router.status()).state == .running else { throw RouterError.notRunning }
+                    try await router.reconcile(routes: routeIntents.values.map(\.route))
+                    let live = try await router.observedRoutes()
+                    guard live.contains(where: { observed in
+                        guard case .fastCGI(let observedSocket, let observedRoot) = observed.target,
+                              case .fastCGI(let expectedSocket, let expectedRoot) = route.target else { return false }
+                        return observed.hostname.lowercased() == route.hostname.lowercased() && observedSocket == expectedSocket && observedRoot == expectedRoot && observed.tls == route.tls
+                    }), (await router.status()).health == .healthy else { throw RouterError.notRunning }
+                    results.append(.init(operationID: operation.id, state: .succeeded, message: "The exact project route was saved and observed live.", verified: true))
+                } catch {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "The project route intent is retained with durable ownership, but Caddy reconciliation is pending: \(error.localizedDescription)", verified: false))
+                }
+            case "requirement.php.select":
+                let eligibleVersions = php?.packageObservations().filter { $0.eligibility == .eligible && $0.package != nil }.compactMap(\.version) ?? []
+                guard let projectID = project.id, let php, let requirement = freshReport.projectSpec?.php,
+                      let selected = requirement.resolveInstalledVersion(from: eligibleVersions) else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "No eligible installed PHP package matches the declared requirement.", verified: false)); continue
+                }
+                do {
+                    try await registry.setPHPOverride(selected, for: projectID)
+                    selectedPHPVersion = selected
+                    _ = try php.start(requestedVersion: selected)
+                    startedPHP = true
+                    results.append(.init(operationID: operation.id, state: .succeeded, message: "PHP \(selected) matching the declared requirement was selected and started for this project.", verified: false))
+                } catch {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "The exact PHP version could not be selected: \(error.localizedDescription)", verified: false))
+                }
             case let id where id.hasPrefix("route.php-target.update."):
                 continue
+            case "requirement.node":
+                guard let projectID = project.id, let selectedVersion = freshReport.nodeRequirementVersion, let version = try? NodeVersion(selectedVersion), freshReport.nodeRequirementState == "available" else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: operation.reason ?? "The exact Node runtime is unavailable.", verified: false)); continue
+                }
+                do {
+                    try await registry.setNodeOverride(version, for: projectID)
+                    results.append(.init(operationID: operation.id, state: .succeeded, message: "The exact installed Node runtime was selected for this project.", verified: false))
+                } catch {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "The exact Node runtime could not be selected: \(error.localizedDescription)", verified: false))
+                }
+            case "route.project-association.attach":
+                guard let projectID = project.id, let routeRepository else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "A unique safely associable durable route could not be verified.", verified: false)); continue
+                }
+                if let persisted = try? routeRepository.all() { routeIntents = Dictionary(uniqueKeysWithValues: persisted.map { ($0.route.id, $0) }) }
+                let currentRouteReport = try await projectEnvironmentReport(for: project)
+                let persistedRoutes = try routeRepository.all()
+                let candidates = routeIntents.values.filter { $0.route.hostname == currentRouteReport.observed.route.hostname && $0.projectID == nil }
+                let persistedHostRoutes = persistedRoutes.filter { $0.route.hostname == currentRouteReport.observed.route.hostname }
+                guard candidates.count == 1, let intent = candidates.first,
+                      persistedHostRoutes.count == 1,
+                      currentRouteReport.observed.route.associationState == .safelyAssociable,
+                      currentRouteReport.observed.route.intentExists,
+                      currentRouteReport.observed.route.hostname == intent.route.hostname,
+                      currentRouteReport.observed.route.documentRoot == routeDocumentRoot(intent.route),
+                      currentRouteReport.observed.route.target == routeTargetDescription(intent.route.target),
+                      currentRouteReport.observed.route.tls == intent.route.tls,
+                      persistedHostRoutes.first == intent,
+                      try localProxyRepository?.list().contains(where: { $0.routeID == intent.route.id }) != true else {
+                    results.append(.init(operationID: operation.id, state: .blocked, message: "The reviewed route is ambiguous, already owned, or belongs to a local proxy.", verified: false)); continue
+                }
+                do {
+                    try routeRepository.associateMetadata(id: intent.route.id, projectID: projectID.rawValue, projectPath: project.rootPath.string)
+                    routeIntents[intent.route.id] = RouteIntent(route: intent.route, projectID: projectID.rawValue, projectPath: project.rootPath.string)
+                    results.append(.init(operationID: operation.id, state: .succeeded, message: "The unique reviewed route was durably associated with this project.", verified: true))
+                } catch {
+                    results.append(.init(operationID: operation.id, state: .failed, message: "The durable route association failed: \(error.localizedDescription)", verified: false))
+                }
+            case let id where id.hasPrefix("service."):
+                guard serviceClaimsReconciled else {
+                    results.append(.init(operationID: id, state: .blocked, message: "Service claims were not reconciled after lifecycle preflight.", verified: false)); continue
+                }
+                guard let projectID = project.id, let binding = freshReport.projectSpec?.services.first(where: { "service.\($0.alias.value)" == id }) else {
+                    results.append(.init(operationID: id, state: .blocked, message: operation.reason ?? "This exact service operation is unsupported.", verified: false)); continue
+                }
+                let instanceID = ServiceInstanceID(kind: binding.kind, name: binding.instance)
+                guard let observation = freshReport.serviceBindings?.first(where: { $0.binding.alias == binding.alias }),
+                      let record = try projectServiceBindings.record(for: instanceID),
+                      let current = freshReport.serviceBindings?.first(where: { $0.binding.alias == binding.alias }), current.binding == binding,
+                      current == observation else {
+                    results.append(.init(operationID: id, state: .blocked, message: "The exact \(binding.kind.rawValue) catalog observation did not verify before mutation.", verified: false)); continue
+                }
+                do {
+                    try projectServiceBindings.activate(binding, projectID: projectID, record: record, action: operation.action, expected: observation)
+                    results.append(.init(operationID: id, state: .succeeded, message: "Exact \(binding.kind.rawValue) instance is claimed and healthy.", verified: true))
+                } catch {
+                    results.append(.init(operationID: id, state: .failed, message: "\(binding.kind.rawValue) activation failed: \(error.localizedDescription). The project claim was retained for retry.", verified: false))
+                }
             default:
                 results.append(.init(operationID: operation.id, state: .skipped, message: "This operation is not executable in M9.", verified: false))
             }
@@ -1730,6 +2129,12 @@ public actor CoreRequestDispatcher {
             }
         }
         finalPlan = planner.plan(report: try await projectEnvironmentReport(for: project))
+        for index in results.indices where results[index].state == .blocked {
+            let operationID = results[index].operationID
+            guard operationID.hasPrefix("requirement.web.") || operationID.hasPrefix("route.php-target.update."),
+                  finalPlan.operations.first(where: { $0.id == operationID })?.disposition == .satisfied else { continue }
+            results[index] = .init(operationID: operationID, state: .satisfied, message: "Final observation proves this route requirement is satisfied.", verified: true)
+        }
         let state: ProjectReconciliationExecutionState
         if finalPlan.state == .satisfied && results.allSatisfy({ $0.state == .satisfied || $0.state == .succeeded }) {
             state = .succeeded

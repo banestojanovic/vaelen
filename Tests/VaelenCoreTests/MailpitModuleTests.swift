@@ -4,6 +4,17 @@ import Foundation
 @testable import VaelenCore
 
 final class MailpitModuleTests: XCTestCase {
+    func testProjectBindingSnapshotUsesExactInstanceDirectoryAndBothConfiguredPorts() throws {
+        let fixture = try makeFixture(resistTermination: false)
+        defer { removeTestRoot(fixture.root) }
+        let snapshot = fixture.module.projectBindingSnapshot()
+        XCTAssertEqual(snapshot.record?.packageIdentifier, "mailpit-1.31.1")
+        XCTAssertEqual(snapshot.record?.dataDirectory, URL(fileURLWithPath: fixture.module.instanceDatabasePath()).deletingLastPathComponent().path)
+        XCTAssertEqual(snapshot.record?.endpoint.portNumbers.first, fixture.configuration.smtpPort)
+        XCTAssertEqual(snapshot.record?.endpoint.portNumbers.second, fixture.configuration.httpPort)
+        XCTAssertEqual(snapshot.health, "installed")
+    }
+
     func testRemoveVerifiedPackagePreservesInboxDatabaseAndLogs() throws {
         guard let source = MailpitModule().installedVersions().first else { throw XCTSkip("installed Mailpit package prerequisite unavailable") }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mailpit-remove-\(UUID().uuidString)", isDirectory: true)
@@ -175,6 +186,47 @@ final class MailpitModuleTests: XCTestCase {
         let persistedMessages = try await fetchMessages(port: configuration.httpPort)
         XCTAssertTrue(persistedMessages.contains("mailpit-test-subject"), persistedMessages)
         _ = try module.stop()
+    }
+
+    func testInstalledPackageUnderPrivateTmpHasVerifiedIdentityAndStopsSafely() throws {
+        let package = try testPackage()
+        let root = URL(fileURLWithPath: "/private/tmp/vmp-\(UUID().uuidString)", isDirectory: true)
+        let configuration = try testConfiguration()
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        try copy(package: package, into: layout)
+        let module = MailpitModule(layout: layout, configuration: configuration)
+        var serviceMayHaveStarted = false
+        defer {
+            let mayRemoveRoot: Bool
+            if serviceMayHaveStarted || module.status().state == .running {
+                do {
+                    _ = try module.stop()
+                    let state = module.status().state
+                    mayRemoveRoot = state == .stopped || state == .installed
+                } catch {
+                    mayRemoveRoot = false
+                }
+            } else {
+                mayRemoveRoot = true
+            }
+            if mayRemoveRoot { removeTestRoot(root) }
+        }
+
+        serviceMayHaveStarted = true
+        let started = try module.start()
+        let pid = try XCTUnwrap(started.pid)
+        XCTAssertEqual(started.state, .running)
+        XCTAssertEqual(started.health, "healthy")
+        XCTAssertEqual(started.executablePath, layout.mailpitPackagesDirectoryURL.appendingPathComponent(package.version, isDirectory: true).appendingPathComponent("mailpit").path)
+        XCTAssertTrue(portAcceptsConnection(configuration.smtpPort))
+        XCTAssertTrue(portAcceptsConnection(configuration.httpPort))
+        XCTAssertTrue(isProcessLive(pid))
+
+        let stopped = try module.stop()
+        XCTAssertEqual(stopped.state, .stopped)
+        XCTAssertFalse(isProcessLive(pid))
+        XCTAssertFalse(portAcceptsConnection(configuration.smtpPort))
+        XCTAssertFalse(portAcceptsConnection(configuration.httpPort))
     }
 
     func testExternalPortConflictDoesNotStartOrSignalAnything() throws {

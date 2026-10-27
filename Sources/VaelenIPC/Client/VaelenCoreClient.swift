@@ -126,6 +126,17 @@ public actor VaelenCoreClient {
         try await projectEnvironment(method: .projectInspect, selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID)
     }
 
+    public func projectAdoptionPreview(selector: String?, workingDirectory: String) async throws -> ProjectAdoptionPreviewResult {
+        let request = IPCRequest(method: .projectAdoptionPreview, params: .projectAdoptionPreview(.init(selector: selector, workingDirectory: workingDirectory)))
+        guard case .projectAdoptionPreview(let result) = try result(from: await send(request)) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
+    public func projectAdoptionApply(_ request: ProjectAdoptionApplyRequest) async throws -> ProjectAdoptionApplyResult {
+        guard case .projectAdoptionApply(let result) = try result(from: await send(IPCRequest(method: .projectAdoptionApply, params: .projectAdoptionApply(request)))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
     public func projectDoctor(selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
         try await projectEnvironment(method: .projectDoctor, selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID)
     }
@@ -137,6 +148,11 @@ public actor VaelenCoreClient {
 
     public func projectActivate(selector: String?, workingDirectory: String) async throws -> ProjectReconciliationExecutionResult {
         guard case .projectActivation(let result) = try result(from: await send(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
+        return result.execution
+    }
+
+    public func projectDown(selector: String?, workingDirectory: String) async throws -> ProjectReconciliationExecutionResult {
+        guard case .projectActivation(let result) = try result(from: await send(IPCRequest(method: .projectDown, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory))))) else { throw CoreClientError.invalidResponse }
         return result.execution
     }
 
@@ -311,6 +327,8 @@ public actor VaelenCoreClient {
     public func portsInstall() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsInstall))) else { throw CoreClientError.invalidResponse }; return result.ports }
     public func portsRemove() async throws -> StandardPortsStatus { guard case .portsStatus(let result) = try result(from: await send(IPCRequest(method: .portsRemove))) else { throw CoreClientError.invalidResponse }; return result.ports }
     public func logsCatalog() async throws -> [CoreLogEntry] { guard case .logsCatalog(let result) = try result(from: await send(IPCRequest(method: .logsCatalog))) else { throw CoreClientError.invalidResponse }; return result.logs }
+    public func serviceInstances() async throws -> ServiceInstanceInventoryResult { guard case .serviceInstances(let result) = try result(from: await send(IPCRequest(method: .serviceInstances))) else { throw CoreClientError.invalidResponse }; return result }
+    public func serviceInstanceLifecycle(_ request: ServiceInstanceLifecycleRequest) async throws -> ServiceInstanceLifecycleResult { guard case .serviceInstanceLifecycle(let result) = try result(from: await send(IPCRequest(method: .serviceInstanceLifecycle, params: .serviceInstanceLifecycle(request)))) else { throw CoreClientError.invalidResponse }; return result }
     public func logsTail(id: String, lines: Int) async throws -> CoreLogTail { guard case .logsTail(let result) = try result(from: await send(IPCRequest(method: .logsTail, params: .logsTail(.init(id: id, lines: lines))))) else { throw CoreClientError.invalidResponse }; return result.tail }
 
     public func disconnect() async {

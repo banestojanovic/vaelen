@@ -9,7 +9,7 @@ public enum SQLiteStateError: Error, Equatable, Sendable {
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public final class SQLiteStateStore: @unchecked Sendable {
-    public static let schemaVersion = 8
+    public static let schemaVersion = 9
     private var database: OpaquePointer?
     internal var databasePointer: OpaquePointer? { database }
 
@@ -18,6 +18,12 @@ public final class SQLiteStateStore: @unchecked Sendable {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: databaseURL.deletingLastPathComponent().path)
         guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
             throw SQLiteStateError.open(message)
+        }
+        guard sqlite3_exec(database, "PRAGMA foreign_keys = ON", nil, nil, nil) == SQLITE_OK else {
+            let error = message
+            sqlite3_close(database)
+            database = nil
+            throw SQLiteStateError.execute(error)
         }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
         do { try initialize() } catch { sqlite3_close(database); database = nil; throw error }
@@ -125,6 +131,12 @@ public final class SQLiteStateStore: @unchecked Sendable {
             if version <= 7 {
                 try execute("ALTER TABLE projects ADD COLUMN node_override_version TEXT NULL")
                 try execute("PRAGMA user_version = 8")
+            }
+            if version <= 8 {
+                try execute("CREATE TABLE service_instances (kind TEXT NOT NULL, name TEXT NOT NULL, package_identifier TEXT NOT NULL, endpoint_kind TEXT NOT NULL, endpoint_port1 INTEGER NOT NULL, endpoint_port2 INTEGER NULL, data_directory TEXT NOT NULL, PRIMARY KEY(kind, name), CHECK (kind IN ('mysql','postgresql','redis','valkey','mailpit')), CHECK (endpoint_kind = kind), CHECK (endpoint_port1 BETWEEN 1 AND 65535), CHECK (endpoint_port2 IS NULL OR endpoint_port2 BETWEEN 1 AND 65535), CHECK ((endpoint_kind = 'mailpit' AND endpoint_port2 IS NOT NULL AND endpoint_port1 <> endpoint_port2) OR (endpoint_kind <> 'mailpit' AND endpoint_port2 IS NULL)))")
+                try execute("CREATE TABLE project_service_claims (project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, alias TEXT NOT NULL, kind TEXT NOT NULL, instance_name TEXT NOT NULL, version TEXT NULL, PRIMARY KEY(project_id, alias), FOREIGN KEY(kind, instance_name) REFERENCES service_instances(kind, name))")
+                try execute("CREATE TABLE manual_service_claims (kind TEXT NOT NULL, instance_name TEXT NOT NULL, PRIMARY KEY(kind, instance_name), FOREIGN KEY(kind, instance_name) REFERENCES service_instances(kind, name))")
+                try execute("PRAGMA user_version = 9")
             }
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

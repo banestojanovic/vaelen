@@ -105,11 +105,26 @@ public final class MailpitModule: @unchecked Sendable {
             try? manager.removeItem(at: paths.process)
             return makeStatus(state: package == nil ? .notInstalled : .stopped, health: "stopped", package: package, pid: nil, paths: paths)
         }
-        guard let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record,
-              child.executablePath == record.executable, child.arguments == record.arguments,
+        guard let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record, let executablePath = child.executablePath,
+              canonicalExecutablePath(executablePath) == canonicalExecutablePath(record.executable), child.arguments == record.arguments,
               processMatches(record) else { return makeStatus(state: .unhealthy, health: "identity-unverified", package: package, pid: record.pid, paths: paths, record: record) }
         guard httpReady(port: record.httpPort), smtpReady(port: record.smtpPort) else { return makeStatus(state: .unhealthy, health: "not-ready", package: package, pid: record.pid, paths: paths) }
         return makeStatus(state: .running, health: "healthy", package: package, pid: record.pid, paths: paths, record: record)
+    }
+
+    public func projectBindingSnapshot() -> ModuleOwnedServiceSnapshot {
+        let observed = status()
+        let paths = instancePaths()
+        guard let version = observed.installedVersion,
+              observed.database == paths.database.path,
+              observed.smtpPort == configuration.smtpPort,
+              observed.httpPort == configuration.httpPort,
+              let endpoint = try? ServiceInstanceEndpoint.mailpit(smtpPort: observed.smtpPort, httpPort: observed.httpPort),
+              let name = try? ProjectInstanceName("default"),
+              let record = try? ServiceInstanceRecord(id: ServiceInstanceID(kind: .mailpit, name: name), packageIdentifier: "mailpit-\(version)", endpoint: endpoint, dataDirectory: paths.instance.path) else {
+            return .init(record: nil, health: observed.health)
+        }
+        return .init(record: record, health: observed.health)
     }
 
     public func start() throws -> MailpitStatus {
@@ -132,8 +147,8 @@ public final class MailpitModule: @unchecked Sendable {
             if manager.fileExists(atPath: paths.process.path) { try manager.removeItem(at: paths.process) }
             return status()
         }
-        guard let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record,
-              child.executablePath == record.executable, child.arguments == record.arguments,
+        guard let child = ownedChild, child.processIdentifier == record.pid, ownedRecord == record, let executablePath = child.executablePath,
+              canonicalExecutablePath(executablePath) == canonicalExecutablePath(record.executable), child.arguments == record.arguments,
               processMatches(record) else { throw MailpitModuleError.processIdentityMismatch }
         guard child.terminateAndWait(timeout: 3) else {
             throw MailpitModuleError.unhealthy("Owned Mailpit PID \(record.pid) did not exit after graceful termination; process record retained for retry")
@@ -155,7 +170,107 @@ public final class MailpitModule: @unchecked Sendable {
     private func makeStatus(state: MailpitState, health: String, package: MailpitPackage?, pid: Int32?, paths: InstancePaths, record: MailpitProcessRecord? = nil) -> MailpitStatus { MailpitStatus(state: state, health: health, installedVersion: package?.version, pid: pid, smtpPort: record?.smtpPort ?? configuration.smtpPort, httpPort: record?.httpPort ?? configuration.httpPort, database: record?.database ?? paths.database.path, uiEndpoint: "http://127.0.0.1:\(record?.httpPort ?? configuration.httpPort)", executablePath: package?.executablePath ?? record?.executable ?? "", uptime: pid.flatMap(processUptime), memoryBytes: pid.flatMap(processMemory), cpuPercent: pid.flatMap(processCPU)) }
     private func processRecord(_ paths: InstancePaths) -> MailpitProcessRecord? { try? JSONDecoder().decode(MailpitProcessRecord.self, from: Data(contentsOf: paths.process)) }
     private func processExists(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
-    private func processMatches(_ record: MailpitProcessRecord) -> Bool { guard processExists(record.pid) else { return false }; let commandLine = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])) ?? ""; let user = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "user="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; let start = (try? command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; return user == record.user && commandLine.contains(record.executable) && record.arguments.allSatisfy { commandLine.contains($0) } && start == record.startedAt }
+    private func canonicalExecutablePath(_ path: String) -> String { URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path }
+    private func processMatches(_ record: MailpitProcessRecord) -> Bool {
+        guard processExists(record.pid),
+              let arguments = processArguments(record.pid),
+              let user = try? identityCommand("/bin/ps", ["-p", "\(record.pid)", "-o", "user="]).trimmingCharacters(in: .whitespacesAndNewlines),
+              let start = try? identityCommand("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]).trimmingCharacters(in: .whitespacesAndNewlines),
+              let openExecutables = try? identityCommand("/usr/sbin/lsof", ["-p", "\(record.pid)", "-a", "-d", "txt", "-Fn"]) else { return false }
+        let expectedExecutable = URL(fileURLWithPath: record.executable).resolvingSymlinksInPath().path
+        let executablePaths = openExecutables.split(separator: "\n").compactMap { entry -> String? in
+            guard entry.first == "n" else { return nil }
+            return URL(fileURLWithPath: String(entry.dropFirst())).resolvingSymlinksInPath().path
+        }
+        let nativeExecutableMatches = executablePaths.contains(expectedExecutable)
+            && Array(arguments.dropFirst()) == record.arguments
+        let scriptArgumentMatches = arguments.indices.contains { index in
+            URL(fileURLWithPath: arguments[index]).resolvingSymlinksInPath().path == expectedExecutable
+                && Array(arguments.dropFirst(index + 1)) == record.arguments
+        }
+        return processExists(record.pid) && user == record.user
+            && (nativeExecutableMatches || scriptArgumentMatches) && start == record.startedAt
+    }
+    private func processArguments(_ pid: Int32) -> [String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0, size >= MemoryLayout<Int32>.size else { return nil }
+        var bytes = [UInt8](repeating: 0, count: size)
+        let result = bytes.withUnsafeMutableBytes { buffer in
+            sysctl(&mib, u_int(mib.count), buffer.baseAddress, &size, nil, 0)
+        }
+        guard result == 0 else { return nil }
+        let argc = bytes.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        guard argc > 0 else { return nil }
+        var cursor = MemoryLayout<Int32>.size
+        while cursor < size, bytes[cursor] != 0 { cursor += 1 }
+        while cursor < size, bytes[cursor] == 0 { cursor += 1 }
+        var arguments = [String]()
+        for _ in 0..<argc {
+            guard cursor < size else { return nil }
+            let start = cursor
+            while cursor < size, bytes[cursor] != 0 { cursor += 1 }
+            guard let value = String(bytes: bytes[start..<cursor], encoding: .utf8) else { return nil }
+            arguments.append(value)
+            cursor += 1
+        }
+        return arguments.count == Int(argc) ? arguments : nil
+    }
+    private func identityCommand(_ executable: String, _ arguments: [String]) throws -> String {
+        let process = Process()
+        let pipe = Pipe()
+        let finished = DispatchSemaphore(value: 0)
+        let outputClosed = DispatchSemaphore(value: 0)
+        let output = MailpitCommandOutputBuffer()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                outputClosed.signal()
+            } else {
+                output.append(data)
+            }
+        }
+        process.terminationHandler = { _ in finished.signal() }
+        do { try process.run() } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            throw error
+        }
+        let deadline = DispatchTime.now() + 0.75
+        let processExited = finished.wait(timeout: deadline) == .success
+        let stdoutClosed = outputClosed.wait(timeout: deadline) == .success
+        if !processExited || !stdoutClosed {
+            var readerCleanupIsDeferred = false
+            if !processExited {
+                process.terminate()
+                if finished.wait(timeout: .now() + 0.25) == .timedOut {
+                    let reader = pipe.fileHandleForReading
+                    reader.readabilityHandler = nil
+                    process.terminationHandler = { [process, reader] _ in
+                        reader.readabilityHandler = nil
+                        try? reader.close()
+                        process.terminationHandler = nil
+                    }
+                    if process.isRunning {
+                        readerCleanupIsDeferred = true
+                        _ = kill(process.processIdentifier, SIGKILL)
+                    } else {
+                        process.terminationHandler = nil
+                        try? reader.close()
+                    }
+                }
+            }
+            pipe.fileHandleForReading.readabilityHandler = nil
+            if !readerCleanupIsDeferred { try? pipe.fileHandleForReading.close() }
+            throw MailpitModuleError.processFailed("identity probe exceeded its timeout")
+        }
+        pipe.fileHandleForReading.readabilityHandler = nil
+        guard process.terminationStatus == 0 else { throw MailpitModuleError.processFailed("identity probe failed") }
+        return String(data: output.data, encoding: .utf8) ?? ""
+    }
     private func connect(port: Int) -> Int32? { let descriptor = socket(AF_INET, SOCK_STREAM, 0); guard descriptor >= 0 else { return nil }; var timeout = timeval(tv_sec: 0, tv_usec: 250_000); setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)); setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)); var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = in_port_t(UInt16(port).bigEndian); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1")); let result = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }; guard result == 0 else { close(descriptor); return nil }; return descriptor }
     private func httpReady(port: Int) -> Bool { guard let descriptor = connect(port: port) else { return false }; defer { close(descriptor) }; guard sendAll(descriptor, data: Data("GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".utf8)) else { return false }; var data = Data(); var buffer = [UInt8](repeating: 0, count: 1024); while true { let count = recv(descriptor, &buffer, buffer.count, 0); if count <= 0 { break }; data.append(buffer, count: count) }; return String(data: data, encoding: .utf8)?.contains(" 200 ") == true }
     private func smtpReady(port: Int) -> Bool { guard let descriptor = connect(port: port) else { return false }; defer { close(descriptor) }; var buffer = [UInt8](repeating: 0, count: 512); let count = recv(descriptor, &buffer, buffer.count, 0); return count > 3 && String(decoding: buffer.prefix(count), as: UTF8.self).hasPrefix("220") }
@@ -175,4 +290,11 @@ public final class MailpitModule: @unchecked Sendable {
     private func processMemory(_ pid: Int32) -> UInt64? { guard let value = try? command("/bin/ps", ["-p", "\(pid)", "-o", "rss="]).trimmingCharacters(in: .whitespacesAndNewlines), let kb = UInt64(value) else { return nil }; return kb * 1024 }
     private func processCPU(_ pid: Int32) -> Double? { guard let value = try? command("/bin/ps", ["-p", "\(pid)", "-o", "%cpu="]).trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }; return Double(value) }
     private func logText(_ url: URL) -> String { (try? String(contentsOf: url, encoding: .utf8)) ?? "" }
+}
+
+private final class MailpitCommandOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+    var data: Data { lock.lock(); defer { lock.unlock() }; return storage }
+    func append(_ data: Data) { lock.lock(); storage.append(data); lock.unlock() }
 }

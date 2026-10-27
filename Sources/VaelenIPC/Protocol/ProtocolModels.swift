@@ -68,9 +68,12 @@ public enum CoreMethod: String, Sendable {
     case projectStatus = "project.status"
     case projectObservationSnapshot = "project.observation-snapshot"
     case projectInspect = "project.inspect"
+    case projectAdoptionPreview = "project.adoption.preview"
+    case projectAdoptionApply = "project.adoption.apply"
     case projectDoctor = "project.doctor"
     case projectPlan = "project.plan"
     case projectActivate = "project.activate"
+    case projectDown = "project.down"
     case projectPHP = "project.php"
     case projectPHPSelections = "project.php.selections"
     case pathPark = "path.park"
@@ -132,6 +135,8 @@ public enum CoreMethod: String, Sendable {
     case portsRemove = "ports.remove"
     case logsCatalog = "logs.catalog"
     case logsTail = "logs.tail"
+    case serviceInstances = "service.instances"
+    case serviceInstanceLifecycle = "service.instance.lifecycle"
 }
 
 public enum RequestParams: Codable, Equatable, Sendable {
@@ -141,6 +146,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case unlink(UnlinkProjectRequest)
     case listProjects(ListProjectsRequest)
     case projectEnvironment(ProjectEnvironmentRequest)
+    case projectAdoptionPreview(ProjectEnvironmentRequest)
+    case projectAdoptionApply(ProjectAdoptionApplyRequest)
     case projectPHP(ProjectPHPRequest)
     case park(ParkPathRequest)
     case unpark(UnparkPathRequest)
@@ -156,6 +163,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case localProxyRemove(LocalProxyRemoveRequest)
     case dnsInstall(DNSInstallRequest)
     case logsTail(LogsTailRequest)
+    case serviceInstanceLifecycle(ServiceInstanceLifecycleRequest)
     case empty
     case raw(JSONValue)
 
@@ -167,6 +175,8 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .unlink(let value): try value.encode(to: encoder)
         case .listProjects(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
+        case .projectAdoptionPreview(let value): try value.encode(to: encoder)
+        case .projectAdoptionApply(let value): try value.encode(to: encoder)
         case .projectPHP(let value): try value.encode(to: encoder)
         case .park(let value): try value.encode(to: encoder)
         case .unpark(let value): try value.encode(to: encoder)
@@ -182,6 +192,7 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .localProxyRemove(let value): try value.encode(to: encoder)
         case .dnsInstall(let value): try value.encode(to: encoder)
         case .logsTail(let value): try value.encode(to: encoder)
+        case .serviceInstanceLifecycle(let value): try value.encode(to: encoder)
         case .empty: try EmptyParams().encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
@@ -201,9 +212,12 @@ public enum RequestParams: Codable, Equatable, Sendable {
                 self = .phpConfigurationUpdate(params); return
             }
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
+            if fields["confirmation"] != nil, let params = try? IPCCodec.decode(ProjectAdoptionApplyRequest.self, from: IPCCodec.encode(value)) { self = .projectAdoptionApply(params); return }
+            if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectEnvironmentRequest.self, from: IPCCodec.encode(value)) { self = .projectAdoptionPreview(params); return }
             if fields["workingDirectory"] != nil, fields.count == 1, let params = try? IPCCodec.decode(PHPResolveRequest.self, from: IPCCodec.encode(value)) { self = .phpResolve(params); return }
             if fields["takeover"] != nil, let params = try? IPCCodec.decode(DNSInstallRequest.self, from: IPCCodec.encode(value)) { self = .dnsInstall(params); return }
             if fields["id"] != nil, fields["lines"] != nil, let params = try? IPCCodec.decode(LogsTailRequest.self, from: IPCCodec.encode(value)) { self = .logsTail(params); return }
+            if fields["action"] != nil, fields["name"] != nil, let params = try? IPCCodec.decode(ServiceInstanceLifecycleRequest.self, from: IPCCodec.encode(value)) { self = .serviceInstanceLifecycle(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, let params = try? IPCCodec.decode(RouteProjectAssociationRequest.self, from: IPCCodec.encode(value)) { self = .routeAssociation(params); return }
             if fields["routeID"] != nil, fields["projectID"] != nil, fields["expectedCurrentSocket"] != nil, let params = try? IPCCodec.decode(RoutePHPTargetUpdateRequest.self, from: IPCCodec.encode(value)) { self = .routePHPTargetUpdate(params); return }
             if fields["hostname"] != nil, fields["upstreamURL"] != nil, let params = try? IPCCodec.decode(LocalProxyCreateRequest.self, from: IPCCodec.encode(value)) { self = .localProxyCreate(params); return }
@@ -387,6 +401,35 @@ public struct ProjectEnvironmentResult: Codable, Equatable, Sendable {
     public init(report: ProjectEnvironmentReport) { self.report = report }
 }
 
+public struct ProjectAdoptionPreviewResult: Codable, Equatable, Sendable {
+    public let confirmation: UUID
+    public let preview: ProjectAdoptionPreview
+    public init(confirmation: UUID, preview: ProjectAdoptionPreview) { self.confirmation = confirmation; self.preview = preview }
+}
+
+public struct ProjectAdoptionApplyRequest: Codable, Equatable, Sendable {
+    public let confirmation: UUID
+    public let selector: String?
+    public let workingDirectory: String
+    public let spec: ProjectEnvironmentSpec
+    public let selectedRouteIDs: [RouteID]
+    public let createRoute: Bool
+    public let webChoiceConfirmed: Bool
+    public init(confirmation: UUID, selector: String?, workingDirectory: String, spec: ProjectEnvironmentSpec, selectedRouteIDs: [RouteID] = [], createRoute: Bool = false, webChoiceConfirmed: Bool = false) {
+        self.confirmation = confirmation; self.selector = selector; self.workingDirectory = workingDirectory; self.spec = spec; self.selectedRouteIDs = selectedRouteIDs; self.createRoute = createRoute; self.webChoiceConfirmed = webChoiceConfirmed
+    }
+}
+
+public struct ProjectAdoptionApplyResult: Codable, Equatable, Sendable {
+    public let identity: ProjectEnvironmentIdentity
+    public let manifestCreated: Bool
+    public let claimedServices: [ProjectServiceBinding]
+    public let selectedRoutes: [RouteID]
+    public init(identity: ProjectEnvironmentIdentity, manifestCreated: Bool, claimedServices: [ProjectServiceBinding], selectedRoutes: [RouteID]) {
+        self.identity = identity; self.manifestCreated = manifestCreated; self.claimedServices = claimedServices; self.selectedRoutes = selectedRoutes
+    }
+}
+
 public struct ProjectObservationSnapshotResult: Codable, Equatable, Sendable {
     public let snapshotID: UUID
     public init(snapshotID: UUID) { self.snapshotID = snapshotID }
@@ -557,6 +600,89 @@ public struct LogsTailRequest: Codable, Equatable, Sendable { public let id: Str
 public struct LogsCatalogResult: Codable, Equatable, Sendable { public let logs: [CoreLogEntry]; public init(logs: [CoreLogEntry]) { self.logs = logs } }
 public struct LogsTailResult: Codable, Equatable, Sendable { public let tail: CoreLogTail; public init(tail: CoreLogTail) { self.tail = tail } }
 
+public enum ServiceInstanceEndpointWire: Codable, Equatable, Sendable {
+    case mysql(port: Int), postgresql(port: Int), redis(port: Int), valkey(port: Int), mailpit(smtpPort: Int, httpPort: Int)
+    public init(_ endpoint: ServiceInstanceEndpoint) {
+        let ports = endpoint.portNumbers
+        switch endpoint.kind {
+        case .mysql: self = .mysql(port: ports.first)
+        case .postgresql: self = .postgresql(port: ports.first)
+        case .redis: self = .redis(port: ports.first)
+        case .valkey: self = .valkey(port: ports.first)
+        case .mailpit: self = .mailpit(smtpPort: ports.first, httpPort: ports.second!)
+        }
+    }
+    public var displayEndpoints: [String] {
+        switch self {
+        case .mysql(let port): ["mysql 127.0.0.1:\(port)"]
+        case .postgresql(let port): ["postgresql 127.0.0.1:\(port)"]
+        case .redis(let port): ["redis 127.0.0.1:\(port)"]
+        case .valkey(let port): ["valkey 127.0.0.1:\(port)"]
+        case .mailpit(let smtp, let http): ["smtp 127.0.0.1:\(smtp)", "http 127.0.0.1:\(http)"]
+        }
+    }
+}
+
+public struct ServiceInstanceRecordWire: Codable, Equatable, Sendable {
+    public let kind: ProjectServiceKind
+    public let name: ProjectInstanceName
+    public let packageIdentifier: String
+    public let endpoint: ServiceInstanceEndpointWire
+    public let dataDirectory: String
+    public init(_ record: ServiceInstanceRecord) { kind = record.id.kind; name = record.id.name; packageIdentifier = record.packageIdentifier; endpoint = .init(record.endpoint); dataDirectory = record.dataDirectory }
+    public init(kind: ProjectServiceKind, name: ProjectInstanceName, packageIdentifier: String, endpoint: ServiceInstanceEndpointWire, dataDirectory: String) { self.kind = kind; self.name = name; self.packageIdentifier = packageIdentifier; self.endpoint = endpoint; self.dataDirectory = dataDirectory }
+}
+
+public enum ServiceInstanceClaimWire: Codable, Equatable, Sendable {
+    case manual
+    case project(projectID: ProjectID, alias: ProjectBindingAlias, version: String?)
+    public init(_ claim: ServiceInstanceClaim) {
+        switch claim {
+        case .manual: self = .manual
+        case .project(let projectID, let binding): self = .project(projectID: projectID, alias: binding.alias, version: binding.version)
+        }
+    }
+}
+
+public struct ServiceInstanceInventoryEntryWire: Codable, Equatable, Sendable {
+    public let instance: ServiceInstanceRecordWire
+    public let owners: [ServiceInstanceClaimWire]
+    public let assessedHealth: String?
+    public let eligibleForProjectBinding: Bool?
+    public var identity: String { "\(instance.kind.rawValue):\(instance.name.value)" }
+    public init(_ entry: ServiceInstanceInventoryEntry, assessedHealth: String? = nil, eligibleForProjectBinding: Bool? = nil) { instance = .init(entry.record); owners = entry.claims.map(ServiceInstanceClaimWire.init); self.assessedHealth = assessedHealth; self.eligibleForProjectBinding = eligibleForProjectBinding }
+    public init(instance: ServiceInstanceRecordWire, owners: [ServiceInstanceClaimWire], assessedHealth: String? = nil, eligibleForProjectBinding: Bool? = nil) { self.instance = instance; self.owners = owners; self.assessedHealth = assessedHealth; self.eligibleForProjectBinding = eligibleForProjectBinding }
+}
+
+public struct ServiceInstanceInventoryResult: Codable, Equatable, Sendable {
+    public let entries: [ServiceInstanceInventoryEntryWire]
+    public init(_ snapshot: ServiceInstanceInventorySnapshot) { entries = snapshot.entries.map { ServiceInstanceInventoryEntryWire($0) } }
+    public init(entries: [ServiceInstanceInventoryEntryWire]) { self.entries = entries }
+}
+
+public enum ServiceInstanceLifecycleAction: String, Codable, Sendable { case create, status, start, stop, remove }
+public struct ServiceInstanceLifecycleRequest: Codable, Equatable, Sendable {
+    public let kind: ProjectServiceKind
+    public let action: ServiceInstanceLifecycleAction
+    public let name: String
+    public let port: Int?
+    public init(kind: ProjectServiceKind = .postgresql, action: ServiceInstanceLifecycleAction, name: String, port: Int? = nil) { self.kind = kind; self.action = action; self.name = name; self.port = port }
+    private enum CodingKeys: String, CodingKey { case kind, action, name, port }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try values.decodeIfPresent(ProjectServiceKind.self, forKey: .kind) ?? .postgresql
+        action = try values.decode(ServiceInstanceLifecycleAction.self, forKey: .action)
+        name = try values.decode(String.self, forKey: .name)
+        port = try values.decodeIfPresent(Int.self, forKey: .port)
+    }
+}
+public struct ServiceInstanceLifecycleResult: Codable, Equatable, Sendable {
+    public let instance: ServiceInstanceRecordWire?
+    public let health: String
+    public let pid: Int32?
+    public init(instance: ServiceInstanceRecordWire?, health: String, pid: Int32?) { self.instance = instance; self.health = health; self.pid = pid }
+}
+
 public enum ResponseResult: Codable, Equatable, Sendable {
     case nodeCommand(NodeCommandResult)
     case handshake(HandshakeResult)
@@ -565,6 +691,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectMutation(ProjectMutationResult)
     case projectList(ProjectListResult)
     case projectEnvironment(ProjectEnvironmentResult)
+    case projectAdoptionPreview(ProjectAdoptionPreviewResult)
+    case projectAdoptionApply(ProjectAdoptionApplyResult)
     case projectObservationSnapshot(ProjectObservationSnapshotResult)
     case projectPlan(ProjectReconciliationPlanResult)
     case projectActivation(ProjectReconciliationExecutionResponse)
@@ -599,6 +727,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case portsStatus(PortsStatusResult)
     case logsCatalog(LogsCatalogResult)
     case logsTail(LogsTailResult)
+    case serviceInstances(ServiceInstanceInventoryResult)
+    case serviceInstanceLifecycle(ServiceInstanceLifecycleResult)
     case raw(JSONValue)
 
     public func encode(to encoder: Encoder) throws {
@@ -610,6 +740,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectMutation(let value): try value.encode(to: encoder)
         case .projectList(let value): try value.encode(to: encoder)
         case .projectEnvironment(let value): try value.encode(to: encoder)
+        case .projectAdoptionPreview(let value): try value.encode(to: encoder)
+        case .projectAdoptionApply(let value): try value.encode(to: encoder)
         case .projectObservationSnapshot(let value): try value.encode(to: encoder)
         case .projectPlan(let value): try value.encode(to: encoder)
         case .projectActivation(let value): try value.encode(to: encoder)
@@ -644,6 +776,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .portsStatus(let value): try value.encode(to: encoder)
         case .logsCatalog(let value): try value.encode(to: encoder)
         case .logsTail(let value): try value.encode(to: encoder)
+        case .serviceInstances(let value): try value.encode(to: encoder)
+        case .serviceInstanceLifecycle(let value): try value.encode(to: encoder)
         case .raw(let value): try value.encode(to: encoder)
         }
     }
@@ -658,6 +792,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["coreVersion"] != nil, let result = try? IPCCodec.decode(HandshakeResult.self, from: data) { self = .handshake(result) }
         else if fields["projects"] != nil, let result = try? IPCCodec.decode(ProjectListResult.self, from: data) { self = .projectList(result) }
         else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
+        else if fields["preview"] != nil, fields["confirmation"] != nil, let result = try? IPCCodec.decode(ProjectAdoptionPreviewResult.self, from: data) { self = .projectAdoptionPreview(result) }
+        else if fields["manifestCreated"] != nil, let result = try? IPCCodec.decode(ProjectAdoptionApplyResult.self, from: data) { self = .projectAdoptionApply(result) }
         else if fields["snapshotID"] != nil, let result = try? IPCCodec.decode(ProjectObservationSnapshotResult.self, from: data) { self = .projectObservationSnapshot(result) }
         else if fields["plan"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationPlanResult.self, from: data) { self = .projectPlan(result) }
         else if fields["execution"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationExecutionResponse.self, from: data) { self = .projectActivation(result) }
@@ -696,6 +832,8 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["ports"] != nil, let result = try? IPCCodec.decode(PortsStatusResult.self, from: data) { self = .portsStatus(result) }
         else if fields["logs"] != nil, let result = try? IPCCodec.decode(LogsCatalogResult.self, from: data) { self = .logsCatalog(result) }
         else if fields["tail"] != nil, let result = try? IPCCodec.decode(LogsTailResult.self, from: data) { self = .logsTail(result) }
+        else if fields["entries"] != nil, let result = try? IPCCodec.decode(ServiceInstanceInventoryResult.self, from: data) { self = .serviceInstances(result) }
+        else if fields["health"] != nil, let result = try? IPCCodec.decode(ServiceInstanceLifecycleResult.self, from: data) { self = .serviceInstanceLifecycle(result) }
         else { self = .raw(value) }
     }
 }

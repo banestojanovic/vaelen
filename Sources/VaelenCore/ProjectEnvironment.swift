@@ -1,7 +1,7 @@
 import Foundation
 import Yams
 
-public enum ProjectEnvironmentFileState: String, Codable, Sendable {
+public enum ProjectEnvironmentFileState: String, Codable, Equatable, Sendable {
     case absent
     case valid
     case invalid
@@ -38,6 +38,123 @@ public enum PHPResolutionState: String, Codable, Sendable {
     case resolved
     case unavailable
     case invalid
+}
+
+public struct PHPRequirement: Codable, Equatable, Sendable {
+    public let value: String
+    public init(value: String) throws { guard value.range(of: "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?\\z", options: .regularExpression) != nil else { throw ProjectYAMLError.invalidValue("PHP version requirement") }; self.value = value }
+    public func resolveInstalledVersion(from versions: [String]) -> String? {
+        if let exactVersion = PHPVersion(value) {
+            return versions.first { PHPVersion($0) == exactVersion }
+        }
+        guard let family = PHPFamily(value)?.description else { return nil }
+        return PHPVersionResolver.resolve(family, versionStrings: versions)
+    }
+    private enum CodingKeys: String, CodingKey { case value }
+    public init(from decoder: Decoder) throws { try self.init(value: decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .value)) }
+}
+
+public struct NodeRequirement: Codable, Equatable, Sendable {
+    public let value: String
+    public init(value: String) throws { guard value.range(of: "^[0-9]+(?:\\.[0-9]+\\.[0-9]+)?\\z", options: .regularExpression) != nil else { throw ProjectYAMLError.invalidValue("Node version requirement") }; self.value = value }
+    private enum CodingKeys: String, CodingKey { case value }
+    public init(from decoder: Decoder) throws { try self.init(value: decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .value)) }
+}
+
+public struct ProjectBindingAlias: Codable, Equatable, Hashable, Sendable {
+    public let value: String
+    public init(_ value: String) throws {
+        guard value.range(of: "^[a-z][a-z0-9-]{0,62}\\z", options: .regularExpression) != nil else { throw ProjectYAMLError.invalidValue("service alias '\(value)'") }
+        self.value = value
+    }
+    public init(from decoder: Decoder) throws { try self.init(try decoder.singleValueContainer().decode(String.self)) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(value) }
+}
+
+public struct ProjectInstanceName: Codable, Equatable, Hashable, Sendable {
+    public let value: String
+    public init(_ value: String) throws {
+        guard value.range(of: "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\\z", options: .regularExpression) != nil else { throw ProjectYAMLError.invalidValue("service instance '\(value)'") }
+        self.value = value
+    }
+    public init(from decoder: Decoder) throws { try self.init(try decoder.singleValueContainer().decode(String.self)) }
+    public func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(value) }
+}
+
+public enum ProjectServiceKind: String, Codable, Equatable, Hashable, Sendable {
+    case mysql, postgresql, redis, valkey, mailpit
+}
+
+public struct ProjectServiceBinding: Codable, Equatable, Hashable, Sendable {
+    public let alias: ProjectBindingAlias
+    public let kind: ProjectServiceKind
+    public let instance: ProjectInstanceName
+    public let version: String?
+
+    public init(alias: ProjectBindingAlias, kind: ProjectServiceKind, instance: ProjectInstanceName, version: String? = nil) throws {
+        if let version, version.range(of: "^[A-Za-z0-9][A-Za-z0-9.+_-]*\\z", options: .regularExpression) == nil { throw ProjectYAMLError.invalidValue("service package version") }
+        self.alias = alias
+        self.kind = kind
+        self.instance = instance
+        self.version = version
+    }
+
+    private enum CodingKeys: String, CodingKey { case alias, kind, instance, version }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(alias: c.decode(ProjectBindingAlias.self, forKey: .alias), kind: c.decode(ProjectServiceKind.self, forKey: .kind), instance: c.decode(ProjectInstanceName.self, forKey: .instance), version: c.decodeIfPresent(String.self, forKey: .version))
+    }
+}
+
+public struct ProjectWebRequirement: Codable, Equatable, Sendable {
+    public let host: String?
+    public let documentRoot: String?
+    public let secure: Bool?
+    public let createRoute: Bool
+
+    public init(host: String? = nil, documentRoot: String? = nil, secure: Bool? = nil, createRoute: Bool = false) throws {
+        guard host != nil || documentRoot != nil || secure != nil else { throw ProjectYAMLError.invalidValue("web must declare at least one field") }
+        if let host, host.range(of: "^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*\\z", options: .regularExpression) == nil { throw ProjectYAMLError.invalidValue("web.host") }
+        if let documentRoot, documentRoot.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) { throw ProjectYAMLError.invalidValue("web.documentRoot must not contain control characters") }
+        if let documentRoot, documentRoot != "", documentRoot != "." {
+            let components = documentRoot.split(separator: "/", omittingEmptySubsequences: false)
+            guard !documentRoot.hasPrefix("/"), components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { throw ProjectYAMLError.invalidValue("web.documentRoot must be a relative path within the project") }
+        }
+        self.host = host
+        self.documentRoot = documentRoot
+        self.secure = secure
+        self.createRoute = createRoute
+    }
+
+    private enum CodingKeys: String, CodingKey { case host, documentRoot, secure, createRoute }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(host: c.decodeIfPresent(String.self, forKey: .host), documentRoot: c.decodeIfPresent(String.self, forKey: .documentRoot), secure: c.decodeIfPresent(Bool.self, forKey: .secure), createRoute: c.decodeIfPresent(Bool.self, forKey: .createRoute) ?? false)
+    }
+}
+
+public struct ProjectEnvironmentSpec: Codable, Equatable, Sendable {
+    public let version: Int
+    public let php: PHPRequirement?
+    public let node: NodeRequirement?
+    public let web: ProjectWebRequirement?
+    public let services: [ProjectServiceBinding]
+
+    public init(version: Int = 2, php: PHPRequirement? = nil, node: NodeRequirement? = nil, web: ProjectWebRequirement? = nil, services: [ProjectServiceBinding] = []) throws {
+        guard version == 1 || version == 2 else { throw ProjectYAMLError.unsupportedVersion(version) }
+        guard Set(services.map(\.alias.value)).count == services.count else { throw ProjectYAMLError.invalidValue("duplicate service alias") }
+        self.version = version
+        self.php = php
+        self.node = node
+        self.web = web
+        self.services = services
+    }
+
+    private enum CodingKeys: String, CodingKey { case version, php, node, web, services }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(version: c.decodeIfPresent(Int.self, forKey: .version) ?? 2, php: c.decodeIfPresent(PHPRequirement.self, forKey: .php), node: c.decodeIfPresent(NodeRequirement.self, forKey: .node), web: c.decodeIfPresent(ProjectWebRequirement.self, forKey: .web), services: c.decodeIfPresent([ProjectServiceBinding].self, forKey: .services) ?? [])
+    }
 }
 
 public struct ProjectMailAuthentication: Codable, Equatable, Sendable {
@@ -129,10 +246,14 @@ public struct ProjectConfiguredEnvironment: Codable, Equatable, Sendable {
     public let mailPort: String?
     public let mailEncryption: String?
     public let mailPassword: ProjectSecretAvailability
+    public let cacheDriver: String?
+    public let cacheHost: String?
+    public let cachePort: String?
+    public let cachePassword: ProjectSecretAvailability?
     public let interpolationDetected: Bool
     public let source: String
 
-    public init(envFile: String, envFilePresent: Bool, dbConnection: String? = nil, dbHost: String? = nil, dbPort: String? = nil, database: String? = nil, dbUsername: String? = nil, usernameConfigured: Bool = false, password: ProjectSecretAvailability = .unknown, mailer: String? = nil, mailHost: String? = nil, mailPort: String? = nil, mailEncryption: String? = nil, mailPassword: ProjectSecretAvailability = .unknown, interpolationDetected: Bool = false, source: String = ".env") {
+    public init(envFile: String, envFilePresent: Bool, dbConnection: String? = nil, dbHost: String? = nil, dbPort: String? = nil, database: String? = nil, dbUsername: String? = nil, usernameConfigured: Bool = false, password: ProjectSecretAvailability = .unknown, mailer: String? = nil, mailHost: String? = nil, mailPort: String? = nil, mailEncryption: String? = nil, mailPassword: ProjectSecretAvailability = .unknown, cacheDriver: String? = nil, cacheHost: String? = nil, cachePort: String? = nil, cachePassword: ProjectSecretAvailability = .unknown, interpolationDetected: Bool = false, source: String = ".env") {
         self.envFile = envFile
         self.envFilePresent = envFilePresent
         self.dbConnection = dbConnection
@@ -147,6 +268,10 @@ public struct ProjectConfiguredEnvironment: Codable, Equatable, Sendable {
         self.mailPort = mailPort
         self.mailEncryption = mailEncryption
         self.mailPassword = mailPassword
+        self.cacheDriver = cacheDriver
+        self.cacheHost = cacheHost
+        self.cachePort = cachePort
+        self.cachePassword = cachePassword
         self.interpolationDetected = interpolationDetected
         self.source = source
     }
@@ -229,8 +354,11 @@ public struct ProjectObservedRoute: Codable, Equatable, Sendable {
     /// Whether the selected route was observed in the live router configuration.
     /// This is endpoint evidence, not permission to mutate the route.
     public let runtimeRouteObserved: Bool?
+    /// Number of routes attributed to the project when the observation was made.
+    /// Nil in older serialized reports, where complete route coverage is unknown.
+    public let associatedRouteCount: Int?
 
-    public init(intentExists: Bool, hostname: String? = nil, documentRoot: String? = nil, target: String? = nil, tls: TLSMode? = nil, routerState: RouterState, routerHealth: RouterHealth, associationState: RouteAssociationState = .none, associationEvidence: RouteAssociationEvidence = .init(), mutationAuthority: RouteMutationAuthority = .blocked, mutationAuthorityReason: String = "No route association evidence was found.", runtimeRouteObserved: Bool? = nil) {
+    public init(intentExists: Bool, hostname: String? = nil, documentRoot: String? = nil, target: String? = nil, tls: TLSMode? = nil, routerState: RouterState, routerHealth: RouterHealth, associationState: RouteAssociationState = .none, associationEvidence: RouteAssociationEvidence = .init(), mutationAuthority: RouteMutationAuthority = .blocked, mutationAuthorityReason: String = "No route association evidence was found.", runtimeRouteObserved: Bool? = nil, associatedRouteCount: Int? = nil) {
         self.intentExists = intentExists
         self.hostname = hostname
         self.documentRoot = documentRoot
@@ -243,6 +371,7 @@ public struct ProjectObservedRoute: Codable, Equatable, Sendable {
         self.mutationAuthority = mutationAuthority
         self.mutationAuthorityReason = mutationAuthorityReason
         self.runtimeRouteObserved = runtimeRouteObserved
+        self.associatedRouteCount = associatedRouteCount
     }
 }
 
@@ -309,8 +438,12 @@ public struct ProjectEnvironmentReport: Codable, Equatable, Sendable {
     public let secret: ProjectSecretEnvironment
     public let diagnostics: [ProjectDiagnostic]
     public let routeTargets: [ProjectPHPRouteTargetObservation]
+    public let projectSpec: ProjectEnvironmentSpec?
+    public let serviceBindings: [ProjectServiceBindingObservation]?
+    public let nodeRequirementState: String?
+    public let nodeRequirementVersion: String?
 
-    public init(identity: ProjectEnvironmentIdentity, desired: ProjectDesiredEnvironment, configured: ProjectConfiguredEnvironment, observed: ProjectObservedEnvironment, derived: ProjectDerivedEnvironment, secret: ProjectSecretEnvironment, diagnostics: [ProjectDiagnostic], routeTargets: [ProjectPHPRouteTargetObservation] = []) {
+    public init(identity: ProjectEnvironmentIdentity, desired: ProjectDesiredEnvironment, configured: ProjectConfiguredEnvironment, observed: ProjectObservedEnvironment, derived: ProjectDerivedEnvironment, secret: ProjectSecretEnvironment, diagnostics: [ProjectDiagnostic], routeTargets: [ProjectPHPRouteTargetObservation] = [], projectSpec: ProjectEnvironmentSpec? = nil, serviceBindings: [ProjectServiceBindingObservation]? = nil, nodeRequirementState: String? = nil, nodeRequirementVersion: String? = nil) {
         self.identity = identity
         self.desired = desired
         self.configured = configured
@@ -319,6 +452,30 @@ public struct ProjectEnvironmentReport: Codable, Equatable, Sendable {
         self.secret = secret
         self.diagnostics = diagnostics
         self.routeTargets = routeTargets
+        self.projectSpec = projectSpec
+        self.serviceBindings = serviceBindings
+        self.nodeRequirementState = nodeRequirementState
+        self.nodeRequirementVersion = nodeRequirementVersion
+    }
+}
+
+public struct ProjectServiceBindingObservation: Codable, Equatable, Sendable {
+    public let binding: ProjectServiceBinding
+    public let packageIdentifier: String?
+    public let endpoint: [String: String]?
+    public let dataDirectory: String?
+    public let health: String
+    public let claimed: Bool
+    public let catalogPersisted: Bool?
+
+    public init(binding: ProjectServiceBinding, packageIdentifier: String?, endpoint: [String: String]?, dataDirectory: String?, health: String, claimed: Bool, catalogPersisted: Bool? = nil) {
+        self.binding = binding
+        self.packageIdentifier = packageIdentifier
+        self.endpoint = endpoint
+        self.dataDirectory = dataDirectory
+        self.health = health
+        self.claimed = claimed
+        self.catalogPersisted = catalogPersisted
     }
 }
 
@@ -352,9 +509,16 @@ public struct ProjectEnvironmentInspector: Sendable {
         let root = URL(fileURLWithPath: project.rootPath.string, isDirectory: true)
         let framework = frameworkDetector.inspect(root: root)
         let desiredResult = readDesiredState(root: root)
+        let declaredRoot = desiredResult.spec.flatMap { $0.version == 2 ? $0.web?.documentRoot : nil }
+        let expectedRoot: String?
+        if let declaredRoot {
+            expectedRoot = validatedDocumentRoot(projectRoot: root, suggested: declaredRoot)
+        } else {
+            expectedRoot = framework.suggestedDocumentRoot.flatMap { validatedDocumentRoot(projectRoot: root, suggested: $0) }
+        }
         let env = readDotenv(root: root)
         let cache = inspectConfigCache(root: root, envPath: root.appendingPathComponent(".env"))
-        let route = routeObservation(project: project, framework: framework, routes: routes, router: router, registeredProjects: registeredProjects, runtimeRoutes: runtimeRoutes)
+        let route = routeObservation(project: project, framework: framework, expectedDocumentRoot: expectedRoot, routes: routes, router: router, registeredProjects: registeredProjects, runtimeRoutes: runtimeRoutes)
         let observedPHP = observePHP(phpPackages: phpPackages, phpStatuses: phpStatuses, phpDefault: phpDefault, phpOverride: phpOverride, invalidPHPVersions: invalidPHPVersions)
         let selection = phpOverride ?? phpDefault
         let resolved = observedPHP.resolvedVersion
@@ -362,7 +526,7 @@ public struct ProjectEnvironmentInspector: Sendable {
         let dbEndpoint = endpointObservation(host: env.dbHost, port: env.dbPort, expectedHost: "127.0.0.1", expectedPort: mysql?.port, matches: endpointMatches(host: env.dbHost, port: env.dbPort, expectedPort: mysql?.port))
         let mailEndpoint = endpointObservation(host: env.mailHost, port: env.mailPort, expectedHost: "127.0.0.1", expectedPort: mailpit?.smtpPort, matches: endpointMatches(host: env.mailHost, port: env.mailPort, expectedPort: mailpit?.smtpPort))
         let mailAuthentication = mailAuthentication(env: env, mailpit: mailpit, endpointMatches: mailEndpoint.matches)
-        let routeRootMatch = route.documentRoot.map { path in framework.suggestedDocumentRoot.map { validatedDocumentRoot(projectRoot: root, suggested: $0) == normalizedDocumentRoot(path) } ?? false } ?? false
+        let routeRootMatch = route.documentRoot.map { path in expectedRoot == normalizedDocumentRoot(path) } ?? false
         let routeTargetMatchesPHP: Bool?
         if let resolvedStatus, let routeIntent = routes.first(where: { $0.route.hostname == route.hostname }), case .fastCGI(let socket, _) = routeIntent.route.target {
             routeTargetMatchesPHP = socket == resolvedStatus.socket
@@ -375,8 +539,8 @@ public struct ProjectEnvironmentInspector: Sendable {
         let observed = ProjectObservedEnvironment(php: observedPHP, mysql: mysql, mailpit: mailpit, route: route, dns: dns, tls: tls, standardPorts: standardPorts)
         let secrets = ProjectSecretEnvironment(databasePassword: env.databasePassword, mailPassword: env.mailPassword, notes: ["Secret values are never returned by inspection."])
         let reportDiagnostics = diagnostics(project: project, desired: desiredResult.state, desiredError: desiredResult.error, framework: framework, env: env, cache: cache, route: route, resolvedPHP: resolved, invalidPHPVersions: invalidPHPVersions, mysql: mysql, mailpit: mailpit, dns: dns, tls: tls, standardPorts: standardPorts, routeRootMatch: derived.routeDocumentRootMatches, dbEndpoint: dbEndpoint, mailEndpoint: mailEndpoint, mailAuthentication: mailAuthentication)
-        let targets = routeTargetObservations(project: project, framework: framework, desiredPHP: selection, resolvedPHP: resolved, routes: routes, runtimeRoutes: runtimeRoutes, phpStatuses: phpStatuses, router: router, association: RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects), pendingTransitions: pendingTransitions)
-        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: reportDiagnostics, routeTargets: targets)
+        let targets = routeTargetObservations(project: project, expectedDocumentRoot: expectedRoot, desiredPHP: selection, resolvedPHP: resolved, routes: routes, runtimeRoutes: runtimeRoutes, phpStatuses: phpStatuses, router: router, association: RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects, expectedDocumentRoot: expectedRoot), pendingTransitions: pendingTransitions)
+        return ProjectEnvironmentReport(identity: .init(project: project), desired: desiredResult.state, configured: env.configured, observed: observed, derived: derived, secret: secrets, diagnostics: reportDiagnostics, routeTargets: targets, projectSpec: desiredResult.spec)
     }
 
     public func observePHP(phpPackages: [PHPPackage], phpStatuses: [PHPStatus], phpDefault: String?, phpOverride: String? = nil, invalidPHPVersions: [String] = []) -> ProjectObservedPHP {
@@ -394,26 +558,70 @@ public struct ProjectEnvironmentInspector: Sendable {
         return ProjectObservedPHP(installedVersions: installed, invalidVersions: invalidPHPVersions.sorted(), runningVersions: running, resolvedVersion: resolved, resolvedState: phpState, defaultVersion: phpDefault, overrideVersion: phpOverride, resolutionState: resolutionState, fpmPID: resolvedStatus?.pid, fpmSocket: resolvedStatus?.socket, fpmHealth: resolvedStatus?.health ?? "not-running")
     }
 
-    private struct DesiredRead { let state: ProjectDesiredEnvironment; let error: String? }
+    private struct DesiredRead { let state: ProjectDesiredEnvironment; let error: String?; let spec: ProjectEnvironmentSpec? }
     private struct EnvRead { let configured: ProjectConfiguredEnvironment; let dbHost: String?; let dbPort: String?; let mailHost: String?; let mailPort: String?; let databasePassword: ProjectSecretAvailability; let mailPassword: ProjectSecretAvailability }
 
     private func readDesiredState(root: URL) -> DesiredRead {
         let url = root.appendingPathComponent("vaelen.yml")
-        guard FileManager.default.fileExists(atPath: url.path) else { return DesiredRead(state: .init(file: .absent), error: nil) }
+        guard FileManager.default.fileExists(atPath: url.path) else { return DesiredRead(state: .init(file: .absent), error: nil, spec: nil) }
         do {
             let contents = try String(contentsOf: url, encoding: .utf8)
-            try validateYAMLKeys(contents)
-            let value = try YAMLDecoder().decode(ProjectEnvironmentYAML.self, from: contents)
-            return DesiredRead(state: .init(file: .valid, php: value.php, secureWeb: value.web?.secure, mysql: value.services?.mysql, mailpit: value.services?.mailpit), error: nil)
-        } catch { return DesiredRead(state: .init(file: .invalid, fileError: String(describing: error)), error: String(describing: error)) }
+            let header = try YAMLDecoder().decode(ProjectEnvironmentVersion.self, from: contents)
+            try validateYAMLKeys(contents, version: header.version)
+            let spec: ProjectEnvironmentSpec
+            let state: ProjectDesiredEnvironment
+            if header.version == 1 {
+                let value = try YAMLDecoder().decode(ProjectEnvironmentV1YAML.self, from: contents)
+                state = .init(file: .valid, php: value.php, secureWeb: value.web?.secure, mysql: value.services?.mysql, mailpit: value.services?.mailpit)
+                var bindings: [ProjectServiceBinding] = []
+                for (alias, kind, enabled) in [("mysql", ProjectServiceKind.mysql, value.services?.mysql), ("mailpit", ProjectServiceKind.mailpit, value.services?.mailpit)] where enabled == true {
+                    bindings.append(try .init(alias: ProjectBindingAlias(alias), kind: kind, instance: ProjectInstanceName("default")))
+                }
+                let phpRequirement = value.php.flatMap { try? PHPRequirement(value: $0) }
+                spec = try ProjectEnvironmentSpec(version: 1, php: phpRequirement, web: value.web?.secure.map { try ProjectWebRequirement(secure: $0) }, services: bindings)
+            } else if header.version == 2 {
+                let value = try YAMLDecoder().decode(ProjectEnvironmentV2YAML.self, from: contents)
+                spec = try value.spec
+                state = .init(file: .valid, php: value.php, secureWeb: value.web?.secure, mysql: nil, mailpit: nil)
+            } else { throw ProjectYAMLError.unsupportedVersion(header.version) }
+            return DesiredRead(state: state, error: nil, spec: spec)
+        } catch { return DesiredRead(state: .init(file: .invalid, fileError: String(describing: error)), error: String(describing: error), spec: nil) }
     }
 
-    private func validateYAMLKeys(_ contents: String) throws {
+    private func validateYAMLKeys(_ contents: String, version: Int) throws {
+        guard let node = try compose(yaml: contents) else { throw ProjectYAMLError.invalidRoot }
+        try validateUniqueMappingKeys(node, path: "")
         guard let root = try load(yaml: contents) as? [String: Any] else { throw ProjectYAMLError.invalidRoot }
-        let allowedRoot = Set(["version", "php", "web", "services"])
-        if let unknown = root.keys.first(where: { !allowedRoot.contains($0) }) { throw ProjectYAMLError.unknownField(unknown) }
-        if let web = root["web"] as? [String: Any], let unknown = web.keys.first(where: { $0 != "secure" }) { throw ProjectYAMLError.unknownField("web.\(unknown)") }
-        if let services = root["services"] as? [String: Any], let unknown = services.keys.first(where: { $0 != "mysql" && $0 != "mailpit" }) { throw ProjectYAMLError.unknownField("services.\(unknown)") }
+        let rootFields = version == 2 ? Set(["version", "php", "node", "web", "services"]) : Set(["version", "php", "web", "services"])
+        if let unknown = root.keys.sorted().first(where: { !rootFields.contains($0) }) { throw ProjectYAMLError.unknownField(unknown) }
+        if let web = root["web"] as? [String: Any] {
+            let fields = version == 2 ? Set(["host", "documentRoot", "secure", "createRoute"]) : Set(["secure"])
+            if let unknown = web.keys.sorted().first(where: { !fields.contains($0) }) { throw ProjectYAMLError.unknownField("web.\(unknown)") }
+        }
+        if version == 1, let services = root["services"] as? [String: Any], let unknown = services.keys.sorted().first(where: { $0 != "mysql" && $0 != "mailpit" }) {
+            throw ProjectYAMLError.unknownField("services.\(unknown)")
+        }
+        if version == 2, let services = root["services"] as? [String: Any] {
+            for (alias, raw) in services {
+                guard let service = raw as? [String: Any] else { continue }
+                if let unknown = service.keys.sorted().first(where: { !["kind", "instance", "version"].contains($0) }) { throw ProjectYAMLError.unknownField("services.\(alias).\(unknown)") }
+            }
+        }
+    }
+
+    private func validateUniqueMappingKeys(_ node: Node, path: String) throws {
+        if let mapping = node.mapping {
+            var seen = Set<String>()
+            for (key, value) in mapping {
+                let keyText: String
+                if case .scalar(let scalar) = key { keyText = scalar.string }
+                else { throw ProjectYAMLError.invalidValue("mapping keys must be strings") }
+                guard seen.insert(keyText).inserted else { throw ProjectYAMLError.invalidValue("duplicate YAML key \(path.isEmpty ? keyText : path + "." + keyText)") }
+                try validateUniqueMappingKeys(value, path: path.isEmpty ? keyText : path + "." + keyText)
+            }
+        } else if case .sequence(let sequence) = node {
+            for child in sequence { try validateUniqueMappingKeys(child, path: path) }
+        }
     }
 
     private func readDotenv(root: URL) -> EnvRead {
@@ -425,7 +633,12 @@ public struct ProjectEnvironmentInspector: Sendable {
         let values = parseDotenv(contents)
         let dbPassword = secretAvailability(values["DB_PASSWORD"])
         let mailPassword = secretAvailability(values["MAIL_PASSWORD"])
-        let configured = ProjectConfiguredEnvironment(envFile: path.path, envFilePresent: true, dbConnection: values["DB_CONNECTION"], dbHost: values["DB_HOST"], dbPort: values["DB_PORT"], database: values["DB_DATABASE"], dbUsername: values["DB_USERNAME"], usernameConfigured: values["DB_USERNAME"]?.isEmpty == false, password: dbPassword, mailer: values["MAIL_MAILER"], mailHost: values["MAIL_HOST"], mailPort: values["MAIL_PORT"], mailEncryption: values["MAIL_ENCRYPTION"] ?? values["MAIL_SCHEME"], mailPassword: mailPassword, interpolationDetected: values.values.contains { $0.contains("${") || $0.contains("$ ") })
+        let cacheDriver = values["CACHE_STORE"] ?? values["CACHE_DRIVER"]
+        let redisBackedCache = cacheDriver.map { ["redis", "valkey"].contains($0.lowercased()) } ?? false
+        let cacheHost = redisBackedCache ? values["REDIS_HOST"] ?? values["CACHE_HOST"] : values["CACHE_HOST"]
+        let cachePort = redisBackedCache ? values["REDIS_PORT"] ?? values["CACHE_PORT"] : values["CACHE_PORT"]
+        let cachePassword = secretAvailability(redisBackedCache ? values["REDIS_PASSWORD"] ?? values["CACHE_PASSWORD"] : values["CACHE_PASSWORD"])
+        let configured = ProjectConfiguredEnvironment(envFile: path.path, envFilePresent: true, dbConnection: values["DB_CONNECTION"], dbHost: values["DB_HOST"], dbPort: values["DB_PORT"], database: values["DB_DATABASE"], dbUsername: values["DB_USERNAME"], usernameConfigured: values["DB_USERNAME"]?.isEmpty == false, password: dbPassword, mailer: values["MAIL_MAILER"], mailHost: values["MAIL_HOST"], mailPort: values["MAIL_PORT"], mailEncryption: values["MAIL_ENCRYPTION"] ?? values["MAIL_SCHEME"], mailPassword: mailPassword, cacheDriver: cacheDriver, cacheHost: cacheHost, cachePort: cachePort, cachePassword: cachePassword, interpolationDetected: values.values.contains { $0.contains("${") || $0.contains("$ ") })
         return EnvRead(configured: configured, dbHost: values["DB_HOST"], dbPort: values["DB_PORT"], mailHost: values["MAIL_HOST"], mailPort: values["MAIL_PORT"], databasePassword: dbPassword, mailPassword: mailPassword)
     }
 
@@ -435,7 +648,7 @@ public struct ProjectEnvironmentInspector: Sendable {
             let raw = String(line).trimmingCharacters(in: .whitespaces)
             guard !raw.isEmpty, !raw.hasPrefix("#"), let separator = raw.firstIndex(of: "=") else { continue }
             let key = String(raw[..<separator]).trimmingCharacters(in: .whitespaces)
-            guard key.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil else { continue }
+            guard key.range(of: "^[A-Za-z_][A-Za-z0-9_]*\\z", options: .regularExpression) != nil else { continue }
             var value = String(raw[raw.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
             if value.count >= 2, (value.first == "\"" && value.last == "\"") || (value.first == "'" && value.last == "'") { value = String(value.dropFirst().dropLast()) }
             result[key] = value
@@ -451,11 +664,11 @@ public struct ProjectEnvironmentInspector: Sendable {
         return .init(state: newer == true ? "present, .env is newer" : "present, appears current", cachePath: cache.path, cacheModifiedAt: cacheDate, envModifiedAt: envDate, envNewerThanCache: newer)
     }
 
-    private func routeObservation(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], router: RouterStatus, registeredProjects: [Project], runtimeRoutes: [Route]?) -> ProjectObservedRoute {
-        let association = RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects)
+    private func routeObservation(project: Project, framework: ProjectFrameworkInspection, expectedDocumentRoot: String?, routes: [RouteIntent], router: RouterStatus, registeredProjects: [Project], runtimeRoutes: [Route]?) -> ProjectObservedRoute {
+        let association = RouteAssociationClassifier().classify(project: project, framework: framework, routes: routes, registeredProjects: registeredProjects, expectedDocumentRoot: expectedDocumentRoot)
         let intent = association.selectedRouteID.flatMap { id in routes.first { $0.route.id == id } }
         let intentExists = !association.routeIDs.isEmpty
-        guard let route = intent?.route else { return .init(intentExists: intentExists, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason, runtimeRouteObserved: nil) }
+        guard let route = intent?.route else { return .init(intentExists: intentExists, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason, runtimeRouteObserved: nil, associatedRouteCount: association.routeIDs.count) }
         let documentRoot: String?
         let target: String
         switch route.target {
@@ -466,10 +679,10 @@ public struct ProjectEnvironmentInspector: Sendable {
         let runtimeRouteObserved = runtimeRoutes.map { runtime in
             runtime.contains { $0.hostname == route.hostname && $0.target == route.target && $0.tls == route.tls }
         }
-        return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason, runtimeRouteObserved: runtimeRouteObserved)
+        return .init(intentExists: true, hostname: route.hostname, documentRoot: documentRoot, target: target, tls: route.tls, routerState: router.state, routerHealth: router.health, associationState: association.state, associationEvidence: association.evidence, mutationAuthority: association.mutationAuthority, mutationAuthorityReason: association.mutationAuthorityReason, runtimeRouteObserved: runtimeRouteObserved, associatedRouteCount: association.routeIDs.count)
     }
 
-    private func routeTargetObservations(project: Project, framework: ProjectFrameworkInspection, desiredPHP: String?, resolvedPHP: String?, routes: [RouteIntent], runtimeRoutes: [Route]?, phpStatuses: [PHPStatus], router: RouterStatus, association: RouteAssociationResult, pendingTransitions: [RouteTargetTransition]) -> [ProjectPHPRouteTargetObservation] {
+    private func routeTargetObservations(project: Project, expectedDocumentRoot: String?, desiredPHP: String?, resolvedPHP: String?, routes: [RouteIntent], runtimeRoutes: [Route]?, phpStatuses: [PHPStatus], router: RouterStatus, association: RouteAssociationResult, pendingTransitions: [RouteTargetTransition]) -> [ProjectPHPRouteTargetObservation] {
         guard let projectID = project.id?.rawValue else { return [] }
         let durable = routes.filter { $0.projectID == projectID && $0.route.target.isFastCGI }
         return durable.sorted { $0.route.id.description < $1.route.id.description }.map { intent in
@@ -490,7 +703,7 @@ public struct ProjectEnvironmentInspector: Sendable {
             else if runtime == nil { providerAgreement = .missing }
             else if runtimeFastCGI?.socket == persistedSocket, runtimeFastCGI?.root == persistedRoot, runtime?.tls == intent.route.tls { providerAgreement = .agreed }
             else { providerAgreement = .diverged }
-            let rootMatches = framework.suggestedDocumentRoot.map { validatedDocumentRoot(projectRoot: URL(fileURLWithPath: project.rootPath.string), suggested: $0) == normalizedDocumentRoot(persistedRoot) } ?? false
+            let rootMatches = expectedDocumentRoot == normalizedDocumentRoot(persistedRoot)
             let transition = pendingTransitions.first { $0.routeID == intent.route.id }
             let transitionMatchesPersisted = transition.map { $0.projectID == projectID && $0.desiredRoute == intent.route && $0.desiredSocket == persistedSocket } ?? false
             let transitionMatchesProvider = transition.flatMap { transition in runtime.flatMap { try? routeProviderFingerprint($0) == transition.previousProviderFingerprint } } ?? false
@@ -522,7 +735,10 @@ public struct ProjectEnvironmentInspector: Sendable {
     func validatedDocumentRoot(projectRoot: URL, suggested: String?) -> String? {
         let root = paths.canonicalize(projectRoot.path)
         guard let suggestion = suggested?.trimmingCharacters(in: .whitespacesAndNewlines), !suggestion.isEmpty else { return root.string }
-        return paths.canonicalize(root.url.appendingPathComponent(suggestion.trimmingCharacters(in: CharacterSet(charactersIn: "/"))).path).string
+        let resolved = paths.canonicalize(root.url.appendingPathComponent(suggestion.trimmingCharacters(in: CharacterSet(charactersIn: "/"))).path)
+        let rootPath = root.string
+        guard resolved.string == rootPath || resolved.string.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/") else { return nil }
+        return resolved.string
     }
 
     func normalizedDocumentRoot(_ path: String) -> String {
@@ -621,7 +837,9 @@ public struct ProjectEnvironmentInspector: Sendable {
     }
 }
 
-private struct ProjectEnvironmentYAML: Decodable {
+private struct ProjectEnvironmentVersion: Decodable { let version: Int }
+
+private struct ProjectEnvironmentV1YAML: Decodable {
     let version: Int
     let php: String?
     let web: Web?
@@ -666,15 +884,79 @@ private struct ProjectEnvironmentYAML: Decodable {
     }
 }
 
+private struct ProjectEnvironmentV2YAML: Decodable {
+    let version: Int
+    let php: String?
+    let node: String?
+    let web: Web?
+    let services: [String: Service]?
+
+    var spec: ProjectEnvironmentSpec {
+        get throws {
+            let bindings = try (services ?? [:]).map { alias, service in
+                guard let kind = ProjectServiceKind(rawValue: service.kind) else { throw ProjectYAMLError.invalidValue("services.\(alias).kind '\(service.kind)'") }
+                return try ProjectServiceBinding(alias: ProjectBindingAlias(alias), kind: kind, instance: ProjectInstanceName(service.instance), version: service.version)
+            }.sorted { $0.alias.value < $1.alias.value }
+            guard Set(bindings.map(\.alias.value)).count == bindings.count else { throw ProjectYAMLError.invalidValue("duplicate service alias") }
+            return try ProjectEnvironmentSpec(version: 2, php: try php.map(PHPRequirement.init(value:)), node: try node.map(NodeRequirement.init(value:)), web: try web.map { try ProjectWebRequirement(host: $0.host, documentRoot: $0.documentRoot, secure: $0.secure, createRoute: $0.createRoute) }, services: bindings)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable { case version, php, node, web, services }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let unknown = Set(c.allKeys.map(\.stringValue)).subtracting(Set(CodingKeys.allCases.map(\.stringValue))).sorted()
+        if let field = unknown.first { throw ProjectYAMLError.unknownField(field) }
+        version = try c.decode(Int.self, forKey: .version)
+        php = try c.decodeIfPresent(String.self, forKey: .php)
+        node = try c.decodeIfPresent(String.self, forKey: .node)
+        web = try c.decodeIfPresent(Web.self, forKey: .web)
+        services = try c.decodeIfPresent([String: Service].self, forKey: .services)
+    }
+
+    struct Web: Decodable {
+        let host: String?
+        let documentRoot: String?
+        let secure: Bool?
+        let createRoute: Bool
+        private enum Keys: String, CodingKey, CaseIterable { case host, documentRoot, secure, createRoute }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: Keys.self)
+            if let field = Set(c.allKeys.map(\.stringValue)).subtracting(Set(Keys.allCases.map(\.stringValue))).sorted().first { throw ProjectYAMLError.unknownField("web.\(field)") }
+            host = try c.decodeIfPresent(String.self, forKey: .host)
+            documentRoot = try c.decodeIfPresent(String.self, forKey: .documentRoot)
+            secure = try c.decodeIfPresent(Bool.self, forKey: .secure)
+            createRoute = try c.decodeIfPresent(Bool.self, forKey: .createRoute) ?? false
+            try ProjectWebRequirement(host: host, documentRoot: documentRoot, secure: secure, createRoute: createRoute)
+        }
+    }
+
+    struct Service: Decodable {
+        let kind: String
+        let instance: String
+        let version: String?
+        private enum Keys: String, CodingKey, CaseIterable { case kind, instance, version }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: Keys.self)
+            if let field = Set(c.allKeys.map(\.stringValue)).subtracting(Set(Keys.allCases.map(\.stringValue))).sorted().first { throw ProjectYAMLError.unknownField("service.\(field)") }
+            kind = try c.decode(String.self, forKey: .kind)
+            instance = try c.decode(String.self, forKey: .instance)
+            version = try c.decodeIfPresent(String.self, forKey: .version)
+        }
+    }
+}
+
 private enum ProjectYAMLError: Error, CustomStringConvertible {
     case unknownField(String)
     case unsupportedVersion(Int)
     case invalidRoot
+    case invalidValue(String)
     var description: String {
         switch self {
         case .unknownField(let field): return "unknown field \(field)"
         case .unsupportedVersion(let version): return "unsupported schema version \(version)"
         case .invalidRoot: return "root must be a mapping"
+        case .invalidValue(let value): return "invalid value for \(value)"
         }
     }
 }

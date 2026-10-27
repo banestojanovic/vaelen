@@ -135,6 +135,28 @@ final class MySQLModuleTests: XCTestCase {
         XCTAssertEqual(MySQLModule.defaultPort, 3306)
     }
 
+    func testProjectBindingSnapshotRequiresInitializedExactDefaultAndPreservesPort() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vaelen-mysql-binding-\(UUID().uuidString)")
+        defer { makeWritableAndRemove(root) }
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let packageURL = layout.mysqlPackagesDirectoryURL.appendingPathComponent(MySQLManifest.official8_4_11.version, isDirectory: true)
+        let bin = packageURL.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            let file = bin.appendingPathComponent(name)
+            try Data("fixture".utf8).write(to: file)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        let package = MySQLPackage(version: MySQLManifest.official8_4_11.version, architecture: "arm64", packagePath: packageURL.path, serverPath: "/fixture/mysqld", clientPath: "/fixture/mysql", adminPath: "/fixture/mysqladmin", source: "fixture", artifactSHA256: MySQLManifest.official8_4_11.artifactSHA256, signatureURL: "fixture", license: "GPL-2.0", installedAt: Date())
+        let override = MySQLPackage(version: package.version, architecture: package.architecture, packagePath: packageURL.path, serverPath: bin.appendingPathComponent("mysqld").path, clientPath: bin.appendingPathComponent("mysql").path, adminPath: bin.appendingPathComponent("mysqladmin").path, source: package.source, artifactSHA256: package.artifactSHA256, signatureURL: package.signatureURL, license: package.license, installedAt: package.installedAt)
+        let module = MySQLModule(layout: layout, manifest: .official8_4_11, downloader: FailingDownloader(), port: 33_417, instanceName: "default", tcpEnabled: true, packageOverride: override)
+        let uninitialized = module.projectBindingSnapshot()
+        XCTAssertEqual(uninitialized.record?.packageIdentifier, "mysql-8.4.11")
+        XCTAssertEqual(uninitialized.record?.endpoint.portNumbers.first, 33_417)
+        XCTAssertEqual(uninitialized.health, "not-initialized")
+        XCTAssertEqual(uninitialized.record?.dataDirectory, layout.mysqlInstancesDirectoryURL.appendingPathComponent("default/data").path)
+    }
+
     func testDebugPruningRejectsSymlinkedPackageBoundariesWithoutTouchingTargets() throws {
         enum Boundary: CaseIterable { case packagesParent, packages, package, bin }
         for boundary in Boundary.allCases {

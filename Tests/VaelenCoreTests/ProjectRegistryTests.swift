@@ -70,6 +70,29 @@ final class ProjectRegistryTests: XCTestCase {
         XCTAssertNil(cleared)
     }
 
+    func testUnlinkReleasesProjectServiceClaimsAndPreservesManualClaimAndInstance() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectPath = root.appendingPathComponent("claimed-project")
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("db.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        guard let projectID = try await registry.link(path: projectPath).id else { return XCTFail("linked project must have an id") }
+        let repository = ServiceInstanceRepository(store: store)
+        let instanceID = ServiceInstanceID(kind: .mysql, name: try ProjectInstanceName("shared"))
+        let record = try ServiceInstanceRecord(id: instanceID, packageIdentifier: "vendor/mysql@x", endpoint: .mysql(port: 3307), dataDirectory: "/data/shared")
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("database"), kind: .mysql, instance: instanceID.name)
+        try repository.saveInstance(record)
+        try repository.replaceProjectClaims([binding], for: projectID)
+        try repository.setManualClaim(for: instanceID, claimed: true)
+
+        try await registry.unlink(path: projectPath)
+
+        XCTAssertTrue(try repository.projectClaims(for: projectID).isEmpty)
+        XCTAssertTrue(try repository.isManuallyClaimed(instanceID))
+        XCTAssertEqual(try repository.instance(instanceID), record)
+    }
+
     func testRecognizedDiscoveryAndExplicitLinkWins() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

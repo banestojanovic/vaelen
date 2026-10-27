@@ -43,7 +43,7 @@ final class NodeCLIIntegrationTests: XCTestCase {
 
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("support", isDirectory: true))
         try FileManager.default.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
-        XCTAssertEqual(SQLiteStateStore.schemaVersion, 8)
+        XCTAssertEqual(SQLiteStateStore.schemaVersion, 9)
         let parentID = ProjectID()
         let nestedID = ProjectID()
         let siblingID = ProjectID()

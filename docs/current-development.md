@@ -1,5 +1,15 @@
 # Current development notes
 
+## Herd replacement project lifecycle — 2026-10-26
+
+`val project up` now applies supported V2 project requirements, with `project activate` retained as an alias. It selects an exact PHP patch or an eligible patch from a declared PHP family, selects an eligible Node package, safely associates a unique unchanged legacy route, and reconciles exact PostgreSQL service claims. `val project down` releases only the project's claims and stops PostgreSQL only when no manual or other project owner remains. Failed identity or stop checks retain the existing claim. Repeated down/up restores the exact PostgreSQL instance.
+
+Reviewed V2 web intent can explicitly request creation of a project-owned FastCGI route. Core resolves the declared document root to an existing canonical directory inside the project, checks case-insensitive host conflicts against persisted routes, proxies, and live routes, and requires a `.test` hostname plus healthy router, DNS, and standard ports. HTTPS creation requires an already trusted Local CA; adoption never changes trust. A failed Caddy reconciliation retains the route ID and ownership so a later `project up` can retry. Live verification compares hostname, target/socket, root, and TLS semantics rather than transient decoder IDs. The private-Core route acceptance fixture invokes built `val project adopt`, `up`, and `down` children for reviewed HTTP and HTTPS routes, serves PHP through copied installed PHP-FPM and Caddy packages, confirms `.env` bytes remain unchanged, and verifies route retention across `down/up`. Parent reran `Scripts/tests/val-project-route-lifecycle-test.sh`, `Scripts/test.sh --filter CaddyRuntimeTests`, and `git diff --check`; all passed. DNS, PF, standard-port readiness, and Local CA trust are injected observations, and HTTPS uses `curl -k`, so system networking or user trust is not verified. The fixture uncovered Caddy process identity rejecting `/private/tmp` executables because `ps` reports the equivalent `/tmp` path; identity now checks the opened executable with symlink resolution. One read-only Sol review found an unbounded curl probe; three-second connect and ten-second request timeouts resolve it.
+
+Parent verification passed `Scripts/test.sh --filter 'ProjectReconciliationTests|ProjectAdoptionApplyTests|ProjectAdoptionCLIParsingTests|PostgreSQLServiceLifecycleEndToEndTests|DispatcherTests|ProjectActivation'`, `Scripts/tests/val-service-lifecycle-test.sh`, and `git diff --check` in both the isolated feature worktree and canonical dirty checkout. One fresh read-only Sol reviewer approved after correction of stopped-instance retry, stale claims, PHP family/exact pin selection, and route-change checks. The unfiltered `Scripts/test.sh` remains red on unavailable/mismatched PHP provider cache fixtures and a release expectation; see `.audit/test-failures/swift-test.ruLvKH` in the isolated worktree.
+
+This does not complete Herd replacement. Project up/down has MySQL/Mailpit bindings for the existing default singletons alongside named PostgreSQL and Valkey instances. A live isolated Debug app/Core run verified Mailpit start-plan review, explicit start, verified state refresh, project-only claim release, and that the singleton remained healthy. Evidence is in `artifacts/verification/project-mysql-mailpit-settings-20261027/`. Core restart/update recovery, signed installed-app workflow, and CLI/app agreement across the complete adoption-to-working-site path remain open. Package acquisition, licensing, provenance, signing/notarization, PostgreSQL repeatability, and macOS 14 execution remain release gates. See `.audit/project-service-environments.todo.md` and the `project-environment-lifecycle.md` verification recipe.
+
 ## Five-task installed acceptance and diagnostics — 2026-10-24
 
 Installed checks passed for disposable `val site info`, Settings proxy add/remove, and the native Projects popover. The site-info fixture used a Laravel marker tree and a PHP Artisan stand-in, verifying installed child arguments, cwd, output, nonzero status propagation, unsupported-framework refusal, narrow human output, and zero-route reporting. It did not run a Laravel application. Proxy Settings rows matched `val proxy list --json`; the temporary route was removed. Menu-bar project groups matched CLI linked and discovered project data. Project, route, parked-root, and proxy snapshots matched the preflight files byte-for-byte, and Doctor remained healthy. Detailed records: `docs/cli/manual-test-slice-2a.md`, `docs/cli/manual-test-slice-2b.md`, and `artifacts/verification/vaelen-five-task-20261024/`.
@@ -199,8 +209,12 @@ fixture model. Captures live outside the source commit in
 Rendered review covered Services, PHP, Projects, Network & Security, and
 General in light/dark appearance with empty, pending, unavailable, and partial
 inventory fixtures. Install success/failure and removal success/confirmation
-were exercised in the isolated fixture. The rendered failed-removal error
-state remains **unverified**; do not claim that visual check passed.
+were exercised in the isolated fixture. On 2026-10-24, the `remove-failed`
+Services fixture rendered the failed MySQL removal as a red error banner below
+the package details. The banner is visible after scrolling the details pane to
+the bottom; the fixture keeps the package listed and reports that Core
+inventory is unchanged. Evidence is in
+`artifacts/verification/vaelen-app-remove-failed-20261024T094910Z/`.
 
 On 2026-09-30, focused inventory tests passed: 5 XCTest methods, 0 failures.
 The complete invocation `swift test --package-path .` exited 0 after the final
@@ -228,4 +242,12 @@ MySQL lifecycle acceptance tests requiring canonical ports/processes to be
 inactive, and the PHP-FPM isolation regression requiring normal PHP-FPM to be
 stopped. The integrated `dev` build passed `./Scripts/vaelen-dev-update` and
 `./Scripts/vaelen-dev smoke`; its signed installed embedded Core is schema 7.
-The rendered failed-removal error banner remains unverified visually.
+
+
+## MySQL and Mailpit project bindings — 2026-10-27
+
+V2 projects can claim only the exact installed default MySQL or Mailpit singleton already observed by Core. Activation validates exact package identity and health, and repeated aliases reuse one service instance. Deactivation releases only project ownership; it cannot stop these legacy singleton runtimes. Package removal is blocked while a project claim exists. Focused planner, catalog, adoption, dispatcher, inventory, and Mailpit module suites passed. The built `val` child exercised private-Core project `up/down/up` with two Mailpit aliases, exact inventory, `.env` preservation, source package preservation, and cleanup. See `Scripts/tests/val-project-service-bindings-test.sh` and `artifacts/verification/project-service-bindings-20261027T055046Z-20630/`.
+
+The live Debug Settings path was driven against a private Core. The app displayed the exact reviewed Mailpit binding, started it through explicit confirmation, then released only the project claim through the ownership confirmation. Core reported the same process healthy with no owner afterward. The project `.env` and installed Mailpit executable hashes were unchanged, and the app/Core/service processes, listeners, and scratch root were removed. The acceptance record is `artifacts/verification/project-mysql-mailpit-settings-20261027/result.txt`. This does not cover signed installed-app maintenance or Core restart recovery.
+
+The final review found a race between identity-probe process exit and asynchronous stdout drain, plus unsafe fixture cleanup after a failed stop. Both are fixed. Identity probes now wait for stdout EOF and process exit, then return within a bounded timeout while retaining probe handles for eventual termination cleanup. Mailpit test fixtures preserve their roots unless the exact service is confirmed stopped. The final read-only Sol follow-up found no remaining issue. Parent verification passed the Mailpit, private-Core project-binding, and multi-alias dispatcher filters, plus `Scripts/tests/val-project-service-bindings-test.sh`; see `artifacts/verification/mailpit-identity-review-20261027/result.txt`. The forced unreapable-after-SIGKILL branch was not directly exercised.

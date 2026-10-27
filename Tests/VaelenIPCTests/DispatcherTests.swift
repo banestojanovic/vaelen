@@ -148,6 +148,23 @@ private actor ParkReconciliationTestRouter: Router {
     func observationCounts() -> (status: Int, routes: Int) { (statusCalls, observedRouteCalls) }
 }
 
+private actor ProjectRouteActivationRouter: Router {
+    private var routes: [Route] = []
+    private var failNextReconcile = true
+    func start() async throws {}
+    func stop() async throws {}
+    func status() async -> RouterStatus { .init(provider: "project-route-fixture", state: .running, health: .healthy, routeCount: routes.count) }
+    func health() async -> RouterHealth { .healthy }
+    func reconcile(routes: [Route]) async throws {
+        if failNextReconcile { failNextReconcile = false; throw RouterError.notRunning }
+        self.routes = routes
+    }
+    func addRoute(_ route: Route) async throws { routes.append(route) }
+    func updateRoute(_ route: Route) async throws { routes.removeAll { $0.id == route.id }; routes.append(route) }
+    func removeRoute(id: RouteID) async throws { routes.removeAll { $0.id == id } }
+    func observedRoutes() async throws -> [Route] { routes }
+}
+
 private struct ShutdownPortsFake: StandardPortsPrivileged {
     let inspection: StandardPortsInspection
     let removals: ShutdownRemovalCounter
@@ -244,6 +261,52 @@ private actor StartupRaceDNSHelper: PrivilegedDNSHelper {
 }
 
 final class DispatcherTests: XCTestCase {
+    func testProjectRouteCreationRetriesWithSameDurableRouteID() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("project-route-activation-\(UUID().uuidString)", isDirectory: true)
+        let projectRoot = root.appendingPathComponent("shop", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectRoot.appendingPathComponent("custom-webroot"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("version: 2\nphp: \"8.4\"\nweb:\n  host: shop.test\n  documentRoot: custom-webroot\n  secure: false\n  createRoute: true\n".utf8).write(to: projectRoot.appendingPathComponent("vaelen.yml"))
+
+        let store = try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite"))
+        let registry = ProjectRegistry(store: store)
+        let project = try await registry.link(path: projectRoot, name: "shop")
+        let routes = RouteIntentRepository(store: store)
+        let router = ProjectRouteActivationRouter()
+        let dispatcher = try CoreRequestDispatcher(runtime: .init(version: "test", pid: 1), registry: registry, router: router, routeRepository: routes)
+        let package = PHPPackage(version: "8.4.24", architecture: "arm64", packagePath: root.path, cliPath: "/fixture/php", fpmPath: "/fixture/php-fpm", source: "fixture", cliSHA256: "", fpmSHA256: "", installedAt: Date())
+        await dispatcher.setProjectReadinessTestOverride(.init(
+            phpPackage: package,
+            phpStatus: .init(version: package.version, package: package, state: .running, pid: 123, socket: root.appendingPathComponent("php.sock").path, health: "healthy", isDefault: true),
+            dns: .init(state: .installed, ownership: .vaelen, health: "healthy"),
+            ports: .init(state: .healthy)
+        ))
+        let request = IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: project.id?.rawValue.uuidString, workingDirectory: root.path)))
+
+        let first = await dispatcher.dispatch(request, handshaken: true).response
+        guard case .projectActivation(let firstResult)? = first.result else { return XCTFail("expected project activation result") }
+        XCTAssertTrue([ProjectReconciliationExecutionState.failed, .partial].contains(firstResult.execution.state))
+        let firstRouteResult = firstResult.execution.operations.first(where: { $0.operationID == "route.create" })
+        XCTAssertEqual(firstRouteResult?.state, .failed, firstRouteResult?.message ?? "missing route result")
+        let retained = try XCTUnwrap(routes.all().first)
+        let expectedSocket = root.appendingPathComponent("php.sock").path
+        XCTAssertEqual(retained.projectID, project.id?.rawValue)
+        XCTAssertEqual(retained.projectPath, project.rootPath.string)
+        XCTAssertEqual(retained.route.hostname, "shop.test")
+        XCTAssertEqual(retained.route.target, .fastCGI(socketPath: expectedSocket, documentRoot: projectRoot.appendingPathComponent("custom-webroot").path))
+
+        let retry = await dispatcher.dispatch(request, handshaken: true).response
+        guard case .projectActivation(let retryResult)? = retry.result else { return XCTFail("expected retry activation result") }
+        XCTAssertEqual(retryResult.execution.state, .succeeded)
+        XCTAssertEqual(retryResult.execution.finalPlan.state, .satisfied)
+        XCTAssertEqual(retryResult.execution.operations.first(where: { $0.operationID == "route.create" })?.state, .succeeded)
+        let persistedAfterRetry = try routes.all()
+        XCTAssertEqual(persistedAfterRetry.count, 1)
+        XCTAssertEqual(persistedAfterRetry.first?.route.id, retained.route.id)
+        let liveRoutes = try await router.observedRoutes()
+        XCTAssertEqual(liveRoutes, [retained.route])
+    }
+
     @MainActor
     func testLocalProxyCreatePersistsAndRemovePreservesUnrelatedSameHostRoute() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("local-proxy-dispatcher-\(UUID().uuidString)")
@@ -2084,14 +2147,30 @@ while True:
         XCTAssertEqual(plan.response.error?.message, "Project reconciliation requires a registered linked project.")
     }
 
-    func testProjectActivationStartsAndThenReusesAnIsolatedMailpit() async throws {
+    func testProjectActivationStartsOneMailpitForMultipleAliasesAndReusesIt() async throws {
         guard let package = MailpitModule().installedVersions().first else { throw XCTSkip("Mailpit package prerequisite unavailable") }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let projectRoot = root.appendingPathComponent("project")
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-        defer { removeTestRoot(root) }
+        var ownedMailpit: MailpitModule?
+        var serviceMayHaveStarted = false
+        defer {
+            let mayRemoveRoot: Bool
+            if let mailpit = ownedMailpit, serviceMayHaveStarted || mailpit.status().state == .running {
+                do {
+                    _ = try mailpit.stop()
+                    let state = mailpit.status().state
+                    mayRemoveRoot = state == .stopped || state == .installed
+                } catch {
+                    mayRemoveRoot = false
+                }
+            } else {
+                mayRemoveRoot = true
+            }
+            if mayRemoveRoot { removeTestRoot(root) }
+        }
         let configuration = MailpitRuntimeConfiguration(smtpPort: try availablePort(), httpPort: try availablePort())
-        try Data("version: 1\nservices:\n  mailpit: true\n".utf8).write(to: projectRoot.appendingPathComponent("vaelen.yml"))
+        try Data("version: 2\nservices:\n  mail:\n    kind: mailpit\n    instance: default\n    version: mailpit-\(package.version)\n  notifications:\n    kind: mailpit\n    instance: default\n    version: mailpit-\(package.version)\n".utf8).write(to: projectRoot.appendingPathComponent("vaelen.yml"))
         try Data("MAIL_MAILER=smtp\nMAIL_HOST=127.0.0.1\nMAIL_PORT=\(configuration.smtpPort)\nMAIL_PASSWORD=null\n".utf8).write(to: projectRoot.appendingPathComponent(".env"))
 
         let layout = VaelenFilesystemLayout(rootURL: root.appendingPathComponent("vaelen"))
@@ -2104,24 +2183,34 @@ while True:
         let mailpit = MailpitModule(layout: layout, configuration: configuration)
         try FileManager.default.createDirectory(at: URL(fileURLWithPath: mailpit.instanceDatabasePath()).deletingLastPathComponent(), withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: mailpit.instanceDatabasePath(), contents: Data())
-        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: layout.databaseURL))
+        ownedMailpit = mailpit
+        let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
+        let registry = ProjectRegistry(store: store)
         _ = try await registry.link(path: projectRoot)
-        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, mailpit: mailpit, router: InMemoryRouter(), routeRepository: RouteIntentRepository(store: try SQLiteStateStore(databaseURL: layout.databaseURL.appendingPathExtension("routes"))))
+        let dispatcher = try CoreRequestDispatcher(runtime: CoreRuntime(version: "0.0.1-dev", pid: 1), registry: registry, mailpit: mailpit, router: InMemoryRouter(), routeRepository: RouteIntentRepository(store: try SQLiteStateStore(databaseURL: layout.databaseURL.appendingPathExtension("routes"))), serviceInstances: ServiceInstanceRepository(store: store))
 
         let planResponse = await dispatcher.dispatch(IPCRequest(method: .projectPlan, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
         guard case .projectPlan(let planResult) = planResponse.response.result else { return XCTFail("project plan did not return a plan") }
         XCTAssertEqual(planResult.plan.state, .actionable)
-        XCTAssertEqual(planResult.plan.operations.first?.id, "mailpit.start")
+        XCTAssertEqual(planResult.plan.operations.map(\.id), ["service.mail", "service.notifications"])
 
+        serviceMayHaveStarted = true
         let activationResponse = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
         guard case .projectActivation(let activationResult) = activationResponse.response.result else { return XCTFail("project activation did not return an execution result") }
         XCTAssertEqual(activationResult.execution.state, .succeeded)
+        XCTAssertEqual(activationResult.execution.operations.filter { $0.state == .succeeded }.count, 2)
         let firstPID = mailpit.status().pid
         XCTAssertEqual(mailpit.status().state, .running)
 
         let secondResponse = await dispatcher.dispatch(IPCRequest(method: .projectActivate, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
         guard case .projectActivation(let secondResult) = secondResponse.response.result else { return XCTFail("second activation did not return an execution result") }
         XCTAssertEqual(secondResult.execution.state, .succeeded)
+        XCTAssertEqual(mailpit.status().pid, firstPID)
+        let downResponse = await dispatcher.dispatch(IPCRequest(method: .projectDown, params: .projectEnvironment(.init(selector: projectRoot.path, workingDirectory: root.path))), handshaken: true)
+        guard case .projectActivation(let downResult) = downResponse.response.result else { return XCTFail("project down did not return a release result") }
+        XCTAssertEqual(downResult.execution.state, .succeeded)
+        XCTAssertEqual(downResult.execution.operations.filter { $0.state == .succeeded }.count, 1)
+        XCTAssertEqual(mailpit.status().state, .running)
         XCTAssertEqual(mailpit.status().pid, firstPID)
         _ = try mailpit.stop()
     }

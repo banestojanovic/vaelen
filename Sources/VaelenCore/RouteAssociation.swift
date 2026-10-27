@@ -58,11 +58,16 @@ public struct RouteAssociationClassifier: Sendable {
 
     public init() {}
 
-    public func classify(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], registeredProjects: [Project] = []) -> RouteAssociationResult {
+    public func classify(project: Project, framework: ProjectFrameworkInspection, routes: [RouteIntent], registeredProjects: [Project] = [], expectedDocumentRoot: String?? = nil) -> RouteAssociationResult {
         let projects = registeredProjects.isEmpty ? [project] : registeredProjects
         let projectPath = paths.canonicalize(project.rootPath.string).string
         let currentID = project.id?.rawValue
-        let expectedRoot = framework.suggestedDocumentRoot.map { paths.canonicalize(URL(fileURLWithPath: projectPath).appendingPathComponent($0)).string }
+        let expectedRoot: String?
+        if let expectedDocumentRoot {
+            expectedRoot = expectedDocumentRoot.map { paths.canonicalize($0).string }
+        } else {
+            expectedRoot = framework.suggestedDocumentRoot.map { paths.canonicalize(URL(fileURLWithPath: projectPath).appendingPathComponent($0)).string }
+        }
         let knownProjectIDs = Set(projects.compactMap { $0.id?.rawValue })
         let duplicateHostnames = duplicateHostnames(in: routes)
 

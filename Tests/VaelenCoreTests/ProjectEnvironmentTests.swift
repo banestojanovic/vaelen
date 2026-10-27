@@ -66,10 +66,46 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertFalse(report.secret.notes.isEmpty)
     }
 
+    func testV2DocumentRootUsesDeclaredCanonicalPathAndRejectsSymlinkEscape() throws {
+        let root = try temporaryDirectory()
+        let outside = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("custom"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("escape"), withDestinationURL: outside)
+        try Data("version: 2\nweb:\n  host: app.test\n  documentRoot: custom\n  secure: false\n  createRoute: true\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let project = project(at: root)
+        let projectID = try XCTUnwrap(project.id)
+        let customRoute = Route(hostname: "app.test", target: .fastCGI(socketPath: "/tmp/php.sock", documentRoot: root.appendingPathComponent("custom").path), tls: .disabled)
+        let custom = inspect(project, routes: [RouteIntent(route: customRoute, projectID: projectID.rawValue, projectPath: root.path)])
+        XCTAssertEqual(custom.derived.routeDocumentRootMatches, true)
+
+        let legacy = inspect(project, routes: [RouteIntent(route: customRoute, projectPath: root.path)])
+        XCTAssertEqual(legacy.observed.route.associationState, .safelyAssociable)
+        XCTAssertEqual(legacy.observed.route.associationEvidence.documentRoot, true)
+
+        try Data("version: 2\nweb:\n  host: app.test\n  documentRoot: escape\n  secure: false\n  createRoute: true\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let escapingRoute = Route(hostname: "app.test", target: .fastCGI(socketPath: "/tmp/php.sock", documentRoot: outside.path), tls: .disabled)
+        let escaping = inspect(project, routes: [RouteIntent(route: escapingRoute, projectID: projectID.rawValue, projectPath: root.path)])
+        XCTAssertEqual(escaping.derived.routeDocumentRootMatches, false)
+    }
+
+    func testCacheEnvironmentObservationExposesEndpointAndSecretAvailabilityOnly() throws {
+        let root = try temporaryDirectory()
+        try Data("CACHE_DRIVER=redis\nREDIS_HOST=127.0.0.1\nREDIS_PORT=6379\nREDIS_USERNAME=private-user\nREDIS_PASSWORD=cache-secret\n".utf8).write(to: root.appendingPathComponent(".env"))
+        let report = inspect(project(at: root))
+        XCTAssertEqual(report.configured.cacheDriver, "redis")
+        XCTAssertEqual(report.configured.cacheHost, "127.0.0.1")
+        XCTAssertEqual(report.configured.cachePort, "6379")
+        XCTAssertEqual(report.configured.cachePassword, .available)
+        let encoded = String(decoding: try JSONEncoder().encode(report), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("cache-secret"))
+        XCTAssertFalse(encoded.contains("private-user"))
+    }
+
     func testUnknownYamlFieldsAndUnsupportedVersionsAreReported() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        try Data("version: 2\nphp: 8.3\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        try Data("version: 3\nphp: 8.3\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
         let report = inspect(project(at: root))
         XCTAssertEqual(report.desired.file, .invalid)
         XCTAssertTrue(report.diagnostics.contains { $0.code == "VAELEN_CONFIG_INVALID" })
@@ -300,5 +336,126 @@ final class ProjectEnvironmentTests: XCTestCase {
         XCTAssertFalse(report.diagnostics.contains { $0.code == "MAIL_PASSWORD_MISSING" })
         let encoded = String(decoding: try JSONEncoder().encode(report), as: UTF8.self)
         XCTAssertFalse(encoded.contains("secret-value"))
+    }
+
+    func testVersionTwoManifestProducesTypedSpecAndPreservesV1Projection() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("version: 2\nphp: \"8.4\"\nnode: \"22\"\nweb:\n  host: shop.test\n  documentRoot: public\n  secure: true\nservices:\n  database:\n    kind: postgresql\n    instance: shop-db\n    version: \"18.6\"\n  cache:\n    kind: valkey\n    instance: shop-cache\n    version: \"9.1.2\"\n  mail:\n    kind: mailpit\n    instance: default\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+
+        let report = inspect(project(at: root))
+
+        XCTAssertEqual(report.desired.file, .valid)
+        XCTAssertEqual(report.desired.php, "8.4")
+        XCTAssertNil(report.desired.mysql)
+        let spec = try XCTUnwrap(report.projectSpec)
+        XCTAssertEqual(spec.php?.value, "8.4")
+        XCTAssertEqual(spec.node?.value, "22")
+        XCTAssertEqual(spec.web?.host, "shop.test")
+        XCTAssertEqual(spec.web?.documentRoot, "public")
+        XCTAssertEqual(spec.web?.secure, true)
+        XCTAssertEqual(spec.services.map(\.alias.value), ["cache", "database", "mail"])
+        XCTAssertEqual(spec.services.first { $0.alias.value == "cache" }?.kind, .valkey)
+        XCTAssertEqual(spec.services.first { $0.alias.value == "database" }?.version, "18.6")
+    }
+
+    func testVersionTwoManifestRejectsUnknownFieldsAndMalformedBindings() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invalidManifests = [
+            "version: 2\nunknown: true\n",
+            "version: 2\nservices:\n  database:\n    kind: mongo\n    instance: db\n",
+            "version: 2\nservices:\n  bad/alias:\n    kind: mysql\n    instance: db\n",
+            "version: 2\nservices:\n  db:\n    kind: mysql\n    instance: ../db\n",
+            "version: 2\nweb:\n  host: shop.test\n  documentRoot: ../outside\n  secure: true\n"
+        ]
+        for manifest in invalidManifests {
+            try Data(manifest.utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+            let report = inspect(project(at: root))
+            XCTAssertEqual(report.desired.file, .invalid, manifest)
+            XCTAssertNil(report.projectSpec, manifest)
+        }
+    }
+
+    func testVersionOneManifestStillExposesLegacySemanticsAndTypedSpec() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("version: 1\nphp: \"8.3\"\nweb:\n  secure: true\nservices:\n  mysql: true\n  mailpit: false\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let report = inspect(project(at: root))
+        XCTAssertEqual(report.desired.php, "8.3")
+        XCTAssertEqual(report.desired.secureWeb, true)
+        XCTAssertEqual(report.desired.mysql, true)
+        XCTAssertEqual(report.desired.mailpit, false)
+        XCTAssertEqual(report.projectSpec?.services.map(\.kind), [.mysql])
+        XCTAssertEqual(report.projectSpec?.services.first?.instance.value, "default")
+        XCTAssertEqual(report.projectSpec?.web?.secure, true)
+
+        try Data("version: 1\nweb:\n  secure: false\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        XCTAssertEqual(inspect(project(at: root)).projectSpec?.web?.secure, false)
+        try Data("version: 1\nweb: {}\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        XCTAssertNil(inspect(project(at: root)).projectSpec?.web)
+    }
+
+    func testVersionTwoOptionalWebFieldsAndProjectRootDocumentRoot() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("version: 2\nweb:\n  documentRoot: .\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        let report = inspect(project(at: root))
+        XCTAssertEqual(report.desired.file, .valid)
+        XCTAssertEqual(report.projectSpec?.web?.documentRoot, ".")
+        XCTAssertNil(report.projectSpec?.web?.host)
+        try Data("version: 2\nweb:\n  documentRoot: \"\"\n".utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+        XCTAssertEqual(inspect(project(at: root)).projectSpec?.web?.documentRoot, "")
+    }
+
+    func testVersionTwoRejectsDuplicateMappingKeysAtEveryLevel() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invalidManifests = [
+            "version: 2\nversion: 2\n",
+            "version: 2\nservices:\n  db:\n    kind: mysql\n    kind: valkey\n    instance: db\n",
+            "version: 2\nservices:\n  db:\n    kind: mysql\n    instance: db\n  db:\n    kind: valkey\n    instance: cache\n",
+            "version: 2\nweb:\n  secure: true\n  secure: false\n",
+            "version: 2\nservices:\n  db:\n    kind: mysql\n    instance: db\nservices:\n  cache:\n    kind: valkey\n    instance: cache\n"
+        ]
+        for manifest in invalidManifests {
+            try Data(manifest.utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+            XCTAssertEqual(inspect(project(at: root)).desired.file, .invalid, manifest)
+        }
+    }
+
+    func testVersionSelectorsValidateForConstructionCodingAndManifest() throws {
+        XCTAssertThrowsError(try PHPRequirement(value: ""))
+        XCTAssertThrowsError(try PHPRequirement(value: "8.4\n"))
+        XCTAssertThrowsError(try NodeRequirement(value: "banana"))
+        XCTAssertThrowsError(try NodeRequirement(value: "22.17.1\n"))
+        XCTAssertThrowsError(try ProjectBindingAlias("database\n"))
+        XCTAssertThrowsError(try ProjectInstanceName("db\n"))
+        XCTAssertThrowsError(try ProjectServiceBinding(alias: ProjectBindingAlias("db"), kind: .mysql, instance: ProjectInstanceName("db"), version: "8.4\n"))
+        XCTAssertThrowsError(try ProjectWebRequirement(host: "shop.test\n"))
+        XCTAssertThrowsError(try ProjectEnvironmentSpec(version: 3))
+        XCTAssertThrowsError(try JSONDecoder().decode(ProjectEnvironmentSpec.self, from: Data("{\"version\":3}".utf8)))
+        XCTAssertNoThrow(try PHPRequirement(value: "8.4.24"))
+        XCTAssertNoThrow(try NodeRequirement(value: "22.17.1"))
+        XCTAssertThrowsError(try JSONDecoder().decode(PHPRequirement.self, from: Data("{\"value\":\"latest\"}".utf8)))
+        XCTAssertThrowsError(try JSONDecoder().decode(NodeRequirement.self, from: Data("{\"value\":\"\"}".utf8)))
+        XCTAssertEqual(try JSONDecoder().decode(PHPRequirement.self, from: JSONEncoder().encode(PHPRequirement(value: "8.4"))), try PHPRequirement(value: "8.4"))
+        let duplicateBindings = """
+        {"version":2,"services":[
+          {"alias":"db","kind":"mysql","instance":"db"},
+          {"alias":"db","kind":"valkey","instance":"cache"}
+        ]}
+        """
+        XCTAssertThrowsError(try JSONDecoder().decode(ProjectEnvironmentSpec.self, from: Data(duplicateBindings.utf8)))
+        let invalidBinding = "{" + "\"alias\":\"bad/alias\",\"kind\":\"mysql\",\"instance\":\"db\"}"
+        XCTAssertThrowsError(try JSONDecoder().decode(ProjectServiceBinding.self, from: Data(invalidBinding.utf8)))
+        let binding = try ProjectServiceBinding(alias: ProjectBindingAlias("db"), kind: .mysql, instance: ProjectInstanceName("db"))
+        XCTAssertThrowsError(try ProjectEnvironmentSpec(services: [binding, binding]))
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for manifest in ["version: 2\nphp: latest\n", "version: 2\nnode: \"22.x\"\n", "version: 2\nweb: {}\n"] {
+            try Data(manifest.utf8).write(to: root.appendingPathComponent("vaelen.yml"))
+            XCTAssertEqual(inspect(project(at: root)).desired.file, .invalid, manifest)
+        }
     }
 }

@@ -40,9 +40,12 @@ enum CLICommand {
     case databaseOpen(selector: String?)
     case projectStatus(selector: String?, json: Bool)
     case projectInspect(selector: String?, json: Bool)
+    case projectAdopt(selector: String?, json: Bool)
+    case projectAdoptApply(selector: String?, confirmation: UUID, php: String?, node: String?, webHost: String?, documentRoot: String?, secure: Bool?, createRoute: Bool, webChoiceConfirmed: Bool, services: [ProjectServiceBinding], routeIDs: [RouteID], json: Bool)
     case projectDoctor(selector: String?, json: Bool)
     case projectPlan(selector: String?, json: Bool)
     case projectActivate(selector: String?, json: Bool)
+    case projectDown(selector: String?, json: Bool)
     case projectPHP(selector: String?, version: String?, useDefault: Bool, json: Bool)
     case phpVersions(json: Bool)
     case phpInstall(String)
@@ -78,6 +81,9 @@ enum CLICommand {
     case mailpitStatus(json: Bool)
     case mailpitOpen
     case serviceList(json: Bool)
+    case serviceInstances(json: Bool)
+    case postgresqlInstance(ServiceInstanceLifecycleAction, name: String, port: Int?, json: Bool)
+    case valkeyInstance(ServiceInstanceLifecycleAction, name: String, port: Int?, json: Bool)
     case serviceAvailable(json: Bool)
     case routingStatus
     case routingStart
@@ -457,13 +463,47 @@ struct VaelenCLIMain {
                 guard !(version != nil && useDefault) else { throw CLIError.usage }
                 return .projectPHP(selector: selector, version: version, useDefault: useDefault, json: json)
             }
+            if args[1] == "adopt", args.dropFirst(2).contains("--apply") {
+                var selector: String?; var confirmation: UUID?; var php: String?; var node: String?; var webHost: String?; var documentRoot: String?; var secure: Bool?; var createRoute = false; var noWeb = false; var json = false
+                var services = [ProjectServiceBinding](); var routeIDs = [RouteID](); var i = 2
+                while i < args.count {
+                    let flag = args[i]
+                    func value() throws -> String { guard i + 1 < args.count else { throw CLIError.commandUsage("project") }; i += 1; return args[i] }
+                    switch flag {
+                    case "--apply": guard confirmation == nil, let id = UUID(uuidString: try value()) else { throw CLIError.commandUsage("project") }; confirmation = id
+                    case "--php": guard php == nil else { throw CLIError.commandUsage("project") }; php = try value()
+                    case "--node": guard node == nil else { throw CLIError.commandUsage("project") }; node = try value()
+                    case "--web-host": guard webHost == nil, !noWeb else { throw CLIError.commandUsage("project") }; webHost = try value()
+                    case "--document-root": guard documentRoot == nil, !noWeb else { throw CLIError.commandUsage("project") }; documentRoot = try value()
+                    case "--secure": guard secure == nil, !noWeb else { throw CLIError.commandUsage("project") }; secure = true
+                    case "--insecure": guard secure == nil, !noWeb else { throw CLIError.commandUsage("project") }; secure = false
+                    case "--create-route": guard !createRoute, !noWeb else { throw CLIError.commandUsage("project") }; createRoute = true
+                    case "--no-web": guard !noWeb, webHost == nil, documentRoot == nil, secure == nil else { throw CLIError.commandUsage("project") }; noWeb = true
+                    case "--service":
+                        let fields = try value().split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+                        guard fields.count == 3 || fields.count == 4, let kind = ProjectServiceKind(rawValue: fields[1]), let alias = try? ProjectBindingAlias(fields[0]), let instance = try? ProjectInstanceName(fields[2]) else { throw CLIError.commandUsage("project") }
+                        services.append(try ProjectServiceBinding(alias: alias, kind: kind, instance: instance, version: fields.count == 4 ? fields[3] : nil))
+                    case "--select-route": guard let id = UUID(uuidString: try value()) else { throw CLIError.commandUsage("project") }; routeIDs.append(RouteID(rawValue: id))
+                    case "--json": guard !json else { throw CLIError.commandUsage("project") }; json = true
+                    default:
+                        guard !flag.hasPrefix("-"), selector == nil else { throw CLIError.commandUsage("project") }; selector = flag
+                    }
+                    i += 1
+                }
+                guard let confirmation else { throw CLIError.commandUsage("project") }
+                guard !(createRoute && !routeIDs.isEmpty) else { throw CLIError.commandUsage("project") }
+                return .projectAdoptApply(selector: selector, confirmation: confirmation, php: php, node: node, webHost: webHost, documentRoot: documentRoot, secure: secure, createRoute: createRoute, webChoiceConfirmed: noWeb || webHost != nil || documentRoot != nil || secure != nil, services: services, routeIDs: routeIDs, json: json)
+            }
             let parsed = try projectEnvironmentArguments(Array(args.dropFirst(2)))
             switch args[1] {
             case "status": return .projectStatus(selector: parsed.selector, json: parsed.json)
             case "inspect": return .projectInspect(selector: parsed.selector, json: parsed.json)
+            case "adopt": return .projectAdopt(selector: parsed.selector, json: parsed.json)
             case "doctor": return .projectDoctor(selector: parsed.selector, json: parsed.json)
             case "plan": return .projectPlan(selector: parsed.selector, json: parsed.json)
             case "activate": return .projectActivate(selector: parsed.selector, json: parsed.json)
+            case "up": return .projectActivate(selector: parsed.selector, json: parsed.json)
+            case "down": return .projectDown(selector: parsed.selector, json: parsed.json)
             default: throw CLIError.usage
             }
         case "link":
@@ -609,6 +649,33 @@ struct VaelenCLIMain {
             guard args.count >= 2 else { return .help(path: [first]) }
             switch args[1] {
             case "list": return .serviceList(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            case "instances": return .serviceInstances(json: try optionalJSONOption(Array(args.dropFirst(2))))
+            case "postgresql":
+                guard args.count >= 4,
+                      let action = ServiceInstanceLifecycleAction(rawValue: args[2]),
+                      (try? ProjectInstanceName(args[3])) != nil else { throw CLIError.message("Usage: val service postgresql <create|status|start|stop|remove> <name> [--port <port>] [--json].") }
+                let name = args[3]
+                var port: Int?
+                var json = false
+                var index = 4
+                while index < args.count {
+                    if args[index] == "--json" { guard !json else { throw CLIError.usage }; json = true; index += 1 }
+                    else if args[index] == "--port", action == .create, index + 1 < args.count, let value = Int(args[index + 1]), (1...65535).contains(value), port == nil { port = value; index += 2 }
+                    else { throw CLIError.usage }
+                }
+                return .postgresqlInstance(action, name: name, port: port, json: json)
+            case "valkey":
+                guard args.count >= 4, let action = ServiceInstanceLifecycleAction(rawValue: args[2]), (try? ProjectInstanceName(args[3])) != nil else { throw CLIError.message("Usage: val service valkey <create|status|start|stop|remove> <name> [--port <port>] [--json].") }
+                let name = args[3]
+                var port: Int?
+                var json = false
+                var index = 4
+                while index < args.count {
+                    if args[index] == "--json" { guard !json else { throw CLIError.usage }; json = true; index += 1 }
+                    else if args[index] == "--port", action == .create, index + 1 < args.count, let value = Int(args[index + 1]), (1...65535).contains(value), port == nil { port = value; index += 2 }
+                    else { throw CLIError.usage }
+                }
+                return .valkeyInstance(action, name: name, port: port, json: json)
             case "available": return .serviceAvailable(json: try optionalJSONOption(Array(args.dropFirst(2))))
             case "versions":
                 guard args.count == 3 || args.count == 4, args.count == 3 || args[3] == "--json" else {
@@ -1046,6 +1113,16 @@ struct VaelenCLIMain {
         case .projectInspect(let selector, let json):
             let report = try await client.projectInspect(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectInspection(report)) }
+        case .projectAdopt(let selector, let json):
+            let result = try await client.projectAdoptionPreview(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print(projectAdoptionPreviewOutput(result.preview) + "\n\nConfirmation: " + result.confirmation.uuidString + "\nApply with explicit --php, --node, --web-host, --document-root, --secure or --insecure, --service, and --select-route choices.") }
+        case .projectAdoptApply(let selector, let confirmation, let php, let node, let webHost, let documentRoot, let secure, let createRoute, let webChoiceConfirmed, let services, let routeIDs, let json):
+            let web: ProjectWebRequirement?
+            if webHost != nil || documentRoot != nil || secure != nil { web = try ProjectWebRequirement(host: webHost, documentRoot: documentRoot, secure: secure, createRoute: createRoute) } else { web = nil }
+            let spec = try ProjectEnvironmentSpec(version: 2, php: try php.map { try PHPRequirement(value: $0) }, node: try node.map { try NodeRequirement(value: $0) }, web: web, services: services)
+            let request = ProjectAdoptionApplyRequest(confirmation: confirmation, selector: selector, workingDirectory: workingDirectory, spec: spec, selectedRouteIDs: routeIDs, createRoute: createRoute, webChoiceConfirmed: webChoiceConfirmed)
+            let result = try await client.projectAdoptionApply(request)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) } else { print(HumanOutput.success("Created vaelen.yml for \(result.identity.name) and applied \(result.claimedServices.count) service claims. Route ownership association remains pending project activation.")) }
         case .projectDoctor(let selector, let json):
             let report = try await client.projectDoctor(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(report), as: UTF8.self)) } else { print(projectDoctor(report)) }
@@ -1054,6 +1131,9 @@ struct VaelenCLIMain {
             if json { print(String(decoding: try IPCCodec.encode(plan), as: UTF8.self)) } else { print(projectPlan(plan)) }
         case .projectActivate(let selector, let json):
             let execution = try await client.projectActivate(selector: selector, workingDirectory: workingDirectory)
+            if json { print(String(decoding: try IPCCodec.encode(execution), as: UTF8.self)) } else { print(projectActivation(execution)) }
+        case .projectDown(let selector, let json):
+            let execution = try await client.projectDown(selector: selector, workingDirectory: workingDirectory)
             if json { print(String(decoding: try IPCCodec.encode(execution), as: UTF8.self)) } else { print(projectActivation(execution)) }
         case .projectPHP(let selector, let version, let useDefault, let json):
             let result = try await client.setProjectPHP(selector: selector, workingDirectory: workingDirectory, version: version, useDefault: useDefault)
@@ -1171,6 +1251,21 @@ struct VaelenCLIMain {
             guard inventory.complete else {
                 throw CLIError.message("Service inventory is incomplete because one or more status observations failed.")
             }
+        case .serviceInstances(let json):
+            print(try ServiceInstanceInventoryFormatter.render(await client.serviceInstances(), json: json))
+        case .postgresqlInstance(let action, let name, let port, let json):
+            let result = try await client.serviceInstanceLifecycle(.init(action: action, name: name, port: port))
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else if let instance = result.instance {
+                let endpoint = instance.endpoint.displayEndpoints.joined(separator: ", ")
+                print(HumanOutput.report("PostgreSQL \(instance.name.value)", rows: [("State", result.health == "healthy" ? "running" : result.health), ("Package", instance.packageIdentifier), ("Endpoint", endpoint), ("Data", displayPath(instance.dataDirectory)), ("PID", result.pid.map(String.init) ?? "none")]))
+            } else { print(HumanOutput.success("Removed PostgreSQL instance \(name).")) }
+        case .valkeyInstance(let action, let name, let port, let json):
+            let result = try await client.serviceInstanceLifecycle(.init(kind: .valkey, action: action, name: name, port: port))
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else if let instance = result.instance {
+                print(HumanOutput.report("Valkey \(instance.name.value)", rows: [("State", result.health == "healthy" ? "running" : result.health), ("Package", instance.packageIdentifier), ("Endpoint", instance.endpoint.displayEndpoints.joined(separator: ", ")), ("Data", displayPath(instance.dataDirectory)), ("PID", result.pid.map(String.init) ?? "none")]))
+            } else { print(HumanOutput.success("Removed Valkey instance \(name).")) }
         case .serviceAvailable(let json):
             print(try ServiceAvailableFormatter.render(.supported, json: json))
          case .mailpitOpen:
@@ -1441,6 +1536,30 @@ struct VaelenCLIMain {
             HumanOutput.report("Configured", rows: [("Database", configuredDB), ("Mail", configuredMail), ("Secret availability", "Database · \(report.secret.databasePassword.rawValue) · Mail · \(report.secret.mailPassword.rawValue)")]),
             HumanOutput.report("Derived", rows: derivedRows),
             HumanOutput.heading("Diagnostics") + "\n" + diagnosticTable
+        ].joined(separator: "\n\n")
+    }
+
+    static func projectAdoptionPreviewOutput(_ preview: ProjectAdoptionPreview) -> String {
+        func terminalSafe(_ value: String) -> String {
+            value.replacingOccurrences(of: "\\p{Cc}", with: " ", options: .regularExpression)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        func requirement(_ value: ProjectAdoptionRequirement) -> String {
+            let sources = value.sources.map { "\(terminalSafe($0.source)): \(terminalSafe($0.rawValue))" }.joined(separator: ", ")
+            return "\(value.state.rawValue)\(value.exactSelectorCandidate.map { " · candidate \(terminalSafe($0))" } ?? "")\(sources.isEmpty ? "" : " · \(sources)")"
+        }
+        let routeRows = preview.routes.map { [$0.id.description, terminalSafe($0.hostname), $0.targetKind.rawValue, $0.documentRoot.map(terminalSafe) ?? "—", $0.tls.rawValue, $0.liveObserved.map { $0 ? "observed" : "not observed" } ?? "unavailable"] }
+        let endpoints = [
+            ("Database", terminalSafe("\(preview.database.connection ?? "unknown") · \(preview.database.host ?? "unknown"): \(preview.database.port ?? "unknown") · secret: \(preview.database.secretAvailability.rawValue)")),
+            ("Mail", terminalSafe("\(preview.mail.connection ?? "unknown") · \(preview.mail.host ?? "unknown"): \(preview.mail.port ?? "unknown") · secret: \(preview.mail.secretAvailability.rawValue)")),
+            ("Cache", terminalSafe("\(preview.cache?.connection ?? "unknown") · \(preview.cache?.host ?? "unknown"): \(preview.cache?.port ?? "unknown") · secret: \(preview.cache?.secretAvailability.rawValue ?? "unknown")"))
+        ]
+        return [
+            HumanOutput.report("Project adoption preview · \(terminalSafe(preview.identity.name))", rows: [("Path", terminalSafe(displayPath(preview.identity.path))), ("Manifest", "\(preview.manifestState.rawValue) · version \(preview.manifestVersion.map(String.init) ?? "unknown")"), ("PHP", requirement(preview.php)), ("Node", requirement(preview.node)), ("herd.yml", preview.herdYMLPresent ? "Present · review manually" : "Absent"), ("Live routes", preview.liveRoutesAvailable ? "Available" : "Unavailable · \(terminalSafe(preview.liveRoutesUnavailableReason ?? "reason unknown"))")]),
+            HumanOutput.heading("Associated routes") + "\n" + HumanOutput.list(routeRows, headers: ["Route ID", "Hostname", "Target", "Document root", "TLS", "Live observation"], empty: "No associated routes."),
+            HumanOutput.report("Configuration endpoints", rows: endpoints),
+            HumanOutput.heading("Unresolved decisions") + "\n" + (preview.unresolvedDecisions.isEmpty ? "None." : preview.unresolvedDecisions.map { "• \(terminalSafe($0))" }.joined(separator: "\n")),
+            terminalSafe(preview.safetyBoundary)
         ].joined(separator: "\n\n")
     }
 

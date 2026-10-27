@@ -48,7 +48,7 @@ final class NodeSelectionTests: XCTestCase {
         let store = try SQLiteStateStore(databaseURL: db)
         try store.execute("PRAGMA user_version = 7")
         XCTAssertThrowsError(try NodeSelectionReader(databaseURL: db).records())
-        try store.execute("PRAGMA user_version = 8")
+        try store.execute("PRAGMA user_version = 9")
         try store.execute("INSERT INTO projects (id,name,canonical_path,registration_kind,node_override_version) VALUES ('bad','bad','/tmp/bad','linked','24')")
         XCTAssertThrowsError(try NodeSelectionReader(databaseURL: db).records())
     }
@@ -65,10 +65,13 @@ final class NodeSelectionTests: XCTestCase {
             try repository.setPHPOverride("8.4.23", for: id)
             try store.execute("INSERT INTO route_intents (id,route_json,project_id,project_path) VALUES ('route',X'010203','\(id)','/tmp/preserved')")
             try store.execute("ALTER TABLE projects DROP COLUMN node_override_version")
+            try store.execute("DROP TABLE project_service_claims")
+            try store.execute("DROP TABLE manual_service_claims")
+            try store.execute("DROP TABLE service_instances")
             try store.execute("PRAGMA user_version = 7")
         }
         let upgraded = try SQLiteStateStore(databaseURL: db)
-        XCTAssertEqual(try upgraded.pragmaVersion(), 8)
+        XCTAssertEqual(try upgraded.pragmaVersion(), 9)
         XCTAssertEqual(try ProjectRepository(store: upgraded).all().map(\.id), [id])
         XCTAssertEqual(try ProjectRepository(store: upgraded).phpOverride(for: id), "8.4.23")
         try upgraded.query("SELECT hex(route_json),project_id,project_path FROM route_intents") { statement in

@@ -10,6 +10,27 @@ import VaelenCore
 @MainActor
 @Observable
 final class AppModel {
+    struct ProjectLifecycleState {
+        var plan: ProjectReconciliationPlan?
+        var reviewedSpec: ProjectEnvironmentSpec?
+        var execution: ProjectReconciliationExecutionResult?
+        var isLoadingPlan = false
+        var isMutating = false
+        var stopping = false
+        var isRefreshing = false
+        var error: String?
+        var refreshError: String?
+    }
+    struct ProjectAdoptionReview {
+        var preview: ProjectAdoptionPreviewResult?
+        var inventory: ServiceInstanceInventoryResult?
+        var instanceHealth: [String: String] = [:]
+        var error: String?
+        var isLoading = false
+        var isApplying = false
+        var confirmationConsumed = false
+        var result: ProjectAdoptionApplyResult?
+    }
     private static let startupLogger = Logger(subsystem: "dev.vaelen.app", category: "ProjectStartup")
     enum State {
         case connecting
@@ -24,6 +45,8 @@ final class AppModel {
     private(set) var earlyProjectList: [ProjectWire]?
     private(set) var projectReports: [ProjectEnvironmentReport] = []
     private(set) var projectReportErrors: [String: String] = [:]
+    private(set) var projectLifecycleStates: [String: ProjectLifecycleState] = [:]
+    private(set) var projectAdoptionReviews: [String: ProjectAdoptionReview] = [:]
     private(set) var projectStartupMilestones: [String: TimeInterval] = [:]
     private(set) var phpCatalog: PHPRuntimeCatalog?
     private(set) var phpCatalogReadPending = false
@@ -193,7 +216,7 @@ final class AppModel {
             case "unavailable":
                 model.state = .unavailable
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
-            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable":
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable", "project-adoption":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
                 let mysqlState: MySQLState = mode == "node-settings-selected" ? .running : mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
                 let mysqlVersion = (mode == "node-settings-selected" || mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
@@ -222,7 +245,7 @@ final class AppModel {
                 )
                 let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
-                if mode.hasPrefix("node-settings-") {
+                if mode.hasPrefix("node-settings-") || mode == "project-adoption" {
                     let projectID = UUID(uuidString: "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!
                     let project = ProjectWire(id: projectID, name: "Storefront", path: "/fixture/projects/storefront", registration: "linked", availability: "available", detectedFramework: "Next.js")
                     let version = try! NodeVersion("24.22.1")
@@ -230,7 +253,7 @@ final class AppModel {
                     let packageJSON = Data(#"{"version":"24.22.1","platform":"darwin","architecture":"arm64","artifactSHA256":"fixture","receiptVersion":1}"#.utf8)
                     let package = try? JSONDecoder().decode(NodePackageIdentity.self, from: packageJSON)
                     model.linkedProjects = [project]
-                    if mode == "node-settings-selected" {
+                    if mode == "node-settings-selected" || mode == "project-adoption" {
                         let projectDomain = Project(
                             id: ProjectID(rawValue: projectID),
                             name: project.name,
@@ -267,13 +290,45 @@ final class AppModel {
                         )
                         model.projectReports = [ProjectEnvironmentReport(
                             identity: ProjectEnvironmentIdentity(project: projectDomain),
-                            desired: ProjectDesiredEnvironment(file: .valid, mysql: false),
+                            desired: ProjectDesiredEnvironment(file: mode == "project-adoption" ? .absent : .valid, mysql: false),
                             configured: ProjectConfiguredEnvironment(envFile: "/fixture/projects/storefront/.env", envFilePresent: true, dbConnection: "sqlite"),
                             observed: observed,
                             derived: derived,
                             secret: ProjectSecretEnvironment(databasePassword: .unknown, mailPassword: .unknown),
                             diagnostics: []
                         )]
+                        if mode == "project-adoption", let report = model.projectReports.first {
+                            let preview = ProjectAdoptionPreview(
+                                identity: report.identity,
+                                manifestState: .absent,
+                                manifestVersion: nil,
+                                php: ProjectAdoptionRequirement(state: .readyForReview, sources: [.init(source: "composer.json require.php", rawValue: "^8.3")], exactSelectorCandidate: "8.3"),
+                                node: ProjectAdoptionRequirement(state: .needsChoice, sources: [.init(source: "package.json engines.node", rawValue: ">=20")]),
+                                routes: [
+                                    ProjectAdoptionRoute(id: RouteID(), hostname: "storefront.test", targetKind: .fastCGI, documentRoot: "public", tls: .local, liveObserved: true)
+                                ],
+                                liveRoutesAvailable: true,
+                                liveRoutesUnavailableReason: nil,
+                                database: ProjectAdoptionEndpoint(connection: "sqlite", host: nil, port: nil, secretAvailability: .missing),
+                                mail: ProjectAdoptionEndpoint(connection: "smtp", host: "127.0.0.1", port: "1025", secretAvailability: .missing),
+                                cache: ProjectAdoptionEndpoint(connection: "redis", host: "127.0.0.1", port: "6379", secretAvailability: .unknown),
+                                herdYMLPresent: false,
+                                unresolvedDecisions: ["Choose a PHP selector from discovered constraints.", "Choose a Node selector from discovered constraints.", "No route is associated; choose a reviewed route or explicitly create one."],
+                                safetyBoundary: "Creates vaelen.yml and exact service claims only. No .env writes, route ownership changes, service lifecycle actions, or credential import.",
+                                discoveryIssues: []
+                            )
+                            model.projectAdoptionReviews[project.path] = ProjectAdoptionReview(
+                                preview: ProjectAdoptionPreviewResult(confirmation: UUID(), preview: preview),
+                                inventory: ServiceInstanceInventoryResult(entries: [
+                                    ServiceInstanceInventoryEntryWire(instance: ServiceInstanceRecordWire(kind: .postgresql, name: try! ProjectInstanceName("fixture-pg"), packageIdentifier: "postgresql-18.6", endpoint: .postgresql(port: 15432), dataDirectory: "/fixture/vaelen/postgresql/fixture-pg/data"), owners: [], eligibleForProjectBinding: true),
+                                    ServiceInstanceInventoryEntryWire(instance: ServiceInstanceRecordWire(kind: .valkey, name: try! ProjectInstanceName("fixture-cache"), packageIdentifier: "valkey-9.1.2", endpoint: .valkey(port: 16379), dataDirectory: "/fixture/vaelen/valkey/fixture-cache/data"), owners: [], eligibleForProjectBinding: true),
+                                    ServiceInstanceInventoryEntryWire(instance: ServiceInstanceRecordWire(kind: .mysql, name: try! ProjectInstanceName("default"), packageIdentifier: "mysql-8.4.11", endpoint: .mysql(port: 13306), dataDirectory: "/fixture/vaelen/mysql/default/data"), owners: [], eligibleForProjectBinding: true),
+                                    ServiceInstanceInventoryEntryWire(instance: ServiceInstanceRecordWire(kind: .mailpit, name: try! ProjectInstanceName("default"), packageIdentifier: "mailpit-1.31.1", endpoint: .mailpit(smtpPort: 11025, httpPort: 18025), dataDirectory: "/fixture/vaelen/mailpit/default"), owners: [], eligibleForProjectBinding: true),
+                                    ServiceInstanceInventoryEntryWire(instance: ServiceInstanceRecordWire(kind: .redis, name: try! ProjectInstanceName("fixture-redis"), packageIdentifier: "redis-7.4", endpoint: .redis(port: 16380), dataDirectory: "/fixture/vaelen/redis/fixture-redis/data"), owners: [], eligibleForProjectBinding: false)
+                                ]),
+                                instanceHealth: ["postgresql:fixture-pg": "running · healthy", "valkey:fixture-cache": "stopped · stopped"]
+                            )
+                        }
                     }
                     let record = NodeProjectRecord(id: ProjectID(rawValue: projectID), name: project.name, path: project.path, pin: pin)
                     model.nodeSnapshot = NodeCommandSnapshot(
@@ -392,9 +447,9 @@ final class AppModel {
         Self.startupLogger.info("startup milestone=popover-view-presented known-projects=\(count) connection=\(connection, privacy: .public)")
     }
 
-    func refresh() async {
+    func refresh(whileRelationshipMutationInFlight: Bool = false) async {
         guard !isSettingsFixture else { return }
-        guard !relationshipMutationInFlight else {
+        guard !relationshipMutationInFlight || whileRelationshipMutationInFlight else {
             refreshRequested = true
             return
         }
@@ -1420,11 +1475,12 @@ final class AppModel {
     }
 
     func setProjectPHP(_ project: ProjectWire, version: String?, useDefault: Bool = false) async {
-        guard !relationshipMutationInFlight, let client else { return }
-        relationshipMutationInFlight = true; relationshipOperation = "Updating PHP for \(project.name)…"; relationshipError = nil
-        defer { relationshipMutationInFlight = false; relationshipOperation = nil }
-        do { _ = try await client.setProjectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: project.path, version: version, useDefault: useDefault); await refresh() }
-        catch { relationshipError = error.localizedDescription }
+        guard let client, beginRelationshipMutation("Updating PHP for \(project.name)…") else { return }
+        do {
+            _ = try await client.setProjectPHP(selector: project.id?.uuidString ?? project.path, workingDirectory: project.path, version: version, useDefault: useDefault)
+            await refresh(whileRelationshipMutationInFlight: true)
+            finishRelationshipMutation()
+        } catch { finishRelationshipMutation(error: error) }
     }
 
     func refreshNodeSelections() async {
@@ -1508,6 +1564,250 @@ final class AppModel {
         guard projectSettingsVisible else { return }
         await refreshProjectRelationships()
         await refreshNodeSelections()
+    }
+
+    func projectLifecycleState(for project: ProjectWire) -> ProjectLifecycleState {
+        projectLifecycleStates[project.path] ?? ProjectLifecycleState()
+    }
+
+    func projectAdoptionReview(for project: ProjectWire) -> ProjectAdoptionReview {
+        projectAdoptionReviews[project.path] ?? ProjectAdoptionReview()
+    }
+
+    func reviewProjectAdoption(_ project: ProjectWire) async {
+        guard !isSettingsFixture,
+              projectReports.first(where: { $0.identity.path == project.path })?.desired.file == .absent,
+              beginRelationshipMutation("Reviewing project adoption…") else { return }
+        var review = ProjectAdoptionReview(isLoading: true)
+        projectAdoptionReviews[project.path] = review
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let selector = project.id?.uuidString ?? project.path
+            let current = try await client.projectStatus(selector: selector, workingDirectory: project.path)
+            guard current.desired.file == .absent else {
+                await client.disconnect()
+                review.error = "The project declaration changed. Refresh project details before reviewing adoption."
+                review.isLoading = false
+                projectAdoptionReviews[project.path] = review
+                finishRelationshipMutation()
+                return
+            }
+            review.preview = try await client.projectAdoptionPreview(selector: selector, workingDirectory: project.path)
+            review.inventory = try await client.serviceInstances()
+            for entry in review.inventory?.entries ?? [] where entry.eligibleForProjectBinding == true {
+                if let assessedHealth = entry.assessedHealth, (entry.instance.kind == .mysql || entry.instance.kind == .mailpit) {
+                    review.instanceHealth["\(entry.instance.kind.rawValue):\(entry.instance.name.value)"] = assessedHealth
+                    continue
+                }
+                do {
+                    let status = try await client.serviceInstanceLifecycle(ServiceInstanceLifecycleRequest(kind: entry.instance.kind, action: .status, name: entry.instance.name.value))
+                    review.instanceHealth["\(entry.instance.kind.rawValue):\(entry.instance.name.value)"] = status.health
+                } catch {
+                    review.instanceHealth["\(entry.instance.kind.rawValue):\(entry.instance.name.value)"] = "unavailable · \(error.localizedDescription)"
+                }
+            }
+            await client.disconnect()
+            review.isLoading = false
+            projectAdoptionReviews[project.path] = review
+            finishRelationshipMutation()
+        } catch {
+            await client.disconnect()
+            review.error = error.localizedDescription
+            review.isLoading = false
+            projectAdoptionReviews[project.path] = review
+            finishRelationshipMutation(error: error)
+        }
+    }
+
+    func applyProjectAdoption(_ project: ProjectWire, spec: ProjectEnvironmentSpec, routeIDs: [RouteID], createRoute: Bool, webChoiceConfirmed: Bool) async {
+        guard !isSettingsFixture,
+              !projectAdoptionReview(for: project).confirmationConsumed,
+              let reviewed = projectAdoptionReview(for: project).preview,
+              beginRelationshipMutation("Applying reviewed project adoption…") else { return }
+        var review = projectAdoptionReview(for: project)
+        review.isApplying = true
+        review.confirmationConsumed = true
+        review.error = nil
+        review.result = nil
+        projectAdoptionReviews[project.path] = review
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let result = try await client.projectAdoptionApply(ProjectAdoptionApplyRequest(
+                confirmation: reviewed.confirmation,
+                selector: project.id?.uuidString ?? project.path,
+                workingDirectory: project.path,
+                spec: spec,
+                selectedRouteIDs: routeIDs,
+                createRoute: createRoute,
+                webChoiceConfirmed: webChoiceConfirmed
+            ))
+            await client.disconnect()
+            review = projectAdoptionReview(for: project)
+            review.result = result
+            review.isApplying = false
+            projectAdoptionReviews[project.path] = review
+            await refreshProjectLifecycleReport(project)
+            finishRelationshipMutation()
+        } catch {
+            await client.disconnect()
+            review = projectAdoptionReview(for: project)
+            review.error = error.localizedDescription
+            review.isApplying = false
+            projectAdoptionReviews[project.path] = review
+            await refreshProjectLifecycleReport(project)
+            finishRelationshipMutation(error: error)
+        }
+    }
+
+    func reviewProjectStart(_ project: ProjectWire) async {
+        guard !isSettingsFixture,
+              !projectLifecycleState(for: project).isMutating,
+              !projectLifecycleState(for: project).isLoadingPlan,
+              beginRelationshipMutation("Reviewing project start plan…") else { return }
+        invalidateProjectReportRefreshes()
+        var lifecycle = projectLifecycleState(for: project)
+        lifecycle.isLoadingPlan = true
+        lifecycle.plan = nil
+        lifecycle.reviewedSpec = nil
+        lifecycle.execution = nil
+        lifecycle.error = nil
+        lifecycle.refreshError = nil
+        projectLifecycleStates[project.path] = lifecycle
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let selector = project.id?.uuidString ?? project.path
+            let report = try await client.projectStatus(selector: selector, workingDirectory: project.path)
+            let plan = try await client.projectPlan(selector: selector, workingDirectory: project.path)
+            await client.disconnect()
+            lifecycle = projectLifecycleState(for: project)
+            lifecycle.plan = plan
+            lifecycle.reviewedSpec = report.projectSpec
+            lifecycle.isLoadingPlan = false
+            projectLifecycleStates[project.path] = lifecycle
+            finishRelationshipMutation()
+        } catch {
+            await client.disconnect()
+            lifecycle = projectLifecycleState(for: project)
+            lifecycle.isLoadingPlan = false
+            lifecycle.error = error.localizedDescription
+            projectLifecycleStates[project.path] = lifecycle
+            finishRelationshipMutation(error: error)
+        }
+    }
+
+    func activateProject(_ project: ProjectWire) async {
+        await runProjectLifecycle(project, stopping: false)
+    }
+
+    func stopProject(_ project: ProjectWire) async {
+        await runProjectLifecycle(project, stopping: true)
+    }
+
+    private func runProjectLifecycle(_ project: ProjectWire, stopping: Bool) async {
+        guard !isSettingsFixture else { return }
+        let selector = project.id?.uuidString ?? project.path
+        var lifecycle = projectLifecycleState(for: project)
+        guard !lifecycle.isMutating, !lifecycle.isLoadingPlan,
+              stopping || lifecycle.plan?.state == .actionable else { return }
+        guard beginRelationshipMutation(stopping ? "Releasing project service claims…" : "Activating project…") else { return }
+        invalidateProjectReportRefreshes()
+        lifecycle.isMutating = true
+        lifecycle.stopping = stopping
+        lifecycle.execution = nil
+        lifecycle.error = nil
+        lifecycle.refreshError = nil
+        projectLifecycleStates[project.path] = lifecycle
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            if !stopping {
+                guard let reviewedPlan = lifecycle.plan else {
+                    await client.disconnect()
+                    lifecycle.error = "Review a start plan before confirming."
+                    projectLifecycleStates[project.path] = lifecycle
+                    finishRelationshipMutation()
+                    lifecycle.isMutating = false
+                    projectLifecycleStates[project.path] = lifecycle
+                    return
+                }
+                let currentReport = try await client.projectStatus(selector: selector, workingDirectory: project.path)
+                let currentPlan = try await client.projectPlan(selector: selector, workingDirectory: project.path)
+                guard lifecycle.reviewedSpec == currentReport.projectSpec,
+                      Self.sameReviewedProjectPlan(reviewedPlan, currentPlan) else {
+                    await client.disconnect()
+                    lifecycle = projectLifecycleState(for: project)
+                    lifecycle.plan = currentPlan
+                    lifecycle.reviewedSpec = currentReport.projectSpec
+                    lifecycle.error = "The project plan changed since review. Review the updated plan and confirm again."
+                    projectLifecycleStates[project.path] = lifecycle
+                    finishRelationshipMutation()
+                    lifecycle.isMutating = false
+                    projectLifecycleStates[project.path] = lifecycle
+                    return
+                }
+            }
+            let execution = stopping
+                ? try await client.projectDown(selector: selector, workingDirectory: project.path)
+                : try await client.projectActivate(selector: selector, workingDirectory: project.path)
+            await client.disconnect()
+            lifecycle = projectLifecycleState(for: project)
+            lifecycle.execution = execution
+            projectLifecycleStates[project.path] = lifecycle
+            await refreshProjectLifecycleReport(project)
+        } catch {
+            await client.disconnect()
+            lifecycle = projectLifecycleState(for: project)
+            lifecycle.error = error.localizedDescription
+            projectLifecycleStates[project.path] = lifecycle
+            await refreshProjectLifecycleReport(project)
+        }
+        lifecycle = projectLifecycleState(for: project)
+        lifecycle.isMutating = false
+        projectLifecycleStates[project.path] = lifecycle
+        finishRelationshipMutation()
+    }
+
+    private static func sameReviewedProjectPlan(_ lhs: ProjectReconciliationPlan, _ rhs: ProjectReconciliationPlan) -> Bool {
+        lhs.identity == rhs.identity && lhs.desired == rhs.desired && lhs.operations == rhs.operations && lhs.state == rhs.state
+    }
+
+    private func invalidateProjectReportRefreshes() {
+        refreshGeneration += 1
+        projectReportsTask?.cancel()
+        projectReportsTask = nil
+    }
+
+    private func refreshProjectLifecycleReport(_ project: ProjectWire) async {
+        let selector = project.id?.uuidString ?? project.path
+        var lifecycle = projectLifecycleState(for: project)
+        lifecycle.isRefreshing = true
+        lifecycle.refreshError = nil
+        projectLifecycleStates[project.path] = lifecycle
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let report = try await client.projectStatus(selector: selector, workingDirectory: project.path)
+            let refreshedPlan = try await client.projectPlan(selector: selector, workingDirectory: project.path)
+            await client.disconnect()
+            projectReports.removeAll { $0.identity.path == project.path }
+            projectReports.append(report)
+            projectReportErrors.removeValue(forKey: project.path)
+            lifecycle = projectLifecycleState(for: project)
+            lifecycle.plan = refreshedPlan
+            lifecycle.reviewedSpec = report.projectSpec
+            lifecycle.isRefreshing = false
+            lifecycle.refreshError = nil
+            projectLifecycleStates[project.path] = lifecycle
+        } catch {
+            await client.disconnect()
+            lifecycle = projectLifecycleState(for: project)
+            lifecycle.isRefreshing = false
+            lifecycle.refreshError = error.localizedDescription
+            projectLifecycleStates[project.path] = lifecycle
+        }
     }
 
     private func refreshProjectRelationships() async {
@@ -2036,6 +2336,10 @@ final class AppModel {
         relationshipMutationInFlight = false
         relationshipOperation = nil
         relationshipError = error?.localizedDescription
+        if refreshRequested {
+            refreshRequested = false
+            Task { @MainActor [weak self] in await self?.refresh() }
+        }
     }
 }
 

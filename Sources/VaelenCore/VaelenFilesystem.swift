@@ -42,10 +42,14 @@ public struct VaelenFilesystemLayout: Sendable {
     public var caddyPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
     public var mysqlPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("mysql", isDirectory: true) }
     public var mailpitPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("mailpit", isDirectory: true) }
+    public var postgresqlPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("postgresql", isDirectory: true) }
+    public var valkeyPackagesDirectoryURL: URL { packagesDirectoryURL.appendingPathComponent("valkey", isDirectory: true) }
     public var instancesDirectoryURL: URL { rootURL.appendingPathComponent("instances", isDirectory: true) }
     public var phpInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("php", isDirectory: true) }
     public var caddyInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("caddy", isDirectory: true) }
     public var mysqlInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("mysql", isDirectory: true) }
+    public var postgresqlInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("postgresql", isDirectory: true) }
+    public var valkeyInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("valkey", isDirectory: true) }
     public var mailpitInstancesDirectoryURL: URL { instancesDirectoryURL.appendingPathComponent("mailpit", isDirectory: true) }
     public var configurationDirectoryURL: URL { rootURL.appendingPathComponent("config", isDirectory: true) }
     public var routingConfigurationDirectoryURL: URL { configurationDirectoryURL.appendingPathComponent("routing", isDirectory: true) }

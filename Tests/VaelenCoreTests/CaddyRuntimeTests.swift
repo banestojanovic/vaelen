@@ -49,6 +49,41 @@ final class CaddyRuntimeTests: XCTestCase {
         XCTAssertNil(stoppedStatus.pid)
     }
 
+    func testOfficialCaddyIdentitySurvivesPrivateTmpPathAlias() async throws {
+        let root = URL(fileURLWithPath: "/private/tmp/caddy-alias-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        let layout = VaelenFilesystemLayout(rootURL: root)
+        let liveLayout = VaelenFilesystemLayout()
+        let live: CaddyPackage
+        do { live = try CaddyModule(layout: liveLayout, verifier: nil).resolveInstalled(requestedVersion: "2.11.4") }
+        catch { throw XCTSkip("Read-only installed Caddy 2.11.4 package required: \(error)") }
+        let packageDirectory = layout.caddyPackagesDirectoryURL.appendingPathComponent(live.version, isDirectory: true)
+        try FileManager.default.createDirectory(at: packageDirectory.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: live.packagePath), to: packageDirectory)
+        let metadataURL = packageDirectory.appendingPathComponent(".vaelen-package.json")
+        var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as! [String: Any]
+        metadata["packagePath"] = packageDirectory.path
+        metadata["executablePath"] = packageDirectory.appendingPathComponent("caddy").path
+        try JSONSerialization.data(withJSONObject: metadata).write(to: metadataURL)
+        let package = try JSONDecoder().decode(CaddyPackage.self, from: JSONSerialization.data(withJSONObject: metadata))
+        let supervisor = CaddyProcessSupervisor(layout: layout, configuration: try CaddyTestSupport.configuration())
+        await supervisor.installPackage(package)
+        addTeardownBlock {
+            do {
+                let result = try await supervisor.stop()
+                guard result.state == .stopped else { XCTFail("Caddy remained running; preserving \(root.path)"); return }
+                CaddyTestSupport.removeIfPresent(root)
+            } catch { XCTFail("Caddy cleanup failed; preserving \(root.path): \(error)") }
+        }
+
+        let started = try await supervisor.start()
+        XCTAssertEqual(started.state, .running)
+        XCTAssertEqual(started.health, .healthy)
+        let repeated = await supervisor.status()
+        XCTAssertEqual(repeated.pid, started.pid, "the process identity must match when `ps` reports /tmp for its /private/tmp executable path")
+        let result = try await supervisor.stop()
+        XCTAssertEqual(result.state, .stopped)
+    }
+
     func testNewCoreCanStopPreciselyRecordedCaddyProcess() async throws {
         let root = URL(fileURLWithPath: "/tmp/vaelen-caddy-core-restart-\(UUID().uuidString)", isDirectory: true)
         defer { CaddyTestSupport.removeIfPresent(root) }

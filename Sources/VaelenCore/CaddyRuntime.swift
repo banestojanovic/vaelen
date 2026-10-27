@@ -249,14 +249,21 @@ public actor CaddyProcessSupervisor {
         if identityCommandFailsForTesting { return processExists(record.pid) ? .unavailable : .gone }
         let commandOutput: String
         let start: String
+        let openExecutables: String
         do {
             commandOutput = try command("/bin/ps", ["-p", "\(record.pid)", "-o", "command="])
             start = try command("/bin/ps", ["-p", "\(record.pid)", "-o", "lstart="]).trimmingCharacters(in: .whitespacesAndNewlines)
+            openExecutables = try command("/usr/sbin/lsof", ["-p", "\(record.pid)", "-a", "-d", "txt", "-Fn"])
         } catch {
             return processExists(record.pid) ? .unavailable : .gone
         }
         guard processExists(record.pid) else { return .gone }
-        return commandOutput.contains(record.executablePath)
+        let expectedExecutable = URL(fileURLWithPath: record.executablePath).resolvingSymlinksInPath().path
+        let executableMatches = openExecutables.split(separator: "\n").contains { entry in
+            guard entry.first == "n" else { return false }
+            return URL(fileURLWithPath: String(entry.dropFirst())).resolvingSymlinksInPath().path == expectedExecutable
+        }
+        return executableMatches
             && record.arguments.allSatisfy { commandOutput.contains($0) }
             && start == record.startedAt ? .matches : .mismatch
     }

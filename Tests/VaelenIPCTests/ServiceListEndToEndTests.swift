@@ -92,12 +92,24 @@ final class ServiceListEndToEndTests: XCTestCase {
         try FileManager.default.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
         let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
         let registry = ProjectRegistry(store: store)
+        let serviceInstances = ServiceInstanceRepository(store: store)
+        let instanceName = try ProjectInstanceName("fixture-postgres")
+        let instanceID = ServiceInstanceID(kind: .postgresql, name: instanceName)
+        let instance = try ServiceInstanceRecord(
+            id: instanceID,
+            packageIdentifier: "fixture/postgresql@18.6",
+            endpoint: .postgresql(port: 25432),
+            dataDirectory: root.appendingPathComponent("instances/postgresql").path
+        )
+        try serviceInstances.saveInstance(instance)
+        try serviceInstances.setManualClaim(for: instanceID, claimed: true)
         let dispatcher = try CoreRequestDispatcher(
             runtime: CoreRuntime(version: "test", pid: getpid()),
             registry: registry,
             mysql: MySQLModule(layout: layout),
             mailpit: MailpitModule(layout: layout),
             serviceIntents: ServiceIntentStore(url: layout.stateDirectoryURL.appendingPathComponent("service-intents.json")),
+            serviceInstances: serviceInstances,
             logs: CoreLogCatalog(layout: layout)
         )
         let paths = CoreEndpointPaths(layout: layout)
@@ -163,6 +175,25 @@ final class ServiceListEndToEndTests: XCTestCase {
             let mailpitHuman = try runVal(valPath, root: root, arguments: ["service", "versions", "mailpit"], preserveRoot: &preserveRoot)
             XCTAssertEqual(mailpitHuman.status, 0, "stdout: \(mailpitHuman.output)\nstderr: \(mailpitHuman.error)")
             XCTAssertTrue(mailpitHuman.output.contains("Mailpit versions"), mailpitHuman.output)
+
+            let instancesJSON = try runVal(valPath, root: root, arguments: ["service", "instances", "--json"], preserveRoot: &preserveRoot)
+            XCTAssertEqual(instancesJSON.status, 0, "stdout: \(instancesJSON.output)\nstderr: \(instancesJSON.error)")
+            XCTAssertEqual(instancesJSON.error, "")
+            let instances = try IPCCodec.decode(ServiceInstanceInventoryResult.self, from: Data(instancesJSON.output.utf8))
+            let instanceEntry = try XCTUnwrap(instances.entries.first)
+            XCTAssertEqual(instances.entries.count, 1)
+            XCTAssertEqual(instanceEntry.instance.kind, .postgresql)
+            XCTAssertEqual(instanceEntry.instance.name, instanceName)
+            XCTAssertEqual(instanceEntry.instance.packageIdentifier, "fixture/postgresql@18.6")
+            XCTAssertEqual(instanceEntry.instance.endpoint, .postgresql(port: 25432))
+            XCTAssertEqual(instanceEntry.instance.dataDirectory, instance.dataDirectory)
+            XCTAssertEqual(instanceEntry.owners, [.manual])
+
+            let instancesHuman = try runVal(valPath, root: root, arguments: ["service", "instances"], preserveRoot: &preserveRoot)
+            XCTAssertEqual(instancesHuman.status, 0, "stdout: \(instancesHuman.output)\nstderr: \(instancesHuman.error)")
+            XCTAssertTrue(instancesHuman.output.contains("postgresql/fixture-postgres"), instancesHuman.output)
+            XCTAssertTrue(instancesHuman.output.contains("fixture/postgresql@18.6"), instancesHuman.output)
+            XCTAssertTrue(instancesHuman.output.contains("manual"), instancesHuman.output)
 
             let stopError = try await stopServer(paths: paths, serverTask: serverTask, serverExited: serverExited)
             serverStopped = true

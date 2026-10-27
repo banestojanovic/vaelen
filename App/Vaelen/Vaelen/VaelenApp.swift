@@ -1486,9 +1486,12 @@ private struct ProjectSelectedDetail: View {
     let project: ProjectWire
     let model: AppModel
     @State private var confirmUnlink = false
+    @State private var confirmStart = false
+    @State private var confirmStop = false
 
     private var report: ProjectEnvironmentReport? { model.projectReports.first { $0.identity.path == project.path } }
     private var routes: [RouteIntent]? { routesForProject(project, report: report, configured: model.configuredRoutes) }
+    private var lifecycle: AppModel.ProjectLifecycleState { model.projectLifecycleState(for: project) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 17) {
@@ -1512,6 +1515,87 @@ private struct ProjectSelectedDetail: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Project actions").font(.headline)
                     HStack(spacing: 8) {
+                        Button("Review Start Plan", systemImage: "play.fill") {
+                            Task { await model.reviewProjectStart(project) }
+                        }
+                        .disabled(model.isSettingsFixture || model.relationshipMutationInFlight || lifecycle.isMutating || lifecycle.isLoadingPlan || !coreAvailable)
+                        .confirmationDialog("Start \(project.name)?", isPresented: $confirmStart, titleVisibility: .visible) {
+                            Button("Start Project") { Task { await model.activateProject(project) } }
+                                    .disabled(lifecycle.plan?.state != .actionable || lifecycle.isMutating || model.relationshipMutationInFlight || model.isSettingsFixture)
+                            Button("Cancel", role: .cancel) { }
+                        } message: {
+                            Text("Review the current Core plan below. Starting applies Vaelen-managed project resources described by this plan.")
+                        }
+                        Button("Release Project Services…", systemImage: "stop.fill", role: .destructive) { confirmStop = true }
+                            .disabled(model.isSettingsFixture || model.relationshipMutationInFlight || lifecycle.isMutating || lifecycle.isLoadingPlan || !coreAvailable)
+                            .confirmationDialog("Release service claims for \(project.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
+                                Button("Release This Project’s Service Claims", role: .destructive) { Task { await model.stopProject(project) } }
+                                    .disabled(lifecycle.isMutating || model.relationshipMutationInFlight || model.isSettingsFixture)
+                                Button("Cancel", role: .cancel) { }
+                            } message: {
+                                Text("This releases only this project’s service claims. After ownership verification, PostgreSQL or Valkey may stop when this project is the final owner. Shared instances stay running. Legacy MySQL and Mailpit are not stopped. PHP and Node runtimes and site routes stay active.")
+                            }
+                    }.buttonStyle(.bordered).controlSize(.small)
+                    if lifecycle.isLoadingPlan {
+                        HStack(spacing: 7) { ProgressView().controlSize(.small); Text("Loading a fresh, non-mutating Core plan…").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    if let plan = lifecycle.plan {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Plan · \(plan.state.rawValue.capitalized)").font(.caption.weight(.semibold))
+                            ForEach(plan.operations, id: \.id) { operation in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(operation.action.rawValue.capitalized) \(operation.resource.rawValue) · \(operation.disposition.rawValue)").font(.caption)
+                                    if let reason = operation.reason, !reason.isEmpty { Text(reason).font(.caption2).foregroundStyle(.secondary) }
+                                }
+                            }
+                            if plan.operations.isEmpty { Text("No project operations are required.").font(.caption).foregroundStyle(.secondary) }
+                            if let bindings = lifecycle.reviewedSpec?.services, !bindings.isEmpty {
+                                Text("Reviewed service bindings").font(.caption.weight(.semibold)).padding(.top, 3)
+                                ForEach(bindings, id: \.alias.value) { binding in
+                                    Text(serviceBindingDescription(binding))
+                                        .font(.caption).textSelection(.enabled)
+                                }
+                            }
+                            if plan.state == .actionable {
+                                Button("Confirm and Start…", systemImage: "play.fill") { confirmStart = true }
+                                    .buttonStyle(.borderedProminent).controlSize(.small)
+                                    .disabled(model.isSettingsFixture || model.relationshipMutationInFlight || lifecycle.isMutating)
+                            } else if plan.state == .blocked {
+                                Label("Start is unavailable while this plan is blocked.", systemImage: "hand.raised.fill").font(.caption).foregroundStyle(.orange)
+                            } else {
+                                Label("The project already matches its desired state.", systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    if lifecycle.isMutating {
+                        HStack(spacing: 7) { ProgressView().controlSize(.small); Text("Executing project operation…").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    if lifecycle.isRefreshing {
+                        HStack(spacing: 7) { ProgressView().controlSize(.small); Text("Refreshing the project report from Core…").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    if let execution = lifecycle.execution {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Execution · \(execution.state.rawValue.capitalized) · final plan \(execution.finalPlan.state.rawValue)").font(.caption.weight(.semibold))
+                            ForEach(execution.operations, id: \.operationID) { operation in
+                                Label("\(operation.message)\(operation.verified ? " · verified" : " · not verified")", systemImage: operation.verified ? "checkmark.circle" : "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(operation.verified ? Color.secondary : Color.orange)
+                            }
+                            if execution.operations.isEmpty { Text("No execution steps were returned.").font(.caption).foregroundStyle(.secondary) }
+                            let operationResultsVerified = execution.operations.allSatisfy(\.verified)
+                            let executionVerified = execution.state == .succeeded && operationResultsVerified && (lifecycle.stopping || execution.finalPlan.state == .satisfied)
+                            if lifecycle.isRefreshing {
+                                Label("Core execution returned. Waiting for the refreshed project report.", systemImage: "arrow.clockwise").font(.caption).foregroundStyle(.secondary)
+                            } else if !executionVerified || lifecycle.refreshError != nil {
+                                Label("The requested state is incomplete or blocked. Review the final plan and operation results.", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+                            } else {
+                                Label(lifecycle.stopping ? "Core verified the reported stop and ownership results. The final plan describes any remaining start actions." : "Core reports the requested state as satisfied and verified.", systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(.green)
+                            }
+                        }
+                    }
+                    if let error = lifecycle.error { VaelenStatusLabel(error, systemImage: "exclamationmark.triangle", tint: .red).font(.caption) }
+                    if let error = lifecycle.refreshError { VaelenStatusLabel("Could not refresh final project state: \(error)", systemImage: "arrow.clockwise.circle", tint: .orange).font(.caption) }
+                    HStack(spacing: 8) {
                         Button("Open Folder", systemImage: "folder") { model.openProjectFolder(project) }.disabled(!model.canOpenProjectFolder(project))
                         if let routes, routes.count == 1, let route = routes.first {
                             Button("Open Site", systemImage: "safari") { model.openProjectRoute(route) }.disabled(route.route.hostname.isEmpty)
@@ -1529,6 +1613,14 @@ private struct ProjectSelectedDetail: View {
                         }
                         Button("Copy Path", systemImage: "doc.on.doc") { model.copyProjectPath(project) }
                     }.buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+            if let report, report.desired.file == .absent {
+                ProjectAdoptionControls(project: project, report: report, model: model)
+            } else if model.projectReportErrors[project.path] != nil || report == nil {
+                SettingsInsetCard {
+                    Label("Adoption review is unavailable until Core provides a current project report.", systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             VStack(alignment: .leading, spacing: 9) {
@@ -1566,9 +1658,19 @@ private struct ProjectSelectedDetail: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Selected project details for \(project.name)")
         .confirmationDialog("Unlink \(project.name)?", isPresented: $confirmUnlink, titleVisibility: .visible) {
-            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint()
+            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint().disabled(model.relationshipMutationInFlight)
             Button("Cancel", role: .cancel) { }
         } message: { Text("This removes Vaelen’s link only. The project folder, files, databases, and services are not deleted.") }
+    }
+
+    private var coreAvailable: Bool {
+        if case .running = model.state { return true }
+        return false
+    }
+
+    private func serviceBindingDescription(_ binding: ProjectServiceBinding) -> String {
+        let version = binding.version ?? "any version"
+        return "\(binding.alias.value) · \(binding.kind.rawValue) · \(version) · instance \(binding.instance.value)"
     }
 
     private var projectPHPText: String {
@@ -1620,6 +1722,275 @@ private struct ProjectSelectedDetail: View {
     }
     private func projectFact(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline) { Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 92, alignment: .leading); Text(value).font(.caption).textSelection(.enabled); Spacer(minLength: 0) }
+    }
+}
+
+private struct ProjectAdoptionControls: View {
+    let project: ProjectWire
+    let report: ProjectEnvironmentReport
+    let model: AppModel
+    @State private var php = ""
+    @State private var node = ""
+    @State private var routeID: String?
+    @State private var existingRouteRoot = ""
+    @State private var existingTLSConfirmed = false
+    @State private var noWeb = false
+    @State private var createRoute = false
+    @State private var host = ""
+    @State private var root = ""
+    @State private var secure: Bool?
+    @State private var confirmedRoute = false
+    @State private var bindings: [ProjectServiceBinding] = []
+    @State private var kind: ProjectServiceKind?
+    @State private var alias = ""
+    @State private var instanceName: String?
+    @State private var confirmApply = false
+    private var state: AppModel.ProjectAdoptionReview { model.projectAdoptionReview(for: project) }
+    private var preview: ProjectAdoptionPreview? { state.preview?.preview }
+    private var blocked: Bool {
+        guard let p = preview, state.inventory != nil else { return true }
+        return p.manifestState != .absent || p.herdYMLPresent || p.hasRouteOwnershipConflicts ||
+            p.php.state == .conflict || p.node.state == .conflict || p.discoveryIssues?.isEmpty != true
+    }
+    private var ready: Bool {
+        guard !state.confirmationConsumed, let p = preview, state.inventory != nil, !blocked, serviceAliasError == nil else { return false }
+        let webChoices = (noWeb ? 1 : 0) + (createRoute ? 1 : 0) + (routeID == nil ? 0 : 1)
+        return (p.php.state == .notDetected || validPHP) &&
+            (p.node.state == .notDetected || validNode) &&
+            webChoices == 1 &&
+            (createRoute ? (p.liveRoutesAvailable && validNewRoute) : (noWeb || (p.liveRoutesAvailable && selectedRouteWeb != nil && existingTLSConfirmed)))
+    }
+    private var validNewRoute: Bool {
+        guard let secure, !root.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return (try? ProjectWebRequirement(host: host, documentRoot: root, secure: secure, createRoute: true)) != nil && confirmedRoute
+    }
+    private var selectedRouteWeb: ProjectWebRequirement? {
+        guard let p = preview, let routeID,
+              let route = p.routes.first(where: { $0.id.rawValue.uuidString == routeID }),
+              route.targetKind != .http else { return nil }
+        guard let routeRoot = route.documentRoot ?? (existingRouteRoot.isEmpty ? nil : existingRouteRoot) else { return nil }
+        let relativeRoot: String
+        if routeRoot.hasPrefix("/") {
+            let projectRoot = URL(fileURLWithPath: p.identity.path, isDirectory: true).standardizedFileURL.path
+            let absoluteRoot = URL(fileURLWithPath: routeRoot, isDirectory: true).standardizedFileURL.path
+            guard absoluteRoot == projectRoot || absoluteRoot.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/") else { return nil }
+            relativeRoot = absoluteRoot == projectRoot ? "." : String(absoluteRoot.dropFirst(projectRoot.count + (projectRoot.hasSuffix("/") ? 0 : 1)))
+        } else { relativeRoot = routeRoot }
+        return try? ProjectWebRequirement(host: route.hostname, documentRoot: relativeRoot, secure: route.tls != .disabled)
+    }
+    private var validPHP: Bool { (try? PHPRequirement(value: php)) != nil }
+    private var validNode: Bool { (try? NodeRequirement(value: node)) != nil }
+    private var routeIDs: [RouteID] {
+        guard let p = preview, !createRoute, !noWeb, let routeID else { return [] }
+        return p.routes.filter { $0.id.rawValue.uuidString == routeID }.map(\.id)
+    }
+
+    var body: some View {
+        SettingsInsetCard {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Adopt existing project").font(.headline)
+                    Spacer()
+                    Button("Review adoption", systemImage: "doc.text.magnifyingglass") { Task { await model.reviewProjectAdoption(project) } }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .disabled(model.relationshipMutationInFlight || state.isLoading || model.isSettingsFixture || !coreAvailable)
+                }
+                Text("Review a read-only Core preview, then choose exactly what Vaelen records in vaelen.yml.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if state.isLoading { ProgressView("Loading Core preview and service inventory…").controlSize(.small) }
+                if !coreAvailable && !model.isSettingsFixture {
+                    Label("Core is unavailable. Adoption review is disabled until project state can be checked.", systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let error = state.error { Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+                if let p = preview {
+                    Text("\(p.identity.name) · \(p.identity.path)").font(.caption.weight(.semibold)).textSelection(.enabled)
+                    fact("Manifest", "\(p.manifestState.rawValue)\(p.manifestVersion.map { " · v\($0)" } ?? "")")
+                    requirement("PHP", p.php, selection: $php)
+                    requirement("Node", p.node, selection: $node)
+                    Text("Associated routes").font(.caption.weight(.semibold))
+                    ForEach(p.routes, id: \.id) { r in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(r.hostname) · \(r.targetKind.rawValue) · root \(r.documentRoot ?? "n/a") · TLS \(r.tls.rawValue) · live \(r.liveObserved.map(String.init) ?? "unavailable")")
+                                .font(.caption2).textSelection(.enabled)
+                            if r.targetKind == .http {
+                                Label("HTTP routes cannot be adopted because the project declaration cannot represent their target.", systemImage: "hand.raised.fill")
+                                    .font(.caption2).foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                    if p.liveRoutesAvailable {
+                        Picker("Reviewed route", selection: $routeID) {
+                            Text("Choose exactly one route").tag(String?.none)
+                            ForEach(p.routes, id: \.id) {
+                                Text($0.hostname).tag(Optional($0.id.rawValue.uuidString)).disabled($0.targetKind == .http)
+                            }
+                        }.pickerStyle(.menu)
+                            .onChange(of: routeID) { _, _ in
+                                existingTLSConfirmed = false
+                                existingRouteRoot = ""
+                            }
+                        if let routeID, let route = p.routes.first(where: { $0.id.rawValue.uuidString == routeID }), route.documentRoot == nil {
+                            TextField("Explicit in-project relative document root", text: $existingRouteRoot)
+                        }
+                        if let routeID, let route = p.routes.first(where: { $0.id.rawValue.uuidString == routeID }) {
+                            Toggle("Confirm reviewed TLS mode: \(route.tls.rawValue)", isOn: $existingTLSConfirmed)
+                        }
+                    } else { Text(p.liveRoutesUnavailableReason ?? "Live route observation unavailable.").font(.caption2).foregroundStyle(.orange) }
+                    Toggle("Choose no web route", isOn: $noWeb)
+                    Toggle("Declare a new route for later up", isOn: $createRoute)
+                    if createRoute {
+                        TextField("Hostname", text: $host)
+                        TextField("In-project relative document root", text: $root)
+                        if root.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("Enter a document root explicitly. Use . for the project root.")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Picker("TLS mode", selection: Binding(get: { secure.map(String.init) ?? "" }, set: { secure = $0.isEmpty ? nil : $0 == "true" })) {
+                            Text("Choose TLS").tag("")
+                            Text("Secure").tag("true")
+                            Text("Insecure").tag("false")
+                        }.pickerStyle(.menu)
+                        Toggle("Confirm creating the route declaration", isOn: $confirmedRoute)
+                    }
+                    endpoint("Database", p.database)
+                    endpoint("Mail", p.mail)
+                    if let cache = p.cache { endpoint("Cache", cache) }
+                    Text("Secrets are never displayed or imported. Environment facts never select an instance.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    if let inventory = state.inventory { serviceEditor(inventory) }
+                    if state.inventory == nil { Label("Service inventory is unavailable. Apply is disabled until Core can provide it.", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
+                    if p.herdYMLPresent { Label("herd.yml is unsupported and requires manual review.", systemImage: "hand.raised.fill").font(.caption).foregroundStyle(.orange) }
+                    if p.hasRouteOwnershipConflicts { Label("Route ownership conflicts block adoption.", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
+                    if let issues = p.discoveryIssues {
+                        ForEach(issues, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption2).foregroundStyle(.orange) }
+                    } else {
+                        Label("Core did not provide typed discovery completeness. Apply is disabled.", systemImage: "hand.raised.fill").font(.caption).foregroundStyle(.orange)
+                    }
+                    ForEach(p.unresolvedDecisions, id: \.self) { Text($0).font(.caption2).foregroundStyle(.secondary) }
+                    fact("Core safety boundary", p.safetyBoundary)
+                    if blocked { Label("Unsupported or incomplete preview. Apply is disabled.", systemImage: "hand.raised.fill").font(.caption).foregroundStyle(.orange) }
+                    if let result = state.result {
+                        Label("Created vaelen.yml with \(result.claimedServices.count) claims. Run up later to apply reviewed route intent.", systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(.green)
+                    }
+                    if ready {
+                        Text("Summary · PHP \(php.isEmpty ? "absent" : php) · Node \(node.isEmpty ? "absent" : node) · \(noWeb ? "no web route" : createRoute ? "new \(host) → \(root), TLS \(secure.map(String.init) ?? "unset")" : "reviewed route \(selectedRouteSummary)") · services \(bindingSummary)")
+                            .font(.caption).textSelection(.enabled)
+                        Button("Review and apply…") { confirmApply = true }.buttonStyle(.borderedProminent).controlSize(.small)
+                            .disabled(model.isSettingsFixture || model.relationshipMutationInFlight || state.isApplying)
+                            .confirmationDialog("Apply this project adoption?", isPresented: $confirmApply, titleVisibility: .visible) {
+                                Button("Apply Reviewed Adoption") { Task { await apply() } }.disabled(!ready || model.relationshipMutationInFlight)
+                                Button("Cancel", role: .cancel) { }
+                            } message: {
+                                Text("Core creates only V2 vaelen.yml and exact service claims. It does not write .env, change route ownership, start or stop services, or import credentials. Run up later to apply route intent.")
+                            }
+                    }
+                    if state.confirmationConsumed {
+                        Label("Apply was attempted or a fresh review is loading. Review adoption again before applying.", systemImage: "arrow.clockwise")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .disabled(model.isSettingsFixture)
+        }
+    }
+
+    private func requirement(_ title: String, _ req: ProjectAdoptionRequirement, selection: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("\(title) · \(req.state.rawValue)").font(.caption.weight(.semibold))
+            ForEach(req.sources, id: \.source) { Text("\($0.source): \($0.rawValue)").font(.caption2).foregroundStyle(.secondary) }
+            if req.state == .readyForReview || req.state == .needsChoice {
+                TextField("Explicit \(title) selector", text: selection)
+                if let candidate = req.exactSelectorCandidate { Text("Exact candidate: \(candidate). Select explicitly if appropriate.").font(.caption2).foregroundStyle(.secondary) }
+            }
+            if req.state == .conflict { Text("Conflicting evidence blocks apply.").font(.caption2).foregroundStyle(.orange) }
+        }
+    }
+    private var coreAvailable: Bool {
+        if case .running = model.state { return true }
+        return false
+    }
+
+    private func endpoint(_ name: String, _ e: ProjectAdoptionEndpoint) -> some View {
+        fact(name, "connection \(e.connection ?? "unknown") · \(e.host ?? "host unknown"):\(e.port ?? "port unknown") · secret \(e.secretAvailability.rawValue)")
+    }
+    private var selectedRouteSummary: String {
+        guard let p = preview, let routeID, let route = p.routes.first(where: { $0.id.rawValue.uuidString == routeID }) else { return "unavailable" }
+        return "\(route.hostname) → \(route.documentRoot ?? existingRouteRoot) · TLS \(route.tls.rawValue)"
+    }
+    private var bindingSummary: String {
+        bindings.isEmpty ? "none" : bindings.map { "\($0.kind.rawValue) \($0.alias.value) → \($0.instance.value) (\($0.version ?? "unversioned"))" }.joined(separator: "; ")
+    }
+    private func fact(_ label: String, _ value: String) -> some View { Text("\(label) · \(value)").font(.caption2).textSelection(.enabled) }
+
+    @ViewBuilder private func serviceEditor(_ inventory: ServiceInstanceInventoryResult) -> some View {
+        let eligibleEntries = inventory.entries.filter { $0.eligibleForProjectBinding == true }
+        let eligibleKinds = Set(eligibleEntries.map(\.instance.kind)).sorted { $0.rawValue < $1.rawValue }
+        Text("Eligible local service instances").font(.caption.weight(.semibold))
+        ForEach(eligibleEntries, id: \.identity) { e in
+            Text("\(e.instance.kind.rawValue) \(e.instance.name.value) · package/version \(e.instance.packageIdentifier) · \(e.instance.endpoint.displayEndpoints.joined(separator: ", ")) · data \(e.instance.dataDirectory) · state/health \(state.instanceHealth["\(e.instance.kind.rawValue):\(e.instance.name.value)"] ?? "unavailable") · owners \(owners(e.owners))")
+                .font(.caption2).textSelection(.enabled)
+        }
+        HStack {
+            Picker("Kind", selection: $kind) {
+                Text("Kind").tag(ProjectServiceKind?.none)
+                ForEach(eligibleKinds, id: \.self) { Text($0.rawValue.capitalized).tag(ProjectServiceKind?.some($0)) }
+            }.pickerStyle(.menu).onChange(of: kind) { _, selectedKind in
+                instanceName = eligibleEntries.first(where: { $0.instance.kind == selectedKind })?.instance.name.value
+            }
+            TextField("Explicit alias", text: $alias).frame(width: 110)
+            if let serviceAliasError { Text(serviceAliasError).font(.caption2).foregroundStyle(.orange) }
+            Picker("Instance", selection: $instanceName) {
+                Text("Instance").tag(String?.none)
+                ForEach(eligibleEntries.filter { $0.instance.kind == kind }, id: \.identity) { Text($0.instance.name.value).tag(Optional($0.instance.name.value)) }
+            }.pickerStyle(.menu)
+            Button("Add binding") { addBinding(inventory) }.disabled(kind == nil || instanceName == nil || alias.isEmpty || serviceAliasError != nil)
+        }
+        ForEach(bindings, id: \.alias.value) { Text("Binding · \($0.kind.rawValue) \($0.alias.value) → \($0.instance.value)").font(.caption2) }
+    }
+
+    private func addBinding(_ inventory: ServiceInstanceInventoryResult) {
+        guard let kind, let instanceName,
+              let name = inventory.entries.first(where: { $0.instance.kind == kind && $0.instance.name.value == instanceName })?.instance.name,
+              let package = inventory.entries.first(where: { $0.instance.kind == kind && $0.instance.name.value == instanceName })?.instance.packageIdentifier,
+              let binding = try? ProjectServiceBinding(alias: ProjectBindingAlias(alias), kind: kind, instance: name, version: package) else { return }
+        bindings.append(binding)
+        alias = ""
+        self.instanceName = nil
+    }
+
+    private var serviceAliasError: String? {
+        guard !alias.isEmpty else { return nil }
+        guard (try? ProjectBindingAlias(alias)) != nil else { return "Use a lowercase alias with letters, digits, or hyphens." }
+        return bindings.contains(where: { $0.alias.value == alias }) ? "This alias is already selected. Choose a unique alias." : nil
+    }
+
+    private func owners(_ claims: [ServiceInstanceClaimWire]) -> String {
+        guard !claims.isEmpty else { return "none" }
+        return claims.map { claim in
+            switch claim {
+            case .manual: return "manual"
+            case .project(let id, let alias, let version):
+                return "project \(id.rawValue.uuidString) alias \(alias.value)\(version.map { " v\($0)" } ?? "")"
+            }
+        }.joined(separator: "; ")
+    }
+
+    private func apply() async {
+        guard let p = preview else { return }
+        let web: ProjectWebRequirement?
+        if createRoute {
+            guard let secure else { return }
+            web = try? ProjectWebRequirement(host: host, documentRoot: root, secure: secure, createRoute: true)
+        } else if noWeb { web = nil }
+        else { web = selectedRouteWeb }
+        guard noWeb || web != nil else { return }
+        let spec = try? ProjectEnvironmentSpec(version: 2,
+            php: p.php.state == .notDetected ? nil : (try? PHPRequirement(value: php)),
+            node: p.node.state == .notDetected ? nil : (try? NodeRequirement(value: node)),
+            web: web, services: bindings)
+        guard let spec else { return }
+        await model.applyProjectAdoption(project, spec: spec, routeIDs: routeIDs, createRoute: createRoute, webChoiceConfirmed: true)
     }
 }
 
@@ -1813,7 +2184,7 @@ private struct ExplicitProjectRow: View {
         .padding(.vertical, VaelenUI.spacing6)
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
         .confirmationDialog("Unlink \(project.name)?", isPresented: $showUnlinkConfirmation, titleVisibility: .visible) {
-            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint()
+            Button("Unlink Project", role: .destructive) { Task { await model.unlinkProject(project) } }.settingsDestructiveTint().disabled(model.relationshipMutationInFlight)
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("This removes Vaelen’s link only. The project folder, files, databases, and services are not deleted.")

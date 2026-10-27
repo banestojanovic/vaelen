@@ -59,6 +59,9 @@ final class TLSCapabilityTests: XCTestCase {
             try store.execute("DROP TABLE park_route_ownership")
             try store.execute("ALTER TABLE projects DROP COLUMN php_override_version")
             try store.execute("ALTER TABLE projects DROP COLUMN node_override_version")
+            try store.execute("DROP TABLE project_service_claims")
+            try store.execute("DROP TABLE manual_service_claims")
+            try store.execute("DROP TABLE service_instances")
             try store.execute("PRAGMA user_version = 5")
         }
         return database
