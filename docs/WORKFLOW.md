@@ -41,7 +41,7 @@ Claude's context guard is configured in `.claude/settings.json`; it warns at 150
 
 ## Unattended shifts
 
-`/auto-shift [rounds]` or `Scripts/auto-shift.sh [rounds]` starts one fresh Claude `-p` `/shift 1` session per item (default 5 rounds). It stops on STOP, failure, no new commit, a report without CONTINUE, or the round limit. It never pushes. The command allowlist is intentionally bounded; native driving and installed-app mutation are excluded. Logs go to `~/.cache/vaelen-shift`. Do not run unattended shifts while another writer is editing this checkout.
+`/auto-shift [rounds]` or `Scripts/auto-shift.sh [rounds]` starts one fresh Claude `-p` `/shift 1` session per item (default 5 rounds). It reports progress to the nearest Rex terminal when available without opening tabs. It stops on STOP, failure, no new commit, a report without CONTINUE, or the round limit. It never pushes. The command allowlist is intentionally bounded; native driving and installed-app mutation are excluded. Logs go to `~/.cache/vaelen-shift`. Do not run unattended shifts while another writer is editing this checkout.
 
 ## Handoff block
 

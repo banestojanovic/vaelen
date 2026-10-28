@@ -5,8 +5,8 @@ Read the Current block, then `AGENTS.md`, `docs/NEXT-PLAN.md`, and the relevant 
 ## Current
 
 Updated 2026-10-28 by Codex.
-Done: Ported Yuva's single-writer shift and auto-shift workflow to Vaelen; replaced project-local agent-routing setup and added Vaelen-specific verification rules. Commit `4159a1a`.
-Checked: `bash -n Scripts/auto-shift.sh`, Python syntax parse for the context guard, JSON parse for Claude settings, `git diff --check`; all passed. No product tests run because this changes only workflow/docs/config.
+Done: Ported Yuva's single-writer shift and auto-shift workflow to Vaelen; replaced project-local agent-routing setup and added Vaelen-specific verification rules. Commits `e2d6760`, `950ace2`.
+Checked: `bash -n Scripts/auto-shift.sh`, Python syntax parse for the context guard, JSON parse for Claude settings, `git diff --check`; all passed. Rex progress reporting added to auto-shift and is syntax-checked; no product tests apply.
 Unverified: Auto-shift was not launched; no Vaelen product behavior changed.
 Next: If no further unblocked storage candidates remain, resume the service lifecycle recovery priority; inspect the current code/test diff and `.audit/project-service-environments.todo.md`, then run focused lifecycle fixtures.
 Traps: `.audit/` contains active TODOs. Cleanup already reclaimed about 9.2 GiB of Swift builds, removed Vaelen DerivedData and generated verification records, and removed 10 Python bytecode cache files. `~/Library/Caches/com.apple.python/private/tmp` is now empty. About 49 GiB is available.

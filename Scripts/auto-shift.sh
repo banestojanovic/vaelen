@@ -12,7 +12,27 @@ fi
 logs=${VAELEN_SHIFT_LOGS:-$HOME/.cache/vaelen-shift}
 mkdir -p "$logs" || exit 1
 final="error:Auto-shift ended unexpectedly"
-trap 'echo "stop: ${final#*:}"' EXIT
+
+# Update the nearest Rex terminal when this script runs as a background task.
+# No-op when there is no writable terminal; never open another tab or process.
+tty_path=""
+pid=$$
+while [ "$pid" -gt 1 ]; do
+  tty_name=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [ -n "$tty_name" ] && [ "$tty_name" != "??" ]; then
+    tty_path="/dev/$tty_name"
+    break
+  fi
+  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  [ -n "$pid" ] || break
+done
+report() {
+  [ -w "$tty_path" ] || return 0
+  title=$(printf 'Vaelen shift' | base64 | tr -d '\n')
+  message=$(printf '%s' "$2" | tr -d '\000-\037' | cut -c1-200 | base64 | tr -d '\n')
+  printf '\033]7501;state=%s:id=shift:app=vaelen-shift:title=%s:msg=%s\033\\' "$1" "$title" "$message" >"$tty_path" 2>/dev/null || true
+}
+trap 'report "${final%%:*}" "${final#*:}"; echo "stop: ${final#*:}"' EXIT
 
 allowed=(
   Read Edit Write Grep Glob Agent
@@ -31,6 +51,7 @@ for round in $(seq 1 "$max"); do
   before=$(git rev-parse HEAD) || exit 1
   log="$logs/$(date +%Y%m%d-%H%M%S)-round$round.log"
   echo "round $round/$max (log: $log)"
+  report working "Auto-shift round $round of $max"
   printf '%s\n' "$prompt" | claude -p --model sonnet --permission-mode acceptEdits \
     --allowedTools "${allowed[@]}" >"$log" 2>&1
   status=$?
