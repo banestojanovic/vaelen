@@ -5,7 +5,7 @@ Read the Current block, then `AGENTS.md`, `docs/NEXT-PLAN.md`, and the relevant 
 ## Current
 
 Updated 2026-10-28 by Codex.
-Done: Ported Yuva's single-writer shift and auto-shift workflow to Vaelen; replaced project-local agent-routing setup and added Vaelen-specific verification rules. Commits `e2d6760`, `950ace2`.
+Done: Ported Yuva's single-writer shift and auto-shift workflow to Vaelen; replaced project-local agent-routing setup, added Vaelen verification rules, and matched Yuva's Rex progress reporting. Commits `e2d6760`, `950ace2`, `bd29245`.
 Checked: `bash -n Scripts/auto-shift.sh`, Python syntax parse for the context guard, JSON parse for Claude settings, `git diff --check`; all passed. Rex progress reporting added to auto-shift and is syntax-checked; no product tests apply.
 Unverified: Auto-shift was not launched; no Vaelen product behavior changed.
 Next: If no further unblocked storage candidates remain, resume the service lifecycle recovery priority; inspect the current code/test diff and `.audit/project-service-environments.todo.md`, then run focused lifecycle fixtures.
