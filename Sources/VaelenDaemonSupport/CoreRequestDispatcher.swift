@@ -36,6 +36,12 @@ private func routeTargetDescription(_ target: RouteTarget) -> String {
     }
 }
 
+private func connectionRecoveryDirectory(projectID: UUID, projectRoot: String) -> URL {
+    URL(fileURLWithPath: projectRoot, isDirectory: true).deletingLastPathComponent()
+        .appendingPathComponent(".vaelen-connection-recovery", isDirectory: true)
+        .appendingPathComponent(projectID.uuidString, isDirectory: true)
+}
+
 private final class LocalProxyProbeRedirectPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
@@ -89,6 +95,23 @@ public actor CoreRequestDispatcher {
         let routes: [RouteIntent]
         let instances: ServiceInstanceInventorySnapshot
     }
+    private struct ProjectConnectionSession {
+        let project: ProjectEnvironmentIdentity
+        let attempt: DatabaseProvisionAttempt
+        let record: ServiceInstanceRecord
+        let manifestBytes: Data?
+        let fileBytes: Data
+        let fileEvidence: ConnectionFileEvidence
+        let patch: ConnectionPatch
+        let passwordBytes: Data
+    }
+    private struct ProjectConnectionRecoverySession {
+        let project: ProjectEnvironmentIdentity
+        let recoveryID: UUID
+        let action: ProjectDatabaseConnectionRecoveryAction
+        let state: String
+        let evidence: ConnectionRecoveryEvidence
+    }
     private let runtime: CoreRuntime
     private let registry: ProjectRegistry
     private let php: PHPModule?
@@ -121,6 +144,9 @@ public actor CoreRequestDispatcher {
     private var phpPackageOperationsInFlight = 0
     private var projectObservationSnapshots: [UUID: (createdAt: Date, observations: ProjectReportObservations)] = [:]
     private var projectAdoptionSessions: [UUID: ProjectAdoptionSession] = [:]
+    private var projectConnectionSessions = ConnectionConfirmationLedger<ProjectConnectionSession>()
+    private var projectConnectionMutationsInFlight: Set<UUID> = []
+    private var projectConnectionRecoverySessions = ConnectionConfirmationLedger<ProjectConnectionRecoverySession>()
     private var projectReadinessTestOverride: ProjectReadinessTestOverride?
     func setProjectReadinessTestOverride(_ value: ProjectReadinessTestOverride?) { projectReadinessTestOverride = value }
     private let logger = Logger(subsystem: "dev.vaelen.daemon", category: "registry")
@@ -425,8 +451,17 @@ public actor CoreRequestDispatcher {
                             || project.id.map { routeProjectIDs.contains($0.rawValue) } == true
                     }
                 }
-                if let name = params.name { try await registry.unlink(name: name) }
-                else { try await registry.unlink(path: params.path ?? params.workingDirectory, workingDirectory: params.workingDirectory) }
+                guard let unlinkProject = linkedBeforeUnlink, let unlinkProjectID = unlinkProject.id else { throw ProjectRegistryError.projectNotFound }
+                let unlinkID = unlinkProjectID.rawValue
+                if !projectConnectionMutationsInFlight.insert(unlinkID).inserted {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "A database connection recovery operation is in progress for this project. Retry unlink after it completes.")
+                }
+                defer { projectConnectionMutationsInFlight.remove(unlinkID) }
+                let recovery = connectionRecoveryDirectory(projectID: unlinkID, projectRoot: unlinkProject.rootPath.string)
+                guard try !ConnectionFileTransaction().hasOutstandingRecovery(recoveryDirectory: recovery) else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Resolve and explicitly discard the retained database connection recovery before unlinking this project.")
+                }
+                try await registry.unlink(projectID: unlinkProjectID)
                 if let projectID = linkedBeforeUnlink?.id?.rawValue, let routeRepository {
                     try routeRepository.disassociateProject(projectID: projectID)
                     for (routeID, intent) in Array(routeIntents) where intent.projectID == projectID {
@@ -464,6 +499,132 @@ public actor CoreRequestDispatcher {
                 }
                 let report = try await projectEnvironmentReport(for: project, observations: observations)
                 return (.init(id: request.id, result: .projectEnvironment(.init(report: report))), true)
+            case .projectDatabaseConnectionReview:
+                let params = try request.params?.decode(ProjectDatabaseConnectionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Database connection review parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard project.registrationKind == .linked, project.availability == .available, let projectID = project.id,
+                      let databaseReceipts, let attempt = try databaseReceipts.attempt(params.operationID), attempt.request.projectID == projectID, attempt.state == .ready else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Choose a ready database receipt for this linked project.")
+                }
+                guard ProjectFrameworkDetector().inspect(root: URL(fileURLWithPath: project.rootPath.string)).framework == "Laravel" else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Connection setup requires a Laravel project.")
+                }
+                let record = try await validateProjectDatabaseTarget(project: project, binding: attempt.request.binding, expectedRecord: attempt.target.record)
+                let recovery = connectionRecoveryDirectory(projectID: projectID.rawValue, projectRoot: project.rootPath.string)
+                guard try !ConnectionFileTransaction().hasOutstandingRecovery(recoveryDirectory: recovery) else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Resolve and explicitly discard the retained connection recovery before reviewing another change.")
+                }
+                let envURL = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent(".env")
+                let (fileBytes, evidence) = try ConnectionFileBoundary().inspect(envURL)
+                let manifestURL = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent("vaelen.yml")
+                let manifestBytes = try? Data(contentsOf: manifestURL)
+                let secret = try databasePasswords.load(for: params.operationID)
+                let passwordBytes = secret.withBytes { Data($0) }
+                guard let password = String(data: passwordBytes, encoding: .utf8) else { throw IPCErrorPayload(code: .invalidRequest, message: "The managed password is not a supported UTF-8 credential.") }
+                let endpoint = attempt.target.record.endpoint
+                let values = ConnectionValues(driver: try ConnectionValues.laravelDriver(managedDriver: attempt.request.binding.kind.rawValue), host: "127.0.0.1", port: String(endpoint.portNumbers.first), database: attempt.request.database.value, username: attempt.request.user.value, password: password)
+                let patch: ConnectionPatch
+                do { patch = try LosslessDotenvDocument.parse(fileBytes).patch(values) }
+                catch ConnectionFileError.unsupportedOverride(let key) { throw IPCErrorPayload(code: .invalidRequest, message: "\(key) or another database override makes conventional connection values ineffective.") }
+                let session = ProjectConnectionSession(project: ProjectEnvironmentIdentity(project: project), attempt: attempt, record: record, manifestBytes: manifestBytes, fileBytes: fileBytes, fileEvidence: evidence, patch: patch, passwordBytes: passwordBytes)
+                let confirmation = projectConnectionSessions.issue(session)
+                let configCache = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent("bootstrap/cache/config.php")
+                var advisories: [String] = ["Apply retains protected recovery files. Another connection change is blocked until explicit discard. Restore also retains recovery files."]
+                if FileManager.default.fileExists(atPath: configCache.path) { advisories.append("Laravel configuration is cached. Requests and Artisan may skip .env until you refresh the cache.") }
+                if FileManager.default.fileExists(atPath: URL(fileURLWithPath: project.rootPath.string).appendingPathComponent(".env.testing").path) { advisories.append("An alternate .env.testing file exists.") }
+                let edits = patch.edits.map { ProjectDatabaseConnectionEdit(key: $0.key.rawValue, action: $0.added ? "add" : "replace", value: $0.displayedValue) }
+                let review = ProjectDatabaseConnectionReview(confirmation: confirmation, project: ProjectEnvironmentIdentity(project: project), expiresAt: Date().addingTimeInterval(30), edits: edits, advisories: advisories)
+                return (.init(id: request.id, result: .projectDatabaseConnectionReview(.init(review: review))), true)
+            case .projectDatabaseConnectionApply:
+                let params = try request.params?.decode(ProjectDatabaseConnectionRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Database connection apply parameters are required.") }()
+                guard let confirmation = params.confirmation else { throw IPCErrorPayload(code: .invalidRequest, message: "A reviewed connection confirmation is required.") }
+                let session: ProjectConnectionSession
+                do { session = try projectConnectionSessions.consume(confirmation) }
+                catch { throw IPCErrorPayload(code: .invalidRequest, message: "The connection review expired or was already used. Review again.") }
+                guard let projectID = session.project.id?.rawValue,
+                      projectConnectionMutationsInFlight.insert(projectID).inserted else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Another apply is in progress for this project. Retry after it completes.")
+                }
+                defer { projectConnectionMutationsInFlight.remove(projectID) }
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard ProjectEnvironmentIdentity(project: project) == session.project,
+                      project.registrationKind == .linked, project.availability == .available,
+                      ProjectFrameworkDetector().inspect(root: URL(fileURLWithPath: project.rootPath.string)).framework == "Laravel",
+                      let latest = try databaseReceipts?.attempt(params.operationID), latest == session.attempt, latest.state == .ready else {
+                    throw IPCErrorPayload(code: .invalidRequest, message: "Project or ready database receipt changed after review. Review again.")
+                }
+                let currentPassword = try databasePasswords.load(for: params.operationID).withBytes { Data($0) }
+                guard currentPassword == session.passwordBytes else { throw IPCErrorPayload(code: .invalidRequest, message: "The managed password changed after review. Review again.") }
+                let record = try await validateProjectDatabaseTarget(project: project, binding: latest.request.binding, expectedRecord: session.record)
+                guard record == session.record else { throw IPCErrorPayload(code: .invalidRequest, message: "The managed database service changed after review. Review again.") }
+                let envURL = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent(".env")
+                let (currentBytes, currentEvidence) = try ConnectionFileBoundary().inspect(envURL)
+                guard currentEvidence == session.fileEvidence, currentBytes == session.fileBytes else { throw IPCErrorPayload(code: .invalidRequest, message: "The .env file changed after review. Review again.") }
+                let manifestURL = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent("vaelen.yml")
+                guard (try? Data(contentsOf: manifestURL)) == session.manifestBytes else { throw IPCErrorPayload(code: .invalidRequest, message: "Project manifest changed after review. Review again.") }
+                let recovery = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).deletingLastPathComponent().appendingPathComponent(".vaelen-connection-recovery", isDirectory: true).appendingPathComponent(projectID.uuidString, isDirectory: true)
+                let transaction = try ConnectionFileTransaction().apply(destination: envURL, recoveryDirectory: recovery, reviewedBytes: session.fileBytes, proposed: session.patch, projectID: projectID)
+                switch transaction {
+                case .applied(let id):
+                    return (.init(id: request.id, result: .projectDatabaseConnection(.init(state: "applied", recoveryID: id, message: "The .env file was updated. The protected original is retained for explicit recovery."))), true)
+                case .conflict(let id):
+                    return (.init(id: request.id, result: .projectDatabaseConnection(.init(state: "conflict", recoveryID: id, message: "A concurrent change was captured. The approved proposal may now be in .env. The displaced edit is preserved for manual reconciliation."))), true)
+                case .needsAttention(let id):
+                    return (.init(id: request.id, result: .projectDatabaseConnection(.init(state: "needsAttention", recoveryID: id, message: "Recovery evidence is ambiguous. All files were retained for manual inspection."))), true)
+                case .restored(let id):
+                    return (.init(id: request.id, result: .projectDatabaseConnection(.init(state: "restored", recoveryID: id, message: "The original .env bytes were restored. The displaced proposal remains in the protected recovery directory."))), true)
+                }
+            case .projectDatabaseConnectionRecovery:
+                let params = try request.params?.decode(ProjectDatabaseConnectionRecoveryRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Connection recovery parameters are required.") }()
+                let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                guard project.registrationKind == .linked, project.availability == .available, let projectID = project.id?.rawValue else { throw IPCErrorPayload(code: .invalidRequest, message: "Recovery requires an available linked project.") }
+                let envURL = URL(fileURLWithPath: project.rootPath.string, isDirectory: true).appendingPathComponent(".env")
+                let recovery = connectionRecoveryDirectory(projectID: projectID, projectRoot: project.rootPath.string)
+                let transaction = ConnectionFileTransaction()
+                switch params.recoveryAction {
+                case .status:
+                    let summaries = try transaction.recoveryStatus(destination: envURL, recoveryDirectory: recovery)
+                    return (.init(id: request.id, result: .projectDatabaseConnectionRecovery(.init(recoveries: summaries))), true)
+                case .reviewRestore, .reviewDiscard:
+                    guard let recoveryID = params.recoveryID,
+                          let summary = try transaction.recoveryStatus(destination: envURL, recoveryDirectory: recovery).first(where: { $0.id == recoveryID }),
+                          params.recoveryAction == .reviewRestore ? summary.restoreAvailable : summary.discardAvailable else {
+                        throw IPCErrorPayload(code: .invalidRequest, message: "The recovery operation is unavailable or its evidence changed.")
+                    }
+                    let evidence = try transaction.recoveryEvidence(destination: envURL, recoveryDirectory: recovery, recoveryID: recoveryID)
+                    let session = ProjectConnectionRecoverySession(project: ProjectEnvironmentIdentity(project: project), recoveryID: recoveryID, action: params.recoveryAction, state: summary.state, evidence: evidence)
+                    let token = projectConnectionRecoverySessions.issue(session)
+                    let review = ProjectDatabaseConnectionRecoveryReview(confirmation: token, recovery: summary, action: params.recoveryAction)
+                    return (.init(id: request.id, result: .projectDatabaseConnectionRecovery(.init(review: review))), true)
+                case .restore, .discard:
+                    guard let token = params.confirmation else { throw IPCErrorPayload(code: .invalidRequest, message: "A recovery confirmation is required.") }
+                    let session: ProjectConnectionRecoverySession
+                    do { session = try projectConnectionRecoverySessions.consume(token) }
+                    catch { throw IPCErrorPayload(code: .invalidRequest, message: "The recovery review expired or was already used.") }
+                    guard
+                          session.project == ProjectEnvironmentIdentity(project: project), session.recoveryID == params.recoveryID,
+                          (params.recoveryAction == .restore && session.action == .reviewRestore || params.recoveryAction == .discard && session.action == .reviewDiscard),
+                          projectConnectionMutationsInFlight.insert(projectID).inserted else {
+                        throw IPCErrorPayload(code: .invalidRequest, message: "The recovery review changed or another project operation is in progress.")
+                    }
+                    defer { projectConnectionMutationsInFlight.remove(projectID) }
+                    let reservedProject = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)
+                    guard ProjectEnvironmentIdentity(project: reservedProject) == session.project,
+                          reservedProject.registrationKind == .linked, reservedProject.availability == .available,
+                          ProjectFrameworkDetector().inspect(root: URL(fileURLWithPath: reservedProject.rootPath.string)).framework == "Laravel" else {
+                        throw IPCErrorPayload(code: .invalidRequest, message: "The project changed before recovery acquired its reservation.")
+                    }
+                    guard try transaction.recoveryEvidence(destination: envURL, recoveryDirectory: recovery, recoveryID: session.recoveryID) == session.evidence else { throw IPCErrorPayload(code: .invalidRequest, message: "Recovery artifacts changed after review. Review again.") }
+                    guard let latest = try transaction.recoveryStatus(destination: envURL, recoveryDirectory: recovery).first(where: { $0.id == session.recoveryID }), latest.state == session.state else { throw IPCErrorPayload(code: .invalidRequest, message: "Recovery evidence changed after review. Review again.") }
+                    if params.recoveryAction == .restore {
+                        let outcome = try transaction.restore(destination: envURL, recoveryDirectory: recovery, recoveryID: session.recoveryID)
+                        let state = outcome == .restored(session.recoveryID) ? "restored" : "conflict"
+                        let message = state == "restored" ? "The original .env bytes were restored. The displaced proposal remains in the protected recovery directory." : "A concurrent change was captured during restore. Both versions are preserved for manual reconciliation."
+                        return (.init(id: request.id, result: .projectDatabaseConnectionRecovery(.init(outcome: .init(state: state, recoveryID: session.recoveryID, message: message)))), true)
+                    }
+                    try transaction.discard(destination: envURL, recoveryDirectory: recovery, recoveryID: session.recoveryID, expectedEvidence: session.evidence)
+                    return (.init(id: request.id, result: .projectDatabaseConnectionRecovery(.init(outcome: .init(state: "discarded", recoveryID: session.recoveryID, message: "The reviewed recovery artifacts were discarded.")))), true)
+                }
             case .projectAdoptionPreview:
                 let params = try request.params?.decode(ProjectEnvironmentRequest.self) ?? { throw IPCErrorPayload(code: .invalidRequest, message: "Project adoption preview parameters are required.") }()
                 let project = try await resolveProject(selector: params.selector, workingDirectory: params.workingDirectory)

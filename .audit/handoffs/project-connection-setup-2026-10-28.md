@@ -1,55 +1,70 @@
-# Handoff: reviewed project connection setup
+# Handoff: reviewed project database connection setup
 
-## Goal for tomorrow
+## Status
 
-Build a safe, explicit workflow that takes a ready project database provisioning receipt and prepares the Laravel project's database connection settings. Vaelen must show the proposed `.env` changes first, require the developer's approval, preserve unrelated file contents, refuse stale-file writes, avoid secret leakage, and support recovery. CLI and native Settings should use the same Core-owned operation and show consistent state.
+The feature is implemented, locally verified, and committed in the isolated worktree `/Users/banes/.codex/worktrees/vaelen/project-connection-setup-fix` on branch `codex/project-connection-setup-fix-20261028`. The main checkout and its unrelated edits were not modified. Use `git log -1` for the current commit and confirm whether the branch has been published.
 
-Do not add `.env` edits to database provisioning, project `up`, or any other silent/background operation.
+The active behavior connects a ready Vaelen database receipt to a linked Laravel project's existing `.env` through an explicit review, one-use approval, and durable recovery. Review never displays the password value. Settings offers the same Core-owned flow and can restore or discard a retained recovery after an app restart without relying on an in-memory receipt.
 
-## Starting point
+## User workflow
 
-- Project: `/Users/banes/Code/apps/vaelen`
-- Provisioning feature branch: `codex/project-database-provisioning-20261027`
-- Provisioning implementation commit before this handoff: `71e1f5ec7eb209a6a34b47d9914998efd61a89df`
-- The feature has been pushed to `origin`.
-- Read `.audit/project-database-provisioning-handoff.md` for current behavior and acceptance evidence.
-- Read `.audit/project-service-environments.todo.md` for the wider Herd-replacement goal and known release gates.
+```text
+val project db connection review <operation-id> [project] [--json]
+val project db connection apply <operation-id> --confirmation <token> [project] [--json]
+val project db connection status [project]
+val project db connection review-restore <recovery-id> [project]
+val project db connection restore <recovery-id> --confirmation <token> [project]
+val project db connection review-discard <recovery-id> [project]
+val project db connection discard <recovery-id> --confirmation <token> [project]
+```
 
-The provisioning receipt already binds an exact project, managed service, database, user, and Keychain password. It does not change `.env`. Database provisioning acceptance passed for MySQL and PostgreSQL, including real migration/restart checks, focused tests, and native Settings fixtures. The unfiltered test suite was inconclusive due to concurrent test/cache failures; do not claim it passed.
+Review proposes six conventional Laravel values: `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, and `DB_PASSWORD`. PostgreSQL maps to Laravel's `pgsql` driver. The user reviews add/replace rows and warnings before applying. Apply requires a Core-issued token valid for 30 seconds and bound to the project, ready receipt, exact service record, Keychain password bytes, manifest snapshot, and `.env` identity/bytes.
 
-## Completion predicate
+Apply preserves unrelated `.env` bytes and uses one Darwin `RENAME_SWAP`. It retains a protected original and metadata journal. A single outstanding recovery blocks another connection change. Restore is available only while the installed proposal still matches evidence; discard requires a separate explicit review. Conflict discard warns that it may remove the only captured external edit. Nothing clears Laravel's config cache, runs migrations, or edits `.env` during provisioning or project activation.
 
-A developer can:
+## Safety boundaries
 
-1. Select a ready provisioning receipt for a linked Laravel project.
-2. Preview the exact connection keys and values Vaelen proposes to change, with password masked and existing-value conflicts clearly shown.
-3. Approve the exact reviewed proposal.
-4. Have Vaelen apply it only if the `.env` file identity/content still matches the preview.
-5. Confirm unrelated lines, comments, ordering, line endings, permissions, and file identity are preserved as designed.
-6. Recover from an interrupted or explicitly reverted operation without losing either the prior file or the approved new settings.
-7. See the same result and state in `val` and native Settings.
+- Core accepts only a linked, available Laravel project and a ready receipt whose current service target still matches.
+- `.env` must already exist as an owner-owned regular single-link file with mode `0600`; no file creation or permission tightening is implicit.
+- Paths use pinned directory descriptors. FIFO and arbitrary ancestor symlinks are refused. The exact root-owned `/tmp`, `/var`, and `/etc` aliases to `/private/...` are accepted after target verification. Ancestor ACLs may only deny access; allow ACLs are refused.
+- Directory metadata support is allowlisted. The supported `com.apple.provenance` file xattr is included in evidence and preserved; other file xattrs are refused.
+- Both the recovery directory and `.env` parent are synchronized after publication/restoration. Discard persists intent, moves each reviewed artifact to an exclusive quarantine name, checks exact evidence, and can resume after interruption.
+- Project unlink is refused while any connection recovery artifacts remain. The unlink guard uses the same per-project reservation as apply/restore/discard and targets the exact linked project ID.
+- No password is written to receipt metadata, ordinary IPC/UI, CLI review, or logs. The generated password is reloaded from Keychain and byte-compared at apply time.
 
-All paths must keep passwords out of process arguments, logs, diagnostics, SQLite receipts, and ordinary UI text. No mutation occurs during preview. Symlinks, duplicate keys, malformed syntax, permission changes, and concurrent edits must fail safely or have an explicitly designed behavior. Never replace the entire `.env` with a normalized rewrite unless the design proves byte preservation for unrelated content.
+## Verification performed
 
-## Suggested session plan
+- Lead rerun: `Scripts/test.sh --skip-update --disable-automatic-resolution --filter 'ProjectConnectionSetupTests|ProjectDatabaseConnectionProtocolTests|ProjectRelationshipCLIParsingTests|ProjectRegistryTests'` — passed.
+- Implementer ran the same focused suite, including system aliases, metadata/ACL, orphan/discard recovery, and stale reserved-ID unlink regressions — passed.
+- Package-backed live lane: `Scripts/tests/val-project-database-provisioning-test.sh` — passed using MySQL 8.4.11, private Core, actual `val` review/apply/restore/discard, Keychain-change refusal, non-Laravel refusal, retained-recovery blocking, unlink refusal while recovery is retained, successful unlink after discard, and PHP PDO with generated `.env` values. Evidence: `/private/tmp/vaelen-project-database-evidence.hds0kU` (`result=PASS`).
+- Read-only ancestor traversal probe passed on `/Users/banes/Code/apps/vaelen`; metadata evidence is in `.audit/connection-setup-fix/`.
+- Native Debug `project-connection-setup` fixture passed. CUA verified six rows, hidden password marker, cached-config advisory, conflict state, and explicit discard warning. Evidence: `artifacts/verification/connection-setup-ui-fix-20261028T074642Z/`.
+- Native Debug `project-connection-recovery` fixture passed with no session receipt or connection review. CUA verified the conflict message, recovery row, Review discard action, and loss warning, then cancelled. Evidence: `artifacts/verification/connection-recovery-ui-20261028/`.
+- Both fixtures were stopped with the ownership-checking cleanup helper; their temporary DerivedData was removed. Screenshot and accessibility observations remain in the CUA transcript because the host does not export screenshots to disk.
+- Independent read-only Sol review found and fixed the missing post-restart recovery UI. The same reviewer rechecked the fix and found no remaining UI issue.
+- `git diff --check` passed after the implementation and UI correction.
 
-1. **Ground current behavior.** Read `AGENTS.md`, `/Users/banes/.codex/pstack-models.md`, the installed pstack Codex mapping, and the relevant `poteto-mode` skill. Inspect existing project adoption, database receipt/Keychain, `.env` discovery/redaction, CLI IPC, Settings, and file-write abstractions. Use the existing Rex session and avoid opening extra tabs unless useful.
-2. **Frame and design.** Record baseline tests and exact `.env` parser behavior. Compare a byte-preserving targeted edit with a separately generated include file. Decide where approved before-images and recovery state live, how confirmation binds to file hash/inode/project/receipt, and how secret values are passed without process arguments. Select the narrowest design that works for Laravel's expected dotenv syntax.
-3. **Implement and verify in slices.** Start with Core preview/confirmation/apply/recovery state and tests. Cover quoted values, comments, duplicate keys, missing keys, CRLF/LF, no trailing newline, conflicts, symlinks, file permission changes, concurrent edits, interrupted atomic replacement, and secret redaction. Then add CLI and Settings over the same IPC operation.
-4. **Independent review.** Use exactly one fresh read-only Sol reviewer by default. Fix actionable findings with one correctly routed implementation delegate. Do not use a review panel unless a genuinely complex integration or bottleneck justifies it.
-5. **Live acceptance.** Use disposable Laravel project directories and actual provisioned fixture databases. Capture before/after byte hashes; verify a real PDO/Laravel connection, refusal of stale proposals, recovery from injected write interruptions, and agreement between CLI and Settings. Clean only fixture-owned state after confirming processes are gone.
-6. **Handoff.** Update a dedicated `.audit` tracker, document coverage limits and any whole-suite failure, commit the accepted feature, and push only if requested for that goal.
+## Known limits and residual coverage
 
-## Scope discipline
+- The PDO journey proves generated values authenticate to the live provisioned MySQL account, but it does not boot a complete Laravel application or directly exercise the installed `phpdotenv` runtime.
+- PostgreSQL mapping is unit-tested; the new connection-setup flow has no separate live PostgreSQL/PDO journey yet.
+- There is no injected `fsync` failure test and no deterministic simultaneous Core unlink/recovery schedule test. The Core reservation order, unlink refusal with retained artifacts, successful unlink after discard, and stale-ID registry behavior are covered by inspection and tests.
+- An uncooperative writer can change `.env` in the final check-to-swap interval. The approved proposal may briefly become active; the actual displaced occupant is retained and the operation reports conflict. The implementation never claims this race is eliminated.
+- Malformed or partially written journal/discard-intent JSON is retained as `needsAttention` for manual inspection. Valid preparation orphans and valid discard intents can be explicitly reviewed and recovered/resumed.
+- Unsupported dotenv syntax, unknown ACLs/xattrs, broader `.env` modes, and custom Laravel database configuration are refused or outside the feature contract.
+- Earlier failed compile/test logs remain under `.audit/test-failures/`; they are retained as audit evidence, not active processes.
 
-Target connection environment variables are the standard Laravel database fields required by the receipt, such as `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, and `DB_PASSWORD`, plus any engine-specific fields only if justified by existing Vaelen behavior. Do not add `.env` discovery beyond linked project scope, credential import, database deletion, automatic migrations, or project activation as a side effect.
+## Next release work
 
-The expected focused coding and acceptance effort is about 3–5 hours. Add 2–4 hours if dotenv parsing or atomic recovery requires a design change.
+1. Decide whether a full disposable Laravel bootstrap/`phpdotenv` acceptance is required before release; if so, add a minimal fixture app that proves the updated `.env` is loaded both with and without cached config.
+2. Add deterministic Core concurrency scheduling and injected directory-sync failure tests if the test seams can be added without weakening production transaction boundaries.
+3. Add a live PostgreSQL connection-setup/PDO journey if PostgreSQL `.env` setup must receive the same integration coverage as MySQL.
+4. Decide whether supporting common `0644` `.env` files should be a later, separately reviewed permission-tightening workflow. Current behavior deliberately refuses them.
 
-## User and workflow preferences
+## Next session startup
 
-- Keep macOS Settings compact and native; avoid creating persistent project windows.
-- Use one reviewer unless the integration is truly complex or a major bottleneck.
-- Never start a reviewer panel just because a template recommends one.
-- Preserve unrelated work and report limitations plainly.
-- No push is implied for the next goal unless the user authorizes it.
+1. Check the fix worktree branch, `git status`, and upstream state.
+2. Read this handoff and `.agents/skills/verify-vaelen/features/project-connection-setup.md`.
+3. Run the focused command above before making follow-up changes.
+4. Preserve `.audit/test-failures/`, `.audit/connection-setup-fix/`, and the verification directories until evidence has been copied or the user requests cleanup.
+5. The implementation is already committed. Do not reset or remove the feature worktree until the branch is integrated and the user confirms its retained evidence can be cleaned.

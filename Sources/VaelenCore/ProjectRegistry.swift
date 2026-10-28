@@ -49,6 +49,11 @@ public actor ProjectRegistry {
         try linkWithCreation(path: path.map { paths.canonicalize($0, relativeTo: workingDirectory).url }, name: name)
     }
 
+    public func unlink(projectID: ProjectID) throws {
+        guard let record = try projects.all().first(where: { $0.id == projectID }) else { throw ProjectRegistryError.projectNotFound }
+        try projects.remove(canonicalPath: record.canonicalPath)
+    }
+
     public func unlink(path: URL? = nil) throws {
         let canonical = paths.canonicalize(path ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
         guard try projects.all().contains(where: { $0.canonicalPath == canonical.string }) else { throw ProjectRegistryError.projectNotFound }

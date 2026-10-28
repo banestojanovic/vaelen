@@ -48,6 +48,9 @@ final class AppModel {
     private(set) var projectLifecycleStates: [String: ProjectLifecycleState] = [:]
     private(set) var projectAdoptionReviews: [String: ProjectAdoptionReview] = [:]
     private(set) var projectDatabaseAttempts: [String: ProjectDatabaseAttemptResult] = [:]
+    private(set) var projectConnectionReviews: [String: ProjectDatabaseConnectionReview] = [:]
+    private(set) var projectConnectionOutcomes: [String: ProjectDatabaseConnectionResult] = [:]
+    private(set) var projectConnectionRecoveries: [String: [ConnectionRecoverySummary]] = [:]
     private(set) var projectStartupMilestones: [String: TimeInterval] = [:]
     private(set) var phpCatalog: PHPRuntimeCatalog?
     private(set) var phpCatalogReadPending = false
@@ -217,10 +220,10 @@ final class AppModel {
             case "unavailable":
                 model.state = .unavailable
                 model.coreLaunchError = "Fixture: Core observations are unavailable."
-            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable", "project-adoption", "project-database", "project-database-postgresql", "project-database-retry":
+            case "partial", "empty", "installed", "all-installed", "install-failed", "remove-failed", "php-settings", "php-settings-no-default", "php-settings-error", "php-settings-invalid", "php-settings-saving", "php-update-review", "php-update-progress", "php-update-unknown-total", "php-update-success", "php-update-failed", "php-update-checking", "php-update-check-failed", "php-release-security", "php-release-coexist", "php-release-stale", "node-settings-selected", "node-settings-unpinned", "node-settings-unavailable", "project-adoption", "project-database", "project-database-postgresql", "project-database-retry", "project-connection-setup", "project-connection-recovery":
                 model.settingsFixtureOperationFailure = mode == "install-failed" || mode == "remove-failed"
-                let mysqlState: MySQLState = mode == "node-settings-selected" || mode == "project-database" ? .running : mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
-                let mysqlVersion = (mode == "node-settings-selected" || mode == "project-database" || mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
+                let mysqlState: MySQLState = mode == "node-settings-selected" || mode == "project-database" || mode.hasPrefix("project-connection-") ? .running : mode == "partial" ? .unhealthy : (mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? .stopped : .notInstalled
+                let mysqlVersion = (mode == "node-settings-selected" || mode == "project-database" || mode.hasPrefix("project-connection-") || mode == "installed" || mode == "all-installed" || mode == "remove-failed") ? "8.4.11" : nil
                 let mysql = MySQLStatus(
                     state: mysqlState,
                     health: mysqlState == .unhealthy ? "identity-unverified" : mysqlState == .stopped ? "stopped" : mysqlState == .running ? "healthy" : "not-installed",
@@ -246,15 +249,15 @@ final class AppModel {
                 )
                 let status = CoreStatusResponse(core: CoreRuntime(version: "0.0.14-fixture", pid: 1).status, protocolVersion: 1, serviceIntents: [])
                 model.state = .running(status, [], nil, RouterStatus(provider: "Caddy", providerVersion: "fixture", state: .stopped, health: .unknown, routeCount: 0), nil, nil, nil, mysql, mailpit)
-                if mode.hasPrefix("node-settings-") || mode == "project-adoption" || mode == "project-database" || mode == "project-database-postgresql" || mode == "project-database-retry" {
+                if mode.hasPrefix("node-settings-") || mode == "project-adoption" || mode == "project-database" || mode == "project-database-postgresql" || mode == "project-database-retry" || mode.hasPrefix("project-connection-") {
                     let projectID = UUID(uuidString: "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!
-                    let project = ProjectWire(id: projectID, name: "Storefront", path: "/fixture/projects/storefront", registration: "linked", availability: "available", detectedFramework: "Next.js")
+                    let project = ProjectWire(id: projectID, name: "Storefront", path: "/fixture/projects/storefront", registration: "linked", availability: "available", detectedFramework: mode.hasPrefix("project-connection-") ? "Laravel" : "Next.js")
                     let version = try! NodeVersion("24.22.1")
                     let pin = mode == "node-settings-selected" ? version : mode == "node-settings-unavailable" ? try! NodeVersion("26.12.1") : nil
                     let packageJSON = Data(#"{"version":"24.22.1","platform":"darwin","architecture":"arm64","artifactSHA256":"fixture","receiptVersion":1}"#.utf8)
                     let package = try? JSONDecoder().decode(NodePackageIdentity.self, from: packageJSON)
                     model.linkedProjects = [project]
-                    if mode == "node-settings-selected" || mode == "project-adoption" || mode == "project-database" || mode == "project-database-postgresql" || mode == "project-database-retry" {
+                    if mode == "node-settings-selected" || mode == "project-adoption" || mode == "project-database" || mode == "project-database-postgresql" || mode == "project-database-retry" || mode.hasPrefix("project-connection-") {
                         let projectDomain = Project(
                             id: ProjectID(rawValue: projectID),
                             name: project.name,
@@ -281,7 +284,7 @@ final class AppModel {
                             standardPorts: StandardPortsStatus(state: .absent)
                         )
                         let derived = ProjectDerivedEnvironment(
-                            framework: ProjectFrameworkInspection(framework: "Next.js", confidence: .unknown, evidence: []),
+                            framework: ProjectFrameworkInspection(framework: mode.hasPrefix("project-connection-") ? "Laravel" : "Next.js", confidence: .unknown, evidence: []),
                             phpResolution: "resolved",
                             dbEndpoint: ProjectEndpointObservation(configuredHost: nil, configuredPort: nil, expectedHost: nil, expectedPort: nil, matches: nil),
                             mailEndpoint: ProjectEndpointObservation(configuredHost: nil, configuredPort: nil, expectedHost: nil, expectedPort: nil, matches: nil),
@@ -294,7 +297,7 @@ final class AppModel {
                         let postgresqlBinding = try! ProjectServiceBinding(alias: ProjectBindingAlias("postgresql"), kind: .postgresql, instance: ProjectInstanceName("fixture-pg"), version: "18.6")
                         let postgresqlObservation = ProjectServiceBindingObservation(binding: postgresqlBinding, packageIdentifier: "postgresql-18.6", endpoint: ["host": "127.0.0.1", "port": "15432"], dataDirectory: "/fixture/postgresql-data", health: "healthy", claimed: true)
                         let isPostgreSQLDatabaseFixture = mode == "project-database-postgresql"
-                        if mode == "project-database" || isPostgreSQLDatabaseFixture || mode == "project-database-retry" {
+                        if mode == "project-database" || isPostgreSQLDatabaseFixture || mode == "project-database-retry" || mode == "project-connection-setup" {
                             let operationID = DatabaseOperationID(UUID(uuidString: mode == "project-database-retry" ? "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC408" : isPostgreSQLDatabaseFixture ? "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC409" : "C0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!)
                             let binding = isPostgreSQLDatabaseFixture ? postgresqlBinding : mysqlBinding
                             let result = ProjectDatabaseAttemptResult(
@@ -315,8 +318,29 @@ final class AppModel {
                             derived: derived,
                             secret: ProjectSecretEnvironment(databasePassword: .unknown, mailPassword: .unknown),
                             diagnostics: [],
-                            serviceBindings: mode == "project-database" || mode == "project-database-retry" ? [mysqlObservation] : isPostgreSQLDatabaseFixture ? [postgresqlObservation] : nil
+                            serviceBindings: mode == "project-database" || mode == "project-database-retry" || mode.hasPrefix("project-connection-") ? [mysqlObservation] : isPostgreSQLDatabaseFixture ? [postgresqlObservation] : nil
                         )]
+                        if mode == "project-connection-setup" {
+                            let confirmation = UUID(uuidString: "E0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!
+                            model.projectConnectionReviews[project.path] = ProjectDatabaseConnectionReview(
+                                confirmation: confirmation,
+                                project: ProjectEnvironmentIdentity(project: projectDomain),
+                                expiresAt: Date().addingTimeInterval(30),
+                                edits: [
+                                    .init(key: "DB_CONNECTION", action: "replace", value: "mysql"),
+                                    .init(key: "DB_HOST", action: "replace", value: "127.0.0.1"),
+                                    .init(key: "DB_PORT", action: "replace", value: "3306"),
+                                    .init(key: "DB_DATABASE", action: "replace", value: "storefront_app"),
+                                    .init(key: "DB_USERNAME", action: "replace", value: "storefront_user"),
+                                    .init(key: "DB_PASSWORD", action: "replace", value: "managed password (hidden)")
+                                ], advisories: ["Laravel configuration is cached. Requests and Artisan may skip .env until you refresh the cache."]
+                            )
+                        }
+                        if mode.hasPrefix("project-connection-") {
+                            let recoveryID = UUID(uuidString: "F0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!
+                            model.projectConnectionRecoveries[project.path] = [ConnectionRecoverySummary(id: recoveryID, state: "conflict", restoreAvailable: false, discardAvailable: true)]
+                            model.projectConnectionOutcomes[project.path] = ProjectDatabaseConnectionResult(state: "conflict", recoveryID: recoveryID, message: "A concurrent change was captured. The approved proposal may now be in .env. The displaced edit is preserved for manual reconciliation.")
+                        }
                         if mode == "project-adoption", let report = model.projectReports.first {
                             let preview = ProjectAdoptionPreview(
                                 identity: report.identity,
@@ -1609,6 +1633,8 @@ final class AppModel {
         projectAdoptionReviews[project.path] ?? ProjectAdoptionReview()
     }
 
+    func dismissProjectConnectionReview(for project: ProjectWire) { projectConnectionReviews.removeValue(forKey: project.path) }
+
     func createProjectDatabase(_ project: ProjectWire, binding: ProjectServiceBinding, database: String, user: String) async throws -> ProjectDatabaseAttemptResult {
         guard let projectUUID = project.id, project.availability == "available", !isSettingsFixture else { throw CoreClientError.coreUnavailable }
         let creation = ProjectDatabaseCreation(
@@ -1670,6 +1696,59 @@ final class AppModel {
             await commandClient.disconnect()
             throw error
         }
+    }
+
+    func reviewProjectDatabaseConnection(_ project: ProjectWire, operationID: DatabaseOperationID) async throws -> ProjectDatabaseConnectionReview {
+        if isSettingsFixture, let review = projectConnectionReviews[project.path] { return review }
+        guard !isSettingsFixture else { throw CoreClientError.coreUnavailable }
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let review = try await client.reviewProjectDatabaseConnection(selector: project.id?.uuidString, workingDirectory: project.path, operationID: operationID)
+            await client.disconnect()
+            projectConnectionReviews[project.path] = review
+            return review
+        } catch { await client.disconnect(); throw error }
+    }
+
+    func applyProjectDatabaseConnection(_ project: ProjectWire, operationID: DatabaseOperationID, confirmation: UUID) async throws -> ProjectDatabaseConnectionResult {
+        if isSettingsFixture, let outcome = projectConnectionOutcomes[project.path] { return outcome }
+        guard !isSettingsFixture else { throw CoreClientError.coreUnavailable }
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let result = try await client.applyProjectDatabaseConnection(selector: project.id?.uuidString, workingDirectory: project.path, operationID: operationID, confirmation: confirmation)
+            await client.disconnect()
+            projectConnectionOutcomes[project.path] = result
+            projectConnectionReviews.removeValue(forKey: project.path)
+            return result
+        } catch { await client.disconnect(); throw error }
+    }
+
+    func projectDatabaseConnectionRecovery(_ project: ProjectWire, action: ProjectDatabaseConnectionRecoveryAction, recoveryID: UUID? = nil, confirmation: UUID? = nil) async throws -> ProjectDatabaseConnectionRecoveryResult {
+        if isSettingsFixture {
+            let recoveries = projectConnectionRecoveries[project.path] ?? []
+            if action == .status { return ProjectDatabaseConnectionRecoveryResult(recoveries: recoveries) }
+            if action == .reviewDiscard, let recoveryID, let summary = recoveries.first(where: { $0.id == recoveryID }) {
+                return ProjectDatabaseConnectionRecoveryResult(review: ProjectDatabaseConnectionRecoveryReview(confirmation: UUID(uuidString: "A0B8DF3A-310A-4F20-9FC5-F7F4B01CC407")!, recovery: summary, action: action))
+            }
+            if action == .discard, let recoveryID, confirmation != nil {
+                projectConnectionRecoveries[project.path] = recoveries.filter { $0.id != recoveryID }
+                let outcome = ProjectDatabaseConnectionResult(state: "discarded", recoveryID: recoveryID, message: "Fixture action: reviewed recovery artifacts were discarded.")
+                projectConnectionOutcomes[project.path] = outcome
+                return ProjectDatabaseConnectionRecoveryResult(outcome: outcome)
+            }
+            throw CoreClientError.coreUnavailable
+        }
+        let client = makeCoreClient()
+        do {
+            try await client.connect()
+            let result = try await client.projectDatabaseConnectionRecovery(.init(selector: project.id?.uuidString, workingDirectory: project.path, recoveryAction: action, recoveryID: recoveryID, confirmation: confirmation))
+            await client.disconnect()
+            if action == .status { projectConnectionRecoveries[project.path] = result.recoveries }
+            if let outcome = result.outcome { projectConnectionOutcomes[project.path] = outcome }
+            return result
+        } catch { await client.disconnect(); throw error }
     }
 
     func reviewProjectAdoption(_ project: ProjectWire) async {

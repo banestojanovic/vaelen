@@ -51,6 +51,9 @@ enum CLICommand {
     case projectDatabaseStatus(operationID: UUID, selector: String?, json: Bool)
     case projectDatabaseRetry(operationID: UUID, selector: String?, json: Bool)
     case projectDatabasePassword(operationID: UUID, selector: String?, copy: Bool)
+    case projectDatabaseConnectionReview(operationID: UUID, selector: String?, json: Bool)
+    case projectDatabaseConnectionApply(operationID: UUID, confirmation: UUID, selector: String?, json: Bool)
+    case projectDatabaseConnectionRecovery(action: ProjectDatabaseConnectionRecoveryAction, recoveryID: UUID?, confirmation: UUID?, selector: String?, json: Bool)
     case phpVersions(json: Bool)
     case phpInstall(String)
     case phpUpdate(String)
@@ -462,6 +465,43 @@ struct VaelenCLIMain {
             if args.count == 1 { return .help(path: [first]) }
             if args.count >= 3, args[1] == "db" {
                 let action = args[2]
+                if action == "connection" {
+                    guard args.count >= 4 else { throw CLIError.commandUsage("project db") }
+                    if args[3] == "status" {
+                        guard args.count == 4 || args.count == 5 else { throw CLIError.commandUsage("project db") }
+                        return .projectDatabaseConnectionRecovery(action: .status, recoveryID: nil, confirmation: nil, selector: args.count == 5 ? args[4] : nil, json: false)
+                    }
+                    let recoveryActions: [String: ProjectDatabaseConnectionRecoveryAction] = ["review-restore": .reviewRestore, "review-discard": .reviewDiscard]
+                    if let recoveryAction = recoveryActions[args[3]] {
+                        guard args.count == 5 || args.count == 6, let recoveryID = UUID(uuidString: args[4]), args.count == 5 || !args[5].hasPrefix("-") else { throw CLIError.commandUsage("project db") }
+                        return .projectDatabaseConnectionRecovery(action: recoveryAction, recoveryID: recoveryID, confirmation: nil, selector: args.count == 6 ? args[5] : nil, json: false)
+                    }
+                    if args[3] == "restore" || args[3] == "discard" {
+                        guard args.count == 7 || args.count == 8, let recoveryID = UUID(uuidString: args[4]), args[5] == "--confirmation", let confirmation = UUID(uuidString: args[6]), args.count == 7 || !args[7].hasPrefix("-") else { throw CLIError.commandUsage("project db") }
+                        return .projectDatabaseConnectionRecovery(action: args[3] == "restore" ? .restore : .discard, recoveryID: recoveryID, confirmation: confirmation, selector: args.count == 8 ? args[7] : nil, json: false)
+                    }
+                    if args[3] == "review" {
+                        guard (5...7).contains(args.count), let operationID = UUID(uuidString: args[4]) else { throw CLIError.commandUsage("project db") }
+                        var selector: String?; var json = false
+                        for value in args.dropFirst(5) {
+                            if value == "--json", !json { json = true }
+                            else if !value.hasPrefix("-"), selector == nil { selector = value }
+                            else { throw CLIError.commandUsage("project db") }
+                        }
+                        return .projectDatabaseConnectionReview(operationID: operationID, selector: selector, json: json)
+                    }
+                    if args[3] == "apply" {
+                        guard (7...9).contains(args.count), let operationID = UUID(uuidString: args[4]), args[5] == "--confirmation", let confirmation = UUID(uuidString: args[6]) else { throw CLIError.commandUsage("project db") }
+                        var selector: String?; var json = false
+                        for value in args.dropFirst(7) {
+                            if value == "--json", !json { json = true }
+                            else if !value.hasPrefix("-"), selector == nil { selector = value }
+                            else { throw CLIError.commandUsage("project db") }
+                        }
+                        return .projectDatabaseConnectionApply(operationID: operationID, confirmation: confirmation, selector: selector, json: json)
+                    }
+                    throw CLIError.commandUsage("project db")
+                }
                 if action == "password" {
                     guard args.count == 5 || args.count == 6, ["reveal", "copy"].contains(args[3]),
                           let id = UUID(uuidString: args[4]), args.count == 5 || !args[5].hasPrefix("-") else { throw CLIError.commandUsage("project db") }
@@ -1202,6 +1242,26 @@ struct VaelenCLIMain {
             } else {
                 FileHandle.standardOutput.write(Data((password + "\n").utf8))
             }
+        case .projectDatabaseConnectionReview(let operationID, let selector, let json):
+            let review = try await client.reviewProjectDatabaseConnection(selector: selector, workingDirectory: workingDirectory, operationID: DatabaseOperationID(operationID))
+            if json { print(String(decoding: try IPCCodec.encode(ProjectDatabaseConnectionReviewResult(review: review)), as: UTF8.self)) }
+            else { print(projectDatabaseConnectionReviewOutput(review)) }
+        case .projectDatabaseConnectionApply(let operationID, let confirmation, let selector, let json):
+            let result = try await client.applyProjectDatabaseConnection(selector: selector, workingDirectory: workingDirectory, operationID: DatabaseOperationID(operationID), confirmation: confirmation)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else { print(result.message) }
+        case .projectDatabaseConnectionRecovery(let action, let recoveryID, let confirmation, let selector, let json):
+            let request = ProjectDatabaseConnectionRecoveryRequest(selector: selector, workingDirectory: workingDirectory, recoveryAction: action, recoveryID: recoveryID, confirmation: confirmation)
+            let result = try await client.projectDatabaseConnectionRecovery(request)
+            if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
+            else if let review = result.review {
+                print("Review \(review.action.rawValue) for recovery \(review.recovery.id.uuidString) in state \(review.recovery.state).")
+                if review.action == .reviewDiscard { print("Discard permanently removes the protected recovery copy and all captured versions, including a possible sole copy of an external edit in a conflict. The current .env is kept. Recovery will no longer be available.") }
+                else { print("Restore retains the displaced proposal and protected recovery files. Explicit discard is required before another connection change.") }
+                print("Confirm with token \(review.confirmation.uuidString).")
+            }
+            else if let outcome = result.outcome { print(outcome.message) }
+            else { for summary in result.recoveries { print("\(summary.id.uuidString) · \(summary.state)") } }
         case .projectPHP(let selector, let version, let useDefault, let json):
             let result = try await client.setProjectPHP(selector: selector, workingDirectory: workingDirectory, version: version, useDefault: useDefault)
             if json { print(String(decoding: try IPCCodec.encode(result), as: UTF8.self)) }
@@ -1604,6 +1664,14 @@ struct VaelenCLIMain {
             HumanOutput.report("Derived", rows: derivedRows),
             HumanOutput.heading("Diagnostics") + "\n" + diagnosticTable
         ].joined(separator: "\n\n")
+    }
+
+    static func projectDatabaseConnectionReviewOutput(_ review: ProjectDatabaseConnectionReview) -> String {
+        var rows = ["Project: \(review.project.name)", "Expires: \(review.expiresAt)"]
+        rows.append(contentsOf: review.edits.map { "\($0.key) · \($0.action) · \($0.value)" })
+        rows.append(contentsOf: review.advisories.map { "Warning: \($0)" })
+        rows.append("Apply with: val project db connection apply <operation-id> --confirmation \(review.confirmation.uuidString) [project]")
+        return rows.joined(separator: "\n")
     }
 
     static func projectAdoptionPreviewOutput(_ preview: ProjectAdoptionPreview) -> String {

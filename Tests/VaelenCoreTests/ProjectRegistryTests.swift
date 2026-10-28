@@ -9,6 +9,25 @@ final class ProjectRegistryTests: XCTestCase {
         return url
     }
 
+    func testReservedUnlinkCannotRemoveAReplacementRegistration() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("app")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let registry = ProjectRegistry(store: try SQLiteStateStore(databaseURL: root.appendingPathComponent("state.sqlite")))
+        let original = try await registry.link(path: project, name: "reserved")
+        let reservedID = try XCTUnwrap(original.id)
+        try await registry.unlink(projectID: reservedID)
+        let replacement = try await registry.link(path: project, name: "reserved")
+        XCTAssertNotEqual(replacement.id, reservedID)
+        do {
+            try await registry.unlink(projectID: reservedID)
+            XCTFail("stale reservation removed replacement")
+        } catch { XCTAssertEqual(error as? ProjectRegistryError, .projectNotFound) }
+        let remaining = try await registry.linkedProjects()
+        XCTAssertEqual(remaining.first?.id, replacement.id)
+    }
+
     func testCanonicalPathExpandsAndResolvesExistingSymlinkWithoutLowercasing() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

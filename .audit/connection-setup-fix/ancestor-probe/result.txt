@@ -1,0 +1,1 @@
+PASS descriptor-pinned ancestor validation at /Users/banes/Code/apps/vaelen

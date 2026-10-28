@@ -80,6 +80,9 @@ public enum CoreMethod: String, Sendable {
     case projectDatabaseStatus = "project.database.status"
     case projectDatabaseRetry = "project.database.retry"
     case projectDatabasePassword = "project.database.password"
+    case projectDatabaseConnectionReview = "project.database.connection.review"
+    case projectDatabaseConnectionApply = "project.database.connection.apply"
+    case projectDatabaseConnectionRecovery = "project.database.connection.recovery"
     case pathPark = "path.park"
     case pathUnpark = "path.unpark"
     case pathList = "path.list"
@@ -157,6 +160,9 @@ public enum RequestParams: Codable, Equatable, Sendable {
     case projectDatabaseStatus(ProjectDatabaseOperationRequest)
     case projectDatabaseRetry(ProjectDatabaseOperationRequest)
     case projectDatabasePassword(ProjectDatabasePasswordRequest)
+    case projectDatabaseConnectionReview(ProjectDatabaseConnectionRequest)
+    case projectDatabaseConnectionApply(ProjectDatabaseConnectionRequest)
+    case projectDatabaseConnectionRecovery(ProjectDatabaseConnectionRecoveryRequest)
     case park(ParkPathRequest)
     case unpark(UnparkPathRequest)
     case phpVersion(PHPVersionRequest)
@@ -190,6 +196,9 @@ public enum RequestParams: Codable, Equatable, Sendable {
         case .projectDatabaseStatus(let value): try value.encode(to: encoder)
         case .projectDatabaseRetry(let value): try value.encode(to: encoder)
         case .projectDatabasePassword(let value): try value.encode(to: encoder)
+        case .projectDatabaseConnectionReview(let value): try value.encode(to: encoder)
+        case .projectDatabaseConnectionApply(let value): try value.encode(to: encoder)
+        case .projectDatabaseConnectionRecovery(let value): try value.encode(to: encoder)
         case .park(let value): try value.encode(to: encoder)
         case .unpark(let value): try value.encode(to: encoder)
         case .phpVersion(let value): try value.encode(to: encoder)
@@ -226,6 +235,9 @@ public enum RequestParams: Codable, Equatable, Sendable {
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectPHPRequest.self, from: IPCCodec.encode(value)) { self = .projectPHP(params); return }
             if fields["creation"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseCreateRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseCreate(params); return }
             if fields["revealPassword"] != nil, let params = try? IPCCodec.decode(ProjectDatabasePasswordRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabasePassword(params); return }
+            if fields["connectionOperation"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseConnectionRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseConnectionReview(params); return }
+            if fields["confirmation"] != nil, fields["operationID"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseConnectionRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseConnectionApply(params); return }
+            if fields["recoveryAction"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseConnectionRecoveryRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseConnectionRecovery(params); return }
             if fields["operationID"] != nil, fields["workingDirectory"] != nil, let params = try? IPCCodec.decode(ProjectDatabaseOperationRequest.self, from: IPCCodec.encode(value)) { self = .projectDatabaseStatus(params); return }
             if fields["confirmation"] != nil, let params = try? IPCCodec.decode(ProjectAdoptionApplyRequest.self, from: IPCCodec.encode(value)) { self = .projectAdoptionApply(params); return }
             if fields["workingDirectory"] != nil, fields["selector"] != nil, let params = try? IPCCodec.decode(ProjectEnvironmentRequest.self, from: IPCCodec.encode(value)) { self = .projectAdoptionPreview(params); return }
@@ -533,6 +545,74 @@ public struct ProjectDatabasePasswordRequest: Codable, Equatable, Sendable {
         self.selector = selector; self.workingDirectory = workingDirectory; self.operationID = operationID; self.revealPassword = true
     }
 }
+
+public struct ProjectDatabaseConnectionRequest: Codable, Equatable, Sendable {
+    public let selector: String?
+    public let workingDirectory: String
+    public let operationID: DatabaseOperationID
+    public let connectionOperation: String?
+    public let confirmation: UUID?
+    public init(selector: String?, workingDirectory: String, operationID: DatabaseOperationID, connectionOperation: String? = "review", confirmation: UUID? = nil) {
+        self.selector = selector; self.workingDirectory = workingDirectory; self.operationID = operationID; self.connectionOperation = connectionOperation; self.confirmation = confirmation
+    }
+}
+
+public enum ProjectDatabaseConnectionRecoveryAction: String, Codable, Sendable { case status, reviewRestore, restore, reviewDiscard, discard }
+
+public struct ProjectDatabaseConnectionRecoveryRequest: Codable, Equatable, Sendable {
+    public let selector: String?
+    public let workingDirectory: String
+    public let recoveryID: UUID?
+    public let confirmation: UUID?
+    public let recoveryAction: ProjectDatabaseConnectionRecoveryAction
+    public init(selector: String?, workingDirectory: String, recoveryAction: ProjectDatabaseConnectionRecoveryAction, recoveryID: UUID? = nil, confirmation: UUID? = nil) {
+        self.selector = selector; self.workingDirectory = workingDirectory; self.recoveryAction = recoveryAction; self.recoveryID = recoveryID; self.confirmation = confirmation
+    }
+}
+
+public struct ProjectDatabaseConnectionRecoveryReview: Codable, Equatable, Sendable {
+    public let confirmation: UUID
+    public let recovery: ConnectionRecoverySummary
+    public let action: ProjectDatabaseConnectionRecoveryAction
+    public init(confirmation: UUID, recovery: ConnectionRecoverySummary, action: ProjectDatabaseConnectionRecoveryAction) { self.confirmation = confirmation; self.recovery = recovery; self.action = action }
+}
+
+public struct ProjectDatabaseConnectionRecoveryResult: Codable, Equatable, Sendable {
+    public let recoveries: [ConnectionRecoverySummary]
+    public let outcome: ProjectDatabaseConnectionResult?
+    public let review: ProjectDatabaseConnectionRecoveryReview?
+    public init(recoveries: [ConnectionRecoverySummary] = [], outcome: ProjectDatabaseConnectionResult? = nil, review: ProjectDatabaseConnectionRecoveryReview? = nil) { self.recoveries = recoveries; self.outcome = outcome; self.review = review }
+}
+
+public struct ProjectDatabaseConnectionEdit: Codable, Equatable, Sendable {
+    public let key: String
+    public let action: String
+    public let value: String
+    public init(key: String, action: String, value: String) { self.key = key; self.action = action; self.value = value }
+}
+
+public struct ProjectDatabaseConnectionReview: Codable, Equatable, Sendable {
+    public let confirmation: UUID
+    public let project: ProjectEnvironmentIdentity
+    public let expiresAt: Date
+    public let edits: [ProjectDatabaseConnectionEdit]
+    public let advisories: [String]
+    public init(confirmation: UUID, project: ProjectEnvironmentIdentity, expiresAt: Date, edits: [ProjectDatabaseConnectionEdit], advisories: [String]) {
+        self.confirmation = confirmation; self.project = project; self.expiresAt = expiresAt; self.edits = edits; self.advisories = advisories
+    }
+}
+
+public struct ProjectDatabaseConnectionResult: Codable, Equatable, Sendable {
+    public let state: String
+    public let recoveryID: UUID
+    public let message: String
+    public init(state: String, recoveryID: UUID, message: String) { self.state = state; self.recoveryID = recoveryID; self.message = message }
+}
+
+public struct ProjectDatabaseConnectionReviewResult: Codable, Equatable, Sendable {
+    public let review: ProjectDatabaseConnectionReview
+    public init(review: ProjectDatabaseConnectionReview) { self.review = review }
+}
 public struct ProjectDatabaseAttemptResult: Codable, Equatable, Sendable {
     public let operationID: DatabaseOperationID
     public let receiptID: UUID
@@ -762,6 +842,9 @@ public enum ResponseResult: Codable, Equatable, Sendable {
     case projectPHPSelections(ProjectPHPSelectionsResult)
     case projectDatabaseAttempt(ProjectDatabaseAttemptResult)
     case projectDatabasePassword(ProjectDatabasePasswordResult)
+    case projectDatabaseConnectionReview(ProjectDatabaseConnectionReviewResult)
+    case projectDatabaseConnection(ProjectDatabaseConnectionResult)
+    case projectDatabaseConnectionRecovery(ProjectDatabaseConnectionRecoveryResult)
     case parkedPathMutation(ParkedPathMutationResult)
     case parkedPathList(ParkedPathListResult)
     case phpVersions(PHPVersionsResult)
@@ -813,6 +896,9 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         case .projectPHPSelections(let value): try value.encode(to: encoder)
         case .projectDatabaseAttempt(let value): try value.encode(to: encoder)
         case .projectDatabasePassword(let value): try value.encode(to: encoder)
+        case .projectDatabaseConnectionReview(let value): try value.encode(to: encoder)
+        case .projectDatabaseConnection(let value): try value.encode(to: encoder)
+        case .projectDatabaseConnectionRecovery(let value): try value.encode(to: encoder)
         case .parkedPathMutation(let value): try value.encode(to: encoder)
         case .parkedPathList(let value): try value.encode(to: encoder)
         case .phpVersions(let value): try value.encode(to: encoder)
@@ -860,6 +946,9 @@ public enum ResponseResult: Codable, Equatable, Sendable {
         else if fields["report"] != nil, let result = try? IPCCodec.decode(ProjectEnvironmentResult.self, from: data) { self = .projectEnvironment(result) }
         else if fields["preview"] != nil, fields["confirmation"] != nil, let result = try? IPCCodec.decode(ProjectAdoptionPreviewResult.self, from: data) { self = .projectAdoptionPreview(result) }
         else if fields["manifestCreated"] != nil, let result = try? IPCCodec.decode(ProjectAdoptionApplyResult.self, from: data) { self = .projectAdoptionApply(result) }
+        else if fields["review"] != nil, let result = try? IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: data) { self = .projectDatabaseConnectionReview(result) }
+        else if fields["recoveryID"] != nil, let result = try? IPCCodec.decode(ProjectDatabaseConnectionResult.self, from: data) { self = .projectDatabaseConnection(result) }
+        else if fields["recoveries"] != nil || fields["review"] != nil, let result = try? IPCCodec.decode(ProjectDatabaseConnectionRecoveryResult.self, from: data) { self = .projectDatabaseConnectionRecovery(result) }
         else if fields["snapshotID"] != nil, let result = try? IPCCodec.decode(ProjectObservationSnapshotResult.self, from: data) { self = .projectObservationSnapshot(result) }
         else if fields["plan"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationPlanResult.self, from: data) { self = .projectPlan(result) }
         else if fields["execution"] != nil, let result = try? IPCCodec.decode(ProjectReconciliationExecutionResponse.self, from: data) { self = .projectActivation(result) }

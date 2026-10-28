@@ -207,6 +207,23 @@ public actor VaelenCoreClient {
         return result.password
     }
 
+    public func reviewProjectDatabaseConnection(selector: String?, workingDirectory: String, operationID: DatabaseOperationID) async throws -> ProjectDatabaseConnectionReview {
+        let params = ProjectDatabaseConnectionRequest(selector: selector, workingDirectory: workingDirectory, operationID: operationID)
+        guard case .projectDatabaseConnectionReview(let result) = try result(from: await send(IPCRequest(method: .projectDatabaseConnectionReview, params: .projectDatabaseConnectionReview(params)))) else { throw CoreClientError.invalidResponse }
+        return result.review
+    }
+
+    public func applyProjectDatabaseConnection(selector: String?, workingDirectory: String, operationID: DatabaseOperationID, confirmation: UUID) async throws -> ProjectDatabaseConnectionResult {
+        let params = ProjectDatabaseConnectionRequest(selector: selector, workingDirectory: workingDirectory, operationID: operationID, connectionOperation: nil, confirmation: confirmation)
+        guard case .projectDatabaseConnection(let result) = try result(from: await send(IPCRequest(method: .projectDatabaseConnectionApply, params: .projectDatabaseConnectionApply(params)))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
+    public func projectDatabaseConnectionRecovery(_ request: ProjectDatabaseConnectionRecoveryRequest) async throws -> ProjectDatabaseConnectionRecoveryResult {
+        guard case .projectDatabaseConnectionRecovery(let result) = try result(from: await send(IPCRequest(method: .projectDatabaseConnectionRecovery, params: .projectDatabaseConnectionRecovery(request)))) else { throw CoreClientError.invalidResponse }
+        return result
+    }
+
     private func projectEnvironment(method: CoreMethod, selector: String?, workingDirectory: String, snapshotID: UUID? = nil) async throws -> ProjectEnvironmentReport {
         do {
             guard case .projectEnvironment(let result) = try result(from: await send(IPCRequest(method: method, params: .projectEnvironment(.init(selector: selector, workingDirectory: workingDirectory, snapshotID: snapshotID))))) else { throw CoreClientError.invalidResponse }

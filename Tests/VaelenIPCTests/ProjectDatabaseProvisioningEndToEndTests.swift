@@ -97,6 +97,11 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             try fm.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
             try fm.createDirectory(at: project, withIntermediateDirectories: true)
             try fm.createDirectory(at: neighbor, withIntermediateDirectories: true)
+            for directory in ["bootstrap", "config", "public"] {
+                try fm.createDirectory(at: project.appendingPathComponent(directory), withIntermediateDirectories: true)
+            }
+            try Data("<?php".utf8).write(to: project.appendingPathComponent("artisan"))
+            try Data("<?php".utf8).write(to: project.appendingPathComponent("public/index.php"))
             try envBytes.write(to: envURL)
             try Data("version: 2\nservices:\n  database:\n    kind: mysql\n    instance: default\n    version: \(packageID)\n".utf8).write(to: project.appendingPathComponent("vaelen.yml"))
             try Data("version: 2\nservices:\n  database:\n    kind: mysql\n    instance: default\n    version: \(packageID)\n".utf8).write(to: neighbor.appendingPathComponent("vaelen.yml"))
@@ -176,10 +181,131 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             XCTAssertFalse(environment.values.contains(where: { $0.contains(secretText) }))
             XCTAssertFalse((created.1 + created.2 + status.1 + status.2).contains(secretText), "ordinary create and status output must not contain the credential")
             XCTAssertTrue(reveal.secret.count >= 32)
-            let pdo = try runPDO(php: php, port: port, database: "dbprov_app", user: "dbprov_app_user", password: reveal.secret, sql: "CREATE TABLE migration_equivalent (id INT PRIMARY KEY, value VARCHAR(64) NOT NULL); INSERT INTO migration_equivalent VALUES (1, 'persisted-row'); SELECT value FROM migration_equivalent WHERE id = 1;")
+
+            var reviewedEnvironment = Data("# preserve this comment\r\nDB_CONNECTION=sqlite\r\nCUSTOM_VALUE=keep\r\n".utf8)
+            try reviewedEnvironment.write(to: envURL)
+            XCTAssertEqual(chmod(envURL.path, 0o600), 0)
+            var reviewFileInfo = stat()
+            XCTAssertEqual(lstat(envURL.path, &reviewFileInfo), 0)
+            XCTAssertEqual(reviewFileInfo.st_uid, getuid())
+            XCTAssertEqual(reviewFileInfo.st_mode & 0o777, 0o600)
+            XCTAssertEqual(reviewFileInfo.st_nlink, 1)
+            XCTAssertEqual(reviewFileInfo.st_flags, 0)
+            XCTAssertNoThrow(try ConnectionFileBoundary().inspect(envURL))
+            let connectionReviewOutput = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            XCTAssertEqual(connectionReviewOutput.0, 0, connectionReviewOutput.2 + connectionReviewOutput.1)
+            XCTAssertFalse((connectionReviewOutput.1 + connectionReviewOutput.2).contains(secretText), "connection review must not disclose the credential")
+            let connectionReview = try IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: Data(connectionReviewOutput.1.utf8)).review
+            XCTAssertEqual(connectionReview.edits.first(where: { $0.key == "DB_PASSWORD" })?.value, "managed password (hidden)")
+            XCTAssertEqual(connectionReview.edits.count, 6)
+
+            let wrongProjectApply = try runVal(["project", "db", "connection", "apply", attempt.operationID.rawValue.uuidString, "--confirmation", connectionReview.confirmation.uuidString, neighborID.rawValue.uuidString], cwd: neighbor)
+            XCTAssertNotEqual(wrongProjectApply.0, 0)
+            XCTAssertFalse((wrongProjectApply.1 + wrongProjectApply.2).contains(secretText))
+            let replayApply = try runVal(["project", "db", "connection", "apply", attempt.operationID.rawValue.uuidString, "--confirmation", connectionReview.confirmation.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(replayApply.0, 0, "single-use confirmation must reject replay")
+            XCTAssertEqual(try Data(contentsOf: envURL), reviewedEnvironment)
+
+            let editorBytes = reviewedEnvironment + Data("# editor change before approval\n".utf8)
+            try editorBytes.write(to: envURL)
+            XCTAssertEqual(chmod(envURL.path, 0o600), 0)
+            reviewedEnvironment = editorBytes
+            let staleReviewOutput = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            let staleReview = try IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: Data(staleReviewOutput.1.utf8)).review
+            let staleEditorBytes = reviewedEnvironment + Data("# later edit\n".utf8)
+            try staleEditorBytes.write(to: envURL)
+            XCTAssertEqual(chmod(envURL.path, 0o600), 0)
+            let staleApply = try runVal(["project", "db", "connection", "apply", attempt.operationID.rawValue.uuidString, "--confirmation", staleReview.confirmation.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(staleApply.0, 0, "changed .env snapshot must reject approval")
+            XCTAssertEqual(try Data(contentsOf: envURL), staleEditorBytes)
+            reviewedEnvironment = staleEditorBytes
+
+            let receiptReviewOutput = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            let receiptReview = try IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: Data(receiptReviewOutput.1.utf8)).review
+            let wrongReceiptApply = try runVal(["project", "db", "connection", "apply", collisionResult.operationID.rawValue.uuidString, "--confirmation", receiptReview.confirmation.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(wrongReceiptApply.0, 0, "confirmation must remain bound to the reviewed ready receipt")
+            XCTAssertEqual(try Data(contentsOf: envURL), reviewedEnvironment)
+
+            let serviceReviewOutput = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            let serviceReview = try IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: Data(serviceReviewOutput.1.utf8)).review
+            try stopFixtureMySQL(module: module, root: root, timeout: 10)
+            let changedServiceApply = try runVal(["project", "db", "connection", "apply", attempt.operationID.rawValue.uuidString, "--confirmation", serviceReview.confirmation.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(changedServiceApply.0, 0, "changed service health must reject approval")
+            mysqlPID = try module.start().pid
+
+            let passwordReviewOutput = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            let passwordReview = try IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: Data(passwordReviewOutput.1.utf8)).review
+            let passwordQuery: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: namespace, kSecAttrAccount: attempt.operationID.rawValue.uuidString]
+            XCTAssertEqual(SecItemUpdate(passwordQuery as CFDictionary, [kSecValueData: Data("changed-after-review".utf8)] as CFDictionary), errSecSuccess)
+            let passwordApply = try runVal(["project", "db", "connection", "apply", attempt.operationID.rawValue.uuidString, "--confirmation", passwordReview.confirmation.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(passwordApply.0, 0)
+            XCTAssertEqual(try Data(contentsOf: envURL), reviewedEnvironment)
+            XCTAssertEqual(SecItemUpdate(passwordQuery as CFDictionary, [kSecValueData: reveal.secret] as CFDictionary), errSecSuccess)
+            try fm.moveItem(at: project.appendingPathComponent("artisan"), to: project.appendingPathComponent("artisan.saved"))
+            let nonLaravelReview = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(nonLaravelReview.0, 0)
+            try fm.moveItem(at: project.appendingPathComponent("artisan.saved"), to: project.appendingPathComponent("artisan"))
+
+            let finalReviewOutput = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            let finalReview = try IPCCodec.decode(ProjectDatabaseConnectionReviewResult.self, from: Data(finalReviewOutput.1.utf8)).review
+            let connectionApplyOutput = try runVal(["project", "db", "connection", "apply", attempt.operationID.rawValue.uuidString, "--confirmation", finalReview.confirmation.uuidString, projectID!.rawValue.uuidString, "--json"], cwd: project)
+            XCTAssertEqual(connectionApplyOutput.0, 0, connectionApplyOutput.2 + connectionApplyOutput.1)
+            XCTAssertFalse((connectionApplyOutput.1 + connectionApplyOutput.2).contains(secretText), "connection apply result must not disclose the credential")
+            let connectionApply = try IPCCodec.decode(ProjectDatabaseConnectionResult.self, from: Data(connectionApplyOutput.1.utf8))
+            XCTAssertEqual(connectionApply.state, "applied")
+            let appliedEnvironment = try Data(contentsOf: envURL)
+            XCTAssertTrue(appliedEnvironment.range(of: Data("# preserve this comment\r\n".utf8)) != nil)
+            XCTAssertTrue(appliedEnvironment.range(of: Data("CUSTOM_VALUE=keep\r\n".utf8)) != nil)
+            XCTAssertTrue(appliedEnvironment.range(of: reveal.secret) != nil, "approved password must be written to .env")
+            let generatedEnvironment = try generatedDotenvValues(appliedEnvironment)
+            XCTAssertEqual(generatedEnvironment["DB_CONNECTION"], "mysql")
+            XCTAssertEqual(generatedEnvironment["DB_HOST"], "127.0.0.1")
+            XCTAssertEqual(generatedEnvironment["DB_PORT"], String(port))
+            XCTAssertEqual(generatedEnvironment["DB_DATABASE"], "dbprov_app")
+            XCTAssertEqual(generatedEnvironment["DB_USERNAME"], "dbprov_app_user")
+            let generatedPassword = try XCTUnwrap(generatedEnvironment["DB_PASSWORD"])
+            XCTAssertEqual(Data(generatedPassword.utf8), reveal.secret)
+            let generatedPort = try XCTUnwrap(Int(generatedEnvironment["DB_PORT"]!))
+            let generatedPasswordBytes = Data(generatedPassword.utf8)
+            var appliedInfo = stat()
+            XCTAssertEqual(lstat(envURL.path, &appliedInfo), 0)
+            XCTAssertEqual(appliedInfo.st_mode & 0o777, 0o600)
+            let connectionStatus = try runVal(["project", "db", "connection", "status", projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertEqual(connectionStatus.0, 0, connectionStatus.2 + connectionStatus.1)
+            let retainedReview = try runVal(["project", "db", "connection", "review", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString], cwd: project)
+            XCTAssertNotEqual(retainedReview.0, 0, "a retained transaction blocks another review")
+            let recoveryID = connectionApply.recoveryID
+            XCTAssertTrue(connectionStatus.1.contains(recoveryID.uuidString))
+            XCTAssertTrue(connectionStatus.1.contains("applied"))
+
+            let recoveryClient = VaelenCoreClient(transport: UnixSocketTransport(path: endpoints.socketPath), identity: fixtureIdentity("connection-recovery"))
+            try await recoveryClient.connect()
+            do {
+                try await recoveryClient.unlink(path: project.path, name: nil, workingDirectory: project.path)
+                XCTFail("unlink must refuse retained connection recovery")
+            } catch let CoreClientError.remote(payload) {
+                XCTAssertEqual(payload.code, .invalidRequest)
+                XCTAssertTrue(payload.message.contains("recovery"))
+            }
+            let stillLinked = try await registry.linkedProject(id: projectID!)
+            XCTAssertEqual(stillLinked?.id, projectID)
+            let statusAfterUnlink = try await recoveryClient.projectDatabaseConnectionRecovery(.init(selector: projectID!.rawValue.uuidString, workingDirectory: project.path, recoveryAction: .status))
+            XCTAssertTrue(statusAfterUnlink.recoveries.contains { $0.id == recoveryID })
+            let restoreReview = try await recoveryClient.projectDatabaseConnectionRecovery(.init(selector: projectID!.rawValue.uuidString, workingDirectory: project.path, recoveryAction: .reviewRestore, recoveryID: recoveryID))
+            let restoreToken = try XCTUnwrap(restoreReview.review?.confirmation)
+            let restored = try await recoveryClient.projectDatabaseConnectionRecovery(.init(selector: projectID!.rawValue.uuidString, workingDirectory: project.path, recoveryAction: .restore, recoveryID: recoveryID, confirmation: restoreToken))
+            XCTAssertEqual(restored.outcome?.state, "restored")
+            XCTAssertEqual(try Data(contentsOf: envURL), reviewedEnvironment)
+            let discardReview = try await recoveryClient.projectDatabaseConnectionRecovery(.init(selector: projectID!.rawValue.uuidString, workingDirectory: project.path, recoveryAction: .reviewDiscard, recoveryID: recoveryID))
+            let discardToken = try XCTUnwrap(discardReview.review?.confirmation)
+            let discarded = try await recoveryClient.projectDatabaseConnectionRecovery(.init(selector: projectID!.rawValue.uuidString, workingDirectory: project.path, recoveryAction: .discard, recoveryID: recoveryID, confirmation: discardToken))
+            XCTAssertEqual(discarded.outcome?.state, "discarded")
+            await recoveryClient.disconnect()
+
+            let pdo = try runPDO(php: php, port: generatedPort, database: generatedEnvironment["DB_DATABASE"]!, user: generatedEnvironment["DB_USERNAME"]!, password: generatedPasswordBytes, sql: "CREATE TABLE migration_equivalent (id INT PRIMARY KEY, value VARCHAR(64) NOT NULL); INSERT INTO migration_equivalent VALUES (1, 'persisted-row'); SELECT value FROM migration_equivalent WHERE id = 1;")
             XCTAssertEqual(pdo.status, 0, pdo.error)
             XCTAssertEqual(pdo.output.trimmingCharacters(in: .whitespacesAndNewlines), "persisted-row")
-            let wildcardGrant = try runPDO(php: php, port: port, database: wildcardNeighbor, user: "dbprov_app_user", password: reveal.secret, sql: "CREATE TABLE denied_neighbor (id INT);")
+            let wildcardGrant = try runPDO(php: php, port: generatedPort, database: wildcardNeighbor, user: generatedEnvironment["DB_USERNAME"]!, password: generatedPasswordBytes, sql: "CREATE TABLE denied_neighbor (id INT);")
             XCTAssertNotEqual(wildcardGrant.status, 0, "application user must not write to a neighboring database")
             XCTAssertEqual(try mysqlClient(package: package, socket: module.status().socket, sql: Data("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='\(wildcardNeighbor)';\n".utf8)).trimmingCharacters(in: .whitespacesAndNewlines), "1", "escaped database underscores must not grant wildcard neighbors")
             let safeOutput = try Data(contentsOf: root.appendingPathComponent("safe.stdout")) + Data(contentsOf: root.appendingPathComponent("safe.stderr"))
@@ -191,14 +317,14 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
 
             let wrongStatus = try runVal(["project", "db", "status", attempt.operationID.rawValue.uuidString, neighborID.rawValue.uuidString, "--json"], cwd: neighbor)
             XCTAssertNotEqual(wrongStatus.0, 0)
-            XCTAssertEqual(try Data(contentsOf: envURL), envBytes)
+            XCTAssertEqual(try Data(contentsOf: envURL), reviewedEnvironment)
             XCTAssertEqual(try ServiceInstanceRepository(store: store).claims(for: serviceID), claims)
 
             try stopFixtureMySQL(module: module, root: root, timeout: 10)
             let staleReveal = try runValWithoutPersisting(["project", "db", "password", "reveal", attempt.operationID.rawValue.uuidString, projectID!.rawValue.uuidString], cwd: project, executable: val, environment: environment, supportRoot: layout.rootURL)
             XCTAssertNotEqual(staleReveal.status, 0, "reveal must refuse a stopped, stale service target")
             mysqlPID = try module.start().pid
-            let recovered = try runPDO(php: php, port: port, database: "dbprov_app", user: "dbprov_app_user", password: reveal.secret, sql: "SELECT value FROM migration_equivalent WHERE id = 1;")
+            let recovered = try runPDO(php: php, port: generatedPort, database: generatedEnvironment["DB_DATABASE"]!, user: generatedEnvironment["DB_USERNAME"]!, password: generatedPasswordBytes, sql: "SELECT value FROM migration_equivalent WHERE id = 1;")
             XCTAssertEqual(recovered.status, 0, recovered.error)
             XCTAssertEqual(recovered.output.trimmingCharacters(in: .whitespacesAndNewlines), "persisted-row")
 
@@ -219,6 +345,10 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             try await reopenedClient.connect()
             let reopenedStatus = try await reopenedClient.projectDatabaseStatus(selector: projectID!.rawValue.uuidString, workingDirectory: project.path, operationID: attempt.operationID)
             XCTAssertEqual(reopenedStatus.state, .ready)
+            XCTAssertEqual(try ServiceInstanceRepository(store: store).claims(for: serviceID), claims)
+            try await reopenedClient.unlink(path: project.path, name: nil, workingDirectory: project.path)
+            let unlinkedProject = try await registry.linkedProject(id: projectID!)
+            XCTAssertNil(unlinkedProject, "explicitly discarded recovery permits project unlink")
             await reopenedClient.disconnect()
             let persisted = try runPDO(php: php, port: port, database: "dbprov_app", user: "dbprov_app_user", password: reveal.secret, sql: "SELECT value FROM migration_equivalent WHERE id = 1;")
             XCTAssertEqual(persisted.status, 0, persisted.error)
@@ -233,13 +363,13 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             coreStopped = true
             try stopFixtureMySQL(module: module, root: root, timeout: 10)
             XCTAssertEqual(module.status().state, .stopped)
-            XCTAssertEqual(try Data(contentsOf: envURL), envBytes)
-            XCTAssertEqual(try ServiceInstanceRepository(store: store).claims(for: serviceID), claims)
+            XCTAssertEqual(try Data(contentsOf: envURL), reviewedEnvironment)
+            XCTAssertTrue(try ServiceInstanceRepository(store: store).claims(for: serviceID).isEmpty, "unlink releases the project service claim after recovery is discarded")
             try removeCredentials(namespace: namespace)
             try fm.removeItem(at: root)
             XCTAssertFalse(fm.fileExists(atPath: root.path))
             if let evidencePath = environment["VAELEN_PROJECT_DATABASE_EVIDENCE"] {
-                let evidence = "result=PASS engine=mysql package=8.4.11 create=ready databaseCollision=refused userCollision=refused existingUserUnchanged=yes requestedDatabaseAbsent=yes pdoMigration=passed neighboringDatabase=denied coreReopen=persisted env=unchanged claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed\n"
+                let evidence = "result=PASS engine=mysql package=8.4.11 create=ready databaseCollision=refused userCollision=refused existingUserUnchanged=yes requestedDatabaseAbsent=yes pdoMigration=passed neighboringDatabase=denied coreReopen=persisted env=restore-reviewed-bytes claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed\n"
                 try Data(evidence.utf8).write(to: URL(fileURLWithPath: evidencePath), options: .atomic)
             }
             print("PROJECT_DATABASE_PROVISIONING_EVIDENCE mysql=8.4.11 port=\(port) create=ready collision=refused sentinel=preserved pdo=authenticated neighboringDatabase=denied coreReopen=persisted env=unchanged claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed")
@@ -269,7 +399,7 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
         }
     }
 
-    private enum FixtureError: Error { case childStillRunning, childTimedOut, coreDidNotStop, keychainItemUnidentified }
+    private enum FixtureError: Error { case childStillRunning, childTimedOut, coreDidNotStop, keychainItemUnidentified, invalidGeneratedEnvironment }
 
     private func availablePort() throws -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -367,6 +497,29 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
         return (process.terminationStatus,
                 String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
                 String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+    }
+
+    private func generatedDotenvValues(_ bytes: Data) throws -> [String: String] {
+        guard let text = String(data: bytes, encoding: .utf8) else { throw FixtureError.invalidGeneratedEnvironment }
+        var values: [String: String] = [:]
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let equals = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[..<equals])
+            let raw = String(trimmed[trimmed.index(after: equals)...])
+            if raw.count >= 2, let first = raw.first, (first == "'" || first == "\""), raw.last == first {
+                let inner = Array(raw.dropFirst().dropLast().utf8)
+                var decoded = [UInt8](); var index = 0
+                while index < inner.count {
+                    if inner[index] == 92, index + 1 < inner.count { index += 1 }
+                    decoded.append(inner[index]); index += 1
+                }
+                values[key] = String(decoding: decoded, as: UTF8.self)
+            } else {
+                values[key] = raw.trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return values
     }
 
     private func removeCredentials(namespace: String) throws {

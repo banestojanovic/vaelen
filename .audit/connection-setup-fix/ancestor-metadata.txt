@@ -1,0 +1,12 @@
+drwxr-x---+ 56 banes  staff  - 1792 Oct 28 08:40 /Users/banes
+ 0: group:everyone deny delete
+drwxr-xr-x@ 13 banes  staff  -  416 Oct 21 07:55 /Users/banes/Code
+	com.apple.FinderInfo	  32
+	com.apple.icon.folder#S	  24
+	com.apple.macl	  72
+	com.apple.provenance	  11
+drwxr-xr-x@  9 banes  staff  -  288 Oct 25 07:42 /Users/banes/Code/apps
+	com.apple.provenance	  11
+drwxr-xr-x@ 24 banes  staff  -  768 Oct 27 10:47 /Users/banes/Code/apps/vaelen
+	com.apple.macl	  72
+	com.apple.provenance	  11

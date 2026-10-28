@@ -1733,6 +1733,7 @@ private struct ProjectDatabaseProvisioningControls: View {
     @State private var databaseName = ""
     @State private var userName = ""
     @State private var revealedPassword: String?
+    @State private var connectionRecoveryReview: ProjectDatabaseConnectionRecoveryReview?
     @State private var error: String?
     @State private var isWorking = false
     @State private var visibilityGeneration = 0
@@ -1798,6 +1799,10 @@ private struct ProjectDatabaseProvisioningControls: View {
                     }
                     if receiptIsReady {
                         HStack(spacing: 8) {
+                            if project.detectedFramework?.lowercased() == "laravel", eligibleBinding != nil {
+                                Button("Review .env connection", systemImage: "doc.text.magnifyingglass") { reviewConnection() }
+                                    .buttonStyle(.borderedProminent).controlSize(.small).disabled(isWorking)
+                            }
                             Button("Reveal Password", systemImage: "eye") { revealPassword() }
                                 .buttonStyle(.bordered).controlSize(.small).disabled(isWorking || model.isSettingsFixture)
                             Button("Copy Password", systemImage: "doc.on.doc") { copyPassword() }
@@ -1806,6 +1811,58 @@ private struct ProjectDatabaseProvisioningControls: View {
                         if let revealedPassword {
                             Text(revealedPassword).font(.caption.monospaced()).textSelection(.enabled)
                         }
+                        if let review = model.projectConnectionReviews[project.path] {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Review changes to .env").font(.subheadline.weight(.semibold))
+                                Text("Apply retains a protected recovery copy. Another connection change is blocked until recovery is explicitly discarded. Restore also retains recovery files.").font(.caption).foregroundStyle(.secondary)
+                                ForEach(review.edits, id: \.key) { edit in
+                                    Text("\(edit.key) · \(edit.action) · \(edit.value)").font(.caption.monospaced())
+                                }
+                                ForEach(review.advisories, id: \.self) { Text($0).font(.caption).foregroundStyle(.orange) }
+                                HStack {
+                                    Button("Apply reviewed values") { applyConnection(review) }
+                                        .buttonStyle(.borderedProminent).controlSize(.small).disabled(isWorking)
+                                    Button("Cancel") { model.dismissProjectConnectionReview(for: project) }
+                                        .buttonStyle(.bordered).controlSize(.small)
+                                    Text("Expires \(review.expiresAt, style: .time)").font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(8).background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
+                        }
+                    }
+                }
+                if let outcome = model.projectConnectionOutcomes[project.path] {
+                    Text(outcome.message).font(.caption).foregroundStyle(outcome.state == "conflict" ? .orange : .secondary).textSelection(.enabled)
+                }
+                HStack(spacing: 8) {
+                    Text("Recovery").font(.caption.weight(.medium))
+                    Button("Refresh") { refreshConnectionRecovery() }.buttonStyle(.bordered).controlSize(.small).disabled(isWorking)
+                }
+                ForEach(model.projectConnectionRecoveries[project.path] ?? [], id: \.id) { recovery in
+                    HStack(spacing: 6) {
+                        Text("\(recovery.id.uuidString.prefix(8)) · \(recovery.state)").font(.caption.monospaced())
+                        Spacer()
+                        if recovery.restoreAvailable {
+                            Button("Review restore") { reviewRecovery(recovery, action: .reviewRestore) }.buttonStyle(.bordered).controlSize(.small).disabled(isWorking)
+                        }
+                        if recovery.discardAvailable {
+                            Button("Review discard") { reviewRecovery(recovery, action: .reviewDiscard) }.buttonStyle(.bordered).controlSize(.small).disabled(isWorking)
+                        }
+                    }
+                }
+                if let recoveryReview = connectionRecoveryReview {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Confirm \(recoveryReview.action.rawValue) for \(recoveryReview.recovery.id.uuidString.prefix(8)) · \(recoveryReview.recovery.state)").font(.caption)
+                            if recoveryReview.action == .reviewDiscard {
+                                Text("Discard permanently removes the protected recovery copy and all captured versions. In a conflict, this may delete the only captured external edit. The current .env is kept. Recovery will no longer be available.").font(.caption).foregroundStyle(.orange)
+                            } else {
+                                Text("Restore keeps the displaced proposal and protected recovery files. Explicit discard is required before another connection change.").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Button(recoveryReview.action == .reviewRestore ? "Restore" : "Discard") { applyRecoveryReview(recoveryReview) }
+                            .buttonStyle(.borderedProminent).controlSize(.small).disabled(isWorking)
+                        Button("Cancel") { connectionRecoveryReview = nil }.buttonStyle(.bordered).controlSize(.small)
                     }
                 }
                 if let error {
@@ -1813,7 +1870,7 @@ private struct ProjectDatabaseProvisioningControls: View {
                 }
             }
         }
-        .onAppear { visibilityGeneration += 1 }
+        .onAppear { visibilityGeneration += 1; refreshConnectionRecovery() }
         .onDisappear { visibilityGeneration += 1; revealedPassword = nil }
     }
 
@@ -1825,6 +1882,57 @@ private struct ProjectDatabaseProvisioningControls: View {
         Task {
             do { _ = try await model.createProjectDatabase(project, binding: binding, database: databaseName, user: userName) }
             catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func reviewConnection() {
+        guard !model.isSettingsFixture, let operationID = attempt?.operationID else { return }
+        isWorking = true; error = nil; revealedPassword = nil
+        Task {
+            do { _ = try await model.reviewProjectDatabaseConnection(project, operationID: operationID) }
+            catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func applyConnection(_ review: ProjectDatabaseConnectionReview) {
+        guard !model.isSettingsFixture, let operationID = attempt?.operationID else { return }
+        isWorking = true; error = nil
+        Task {
+            do {
+                _ = try await model.applyProjectDatabaseConnection(project, operationID: operationID, confirmation: review.confirmation)
+                _ = try await model.projectDatabaseConnectionRecovery(project, action: .status)
+            } catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func refreshConnectionRecovery() {
+        guard !model.isSettingsFixture else { return }
+        Task { _ = try? await model.projectDatabaseConnectionRecovery(project, action: .status) }
+    }
+
+    private func reviewRecovery(_ recovery: ConnectionRecoverySummary, action: ProjectDatabaseConnectionRecoveryAction) {
+        isWorking = true; error = nil
+        Task {
+            do {
+                let result = try await model.projectDatabaseConnectionRecovery(project, action: action, recoveryID: recovery.id)
+                connectionRecoveryReview = result.review
+            } catch { self.error = error.localizedDescription }
+            isWorking = false
+        }
+    }
+
+    private func applyRecoveryReview(_ review: ProjectDatabaseConnectionRecoveryReview) {
+        isWorking = true; error = nil
+        let action: ProjectDatabaseConnectionRecoveryAction = review.action == .reviewRestore ? .restore : .discard
+        Task {
+            do {
+                _ = try await model.projectDatabaseConnectionRecovery(project, action: action, recoveryID: review.recovery.id, confirmation: review.confirmation)
+                connectionRecoveryReview = nil
+                _ = try await model.projectDatabaseConnectionRecovery(project, action: .status)
+            } catch { self.error = error.localizedDescription }
             isWorking = false
         }
     }

@@ -20,6 +20,21 @@ final class ProjectRelationshipCLIParsingTests: XCTestCase {
         XCTAssertThrowsError(try VaelenCLIMain.parse(["project", "db", "create", "db", "user", "--password", "secret"]))
     }
 
+    func testProjectDatabaseConnectionCommandsRequireOpaqueReviewTokenAndParseRecovery() throws {
+        let operationID = UUID()
+        let confirmation = UUID()
+        let recoveryID = UUID()
+        guard case .projectDatabaseConnectionReview(let parsedID, let selector, false) = try VaelenCLIMain.parse(["project", "db", "connection", "review", operationID.uuidString, "demo"]) else { return XCTFail("connection review did not parse") }
+        XCTAssertEqual(parsedID, operationID); XCTAssertEqual(selector, "demo")
+        guard case .projectDatabaseConnectionApply(let appliedID, let appliedToken, nil, false) = try VaelenCLIMain.parse(["project", "db", "connection", "apply", operationID.uuidString, "--confirmation", confirmation.uuidString]) else { return XCTFail("connection apply did not parse") }
+        XCTAssertEqual(appliedID, operationID); XCTAssertEqual(appliedToken, confirmation)
+        guard case .projectDatabaseConnectionRecovery(.reviewRestore, let parsedRecoveryID, nil, nil, false) = try VaelenCLIMain.parse(["project", "db", "connection", "review-restore", recoveryID.uuidString]) else { return XCTFail("restore review did not parse") }
+        XCTAssertEqual(parsedRecoveryID, recoveryID)
+        guard case .projectDatabaseConnectionRecovery(.discard, let parsedRecoveryID, let appliedToken, "demo", false) = try VaelenCLIMain.parse(["project", "db", "connection", "discard", recoveryID.uuidString, "--confirmation", confirmation.uuidString, "demo"]) else { return XCTFail("discard did not parse") }
+        XCTAssertEqual(parsedRecoveryID, recoveryID); XCTAssertEqual(appliedToken, confirmation)
+        XCTAssertThrowsError(try VaelenCLIMain.parse(["project", "db", "connection", "apply", operationID.uuidString, "--confirmation", "secret"]))
+    }
+
     func testParkCommandsAcceptCurrentDirectoryOrExplicitPath() throws {
         guard case .park(let currentParkPath) = try VaelenCLIMain.parse(["park"]) else {
             return XCTFail("park without a path should use the current directory")
