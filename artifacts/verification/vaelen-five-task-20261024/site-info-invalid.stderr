@@ -1,7 +1,0 @@
-Site commands
-
-  driver  Inspect framework evidence and configured routes.
-  info    Run Laravel Artisan about with project PHP.
-
-Run “val list” for every command and invocation form; run “val site <command>
- --help” for details.

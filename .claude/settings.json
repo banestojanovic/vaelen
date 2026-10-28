@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f \"$CLAUDE_PROJECT_DIR/docs/HANDOFF.md\" ] && { echo '# Session handoff (auto-injected from docs/HANDOFF.md). Read this first; trust it over older conversation history.'; cat \"$CLAUDE_PROJECT_DIR/docs/HANDOFF.md\"; } || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/context-guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/context-guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -75,4 +75,4 @@ Read [the feature map](features/README.md), then the affected journey. Update th
 
 ## Maintenance
 
-Use `pstack:maintain-verification-skill` to audit the map when the Settings surface changes.
+When the Settings surface changes, review the affected feature-map entry and update its steps, evidence requirements, and limits.

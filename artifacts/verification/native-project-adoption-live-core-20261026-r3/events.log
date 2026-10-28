@@ -1,8 +1,0 @@
-prepared token=93FC3504-BED8-44F8-BA5F-CA0C97A1C8F2 project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E; no service processes started
-inspect expect=unadopted project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E declaration_sha256=absent dotenv_sha256=40159274711e850f0e3b974731e710bcca23ec84054c49340077602e1472b263 inventory=2
-invalidate-discovery composer.php ^8.3 -> ^8.4
-inspect expect=unadopted project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E declaration_sha256=absent dotenv_sha256=40159274711e850f0e3b974731e710bcca23ec84054c49340077602e1472b263 inventory=2
-inspect expect=unadopted project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E declaration_sha256=absent dotenv_sha256=40159274711e850f0e3b974731e710bcca23ec84054c49340077602e1472b263 inventory=2
-inspect expect=unadopted project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E declaration_sha256=absent dotenv_sha256=40159274711e850f0e3b974731e710bcca23ec84054c49340077602e1472b263 inventory=2
-inspect expect=adopted project_id=8B83E34A-397C-4D6E-980C-37EF1072A35E declaration_sha256=f5d444233b72b28d77c6c624560e0595efe64ee3984e1990c7bb4d4eaec9f2bd dotenv_sha256=40159274711e850f0e3b974731e710bcca23ec84054c49340077602e1472b263 inventory=2
-cleanup complete token=93FC3504-BED8-44F8-BA5F-CA0C97A1C8F2; evidence retained

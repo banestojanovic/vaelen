@@ -1,6 +1,0 @@
-laravel_path=/Users/banes/Code/apps/vaelen/artifacts/verification/vaelen-five-task-20261024/fixtures/laravel-decad6eb-9fa4-4bce-b690-2cbc6fec5794
-unsupported_path=/Users/banes/Code/apps/vaelen/artifacts/verification/vaelen-five-task-20261024/fixtures/unsupported-decad6eb-9fa4-4bce-b690-2cbc6fec5794
-human_status=0
-json_status=7
-unsupported_status=1
-invalid_status=1

@@ -65,4 +65,4 @@ A normal run reports the server stopped and fixture root removed. Evidence lives
 
 ## Maintain the map
 
-When a bounded feature changes, update its entry and run its recipe. Use `pstack:maintain-verification-skill` for a broader map audit. Mark skipped, simulated, manual, and unverified entry points explicitly. Existing installed-app helpers such as `Scripts/vaelen-dev` and `Scripts/vaelen-dev-update` can build, sign, install, or mutate live state. Execute them only under a separate task that authorizes those effects.
+When a bounded feature changes, update its entry and run its recipe. Periodically review the map for stale steps. Mark skipped, simulated, manual, and unverified entry points explicitly. Existing installed-app helpers such as `Scripts/vaelen-dev` and `Scripts/vaelen-dev-update` can build, sign, install, or mutate live state. Execute them only under a separate task that authorizes those effects.

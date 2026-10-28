@@ -1,9 +1,0 @@
-Usage:
-  val site info [project]
-  val site info [project] --json
-
-Run Laravel Artisan about with effective project PHP; other frameworks are not supported yet.
-
-Examples:
-  val site info
-  val site info my-app --json

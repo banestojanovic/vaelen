@@ -22,6 +22,6 @@ The Core end-to-end test invokes the actual `val proxy` child through a private 
 
 ## Installed acceptance (2026-10-24)
 
-The installed Vaelen Settings > Network & Security journey added a temporary `.test` proxy to loopback port 39991, showed it as the second configured route, and removed it with the Settings action. `val proxy list --json` agreed after both mutations. The pre-existing `bakalar.test` proxy remained unchanged; upstream reachability was intentionally false because no service listened on port 3001. Exact project, route, and proxy snapshots matched the preflight state after cleanup. Evidence: `artifacts/verification/vaelen-five-task-20261024/`.
+The installed Vaelen Settings > Network & Security journey added a temporary `.test` proxy to loopback port 39991, showed it as the second configured route, and removed it with the Settings action. `val proxy list --json` agreed after both mutations. The pre-existing `bakalar.test` proxy remained unchanged; upstream reachability was intentionally false because no service listened on port 3001. Exact project, route, and proxy snapshots matched the preflight state after cleanup. Supporting generated evidence in `artifacts/verification/vaelen-five-task-20261024/` was removed during local cleanup.
 
 This verifies installed add/remove and CLI parity only. Open and Copy URL actions and successful upstream forwarding were not part of this installed journey; isolated Caddy forwarding remains covered by the focused automated test above.
