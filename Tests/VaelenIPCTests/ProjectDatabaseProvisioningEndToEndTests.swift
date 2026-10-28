@@ -7,6 +7,25 @@ import VaelenIPC
 import VaelenDaemonSupport
 
 final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
+    func testLaravelChildCredentialOutputIsRedactedAndRejected() throws {
+        let candidates = [ProcessInfo.processInfo.environment["VAELEN_TEST_PHP_EXECUTABLE"], "/opt/homebrew/bin/php", "/usr/bin/php"].compactMap { $0 }
+        guard let php = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("A PHP executable is required for the Laravel child negative control.")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let secret = "known-credential-sentinel"
+        let result = try runLaravelPHP(php: php, cwd: project, arguments: ["-r", "echo 'known-credential-sentinel';"], secret: Data(secret.utf8))
+        XCTAssertEqual(result.status, 0)
+        XCTAssertTrue(result.credentialOutputDetected)
+        XCTAssertFalse(result.isSuccessful)
+        XCTAssertFalse(result.output.contains(secret))
+        XCTAssertEqual(result.output, "Laravel child output contained the generated credential")
+    }
+
     func testInstalledMySQLProvisioningThroughValAndPrivateCore() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let val = environment["VAELEN_VAL_EXECUTABLE"],
@@ -14,6 +33,10 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
               let php = environment["VAELEN_TEST_PHP_EXECUTABLE"] else {
             throw XCTSkip("Run Scripts/tests/val-project-database-provisioning-test.sh with the verified local MySQL and PHP packages.")
         }
+        let laravelAppRoot = environment["VAELEN_TEST_LARAVEL_APP_ROOT"]
+        let laravelProbe = environment["VAELEN_TEST_LARAVEL_PROBE"]
+        let laravelAcceptance = laravelAppRoot != nil && laravelProbe != nil
+        XCTAssertEqual(laravelAppRoot == nil, laravelProbe == nil, "Laravel acceptance inputs must be supplied together")
         let fm = FileManager.default
         let packageRoot = URL(fileURLWithPath: mysqlRoot, isDirectory: true)
         let package = try JSONDecoder().decode(MySQLPackage.self, from: Data(contentsOf: packageRoot.appendingPathComponent(".vaelen-package.json")))
@@ -44,7 +67,10 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
         let project = root.appendingPathComponent("project", isDirectory: true)
         let neighbor = root.appendingPathComponent("neighbor", isDirectory: true)
         let envURL = project.appendingPathComponent(".env")
-        let envBytes = Data([0x23, 0x20, 0xff, 0x0a, 0x44, 0x42, 0x5f, 0x48, 0x4f, 0x53, 0x54, 0x3d, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x0a])
+        let envBytes = Data("APP_ENV=testing\nAPP_DEBUG=false\nCUSTOM_VALUE=keep\n".utf8)
+        let laravelApp = laravelAppRoot.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let laravelProbeURL = laravelProbe.map { URL(fileURLWithPath: $0) }
+        let expectationURL = root.appendingPathComponent("laravel-expectation.json")
 
         func makeDispatcher() throws -> CoreRequestDispatcher {
             let store = try SQLiteStateStore(databaseURL: layout.databaseURL)
@@ -95,14 +121,20 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
 
         do {
             try fm.createDirectory(at: layout.stateDirectoryURL, withIntermediateDirectories: true)
-            try fm.createDirectory(at: project, withIntermediateDirectories: true)
             try fm.createDirectory(at: neighbor, withIntermediateDirectories: true)
-            for directory in ["bootstrap", "config", "public"] {
-                try fm.createDirectory(at: project.appendingPathComponent(directory), withIntermediateDirectories: true)
+            if let laravelApp {
+                try fm.copyItem(at: laravelApp, to: project)
+            } else {
+                try fm.createDirectory(at: project, withIntermediateDirectories: true)
+                for directory in ["bootstrap", "config", "public"] {
+                    try fm.createDirectory(at: project.appendingPathComponent(directory), withIntermediateDirectories: true)
+                }
+                try Data("<?php".utf8).write(to: project.appendingPathComponent("artisan"))
+                try Data("<?php".utf8).write(to: project.appendingPathComponent("public/index.php"))
             }
-            try Data("<?php".utf8).write(to: project.appendingPathComponent("artisan"))
-            try Data("<?php".utf8).write(to: project.appendingPathComponent("public/index.php"))
             try envBytes.write(to: envURL)
+            XCTAssertEqual(chmod(root.path, 0o700), 0)
+            XCTAssertEqual(chmod(envURL.path, 0o600), 0)
             try Data("version: 2\nservices:\n  database:\n    kind: mysql\n    instance: default\n    version: \(packageID)\n".utf8).write(to: project.appendingPathComponent("vaelen.yml"))
             try Data("version: 2\nservices:\n  database:\n    kind: mysql\n    instance: default\n    version: \(packageID)\n".utf8).write(to: neighbor.appendingPathComponent("vaelen.yml"))
 
@@ -257,6 +289,7 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             XCTAssertTrue(appliedEnvironment.range(of: Data("# preserve this comment\r\n".utf8)) != nil)
             XCTAssertTrue(appliedEnvironment.range(of: Data("CUSTOM_VALUE=keep\r\n".utf8)) != nil)
             XCTAssertTrue(appliedEnvironment.range(of: reveal.secret) != nil, "approved password must be written to .env")
+            XCTAssertTrue(try Data(contentsOf: envURL) == appliedEnvironment, "Laravel acceptance must use the exact bytes written by apply")
             let generatedEnvironment = try generatedDotenvValues(appliedEnvironment)
             XCTAssertEqual(generatedEnvironment["DB_CONNECTION"], "mysql")
             XCTAssertEqual(generatedEnvironment["DB_HOST"], "127.0.0.1")
@@ -264,9 +297,75 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             XCTAssertEqual(generatedEnvironment["DB_DATABASE"], "dbprov_app")
             XCTAssertEqual(generatedEnvironment["DB_USERNAME"], "dbprov_app_user")
             let generatedPassword = try XCTUnwrap(generatedEnvironment["DB_PASSWORD"])
-            XCTAssertEqual(Data(generatedPassword.utf8), reveal.secret)
+            XCTAssertTrue(Data(generatedPassword.utf8) == reveal.secret, "applied password matches the in-memory Keychain reveal")
             let generatedPort = try XCTUnwrap(Int(generatedEnvironment["DB_PORT"]!))
             let generatedPasswordBytes = Data(generatedPassword.utf8)
+            if laravelAcceptance, let laravelProbeURL {
+                let expectation = LaravelConnectionExpectation(
+                    defaultConnection: "mysql",
+                    host: "127.0.0.1",
+                    port: String(port),
+                    database: "dbprov_app",
+                    username: "dbprov_app_user",
+                    password: String(decoding: reveal.secret, as: UTF8.self)
+                )
+                let expectationData = try JSONEncoder().encode(expectation)
+                try expectationData.write(to: expectationURL, options: .atomic)
+                XCTAssertEqual(chmod(expectationURL.path, 0o600), 0)
+                let wrongExpectation = LaravelConnectionExpectation(values: expectation.values.merging(["database.connections.mysql.port": "1"]) { _, replacement in replacement })
+                let wrongExpectationURL = root.appendingPathComponent("laravel-wrong-expectation.json")
+                try JSONEncoder().encode(wrongExpectation).write(to: wrongExpectationURL, options: .atomic)
+                XCTAssertEqual(chmod(wrongExpectationURL.path, 0o600), 0)
+                let wrongExpectationRun = try runLaravelProbe(php: php, probe: laravelProbeURL, phase: "uncached", expectation: wrongExpectationURL, cwd: project, secret: reveal.secret)
+                XCTAssertNotEqual(wrongExpectationRun.status, 0)
+                XCTAssertTrue(wrongExpectationRun.output.contains("field=database.connections.mysql.port"))
+                XCTAssertFalse(wrongExpectationRun.credentialOutputDetected)
+                try fm.removeItem(at: wrongExpectationURL)
+
+                let missingCacheRun = try runLaravelProbe(php: php, probe: laravelProbeURL, phase: "cached", expectation: expectationURL, cwd: project, secret: reveal.secret)
+                XCTAssertNotEqual(missingCacheRun.status, 0)
+                XCTAssertTrue(missingCacheRun.output.contains("phase=cached config cache"))
+                XCTAssertFalse(missingCacheRun.credentialOutputDetected)
+
+                let uncachedRun = try runLaravelProbe(php: php, probe: laravelProbeURL, phase: "uncached", expectation: expectationURL, cwd: project, secret: reveal.secret)
+                XCTAssertEqual(uncachedRun.status, 0, "uncached Laravel probe failed")
+                XCTAssertEqual(uncachedRun.output.trimmingCharacters(in: .whitespacesAndNewlines), "LARAVEL_CONNECTION uncached PASS")
+                XCTAssertFalse(uncachedRun.credentialOutputDetected)
+
+                let configCacheRun = try runLaravelArtisan(php: php, cwd: project, secret: reveal.secret)
+                XCTAssertTrue(configCacheRun.isSuccessful, "Laravel config:cache failed or disclosed the credential")
+                XCTAssertFalse(configCacheRun.credentialOutputDetected)
+                let configCacheURL = project.appendingPathComponent("bootstrap/cache/config.php")
+                XCTAssertEqual(chmod(configCacheURL.path, 0o600), 0)
+                var cacheInfo = stat()
+                XCTAssertEqual(lstat(configCacheURL.path, &cacheInfo), 0)
+                XCTAssertTrue((cacheInfo.st_mode & 0o170000) == 0o100000)
+                XCTAssertEqual(cacheInfo.st_mode & 0o777, 0o600)
+                var appliedFileInfo = stat()
+                XCTAssertEqual(lstat(envURL.path, &appliedFileInfo), 0)
+                let heldEnvironment = root.appendingPathComponent("applied-env-held")
+                try fm.moveItem(at: envURL, to: heldEnvironment)
+                let cachedRun: LaravelChildResult
+                do {
+                    cachedRun = try runLaravelProbe(php: php, probe: laravelProbeURL, phase: "cached", expectation: expectationURL, cwd: project, secret: reveal.secret)
+                    XCTAssertFalse(fm.fileExists(atPath: envURL.path))
+                } catch {
+                    try fm.moveItem(at: heldEnvironment, to: envURL)
+                    throw error
+                }
+                try fm.moveItem(at: heldEnvironment, to: envURL)
+                XCTAssertEqual(cachedRun.status, 0, "cached Laravel probe failed")
+                XCTAssertEqual(cachedRun.output.trimmingCharacters(in: .whitespacesAndNewlines), "LARAVEL_CONNECTION cached PASS")
+                XCTAssertFalse(cachedRun.credentialOutputDetected)
+                XCTAssertTrue(fm.fileExists(atPath: envURL.path))
+                XCTAssertTrue(try Data(contentsOf: envURL) == appliedEnvironment, "Laravel acceptance must restore the identical .env file")
+                var restoredFileInfo = stat()
+                XCTAssertEqual(lstat(envURL.path, &restoredFileInfo), 0)
+                XCTAssertEqual(restoredFileInfo.st_dev, appliedFileInfo.st_dev)
+                XCTAssertEqual(restoredFileInfo.st_ino, appliedFileInfo.st_ino)
+                try fm.removeItem(at: configCacheURL)
+                try fm.removeItem(at: expectationURL)
+            }
             var appliedInfo = stat()
             XCTAssertEqual(lstat(envURL.path, &appliedInfo), 0)
             XCTAssertEqual(appliedInfo.st_mode & 0o777, 0o600)
@@ -369,10 +468,12 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
             try fm.removeItem(at: root)
             XCTAssertFalse(fm.fileExists(atPath: root.path))
             if let evidencePath = environment["VAELEN_PROJECT_DATABASE_EVIDENCE"] {
-                let evidence = "result=PASS engine=mysql package=8.4.11 create=ready databaseCollision=refused userCollision=refused existingUserUnchanged=yes requestedDatabaseAbsent=yes pdoMigration=passed neighboringDatabase=denied coreReopen=persisted env=restore-reviewed-bytes claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed\n"
+                let laravelEvidence = laravelAcceptance ? " laravel=13.39.0 phpdotenv=5.8.0 uncached=boot-query cached=boot-query dotenvMarker=uncached-only wrongExpectation=refused missingCache=refused cacheMode=0600" : ""
+                let evidence = "result=PASS engine=mysql package=8.4.11 create=ready databaseCollision=refused userCollision=refused existingUserUnchanged=yes requestedDatabaseAbsent=yes pdoMigration=passed neighboringDatabase=denied coreReopen=persisted env=restore-reviewed-bytes claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed\(laravelEvidence)\n"
                 try Data(evidence.utf8).write(to: URL(fileURLWithPath: evidencePath), options: .atomic)
             }
-            print("PROJECT_DATABASE_PROVISIONING_EVIDENCE mysql=8.4.11 port=\(port) create=ready collision=refused sentinel=preserved pdo=authenticated neighboringDatabase=denied coreReopen=persisted env=unchanged claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed")
+            let laravelEvidence = laravelAcceptance ? " laravel=13.39.0 phpdotenv=5.8.0 uncached=boot-query cached=boot-query dotenvMarker=uncached-only wrongExpectation=refused missingCache=refused cacheMode=0600" : ""
+            print("PROJECT_DATABASE_PROVISIONING_EVIDENCE mysql=8.4.11 port=\(port) create=ready collision=refused sentinel=preserved pdo=authenticated neighboringDatabase=denied coreReopen=persisted env=unchanged claims=unchanged keychain=exact-items-deleted cleanup=confirmed processTable=clear processRecord=absent socket=absent root=removed\(laravelEvidence)")
         } catch {
             if let serverTask, !coreStopped {
                 let client = VaelenCoreClient(transport: UnixSocketTransport(path: endpoints.socketPath), identity: fixtureIdentity("dbprov-cleanup"))
@@ -400,6 +501,67 @@ final class ProjectDatabaseProvisioningEndToEndTests: XCTestCase {
     }
 
     private enum FixtureError: Error { case childStillRunning, childTimedOut, coreDidNotStop, keychainItemUnidentified, invalidGeneratedEnvironment }
+
+    private struct LaravelConnectionExpectation: Encodable {
+        let values: [String: String]
+
+        func encode(to encoder: Encoder) throws { try values.encode(to: encoder) }
+
+        init(defaultConnection: String, host: String, port: String, database: String, username: String, password: String) {
+            values = [
+                "database.default": defaultConnection,
+                "database.connections.mysql.host": host,
+                "database.connections.mysql.port": port,
+                "database.connections.mysql.database": database,
+                "database.connections.mysql.username": username,
+                "database.connections.mysql.password": password
+            ]
+        }
+
+        init(values: [String: String]) { self.values = values }
+    }
+
+    private struct LaravelChildResult {
+        let status: Int32
+        let output: String
+        let credentialOutputDetected: Bool
+        var isSuccessful: Bool { status == 0 && !credentialOutputDetected }
+    }
+
+    private func runLaravelProbe(php: String, probe: URL, phase: String, expectation: URL, cwd: URL, secret: Data) throws -> LaravelChildResult {
+        try runLaravelPHP(php: php, cwd: cwd, arguments: [probe.path, phase, expectation.path], secret: secret)
+    }
+
+    private func runLaravelArtisan(php: String, cwd: URL, secret: Data) throws -> LaravelChildResult {
+        try runLaravelPHP(php: php, cwd: cwd, arguments: ["artisan", "config:cache"], secret: secret, restrictiveUmask: true)
+    }
+
+    private func runLaravelPHP(php: String, cwd: URL, arguments: [String], secret: Data, restrictiveUmask: Bool = false) throws -> LaravelChildResult {
+        let process = Process(), output = Pipe(), error = Pipe()
+        let privateHome = cwd.deletingLastPathComponent().appendingPathComponent("laravel-child-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: privateHome, withIntermediateDirectories: true)
+        XCTAssertEqual(chmod(privateHome.path, 0o700), 0)
+        if restrictiveUmask {
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", "umask 077; exec \"$1\" -d display_errors=0 -d log_errors=0 artisan config:cache", "sh", php]
+        } else {
+            process.executableURL = URL(fileURLWithPath: php)
+            process.arguments = ["-d", "display_errors=0", "-d", "log_errors=0"] + arguments
+        }
+        process.currentDirectoryURL = cwd
+        process.environment = ["PATH": "/usr/bin:/bin", "HOME": privateHome.path, "TMPDIR": privateHome.path, "LC_ALL": "C", "PHP_DISPLAY_ERRORS": "0", "PHP_LOG_ERRORS": "0"]
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        try finish(process)
+        let stdout = output.fileHandleForReading.readDataToEndOfFile()
+        let stderr = error.fileHandleForReading.readDataToEndOfFile()
+        let combined = stdout + stderr
+        guard !secret.isEmpty, combined.range(of: secret) == nil else {
+            return LaravelChildResult(status: process.terminationStatus, output: "Laravel child output contained the generated credential", credentialOutputDetected: true)
+        }
+        return LaravelChildResult(status: process.terminationStatus, output: String(decoding: stdout, as: UTF8.self) + String(decoding: stderr, as: UTF8.self), credentialOutputDetected: false)
+    }
 
     private func availablePort() throws -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, 0)

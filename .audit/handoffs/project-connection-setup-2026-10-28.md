@@ -46,7 +46,7 @@ Apply preserves unrelated `.env` bytes and uses one Darwin `RENAME_SWAP`. It ret
 
 ## Known limits and residual coverage
 
-- The PDO journey proves generated values authenticate to the live provisioned MySQL account, but it does not boot a complete Laravel application or directly exercise the installed `phpdotenv` runtime.
+- The opt-in extension in `/Users/banes/.codex/worktrees/vaelen/project-laravel-acceptance` passed with pinned Laravel 13.39.0 / phpdotenv 5.8.0 boot and query checks before and after config caching. Its evidence and exact commands are in `.audit/handoffs/project-laravel-acceptance-2026-10-28.md`; the extension still needs lead review and integration.
 - PostgreSQL mapping is unit-tested; the new connection-setup flow has no separate live PostgreSQL/PDO journey yet.
 - There is no injected `fsync` failure test and no deterministic simultaneous Core unlink/recovery schedule test. The Core reservation order, unlink refusal with retained artifacts, successful unlink after discard, and stale-ID registry behavior are covered by inspection and tests.
 - An uncooperative writer can change `.env` in the final check-to-swap interval. The approved proposal may briefly become active; the actual displaced occupant is retained and the operation reports conflict. The implementation never claims this race is eliminated.
@@ -56,7 +56,7 @@ Apply preserves unrelated `.env` bytes and uses one Darwin `RENAME_SWAP`. It ret
 
 ## Next release work
 
-1. Decide whether a full disposable Laravel bootstrap/`phpdotenv` acceptance is required before release; if so, add a minimal fixture app that proves the updated `.env` is loaded both with and without cached config.
+1. Review and integrate the pinned Laravel acceptance from its isolated worktree.
 2. Add deterministic Core concurrency scheduling and injected directory-sync failure tests if the test seams can be added without weakening production transaction boundaries.
 3. Add a live PostgreSQL connection-setup/PDO journey if PostgreSQL `.env` setup must receive the same integration coverage as MySQL.
 4. Decide whether supporting common `0644` `.env` files should be a later, separately reviewed permission-tightening workflow. Current behavior deliberately refuses them.

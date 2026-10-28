@@ -32,6 +32,8 @@ Scripts/tests/val-project-database-provisioning-postgresql-test.sh
 
 The MySQL fixture verifies database and user collision refusal and confirms the existing account grants remain unchanged. The PostgreSQL fixture verifies role attributes, wrong-password rejection, and suppression of password SQL while aggressive statement and sampling logging is enabled. Both fixtures verify provisioning, neighboring-database isolation, a PDO migration, persistence through service and Core restarts, unchanged project `.env` bytes and service claims, and exact Keychain-item cleanup. They use extracted local engine packages and private Core and project roots. The scripts print the retained evidence directory on success.
 
+For the explicit Laravel connection setup flow, use `Scripts/tests/val-project-database-connection-laravel-test.sh` from [Review and apply a project database connection](project-connection-setup.md). That opt-in lane uses Laravel 13.39.0, phpdotenv 5.8.0, Composer 2.9.8, and installed Vaelen PHP 8.4.27. It does not change the standard provisioning recipes or establish PostgreSQL framework coverage.
+
 Run the Settings fixture after checking that no Vaelen process is running:
 
 ```sh

@@ -5,7 +5,8 @@ cd "$(dirname "$0")/../.."
 SUPPORT="$HOME/Library/Application Support/Vaelen"
 MYSQL_PACKAGE="$SUPPORT/packages/mysql/8.4.11"
 PHP_PACKAGE="$SUPPORT/packages/php/8.4.27"
-EVIDENCE=$(mktemp -d /private/tmp/vaelen-project-database-evidence.XXXXXX)
+EVIDENCE=${VAELEN_PROJECT_DATABASE_EVIDENCE_DIR:-$(mktemp -d /private/tmp/vaelen-project-database-evidence.XXXXXX)}
+mkdir -p "$EVIDENCE"
 trap 'printf "Evidence retained at %s\n" "$EVIDENCE"' EXIT HUP INT TERM
 
 python3 - "$MYSQL_PACKAGE" "$PHP_PACKAGE" > "$EVIDENCE/preflight.log" <<'PY'
@@ -65,6 +66,12 @@ shasum -a 256 \
     Scripts/tests/val-project-database-provisioning-test.sh \
     "$MYSQL_PACKAGE/.vaelen-package.json" \
     "$PHP_PACKAGE/.vaelen-package.json" >> "$EVIDENCE/source.txt"
+if [ -n "${VAELEN_TEST_LARAVEL_APP_ROOT:-}" ]; then
+    test -n "${VAELEN_TEST_LARAVEL_PROBE:-}"
+    test -f "$VAELEN_TEST_LARAVEL_APP_ROOT/vendor/autoload.php"
+    test -f "$VAELEN_TEST_LARAVEL_PROBE"
+    shasum -a 256 "$VAELEN_TEST_LARAVEL_APP_ROOT/composer.lock" "$VAELEN_TEST_LARAVEL_PROBE" >> "$EVIDENCE/source.txt"
+fi
 
 printf '%s\n' 'swift build --product val --skip-update --disable-automatic-resolution' > "$EVIDENCE/commands.txt"
 swift build --product val --skip-update --disable-automatic-resolution > "$EVIDENCE/build.log" 2>&1

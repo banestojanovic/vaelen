@@ -1,0 +1,34 @@
+{
+  "source": {
+    "repository": "https://github.com/laravel/laravel",
+    "tag": "v13.11.0",
+    "tagObject": "06d016a364a37430eec9cbc52209adce3d7667ce",
+    "sourceArchiveSHA256": "afd5c6f2d147287b6ccc04b505cc673e12bb583ceb4d68c763c5c2646431639d"
+  },
+  "toolchain": {
+    "composerObserved": "2.9.8",
+    "phpObserved": "8.4.27"
+  },
+  "lockedPackages": {
+    "laravel/framework": "v13.39.0",
+    "vlucas/phpdotenv": "v5.8.0"
+  },
+  "retainedFileSHA256": {
+    "app/composer.json": "dc30862e917de4ddf6866056c83eeabcac72c078e5ed604ddcecc73147a1ceaa",
+    "app/composer.lock": "ee74bd1edcfc94c29b8fd7db48ad19d641ec8071ceaf3a3ac378701e10a783e6",
+    "app/artisan": "f91a517c0c5d3a904c3f390933964a5e08ec1fc68146882730daac4aca4ffcec",
+    "app/bootstrap/app.php": "5affac529645646b3e4d599096e79c194aac63e8293690364b856d72c1e9ecbf",
+    "app/config/database.php": "02cd62f589b43d33f9ceac740705dac1dec9740eb2bb9e6e202d4b66a15244cf"
+  },
+  "omitted": [
+    ".git",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "vendor",
+    "node_modules",
+    ".env",
+    "database/database.sqlite",
+    "bootstrap/cache/*.php",
+    "storage runtime contents"
+  ]
+}
