@@ -35,7 +35,8 @@ After `val project db connection apply` writes the six approved `DB_*` values in
 - [x] Verify real Laravel bootstrap in uncached and cached modes.
 - [x] Update the verification map and handoff with coverage limits.
 - [x] Review the complete diff once with one fresh read-only Sol reviewer.
-- [ ] Commit and push the isolated feature branch. The implementation brief explicitly forbids committing; the lead owns any later commit/push decision.
+- [x] Commit and push the isolated feature branch. Commit `a4fb244` is on `origin/codex/project-laravel-acceptance-20261028`.
+- [ ] Run Opening a PR. skip: neither `gh` nor `origin` is installed, and no browser surface is available; use the GitHub compare link in the handoff.
 
 ## Execution checkpoint
 
@@ -47,7 +48,9 @@ After `val project db connection apply` writes the six approved `DB_*` values in
 - The fresh Sol review found a false-pass case when a successful Artisan child printed the credential. `LaravelChildResult` now separates status, redacted output, and credential detection. Its success predicate requires status zero and no detected credential. A zero-exit credential-emission negative control passes.
 - Lead reruns passed for the focused suite and the complete Laravel recipe. Final evidence is at `/private/tmp/vaelen-laravel-connection-evidence.UPgcZY`; its recorded Swift hash matches the final file.
 - `git diff --check` flags three whitespace-only lines in the verified upstream Laravel welcome view. The exact upstream snapshot is preserved. Authored files pass the check.
-- Review found no other actionable provenance or comment issues. The feature is ready to commit and push.
+- Review found no other actionable provenance or comment issues. Commit `a4fb244` is pushed; PR creation is pending because this session lacks a forge CLI and browser surface.
+- Cleanup removed seven measured Swift `.build` trees (9,632,688 KiB total), Vaelen DerivedData (30 MiB), and `Scripts/__pycache__` (60 KiB). The filesystem reported 39 GiB available before and 48 GiB after.
+- No worktree was removed because chat ownership is unknown and three worktrees contain uncommitted project work. Previously rejected `/private/tmp` deletion targets remain untouched. Historical verification artifacts and the initial failure log remain available.
 
 ## Design selection
 

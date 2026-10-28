@@ -2,7 +2,7 @@
 
 ## Status
 
-The implementation and acceptance are complete in `/Users/banes/.codex/worktrees/vaelen/project-laravel-acceptance`, based on `2fad8cc741f229a090e45c7decf3042da240c2c1`. The feature branch is ready for commit and push. Product code under `Sources/` and `App/` was not changed.
+The implementation and acceptance are complete in `/Users/banes/.codex/worktrees/vaelen/project-laravel-acceptance`, based on `2fad8cc741f229a090e45c7decf3042da240c2c1`. Commit `a4fb244` is pushed. PR creation is pending. Product code under `Sources/` and `App/` was not changed.
 
 ## Acceptance implemented
 
@@ -32,4 +32,8 @@ This proves the locked Laravel 13.39.0 / phpdotenv 5.8.0 MySQL path under PHP 8.
 
 ## Next actions
 
-Commit and push the isolated feature branch, then open a PR stacked on `codex/project-connection-setup-fix-20261028`. Preserve the main checkout's unrelated uncommitted changes. Keep `.audit/test-failures/swift-test.JlOJDz` as historical failure evidence and do not stage it.
+The implementation commit `a4fb244` is pushed to `codex/project-laravel-acceptance-20261028`. Open the PR stacked on `codex/project-connection-setup-fix-20261028` at [the GitHub compare page](https://github.com/banestojanovic/vaelen/compare/codex/project-connection-setup-fix-20261028...codex/project-laravel-acceptance-20261028?expand=1). This session had no `gh` or `origin` CLI and no browser surface, so it could not submit the PR.
+
+The cleanup removed seven measured Swift `.build` trees totaling 9,632,688 KiB, the 30 MiB Vaelen Xcode DerivedData directory, and the 60 KiB `Scripts/__pycache__` directory. Available disk space rose from 39 GiB to 48 GiB. It preserved all source and every Git worktree. The audit could not confirm chat ownership, and it found uncommitted work in `project-connection-setup-impl`, `vaelen-provider-fixture`, and `.worktrees/invalid-instance-remove-fix`.
+
+The read-only `/private/tmp` inventory still shows large Vaelen candidates: `vaelen-recovery-build-20261028` (779 MiB), `vaelen-db-badge-build` (774 MiB), `vaelen-dbprov-settings-build` (766 MiB), and seven `vaelen-dbprov-<UUID>` directories at about 190 MiB each. They remain because an earlier removal attempt was safety-blocked and this session must not retry those paths. The final acceptance evidence remains at `/private/tmp/vaelen-laravel-connection-evidence.UPgcZY`. The initial failure log remains at `.audit/test-failures/swift-test.JlOJDz` as historical evidence and was not staged.
