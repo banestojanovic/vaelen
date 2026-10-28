@@ -13,7 +13,7 @@ Risky changes are persistence/schema migration, recovery, project file writes, e
 
 ## Queue
 
-The queue is `docs/NEXT-PLAN.md` plus the **Next** line in `docs/HANDOFF.md`. The owner assigns a goal by naming it or saying `/shift N` (Claude) or “run a shift of N” (Codex). Default N is 3; any nonnumeric argument is one named goal. Work bugs first, then the next unfinished queue item with acceptance criteria. Do not treat historical `.audit/` notes as approved feature scope; use them as investigation sources only. Never infer permission for system or installed-app mutations from a queue entry.
+The queue is `docs/NEXT-PLAN.md` plus the **Next** line in `docs/HANDOFF.md`. Invoke `/shift N` in Claude Code or `$shift` / “run a shift of N” in Codex. Both use the same skill contract and handoff loop. Default N is 3; any nonnumeric argument is one named goal. Work bugs first, then the next unfinished queue item with acceptance criteria. Do not treat historical `.audit/` notes as approved feature scope; use them as investigation sources only. Never infer permission for system or installed-app mutations from a queue entry.
 
 ## Loop (per item)
 

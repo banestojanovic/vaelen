@@ -2,6 +2,8 @@
 
 Read `docs/HANDOFF.md`, this file, and the relevant section of `docs/NEXT-PLAN.md` at the start of a task. `docs/ARCHITECTURE.md` owns product boundaries. Preserve unrelated user changes; inspect `git status` before editing and stage only files belonging to the task.
 
+For queue work, invoke the shared workflow through `/shift N` in Claude Code or the `$shift` skill in Codex. `/auto-shift N` and `$auto-shift` run the unattended Claude-session loop; it requires the Claude CLI.
+
 ## Execution
 
 Use the workflow in `docs/WORKFLOW.md`. One writer per checkout; do routine work in the current context. Do not fan out work or create explorer/verification agents automatically. A feature, refactor, or bounded bug fix gets one focused loop and self-review. Use exactly one fresh, read-only independent reviewer only for risky persistence, migration, recovery, export, process ownership, privileged system changes, or subtle concurrency work. Multiple reviewers are an exceptional measure for a genuinely complex integration or major bottleneck; explain the concrete reason first.
